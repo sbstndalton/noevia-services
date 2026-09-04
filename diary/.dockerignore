@@ -1,0 +1,10 @@
+.venv/
+.git/
+.gitignore
+data/
+.pytest_cache/
+__pycache__/
+samples/
+results.json
+.DS_Store
+.env

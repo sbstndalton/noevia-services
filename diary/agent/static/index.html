@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Diary Companion</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="lock" class="hidden">
+    <form id="lockform">
+      <h1>Diary Companion</h1>
+      <p class="muted">Enter your access passphrase.</p>
+      <input type="password" id="tokeninput" placeholder="access token" autocomplete="current-password">
+      <button type="submit" id="unlockbtn">Unlock</button>
+      <p id="lockerror" class="error-text hidden">Wrong token — try again.</p>
+    </form>
+  </div>
+
+  <div id="layout" class="hidden">
+    <aside id="sidebar">
+      <h1>Diary Companion</h1>
+      <section>
+        <h2>Today's log</h2>
+        <pre id="todaylog" class="panel">loading…</pre>
+      </section>
+      <section>
+        <h2>Standing sections</h2>
+        <pre id="standing" class="panel">loading…</pre>
+      </section>
+      <section>
+        <h2>System</h2>
+        <pre id="health" class="panel">loading…</pre>
+      </section>
+      <section>
+        <button id="lockbtn" class="ghost">Lock</button>
+      </section>
+    </aside>
+    <main id="main">
+      <div id="chatlog" aria-live="polite"></div>
+      <form id="chatform" autocomplete="off">
+        <textarea id="message" name="message" rows="3"
+          placeholder="What's on your mind today?"></textarea>
+        <div id="formbar">
+          <span id="logstatus" class="muted"></span>
+          <button type="submit" id="sendbtn">Send</button>
+        </div>
+      </form>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
