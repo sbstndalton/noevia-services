@@ -20,7 +20,13 @@ Run:  uvicorn agent.app:app --host 0.0.0.0 --port 8010
 from __future__ import annotations
 
 import logging
+import copy
+import base64
+import hashlib
+import json
+import os
 import re
+import shutil
 import secrets
 import threading
 import time
@@ -85,13 +91,64 @@ class AppState:
 
 
 _state: Optional[AppState] = None
+_tenant_states: Dict[str, AppState] = {}
+_tenant_lock = threading.Lock()
+_base_cfg = load_config()
+
+
+def _set_cfg(cfg, dotted: str, value) -> None:
+    node = cfg.as_dict()
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    node[parts[-1]] = value
 
 
 def get_state() -> AppState:
     global _state
     if _state is None:
-        _state = AppState(load_config())
+        _state = AppState(_base_cfg)
     return _state
+
+
+def _tenant_state(request: Request) -> AppState:
+    user_id = request.headers.get("X-Cowork-User-ID", "") or os.environ.get("DIARY_LEGACY_USER_ID", "")
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
+        return get_state()
+    storage_header = request.headers.get("X-Cowork-Storage", "")
+    state_key = f"{user_id}:{hashlib.sha256(storage_header.encode()).hexdigest()[:16]}"
+    with _tenant_lock:
+        if state_key in _tenant_states:
+            return _tenant_states[state_key]
+        cfg = copy.deepcopy(_base_cfg)
+        tenant_root = Path(cfg.get("retrieval.db_path")).parent / "users" / user_id
+        tenant_root.mkdir(parents=True, exist_ok=True)
+        tenant_db = tenant_root / "index.db"
+        legacy_owner = request.headers.get("X-Cowork-Legacy-Owner") == "1" or bool(os.environ.get("DIARY_LEGACY_USER_ID"))
+        source_db = Path(cfg.get("retrieval.db_path"))
+        if legacy_owner and source_db.exists() and not tenant_db.exists():
+            shutil.copy2(source_db, tenant_db)
+        _set_cfg(cfg, "retrieval.db_path", str(tenant_db))
+        storage = None
+        if storage_header:
+            try:
+                storage = json.loads(base64.urlsafe_b64decode(storage_header + "=" * (-len(storage_header) % 4)))
+            except Exception:  # noqa: BLE001
+                storage = None
+        if storage and storage.get("kind") in ("nextcloud", "webdav"):
+            _set_cfg(cfg, "corpus.backend", "webdav")
+            _set_cfg(cfg, "corpus.webdav.base_url", storage.get("baseUrl", ""))
+            _set_cfg(cfg, "corpus.webdav.username", storage.get("username", ""))
+            _set_cfg(cfg, "corpus.webdav.password", storage.get("secret", ""))
+            _set_cfg(cfg, "corpus.root", storage.get("corpusRoot", ""))
+        elif not legacy_owner:
+            _set_cfg(cfg, "corpus.backend", "local")
+            _set_cfg(cfg, "corpus.local.root", str(tenant_root / "corpus"))
+            _set_cfg(cfg, "corpus.root", "")
+        state = AppState(cfg)
+        state.store.apply_pending()
+        _tenant_states[state_key] = state
+        return state
 
 
 @asynccontextmanager
@@ -130,15 +187,36 @@ def check_auth(request: Request) -> bool:
     return bool(supplied) and secrets.compare_digest(supplied, st.auth_token)
 
 
+@app.delete("/api/internal/tenant")
+def delete_tenant(request: Request) -> JSONResponse:
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    user_id = request.headers.get("X-Cowork-User-ID", "")
+    if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
+        return JSONResponse({"error": "invalid user"}, status_code=400)
+    root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    with _tenant_lock:
+        for key, state in list(_tenant_states.items()):
+            if key.startswith(f"{user_id}:"):
+                try:
+                    state.backend.close(); state.llm_main.close(); state.llm_aux.close(); state.retrieval.close(); state.journal.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _tenant_states.pop(key, None)
+        shutil.rmtree(root, ignore_errors=True)
+    return JSONResponse({"ok": True})
+
+
 # ---------------- in-memory session (single user) ----------------
 
 SESSIONS: Dict[str, dict] = {}
 
 
-def _session(session_id: str) -> dict:
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = {"turns": [], "log_status": []}
-    return SESSIONS[session_id]
+def _session(session_id: str, tenant_id: str = "legacy") -> dict:
+    key = f"{tenant_id}:{session_id}"
+    if key not in SESSIONS:
+        SESSIONS[key] = {"turns": [], "log_status": []}
+    return SESSIONS[key]
 
 
 # ---------------- request/response models ----------------
@@ -166,10 +244,9 @@ def index() -> str:
 # ---------------- shared conversation core (UI + /v1 both use this) ----------------
 
 
-def _run_exchange(message: str, session_id: str) -> dict:
+def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy") -> dict:
     """One full exchange: context build -> main model -> strip marker -> log -> return payload."""
-    st = get_state()
-    sess = _session(session_id)
+    sess = _session(session_id, tenant_id)
     day = datetime.now().date()
     messages = st.assembler.build(day, message, session_turns=sess["turns"])
     reply = st.llm_main.chat(messages, temperature=0.7)
@@ -222,7 +299,7 @@ def api_chat(req: ChatRequest, request: Request) -> JSONResponse:
     if not message:
         return JSONResponse({"error": "empty message"}, status_code=400)
     try:
-        result = _run_exchange(message, req.session_id)
+        result = _run_exchange(_tenant_state(request), message, req.session_id, request.headers.get("X-Cowork-User-ID", "legacy"))
     except Exception as exc:  # noqa: BLE001
         log.exception("chat failed")
         return JSONResponse({"error": f"model error: {exc}"}, status_code=502)
@@ -233,8 +310,8 @@ def api_chat(req: ChatRequest, request: Request) -> JSONResponse:
 def api_relog(req: RelogRequest, request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = get_state()
-    sess = _session(req.session_id)
+    st = _tenant_state(request)
+    sess = _session(req.session_id, request.headers.get("X-Cowork-User-ID", "legacy"))
     try:
         item = sess["log_status"][req.index]
     except IndexError:
@@ -255,7 +332,7 @@ def api_day(request: Request, month: Optional[str] = None) -> JSONResponse:
     whole month's display text when ?month=YYYY-MM is given."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = get_state()
+    st = _tenant_state(request)
     if month:
         m = re.fullmatch(r"(\d{4})-(\d{2})", month or "")
         if not m:
@@ -280,7 +357,7 @@ def api_day(request: Request, month: Optional[str] = None) -> JSONResponse:
 def api_months(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = get_state()
+    st = _tenant_state(request)
     months = run_in_threadpool_sync(st.store.list_months)
     return JSONResponse({"months": months})
 
@@ -289,7 +366,7 @@ def api_months(request: Request) -> JSONResponse:
 def api_health(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = get_state()
+    st = _tenant_state(request)
     return JSONResponse({
         "ok": True,
         "journal_pending": st.journal.pending_count(),
@@ -306,7 +383,7 @@ def api_health(request: Request) -> JSONResponse:
 def v1_models(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = get_state()
+    st = _tenant_state(request)
     model_id = "diary-companion"
     return JSONResponse({
         "object": "list",
@@ -342,13 +419,15 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
     prior = [{"role": "user", "content": str(m)} for m in user_msgs[:-1] if str(m).strip()][-6:]
 
     session_id = "openai-client"
-    sess = _session(session_id)
+    tenant_id = request.headers.get("X-Cowork-User-ID", "legacy")
+    st = _tenant_state(request)
+    sess = _session(session_id, tenant_id)
     if prior and not sess["turns"]:
         sess["turns"].extend(prior)  # seed short client-thread context
 
     try:
         # _run_exchange does blocking inference I/O — keep the event loop free.
-        result = await run_in_threadpool(_run_exchange, last, session_id)
+        result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id)
     except Exception as exc:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
