@@ -1,12 +1,18 @@
 # Diary Companion service
 
-Diary Companion is Cowork's independently runnable FastAPI service. It provides a browser UI and an OpenAI-compatible `/v1` API, assembles diary context for conversations, and records selected exchanges into monthly Markdown files.
+Diary Companion is Cowork's optional, independently runnable FastAPI service. It provides a browser UI and an OpenAI-compatible `/v1` API, assembles diary context for conversations, and records selected exchanges into daily Markdown files.
 
 ## Storage
 
 `CORPUS_BACKEND=local` is the default and uses `CORPUS_LOCAL_ROOT`. `CORPUS_BACKEND=webdav` uses `WEBDAV_BASE_URL`, `WEBDAV_USERNAME`, and `WEBDAV_PASSWORD`. `CORPUS_ROOT` adds an optional subdirectory within either backend.
 
 Both backends implement the same versioned storage contract. Local writes use locking, content hashes, `fsync`, and atomic replacement; WebDAV writes use ETag preconditions and bounded conflict retries.
+
+The default daily layout is `Entries/YYYY/Month/Month D, YYYY.md`; month views
+aggregate those files in calendar order. Existing monthly corpora remain
+supported with `DIARY_ENTRY_LAYOUT=monthly` and
+`DIARY_MONTH_FILE_TEMPLATE={year}-{month02}.md`. Files under `AI Memory` and
+`Raw Sources` are left untouched by the entry writer.
 
 ## Run locally
 

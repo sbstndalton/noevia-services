@@ -77,6 +77,21 @@ class WebDAVCorpusBackend:
             return None, None
         return data.decode("utf-8", errors="replace"), etag
 
+    def _ensure_parent_dirs(self, remote_path: str) -> None:
+        """Create missing WebDAV collections from shallowest to deepest.
+
+        MKCOL is idempotent here: Nextcloud returns 405 when a collection
+        already exists, which is treated as success. This is needed by the
+        daily layout when the first entry of a new month or year is written.
+        """
+        parts = remote_path.strip("/").split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            directory = "/".join(parts[:index])
+            resp = self._client.request("MKCOL", self._url(directory + "/"))
+            if resp.status_code in (201, 405):
+                continue
+            resp.raise_for_status()
+
     def put(
         self,
         remote_path: str,
@@ -97,6 +112,7 @@ class WebDAVCorpusBackend:
             headers["If-Match"] = if_match
         else:
             headers["If-None-Match"] = if_none_match
+            self._ensure_parent_dirs(remote_path)
 
         for attempt in range(max_retries):
             resp = self._client.put(url, content=data, headers=headers)

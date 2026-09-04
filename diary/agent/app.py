@@ -276,7 +276,7 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
 def _reindex_today(st: AppState, day) -> None:
     try:
         month_text, _ = st.store.read_month(day)
-        st.retrieval.reindex_file(st.store.month_filename(day), month_text)
+        st.retrieval.reindex_file(st.store.document_path(day), month_text)
     except Exception as exc:  # noqa: BLE001
         log.warning("background reindex failed: %s", exc)
 

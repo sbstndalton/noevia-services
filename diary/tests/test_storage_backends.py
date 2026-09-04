@@ -61,3 +61,31 @@ def test_journal_replay_with_local_backend(tmp_path):
 def test_backend_factory_defaults_to_local(tmp_path):
     cfg = Config({"corpus": {"local": {"root": str(tmp_path)}}})
     assert isinstance(create_backend(cfg), LocalCorpusBackend)
+
+
+def test_daily_layout_reads_writes_and_lists_months(tmp_path):
+    backend = LocalCorpusBackend(str(tmp_path / "corpus"))
+    cfg = Config({
+        "corpus": {
+            "root": "",
+            "entry_layout": "daily",
+            "entries_prefix": "Entries",
+            "index_enabled": False,
+        }
+    })
+    store = CorpusStore(cfg, backend, Journal(tmp_path / "daily.db"))
+
+    store.log_exchange(date(2026, 8, 31), "Evening", "August note", "Saved")
+    store.log_exchange(date(2026, 9, 1), "Morning", "First September note", "Saved")
+    store.log_exchange(date(2026, 9, 4), "Later", "Fourth September note", "Saved")
+
+    assert store.daily_path(date(2026, 9, 4)) == "Entries/2026/September/September 4, 2026.md"
+    assert backend.exists(store.daily_path(date(2026, 9, 4)))
+    september = store.read_month_text(2026, 9)
+    assert "First September note" in september
+    assert "Fourth September note" in september
+    assert "August note" not in september
+    assert "xid" not in september
+    assert [item["id"] for item in store.list_months()] == ["2026-08", "2026-09"]
+    assert "Fourth September note" in store.get_day_text(date(2026, 9, 4))
+    assert not backend.exists("INDEX.md")

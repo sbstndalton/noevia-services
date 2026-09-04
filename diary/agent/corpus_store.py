@@ -34,6 +34,10 @@ class CorpusStore:
         self.journal = journal
         self.remote_root = (cfg.get("corpus.root") or cfg.get("corpus.webdav.remote_root") or "").strip("/")
         self.monthly_prefix = cfg.get("corpus.monthly_prefix") or ""
+        self.entry_layout = str(cfg.get("corpus.entry_layout", "monthly")).strip().lower()
+        if self.entry_layout not in ("daily", "monthly"):
+            raise ValueError("corpus.entry_layout must be 'daily' or 'monthly'")
+        self.entries_prefix = cfg.get("corpus.entries_prefix") or "Entries"
         self.index_file = cfg.get("corpus.index_file") or "INDEX.md"
         # Month-file naming template (default preserves the original 2026-09 style).
         # Example for human-named corpora: "Diary - {month_name} {year}.md"
@@ -58,13 +62,28 @@ class CorpusStore:
     def month_path(self, day: date) -> str:
         return self._join(self.monthly_prefix, self.month_filename(day))
 
+    def daily_filename(self, day: date) -> str:
+        return f"{day.strftime('%B')} {day.day}, {day.year}.md"
+
+    def daily_path(self, day: date) -> str:
+        return self._join(
+            self.entries_prefix,
+            str(day.year),
+            day.strftime("%B"),
+            self.daily_filename(day),
+        )
+
+    def document_path(self, day: date) -> str:
+        return self.daily_path(day) if self.entry_layout == "daily" else self.month_path(day)
+
     def index_path(self) -> str:
         return self._join(self.monthly_prefix, self.index_file)
 
     # ---------------- reads ----------------
 
     def read_month(self, day: date) -> Tuple[Optional[str], Optional[str]]:
-        return self.backend.get_text(self.month_path(day))
+        # Compatibility name: in daily layout this reads the day's document.
+        return self.backend.get_text(self.document_path(day))
 
     def read_index(self) -> Tuple[Optional[str], Optional[str]]:
         return self.backend.get_text(self.index_path())
@@ -80,14 +99,34 @@ class CorpusStore:
         Empty string when the month has no file yet (or the read fails —
         display-only read, same degradation policy as get_day_text).
         """
+        if self.entry_layout == "monthly":
+            try:
+                month_text, _ = self.read_month(date(year, month, 1))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("month-text read failed (degrading to empty): %s", exc)
+                return ""
+            return fmt.strip_markers(month_text) if month_text else ""
+
+        parts: List[str] = []
+        month_dir = self._join(self.entries_prefix, str(year), date(year, month, 1).strftime("%B"))
         try:
-            month_text, _ = self.read_month(date(year, month, 1))
+            entries = self.backend.list_dir(month_dir)
+            expected = re.compile(rf"^{calendar.month_name[month]} (\d{{1,2}}), {year}\.md$")
+            dated = []
+            for entry in entries:
+                match = expected.match(entry.get("name") or "")
+                if entry.get("is_dir") or not match:
+                    continue
+                day_number = int(match.group(1))
+                if 1 <= day_number <= calendar.monthrange(year, month)[1]:
+                    dated.append((day_number, entry.get("path") or self.daily_path(date(year, month, day_number))))
+            for _, path in sorted(dated):
+                text, _ = self.backend.get_text(path)
+                if text:
+                    parts.append(fmt.strip_markers(text).strip())
         except Exception as exc:  # noqa: BLE001
-            log.warning("month-text read failed (degrading to empty): %s", exc)
-            return ""
-        if not month_text:
-            return ""
-        return fmt.strip_markers(month_text)
+            log.warning("daily month read failed (degrading to partial/empty): %s", exc)
+        return "\n\n".join(part for part in parts if part)
 
     def list_months(self) -> List[dict]:
         """Months that actually have a corpus file, oldest first.
@@ -96,6 +135,9 @@ class CorpusStore:
         configured month_file_template ({year}, {month02}, {month_name} are
         recognized). Non-matching files and subdirectories are ignored.
         """
+        if self.entry_layout == "daily":
+            return self._list_daily_months()
+
         template = self.month_file_template
         # Build a regex from the template: literal text around named fields.
         pattern = re.escape(template)
@@ -151,6 +193,37 @@ class CorpusStore:
         months.sort(key=lambda x: x["id"])
         return months
 
+    def _list_daily_months(self) -> List[dict]:
+        months: List[dict] = []
+        try:
+            years = self.backend.list_dir(self._join(self.entries_prefix))
+            for year_entry in years:
+                name = year_entry.get("name") or ""
+                if not year_entry.get("is_dir") or not re.fullmatch(r"\d{4}", name):
+                    continue
+                year = int(name)
+                if year < 2000 or year > 2100:
+                    continue
+                for month_entry in self.backend.list_dir(year_entry.get("path") or self._join(self.entries_prefix, name)):
+                    month_name = month_entry.get("name") or ""
+                    if not month_entry.get("is_dir") or month_name not in calendar.month_name:
+                        continue
+                    month = list(calendar.month_name).index(month_name)
+                    month_path = month_entry.get("path") or self._join(self.entries_prefix, name, month_name)
+                    daily_rx = re.compile(rf"^{month_name} \d{{1,2}}, {year}\.md$")
+                    if not any(not item.get("is_dir") and daily_rx.match(item.get("name") or "") for item in self.backend.list_dir(month_path)):
+                        continue
+                    months.append({
+                        "id": f"{year:04d}-{month:02d}",
+                        "label": date(year, month, 1).strftime("%B %Y"),
+                        "file": month_path,
+                    })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("daily month listing failed (degrading to empty): %s", exc)
+            return []
+        months.sort(key=lambda item: item["id"])
+        return months
+
     # ---------------- guarded remote writes ----------------
 
     def _guarded_write(
@@ -204,12 +277,13 @@ class CorpusStore:
                 "sub_header": header_text,
                 "body": body,
                 "month": self.month_filename(day),
+                "document": self.document_path(day),
                 "month_label": self.month_label(day),
             },
         )
         # Register the month link too (applier dedupes; harmless if the link exists).
         # Skipped entirely when the corpus runs without an INDEX.md.
-        if self.index_enabled:
+        if self.index_enabled and self.entry_layout == "monthly":
             self.journal.enqueue(
                 "index_month",
                 {"month": self.month_filename(day), "label": self.month_label(day)},
@@ -261,7 +335,7 @@ class CorpusStore:
         xid = p["xid"]
         sub_header = p["sub_header"]
         body = p["body"]
-        path = self.month_path(day)
+        path = self.document_path(day)
 
         def mutate(current: Optional[str]) -> Tuple[Optional[str], bool]:
             if current is not None and fmt.has_marker(current, xid):
@@ -351,6 +425,8 @@ class CorpusStore:
         return out
 
     def month_registered(self, day: date) -> bool:
+        if self.entry_layout == "daily":
+            return self.backend.exists(self.daily_path(day))
         index_text, _ = self.read_index()
         idx = fmt.parse_index(index_text)
         return any(self.month_filename(day) in link for link in idx.month_links)

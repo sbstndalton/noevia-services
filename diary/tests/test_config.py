@@ -30,3 +30,12 @@ def test_config_deepcopy_does_not_share_nested_state():
 
     assert cfg.corpus.backend == "local"
     assert cloned.corpus.backend == "webdav"
+
+
+def test_daily_layout_environment(monkeypatch):
+    monkeypatch.setenv("DIARY_ENTRY_LAYOUT", "daily")
+    monkeypatch.setenv("DIARY_ENTRIES_PREFIX", "Entries")
+    cfg = Config({})
+    _apply_env(cfg)
+    assert cfg.get("corpus.entry_layout") == "daily"
+    assert cfg.get("corpus.entries_prefix") == "Entries"

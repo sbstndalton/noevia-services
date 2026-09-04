@@ -6,6 +6,7 @@ Env overrides:
   CORPUS_BACKEND, CORPUS_ROOT, CORPUS_LOCAL_ROOT,
   WEBDAV_BASE_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD, CORPUS_REMOTE_ROOT (legacy),
   DIARY_MONTH_FILE_TEMPLATE, DIARY_INDEX_ENABLED,
+  DIARY_ENTRY_LAYOUT, DIARY_ENTRIES_PREFIX,
   DB_PATH, DIARY_PORT
 """
 from __future__ import annotations
@@ -78,6 +79,8 @@ def _apply_env(cfg: Config) -> None:
         "WEBDAV_PASSWORD": "corpus.webdav.password",
         "CORPUS_REMOTE_ROOT": "corpus.root",
         "DIARY_MONTH_FILE_TEMPLATE": "corpus.month_file_template",
+        "DIARY_ENTRY_LAYOUT": "corpus.entry_layout",
+        "DIARY_ENTRIES_PREFIX": "corpus.entries_prefix",
         "DIARY_INDEX_ENABLED": "corpus.index_enabled",
         "DB_PATH": "retrieval.db_path",
         "DIARY_PORT": "ui.port",

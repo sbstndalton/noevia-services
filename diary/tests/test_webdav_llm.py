@@ -114,6 +114,31 @@ def test_list_dir_uses_generic_webdav_base_path(monkeypatch):
     dav.close()
 
 
+def test_daily_write_creates_parent_collections(monkeypatch):
+    dav = WebDAVClient("https://cloud.example/dav/user/", "u", "p")
+    calls = []
+
+    class Response:
+        status_code = 201
+
+        def raise_for_status(self):
+            return None
+
+    def request(method, url, **_kwargs):
+        calls.append((method, url))
+        return Response()
+
+    monkeypatch.setattr(dav._client, "request", request)
+    dav._ensure_parent_dirs("Diary/Entries/2026/October/October 1, 2026.md")
+    assert calls == [
+        ("MKCOL", "https://cloud.example/dav/user/Diary/"),
+        ("MKCOL", "https://cloud.example/dav/user/Diary/Entries/"),
+        ("MKCOL", "https://cloud.example/dav/user/Diary/Entries/2026/"),
+        ("MKCOL", "https://cloud.example/dav/user/Diary/Entries/2026/October/"),
+    ]
+    dav.close()
+
+
 # ---------------- LLM marker parsing ----------------
 
 

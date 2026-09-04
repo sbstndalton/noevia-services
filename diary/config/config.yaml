@@ -14,6 +14,10 @@ llm:
   max_retries: 3
 
 corpus:
+  # Daily files are stored as Entries/YYYY/Month/Month D, YYYY.md.
+  # Set to monthly for compatibility with older single-file-per-month corpora.
+  entry_layout: daily
+  entries_prefix: Entries
   # Local storage works on a clean installation; select webdav explicitly for remote storage.
   backend: local
   root: ""
@@ -25,7 +29,7 @@ corpus:
     timeout_s: 60
   monthly_prefix: ""
   month_file_template: "{year}-{month02}.md"
-  index_enabled: true
+  index_enabled: false
   index_file: INDEX.md
   redact_markers: true
 
