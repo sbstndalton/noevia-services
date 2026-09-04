@@ -55,7 +55,7 @@ class FakeWebDAV:
 def _store(tmp_path, corpus_cfg):
     base = {
         "corpus": {
-            "webdav": {"remote_root": "Documents/Important Documents/Diary"},
+            "root": "Notes/Journal",
             "monthly_prefix": "",
             "index_file": "INDEX.md",
         },
@@ -91,7 +91,7 @@ def test_human_naming_end_to_end_append_and_replay_dedupe(tmp_path):
     assert "<!-- xid:" in month_text
 
     # month file named with the template, INDEX.md never created
-    assert store.month_path(day) == "Documents/Important Documents/Diary/Diary - September 2026.md"
+    assert store.month_path(day) == "Notes/Journal/Diary - September 2026.md"
     assert "INDEX.md" not in store.dav.files
 
     # replay: marker dedupe still holds with the adapted naming

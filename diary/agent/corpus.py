@@ -8,7 +8,7 @@ Canonical format (the user's spec, enforced mechanically — never LLM-generated
 
     **Me:** <user's message, kept near-verbatim, unparaphrased>
 
-    **Claude:** <assistant's reply condensed into third-person natural prose>
+    **Assistant:** <assistant's reply condensed into third-person natural prose>
 
 Hidden exchange markers (`<!-- xid:... -->`) are appended after each exchange block so the
 applier can dedupe idempotently; they are stripped when the log is shown to the model.
@@ -23,14 +23,14 @@ from typing import List, Optional
 DAY_HEADER_RE = re.compile(r"^## (?:(?P<dow>[A-Za-z]+), )?(?P<month>[A-Za-z]+) (?P<day>\d{1,2}), (?P<year>\d{4})\s*$")
 SUB_HEADER_RE = re.compile(r"^### (?P<rest>.+?)\s*$")
 ME_RE = re.compile(r"^\*\*Me:\*\*[ \t]?", re.M)
-CLAUDE_RE = re.compile(r"^\*\*Claude:\*\*[ \t]?", re.M)
+ASSISTANT_RE = re.compile(r"^\*\*(?:Assistant|Claude):\*\*[ \t]?", re.M)
 MARKER_RE = re.compile(r"<!--\s*xid:(?P<xid>[0-9a-fA-F-]+)\s*-->")
 TIME_PREFIX_RE = re.compile(r"^(?P<time>\d{1,2}:\d{2})(?:\s*[—–-]\s*(?P<topic>.*))?$")
 
 
 @dataclass
 class Exchange:
-    """One Me:/Claude: pair inside a ### subsection."""
+    """One user/assistant pair inside a diary subsection."""
 
     me: str
     claude: str
@@ -81,7 +81,7 @@ def render_exchange(me: str, claude: str, xid: str) -> str:
     claude_clean = claude.strip()
     return (
         f"**Me:** {me_clean}\n\n"
-        f"**Claude:** {claude_clean}\n\n"
+        f"**Assistant:** {claude_clean}\n\n"
         f"<!-- xid:{xid} -->\n"
     )
 
@@ -145,7 +145,7 @@ def _parse_day_date(m: re.Match) -> Optional[date]:
 
 
 def _append_buf_to_sub(sub: SubSection, body: str) -> None:
-    """Split a subsection body into Me:/Claude: exchanges, tolerating intermixed text.
+    """Split a subsection body into user/assistant exchanges, tolerating intermixed text.
 
     Multi-line messages are preserved verbatim (minus surrounding blank lines).
     """
@@ -167,7 +167,7 @@ def _append_buf_to_sub(sub: SubSection, body: str) -> None:
             part = part[me_m.start():]
             me_m = ME_RE.search(part)
         rest = part[me_m.end():]
-        claude_m = CLAUDE_RE.search(rest)
+        claude_m = ASSISTANT_RE.search(rest)
         if claude_m:
             me_text = rest[: claude_m.start()].strip()
             claude_text = rest[claude_m.end():].strip()

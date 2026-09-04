@@ -1,0 +1,20 @@
+from agent.config import Config, _apply_env
+
+
+def test_neutral_corpus_environment(monkeypatch):
+    monkeypatch.setenv("CORPUS_BACKEND", "webdav")
+    monkeypatch.setenv("CORPUS_ROOT", "Notes/Journal")
+    monkeypatch.setenv("CORPUS_LOCAL_ROOT", "/data/corpus")
+    cfg = Config({})
+    _apply_env(cfg)
+    assert cfg.get("corpus.backend") == "webdav"
+    assert cfg.get("corpus.root") == "Notes/Journal"
+    assert cfg.get("corpus.local.root") == "/data/corpus"
+
+
+def test_legacy_remote_root_alias(monkeypatch, caplog):
+    monkeypatch.setenv("CORPUS_REMOTE_ROOT", "Legacy/Diary")
+    cfg = Config({})
+    _apply_env(cfg)
+    assert cfg.get("corpus.root") == "Legacy/Diary"
+    assert "deprecated" in caplog.text

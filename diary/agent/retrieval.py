@@ -106,7 +106,7 @@ class Retriever:
             day_iso = d.date.isoformat()
             for sub in d.subsections:
                 body = "\n".join(
-                    (f"**Me:** {ex.me}\n\n**Claude:** {ex.claude}" if ex.claude else f"**Me:** {ex.me}")
+                    (f"**Me:** {ex.me}\n\n**Assistant:** {ex.claude}" if ex.claude else f"**Me:** {ex.me}")
                     for ex in sub.exchanges
                 ).strip()
                 if not body:

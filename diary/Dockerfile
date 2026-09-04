@@ -12,8 +12,7 @@ COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
 
-# Runs as root (Unraid community-container convention) so the ./data bind mount is
-# writable regardless of host-side ownership. Isolated bridge network, LAN-only.
+# Bind-mounted state must be writable by the image's runtime user.
 
 EXPOSE 8010
 # Authed probe: /api/health returns 401 once DIARY_AUTH_TOKEN is set (same fix as

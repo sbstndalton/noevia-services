@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Dict, Optional, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
@@ -37,9 +37,10 @@ def clean_etag(etag: Optional[str]) -> Optional[str]:
     return f'"{core}"'
 
 
-class WebDAVClient:
+class WebDAVCorpusBackend:
     def __init__(self, base_url: str, username: str, password: str, timeout_s: float = 60.0):
         self.base_url = base_url.rstrip("/") + "/"
+        self.base_path = unquote(urlparse(self.base_url).path).rstrip("/") + "/"
         self.auth = (username, password) if username else None
         self.timeout_s = timeout_s
         self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, auth=self.auth)
@@ -137,14 +138,17 @@ class WebDAVClient:
         resp.raise_for_status()
         body = resp.text
         entries: list = []
-        # Lightweight regex parse — sufficient for Nextcloud's flat, predictable DAV responses.
+        # Lightweight XML extraction for the flat Depth-1 response shape.
         for m in re.finditer(r"<d:response>(.*?)</d:response>", body, re.S | re.I):
             block = m.group(1)
             href_m = re.search(r"<d:href>(.*?)</d:href>", block, re.S | re.I)
             if not href_m:
                 continue
             href = href_m.group(1)
-            path = unquote(re.sub(r"^.*?/remote\.php/dav/files/[^/]+/", "", href))
+            href_path = unquote(urlparse(href).path)
+            if not href_path.startswith(self.base_path):
+                continue
+            path = href_path[len(self.base_path):]
             name = path.rstrip("/").rsplit("/", 1)[-1]
             if not name:
                 continue
@@ -170,3 +174,7 @@ class WebDAVClient:
 
     def close(self) -> None:
         self._client.close()
+
+
+# Compatibility import for one release.
+WebDAVClient = WebDAVCorpusBackend

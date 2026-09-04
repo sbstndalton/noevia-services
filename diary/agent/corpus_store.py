@@ -17,7 +17,7 @@ from typing import Callable, List, Optional, Tuple
 from . import corpus as fmt
 from .config import Config
 from .journal import Journal, JournalEntry
-from .webdav import WebDAVClient
+from .storage import CorpusBackend
 
 log = logging.getLogger(__name__)
 
@@ -27,11 +27,12 @@ class CorpusError(RuntimeError):
 
 
 class CorpusStore:
-    def __init__(self, cfg: Config, dav: WebDAVClient, journal: Journal):
+    def __init__(self, cfg: Config, backend: CorpusBackend, journal: Journal):
         self.cfg = cfg
-        self.dav = dav
+        self.backend = backend
+        self.dav = backend  # one-release compatibility for integrations/tests
         self.journal = journal
-        self.remote_root = (cfg.get("corpus.webdav.remote_root") or "").strip("/")
+        self.remote_root = (cfg.get("corpus.root") or cfg.get("corpus.webdav.remote_root") or "").strip("/")
         self.monthly_prefix = cfg.get("corpus.monthly_prefix") or ""
         self.index_file = cfg.get("corpus.index_file") or "INDEX.md"
         # Month-file naming template (default preserves the original 2026-09 style).
@@ -63,10 +64,10 @@ class CorpusStore:
     # ---------------- reads ----------------
 
     def read_month(self, day: date) -> Tuple[Optional[str], Optional[str]]:
-        return self.dav.get_text(self.month_path(day))
+        return self.backend.get_text(self.month_path(day))
 
     def read_index(self) -> Tuple[Optional[str], Optional[str]]:
-        return self.dav.get_text(self.index_path())
+        return self.backend.get_text(self.index_path())
 
     def month_label(self, day: date) -> str:
         return day.strftime("%B %Y")
@@ -108,7 +109,7 @@ class CorpusStore:
         months: List[dict] = []
         seen = set()
         try:
-            entries = self.dav.list_dir(self._join(self.monthly_prefix))
+            entries = self.backend.list_dir(self._join(self.monthly_prefix))
         except Exception as exc:  # noqa: BLE001
             log.warning("month listing failed (degrading to empty): %s", exc)
             return []
@@ -165,11 +166,11 @@ class CorpusStore:
         Returns (applied, final_etag).
         """
         for attempt in range(max_attempts):
-            text, etag = self.dav.get_text(path)
+            text, etag = self.backend.get_text(path)
             new_text, changed = mutate(text)
             if not changed:
                 return True, etag  # nothing to do (already applied)
-            ok, new_etag, status = self.dav.put(
+            ok, new_etag, status = self.backend.put(
                 path,
                 (new_text or "").encode("utf-8"),
                 if_match=etag,
@@ -325,7 +326,7 @@ class CorpusStore:
                             parts.append(f"**Me:** {ex.me}")
                             parts.append("")
                         if ex.claude:
-                            parts.append(f"**Claude:** {ex.claude}")
+                            parts.append(f"**Assistant:** {ex.claude}")
                             parts.append("")
                 text = "\n".join(parts).strip()
                 if max_chars and len(text) > max_chars:

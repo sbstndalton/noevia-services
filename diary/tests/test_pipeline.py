@@ -89,7 +89,7 @@ def test_summarizer_failure_logs_verbatim(store):
     outcome = pipe.log_exchange("Entry text.", "Assistant reply text.", now=datetime(2026, 9, 3, 9, 0))
     assert outcome.decision == "logged"
     text, _ = store.read_month(datetime(2026, 9, 3).date())
-    assert "**Claude:** Assistant reply text." in text  # verbatim fallback
+    assert "**Assistant:** Assistant reply text." in text  # verbatim fallback
 
 
 def test_json_extract():

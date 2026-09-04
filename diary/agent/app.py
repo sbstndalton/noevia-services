@@ -43,7 +43,7 @@ from .journal import Journal
 from .llm import LLMClient
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
-from .webdav import WebDAVClient
+from .storage import create_backend
 
 log = logging.getLogger("diary")
 
@@ -55,12 +55,7 @@ class AppState:
         self.cfg = cfg
         self.auth_token = (cfg.get("ui.auth_token") or "").strip()
         self.journal = Journal(Path(cfg.get("retrieval.db_path")))
-        self.dav = WebDAVClient(
-            base_url=cfg.get("corpus.webdav.base_url"),
-            username=cfg.get("corpus.webdav.username"),
-            password=cfg.get("corpus.webdav.password") or "",
-            timeout_s=float(cfg.get("corpus.webdav.timeout_s", 60)),
-        )
+        self.backend = create_backend(cfg)
         self.llm_main = LLMClient(
             base_url=cfg.get("llm.base_url"),
             api_key=cfg.get("llm.api_key") or "",
@@ -77,7 +72,7 @@ class AppState:
             timeout_s=float(cfg.get("llm.timeout_s", 300)),
             max_retries=int(cfg.get("llm.max_retries", 3)),
         )
-        self.store = CorpusStore(cfg, self.dav, self.journal)
+        self.store = CorpusStore(cfg, self.backend, self.journal)
         self.retrieval = Retriever(
             Path(cfg.get("retrieval.db_path")),
             self.llm_main,
@@ -105,7 +100,7 @@ async def lifespan(_app: FastAPI):
     applied = st.store.apply_pending()
     log.info("startup: applied %d pending journal entries (%d still pending)", applied, st.journal.pending_count())
     yield
-    st.dav.close()
+    st.backend.close()
     st.llm_main.close()
     st.llm_aux.close()
     st.retrieval.close()
@@ -317,7 +312,7 @@ def v1_models(request: Request) -> JSONResponse:
         "object": "list",
         "data": [
             {"id": model_id, "object": "model", "created": 0, "owned_by": "diary-companion"},
-            {"id": st.cfg.get("llm.chat_model") or model_id, "object": "model", "created": 0, "owned_by": "lemonade"},
+            {"id": st.cfg.get("llm.chat_model") or model_id, "object": "model", "created": 0, "owned_by": "cowork"},
         ],
     })
 
@@ -352,7 +347,7 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         sess["turns"].extend(prior)  # seed short client-thread context
 
     try:
-        # _run_exchange does blocking network I/O (Lemonade) — keep the event loop free.
+        # _run_exchange does blocking inference I/O — keep the event loop free.
         result = await run_in_threadpool(_run_exchange, last, session_id)
     except Exception as exc:  # noqa: BLE001
         log.exception("v1 exchange failed")

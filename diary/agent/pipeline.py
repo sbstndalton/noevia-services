@@ -2,8 +2,8 @@
 
 Decision sequence per exchange:
   1. skip_classifier (aux LLM): LOG or SKIP — meta/administrative exchanges are skipped.
-  2. summarizer (aux LLM): assistant reply -> third-person prose for the **Claude:** field.
-  3. log_exchange: write-ahead journal + ETag-guarded WebDAV append (idempotent replay).
+  2. summarizer (aux LLM): assistant reply -> third-person prose for the assistant field.
+  3. log_exchange: write-ahead journal + conditional backend append (idempotent replay).
   4. standing-section maintenance (gated, cheap aux call): INDEX.md update only when warranted.
 """
 from __future__ import annotations

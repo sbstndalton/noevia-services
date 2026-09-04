@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Phase 1b — model benchmark harness for the Diary Companion.
+"""Model benchmark harness for Diary Companion.
 
-Benchmarks candidate models from the existing Lemonade library against REAL diary
+Benchmarks candidate models from any OpenAI-compatible provider against diary
 excerpts (not leaderboard tasks), measuring what this workload actually needs:
 
   1. TTFT + decode speed at realistic 10-15k-token contexts (not the 32k ceiling)
@@ -10,16 +10,14 @@ excerpts (not leaderboard tasks), measuring what this workload actually needs:
   3. Long-context instruction adherence: format compliance AFTER a large diary preamble
   4. Tone (MANUAL): blind A/B scores by the human — see --samples to generate the pack
 
-Usage (on DaServer, with Lemonade running):
+Usage:
   # 0. Generate a sample pack once (fills samples/ with excerpts you paste in):
   python3 scripts/benchmark_models.py --samples
 
   # 1. Run the benchmark across candidates:
   python3 scripts/benchmark_models.py \
-      --base-url http://10.69.0.130:13305/v1 \
-      --models gpt-oss-20b-GGUF-MXFP4 gemma-4-E4B-it-GGUF-Q6_K \
-               gemma-4-12b-it-GGUF-UD-Q4_K_XL Llama-3.3-8B-Instruct-GGUF-Q6_K_M \
-               Phi-4-14B-Q4_K_M \
+      --base-url http://localhost:11434/v1 \
+      --models model-a model-b \
       --samples-dir samples --out results.json
 
   # 2. Score tone blind: the harness writes pairs to samples/tone_pack.md —
@@ -67,10 +65,10 @@ def build_long_preamble(excerpts: List[str]) -> str:
 DEFAULT_EXCERPTS = [
     """**Me:** Work was loud today, open office, couldn't focus. Ended up staying late to finish the deck.
 
-**Claude:** The user described a difficult focus day; the companion asked whether headphones helped last time this came up.""",
+**Assistant:** The user described a difficult focus day; the companion asked whether headphones helped last time this came up.""",
     """**Me:** Called mom, she sounded tired but said she was fine. I didn't push.
 
-**Claude:** The user noted the call and chose not to press; the companion reflected on the pattern of protecting family from worry.""",
+**Assistant:** The user noted the call and chose not to press; the companion reflected on the pattern of protecting family from worry.""",
 ]
 
 # ---------------------------------------------------------------------------
@@ -221,14 +219,14 @@ def make_sample_pack(samples_dir: Path) -> None:
         f = samples_dir / f"excerpt_{i}.md"
         if not f.exists():
             f.write_text(
-                "Paste one REAL diary excerpt here (a ### subsection, Me:/Claude: block).\n", encoding="utf-8"
+                "Paste one diary excerpt here (a ### subsection with user/assistant messages).\n", encoding="utf-8"
             )
     print(f"sample pack scaffold written to {samples_dir}/ — paste real excerpts into excerpt_*.md")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", default="http://10.69.0.130:13305/v1")
+    ap.add_argument("--base-url", required=True, help="OpenAI-compatible /v1 endpoint")
     ap.add_argument("--models", nargs="+", required=False)
     ap.add_argument("--samples-dir", default="samples")
     ap.add_argument("--out", default="results.json")

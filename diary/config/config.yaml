@@ -1,62 +1,50 @@
-# Diary Companion Agent — configuration
-# Copy to /mnt/docker/appdata/diary-companion/config/config.yaml on DaServer.
+# Diary Companion portable defaults
 
 llm:
-  # Lemonade OpenAI-compatible endpoint (per DaServer.md canonical stack)
-  base_url: http://10.69.0.130:13305/v1
-  api_key: ""            # Lemonade ignores keys; set via LLM_API_KEY env if needed
-  chat_model: Gemma-4-E4B-it-GGUF   # provisional until Phase 1b benchmark picks the winner
-  embed_model: nomic-embed-text-v1-GGUF   # embeddings — do not change once the index has content (re-index required)
-  # Auxiliary model (skip-classifier, summarizer, index-maintenance).
-  # Same server by default; point host/port at the A380 SYCL instance if Phase 1a-2 adopts aux offload.
+  # Any OpenAI-compatible endpoint. Override for your provider.
+  base_url: http://host.docker.internal:11434/v1
+  api_key: ""
+  chat_model: default
+  embed_model: default
   aux:
-    base_url: http://10.69.0.130:13305/v1
+    base_url: http://host.docker.internal:11434/v1
     api_key: ""
-    model: gemma-4-E2B-it-GGUF-Q8_0
+    model: default
   timeout_s: 300
   max_retries: 3
 
 corpus:
-  # Diary corpus in the Nextcloud-synced folder (Mac ↔ server). Served via Nextcloud WebDAV.
+  # Local storage works on a clean installation; select webdav explicitly for remote storage.
+  backend: local
+  root: ""
+  local:
+    root: data/corpus
   webdav:
-    base_url: http://10.69.0.130:11000/remote.php/dav/files/ADMIN_USER/
-    # Where the corpus lives inside Nextcloud. If your Nextcloud-sync folder on the Mac
-    # is not the Nextcloud root, set remote_root to the server-side prefix
-    # (e.g. "Documents/Diary" if the Mac syncs a subfolder).
-    remote_root: "Diary"
-    username: ADMIN_USER      # override with WEBDAV_USERNAME
-    # password: set via WEBDAV_PASSWORD env var (do not store in this file)
+    base_url: https://cloud.example.com/remote.php/dav/files/username/
+    username: ""
     timeout_s: 60
-  monthly_prefix: ""          # e.g. "Diary/" if files live in a subfolder; blank = remote_root
-  # Month-file naming template. Placeholders: {year}, {month}, {month02}, {month_name}.
-  # Default "2026-09.md" style; the live deployment uses the human-named style:
-  # month_file_template: "Diary - {month_name} {year}.md"   # (set via DIARY_MONTH_FILE_TEMPLATE env)
+  monthly_prefix: ""
   month_file_template: "{year}-{month02}.md"
-  # INDEX.md month-links + standing sections. Disable for corpora that manage their own
-  # index / have none (the app then never creates or edits an index file).
-  index_enabled: true         # (live deployment: DIARY_INDEX_ENABLED=false)
+  index_enabled: true
   index_file: INDEX.md
-  # Current-day log: strip "### 14:32 — topic" and hidden markers when sending the day's log back to the model
   redact_markers: true
 
 retrieval:
-  db_path: data/index.db      # sqlite-vec store + write-ahead journal (back this up too)
+  db_path: data/index.db
   embed_batch_size: 8
   top_k: 8
-  max_context_tokens: 5200    # token cap for retrieved excerpts block
-  min_score: 0.30             # cosine-similarity floor (nomic-embed cosine space)
+  max_context_tokens: 5200
+  min_score: 0.30
 
 context:
-  max_today_tokens: 4500      # cap for the current day's existing log
-  max_standing_tokens: 2200   # cap for standing sections (open questions, timeline)
+  max_today_tokens: 4500
+  max_standing_tokens: 2200
 
 ui:
   host: 0.0.0.0
-  port: 8010                  # unused port per DaServer.md port reference
+  port: 8010
   title: "Diary Companion"
-  # Access token for the UI + /v1 API. Empty = open (LAN-only mode).
-  # REQUIRED before exposing via Cloudflare Tunnel. Set via env: DIARY_AUTH_TOKEN.
-  # Generate one with:  openssl rand -base64 24
+  # Set DIARY_AUTH_TOKEN before exposing this service beyond a trusted machine.
   auth_token: ""
 
 logging:

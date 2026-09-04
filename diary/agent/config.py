@@ -3,17 +3,21 @@
 Env overrides:
   LLM_BASE_URL, LLM_API_KEY, LLM_CHAT_MODEL, LLM_EMBED_MODEL,
   LLM_AUX_BASE_URL, LLM_AUX_MODEL,
-  WEBDAV_BASE_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD, CORPUS_REMOTE_ROOT,
+  CORPUS_BACKEND, CORPUS_ROOT, CORPUS_LOCAL_ROOT,
+  WEBDAV_BASE_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD, CORPUS_REMOTE_ROOT (legacy),
   DIARY_MONTH_FILE_TEMPLATE, DIARY_INDEX_ENABLED,
   DB_PATH, DIARY_PORT
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+
+log = logging.getLogger(__name__)
 
 
 class Config:
@@ -60,10 +64,13 @@ def _apply_env(cfg: Config) -> None:
         "LLM_EMBED_MODEL": "llm.embed_model",
         "LLM_AUX_BASE_URL": "llm.aux.base_url",
         "LLM_AUX_MODEL": "llm.aux.model",
+        "CORPUS_BACKEND": "corpus.backend",
+        "CORPUS_ROOT": "corpus.root",
+        "CORPUS_LOCAL_ROOT": "corpus.local.root",
         "WEBDAV_BASE_URL": "corpus.webdav.base_url",
         "WEBDAV_USERNAME": "corpus.webdav.username",
         "WEBDAV_PASSWORD": "corpus.webdav.password",
-        "CORPUS_REMOTE_ROOT": "corpus.webdav.remote_root",
+        "CORPUS_REMOTE_ROOT": "corpus.root",
         "DIARY_MONTH_FILE_TEMPLATE": "corpus.month_file_template",
         "DIARY_INDEX_ENABLED": "corpus.index_enabled",
         "DB_PATH": "retrieval.db_path",
@@ -78,6 +85,8 @@ def _apply_env(cfg: Config) -> None:
             if env_key == "DIARY_INDEX_ENABLED":
                 value = value.strip().lower() not in ("0", "false", "no", "off", "")
             setpath(dotted, value)
+    if "CORPUS_REMOTE_ROOT" in env and "CORPUS_ROOT" not in env:
+        log.warning("CORPUS_REMOTE_ROOT is deprecated; use CORPUS_ROOT")
 
 
 def load_config(path: Optional[str] = None) -> Config:

@@ -1,4 +1,4 @@
-"""LLM client — chat completions + embeddings via Lemonade's OpenAI-compatible API."""
+"""LLM client for OpenAI-compatible chat and embedding endpoints."""
 from __future__ import annotations
 
 import logging
