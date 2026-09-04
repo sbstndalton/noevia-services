@@ -1,3 +1,5 @@
+import copy
+
 from agent.config import Config, _apply_env
 
 
@@ -18,3 +20,13 @@ def test_legacy_remote_root_alias(monkeypatch, caplog):
     _apply_env(cfg)
     assert cfg.get("corpus.root") == "Legacy/Diary"
     assert "deprecated" in caplog.text
+
+
+def test_config_deepcopy_does_not_share_nested_state():
+    cfg = Config({"corpus": {"backend": "local"}})
+
+    cloned = copy.deepcopy(cfg)
+    cloned.as_dict()["corpus"]["backend"] = "webdav"
+
+    assert cfg.corpus.backend == "local"
+    assert cloned.corpus.backend == "webdav"

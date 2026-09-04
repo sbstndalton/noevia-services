@@ -27,8 +27,14 @@ class Config:
         self._data = data
 
     def __getattr__(self, name: str) -> Any:
+        # deepcopy probes special attributes before _data is installed on the
+        # reconstructed object. Avoid recursively invoking __getattr__ then.
         try:
-            value = self._data[name]
+            data = object.__getattribute__(self, "_data")
+        except AttributeError:
+            raise AttributeError(name) from None
+        try:
+            value = data[name]
         except KeyError as exc:  # pragma: no cover - config contract
             raise AttributeError(f"missing config key: {name}") from exc
         if isinstance(value, dict):
