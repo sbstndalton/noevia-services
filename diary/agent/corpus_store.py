@@ -45,6 +45,11 @@ class CorpusStore:
         # INDEX.md standing sections can be disabled entirely (corpora that manage
         # their own index / don't use one). Default: enabled (original behavior).
         self.index_enabled = bool(cfg.get("corpus.index_enabled", True))
+        # (document path, owning day) of the most recently applied exchange_edit
+        # (not durable state — a same-process communication channel from
+        # _apply_exchange_edit back to edit_exchange so the endpoint can report
+        # what was touched and reindex exactly that document).
+        self._last_edit_result: Optional[Tuple[str, date]] = None
 
     # ---------------- paths ----------------
 
@@ -93,11 +98,14 @@ class CorpusStore:
 
     # ---------------- month browsing (read-only) ----------------
 
-    def read_month_text(self, year: int, month: int) -> str:
-        """A whole month file's text, xid markers stripped, for display.
+    def read_month_text(self, year: int, month: int, include_xids: bool = False) -> str:
+        """A whole month file's text for display.
 
-        Empty string when the month has no file yet (or the read fails —
-        display-only read, same degradation policy as get_day_text).
+        xid markers are stripped unless include_xids is set (the diary UI asks
+        for them so each rendered exchange can offer an edit affordance keyed
+        by xid; every other caller gets clean display text). Empty string when
+        the month has no file yet (or the read fails — display-only read, same
+        degradation policy as get_day_text).
         """
         if self.entry_layout == "monthly":
             try:
@@ -105,7 +113,9 @@ class CorpusStore:
             except Exception as exc:  # noqa: BLE001
                 log.warning("month-text read failed (degrading to empty): %s", exc)
                 return ""
-            return fmt.strip_markers(month_text) if month_text else ""
+            if not month_text:
+                return ""
+            return month_text if include_xids else fmt.strip_markers(month_text)
 
         parts: List[str] = []
         month_dir = self._join(self.entries_prefix, str(year), date(year, month, 1).strftime("%B"))
@@ -123,7 +133,7 @@ class CorpusStore:
             for _, path in sorted(dated):
                 text, _ = self.backend.get_text(path)
                 if text:
-                    parts.append(fmt.strip_markers(text).strip())
+                    parts.append((text if include_xids else fmt.strip_markers(text)).strip())
         except Exception as exc:  # noqa: BLE001
             log.warning("daily month read failed (degrading to partial/empty): %s", exc)
         return "\n\n".join(part for part in parts if part)
@@ -304,6 +314,108 @@ class CorpusStore:
         self.apply_pending()
         return jid
 
+    # ---------------- editing ----------------
+
+    def edit_exchange(self, xid: str, new_me: str, new_claude: str, month: Optional[str] = None) -> str:
+        """Durably record + apply a human-initiated correction to one logged exchange.
+
+        The edit intent goes through the same write-ahead journal as appends, then
+        applies via the same ETag-guarded write — there is no unguarded path. The
+        exchange keeps its xid marker, so replays and further edits stay safe.
+
+        month (YYYY-MM) narrows the document search when the caller knows it (the
+        UI always does); without it, all corpus documents are scanned newest-first.
+        Returns the document path that was edited.
+
+        The xid is located synchronously BEFORE anything is enqueued, so a bad id
+        fails fast here instead of leaving a permanently-retrying journal entry.
+        The apply step still re-discovers (replay after a crash cannot rely on
+        this call's pre-check) — a race between check and apply merely leaves the
+        entry pending for the next apply_pending, which is the safe direction.
+
+        Returns (document path, owning day ISO) for the edited exchange.
+        """
+        found = self._find_document_with_xid(xid, month)
+        if found is None:
+            raise CorpusError(f"no corpus document contains exchange {xid}")
+        payload = {"xid": xid, "new_me": new_me, "new_claude": new_claude}
+        if month:
+            payload["month"] = month
+        self.journal.enqueue("exchange_edit", payload)
+        self.apply_pending()
+        path, day = self._last_edit_result
+        self._last_edit_result = None
+        return path, day.isoformat()
+
+    def _documents_for_month(self, month_id: str) -> List[Tuple[str, date]]:
+        """(document path, owning day) pairs for a YYYY-MM month id."""
+        year, mon = int(month_id[:4]), int(month_id[5:7])
+        first = date(year, mon, 1)
+        if self.entry_layout == "monthly":
+            return [(self.month_path(first), first)]
+        month_dir = self._join(self.entries_prefix, str(year), first.strftime("%B"))
+        try:
+            entries = self.backend.list_dir(month_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("edit discovery: month dir listing failed for %s: %s", month_dir, exc)
+            return []
+        expected = re.compile(rf"^{re.escape(first.strftime('%B'))} (\d{{1,2}}), {year}\.md$")
+        docs = []
+        for e in entries:
+            name = e.get("name") or ""
+            m = expected.match(name)
+            if e.get("is_dir") or not m:
+                continue
+            day_num = int(m.group(1))
+            if 1 <= day_num <= calendar.monthrange(year, mon)[1]:
+                d = date(year, mon, day_num)
+                docs.append((self.daily_path(d), d))
+        return sorted(docs, key=lambda pair: pair[1])
+
+    def _find_document_with_xid(self, xid: str, month: Optional[str] = None) -> Optional[Tuple[str, date]]:
+        """Newest-first scan for the document containing an exchange marker.
+
+        Edits overwhelmingly target recent entries, so months are walked in
+        reverse; without a month hint this remains O(months) GETs — acceptable
+        for an explicit, human-initiated action. Returns (path, owning day).
+        """
+        if month:
+            candidates = self._documents_for_month(month)
+        else:
+            candidates = []
+            for m in reversed(self.list_months()):
+                docs = self._documents_for_month(m["id"])
+                candidates.extend(reversed(docs))
+        for path, day in candidates:
+            try:
+                text, _ = self.backend.get_text(path)
+            except Exception as exc:  # noqa: BLE001 — unreachable doc: keep scanning
+                log.warning("edit discovery: read failed for %s: %s", path, exc)
+                continue
+            if text and fmt.has_marker(text, xid):
+                return path, day
+        return None
+
+    def _apply_exchange_edit(self, entry: JournalEntry) -> None:
+        p = entry.payload
+        xid = p["xid"]
+        found = self._find_document_with_xid(xid, p.get("month"))
+        if found is None:
+            raise CorpusError(f"no corpus document contains exchange {xid}")
+        target, day = found
+        self._last_edit_result = (target, day)
+
+        def mutate(current: Optional[str]) -> Tuple[Optional[str], bool]:
+            if current is None:
+                return current, False
+            new_text = fmt.replace_exchange_text(current, xid, p["new_me"], p["new_claude"])
+            if new_text is None or new_text == current:
+                return current, False  # nothing to do (already applied — replay safe)
+            return new_text, True
+
+        self._guarded_write(target, mutate)
+        log.info("exchange %s edited in %s", xid, target)
+
     # ---------------- appliers ----------------
 
     def apply_pending(self, limit: int = 100) -> int:
@@ -322,6 +434,8 @@ class CorpusStore:
     def _apply_entry(self, entry: JournalEntry) -> None:
         if entry.kind == "exchange":
             self._apply_exchange(entry)
+        elif entry.kind == "exchange_edit":
+            self._apply_exchange_edit(entry)
         elif entry.kind == "index_month":
             self._apply_month_registration(entry)
         elif entry.kind == "index_update":
@@ -373,8 +487,12 @@ class CorpusStore:
 
     # ---------------- context helpers ----------------
 
-    def get_day_text(self, day: date, max_chars: Optional[int] = None) -> str:
-        """The current day's log section, markers stripped, for the model context.
+    def get_day_text(self, day: date, max_chars: Optional[int] = None, include_markers: bool = False) -> str:
+        """The current day's log section for the model context (markers stripped).
+
+        With include_markers=True the hidden xid markers are kept so the UI can
+        key edit affordances to specific exchanges — never used for model context,
+        which must stay free of markers.
 
         If over max_chars, the earliest exchanges are dropped (recency matters most
         within a day); a truncation notice is prepended. Read failures (e.g. WebDAV
@@ -401,6 +519,9 @@ class CorpusStore:
                             parts.append("")
                         if ex.claude:
                             parts.append(f"**Assistant:** {ex.claude}")
+                            parts.append("")
+                        if include_markers and ex.xid:
+                            parts.append(f"<!-- xid:{ex.xid} -->")
                             parts.append("")
                 text = "\n".join(parts).strip()
                 if max_chars and len(text) > max_chars:

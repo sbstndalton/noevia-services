@@ -48,6 +48,23 @@ class FakeWebDAV:
         self.files[path] = (data.decode("utf-8"), etag)
         return True, etag, 204
 
+    def list_dir(self, path):
+        """Immediate children of a prefix, from the in-memory file map.
+
+        Added for edit-by-xid discovery, which enumerates daily-layout day
+        files via the same listing call the real WebDAV backend serves with
+        PROPFIND.
+        """
+        prefix = path.rstrip("/") + "/"
+        names = set()
+        for known in self.files:
+            if not known.startswith(prefix):
+                continue
+            rest = known[len(prefix):]
+            head, _, tail = rest.partition("/")
+            names.add((head, tail != ""))  # (name, is_dir)
+        return [{"name": n, "is_dir": d, "path": f"{prefix}{n}"} for n, d in sorted(names)]
+
 
 @pytest.fixture
 def store(tmp_path):

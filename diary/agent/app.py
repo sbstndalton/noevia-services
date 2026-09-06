@@ -33,7 +33,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -46,7 +46,7 @@ from pydantic import BaseModel
 
 from .config import load_config
 from .context import ContextAssembler
-from .corpus_store import CorpusStore
+from .corpus_store import CorpusError, CorpusStore
 from .external_sources import (
     external_source_paths,
     infer_date,
@@ -362,6 +362,13 @@ class RelogRequest(BaseModel):
     session_id: str = "default"
 
 
+class EditEntryRequest(BaseModel):
+    xid: str
+    me: str
+    assistant: str = ""
+    month: Optional[str] = None  # YYYY-MM hint; discovery scans all months without it
+
+
 # ---------------- pages ----------------
 
 
@@ -475,13 +482,13 @@ def api_day(request: Request, month: Optional[str] = None) -> JSONResponse:
             return JSONResponse({"error": "month out of range"}, status_code=400)
         return JSONResponse({
             "month": month,
-            "log": st.store.read_month_text(year, mon),
+            "log": st.store.read_month_text(year, mon, include_xids=True),
             "standing": "",
         })
     day = datetime.now().date()
     return JSONResponse({
         "day": day.isoformat(),
-        "today_log": st.store.get_day_text(day, max_chars=12000),
+        "today_log": st.store.get_day_text(day, max_chars=12000, include_markers=True),
         "standing": st.store.get_standing_sections_text(max_chars=4000),
     })
 
@@ -493,6 +500,42 @@ def api_months(request: Request) -> JSONResponse:
     st = _tenant_state(request)
     months = run_in_threadpool_sync(st.store.list_months)
     return JSONResponse({"months": months})
+
+
+@app.post("/api/entries/edit")
+def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
+    """Edit one logged exchange, matched by its hidden xid marker.
+
+    This is the ONLY supported way to correct past diary text from the app, and
+    it exists to keep the diary's integrity guarantee: editing is an explicit,
+    human-initiated action on the user's own words — never a silent assistant
+    rewrite. Routed through the same write-ahead journal and ETag-guarded write
+    as every other corpus mutation (no separate, unguarded write path), and the
+    retrieval index is refreshed so the corrected text supersedes the old chunk.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    xid = (req.xid or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", xid):
+        return JSONResponse({"error": "invalid xid"}, status_code=400)
+    if not req.me.strip():
+        return JSONResponse({"error": "me is required"}, status_code=400)
+    st = _tenant_state(request)
+    try:
+        path, day_iso = run_in_threadpool_sync(st.store.edit_exchange, xid, req.me, req.assistant, req.month)
+    except CorpusError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except Exception as exc:  # noqa: BLE001 — persistent write conflict etc.
+        log.exception("entry edit failed")
+        return JSONResponse({"error": f"edit failed: {exc}"}, status_code=502)
+    # Refresh retrieval for the edited document: reindex_file's supersede pass
+    # removes the stale chunk so the corrected text is the only searchable one.
+    try:
+        month_text, _ = st.store.read_month(date.fromisoformat(day_iso))
+        st.retrieval.reindex_file(path, month_text)
+    except Exception as exc:  # noqa: BLE001 — reindex failure never fails the edit
+        log.warning("post-edit reindex failed: %s", exc)
+    return JSONResponse({"ok": True, "document": path, "day": day_iso})
 
 
 @app.get("/api/external-sources")

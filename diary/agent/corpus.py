@@ -182,6 +182,68 @@ def _append_buf_to_sub(sub: SubSection, body: str) -> None:
         sub.exchanges.append(Exchange(me=me_text, claude=claude_text, xid=xid))
 
 
+# ---------------- editing ----------------
+
+
+def replace_exchange_text(text: str, xid: str, new_me: str, new_claude: str) -> Optional[str]:
+    """Rewrite one exchange (matched by its hidden xid marker) in place.
+
+    Returns the new text, or None when no exchange with that xid exists (or
+    the block is malformed). Everything outside the matched block — the day
+    header, the subsection header, the timestamp/topic, sibling exchanges,
+    and the exchange's own position — is preserved. The marker itself is
+    kept, so the exchange stays replay-safe and can be edited again later.
+
+    This is the format-level half of diary editing: the caller is responsible
+    for the human/consent half (an explicit, user-initiated request routed
+    through the guarded write path).
+    """
+    marker = f"<!-- xid:{xid} -->"
+    if marker not in text:
+        return None
+    lines = text.split("\n")
+
+    marker_idx = next((i for i, l in enumerate(lines) if marker in l), None)
+    if marker_idx is None:
+        return None  # marker present in text but not on any single line
+
+    # Walk BACKWARD from the marker to bound the exchange block: the nearest
+    # '**Me:**' opener above it. Structural headers terminate the search. In
+    # the canonical format (render_exchange) the marker is the last line of
+    # the exchange and both the Me: and Assistant: blocks sit between the
+    # opener and the marker, so this bounds the whole block. A marker without
+    # a Me: opener above it is malformed (never written by this codebase) —
+    # refuse rather than risk editing the wrong exchange's words.
+    me_re = re.compile(r"^\*\*Me:\*\*[ \t]?")
+    # Only day/subsection headers and another Me: opener bound the backward
+    # walk. '**Assistant:**' must NOT terminate it — the assistant block sits
+    # between the Me: opener and the marker, inside the very block we're
+    # bounding (this bit me once: treating it as structural made every edit
+    # of a canonical two-part exchange refuse with "malformed").
+    struct_re = re.compile(r"^(#{2,3} |\*\*Me:\*\*)")
+    me_start = None
+    for i in range(marker_idx - 1, -1, -1):
+        if me_re.match(lines[i]):
+            me_start = i
+            break
+        if struct_re.match(lines[i]):
+            return None  # malformed: no Me: opener between the header and the marker
+    if me_start is None:
+        return None
+    block_end = marker_idx
+
+    me_clean = new_me.strip()
+    claude_clean = new_claude.strip()
+    replacement: List[str] = [f"**Me:** {me_clean}"]
+    if claude_clean:
+        replacement.extend(["", f"**Assistant:** {claude_clean}"])
+    replacement.append("")
+    replacement.append(marker)
+
+    out = lines[:me_start] + replacement + lines[block_end + 1:]
+    return "\n".join(out)
+
+
 # ---------------- markers ----------------
 
 
