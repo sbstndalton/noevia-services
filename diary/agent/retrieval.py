@@ -94,7 +94,13 @@ class Retriever:
     def reindex_file(self, file_name: str, month_text: Optional[str], day_of_month: Optional[int] = None) -> int:
         """Parse one month file into chunks and upsert embeddings incrementally.
 
-        Returns the number of chunks (re)embedded.
+        Callers must pass the full current text of the month file. A chunk is
+        identified by (day, header); its row is keyed by content hash. After
+        indexing, rows for this file whose hash no longer appears in the
+        parsed text (edited or removed subsections) are deleted so a corrected
+        entry never stays searchable alongside its stale version.
+
+        Returns the number of chunks embedded this pass.
         """
         if not month_text:
             return 0
@@ -113,7 +119,22 @@ class Retriever:
                     continue
                 chunk_text = f"[{day_iso}] {d.header}\n### {sub.header}\n{body}"
                 rows.append((day_iso, sub.header, chunk_text, self._hash(chunk_text)))
+        keep_hashes = {h for _, _, _, h in rows}
+
+        # Supersede cleanup runs even when nothing new is embedded (rows may
+        # be empty — e.g. the file was emptied): any stored row for this file
+        # whose content hash is no longer present in the parsed text is a
+        # stale version of an edited subsection (same day+header identity,
+        # new hash) or removed content. Delete it, embedding included, so
+        # retrieval cannot serve the old text next to the corrected one.
+        for row in self._conn.execute("SELECT id, content_hash FROM chunks WHERE file = ?", (file_name,)).fetchall():
+            if row["content_hash"] not in keep_hashes:
+                if self.vec_available:
+                    self._conn.execute("DELETE FROM vec_items WHERE chunk_id = ?", (row["id"],))
+                self._conn.execute("DELETE FROM chunks WHERE id = ?", (row["id"],))
+
         if not rows:
+            self._conn.commit()
             return 0
 
         embedded = 0
@@ -123,26 +144,32 @@ class Retriever:
             ).fetchone()
             if existing:
                 continue  # unchanged chunk — skip re-embedding
+            # Embed BEFORE inserting the chunk row: the hash-indexed row is
+            # the dedupe record, so inserting it first would make a failed
+            # embed skip this chunk on every future reindex (permanently
+            # degrading retrieval while claiming it will retry). With no row,
+            # the next reindex simply tries the embed again.
+            emb = self._embed_one(chunk_text) if self.vec_available else None
+            if self.vec_available and emb is None:
+                log.warning("embedding failed for a chunk in %s — will retry on next reindex", file_name)
+                continue
             cur = self._conn.execute(
                 "INSERT INTO chunks (day, file, header, body, content_hash) VALUES (?, ?, ?, ?, ?)",
                 (day_iso, file_name, header, chunk_text, h),
             )
             chunk_id = cur.lastrowid
-            if self.vec_available:
-                emb = self._embed_one(chunk_text)
-                if emb is not None:
-                    if self._dim is None:
-                        self._create_vec_table(len(emb))
-                    if len(emb) == self._dim:
-                        self._conn.execute(
-                            "INSERT OR REPLACE INTO vec_items (chunk_id, embedding) VALUES (?, ?)",
-                            (chunk_id, _serialize_f32(emb)),
-                        )
-                    else:
-                        log.warning("embedding dim mismatch (%s != %s) — chunk skipped", len(emb), self._dim)
+            if emb is not None:
+                if self._dim is None:
+                    self._create_vec_table(len(emb))
+                if len(emb) == self._dim:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO vec_items (chunk_id, embedding) VALUES (?, ?)",
+                        (chunk_id, _serialize_f32(emb)),
+                    )
                 else:
-                    log.warning("embedding failed for chunk %s — will retry on next reindex", chunk_id)
+                    log.warning("embedding dim mismatch (%s != %s) — chunk skipped", len(emb), self._dim)
             embedded += 1
+
         self._conn.commit()
         return embedded
 

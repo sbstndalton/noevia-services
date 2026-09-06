@@ -82,6 +82,61 @@ def test_search_before_index_returns_empty(retriever):
     assert retriever.search("anything") == []
 
 
+class FlakyLLM(StubLLM):
+    """Embedder whose first N calls fail, simulating an aux-model outage."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_next = 0
+
+    def embed(self, texts, model=None):
+        if self.fail_next > 0:
+            self.fail_next -= 1
+            raise RuntimeError("embed backend down")
+        return super().embed(texts, model=model)
+
+
+def test_failed_embed_leaves_no_dedupe_row_behind(tmp_path):
+    """A failed embed must not insert the content-hash row, or the chunk can
+    never be retried (the dedupe check would skip it forever)."""
+    llm = FlakyLLM()
+    llm.fail_next = 1
+    retriever = Retriever(tmp_path / "idx.db", llm)
+    if not retriever.vec_available:
+        pytest.skip("sqlite-vec not available in this environment")
+    embedded = retriever.reindex_file("2026-08.md", DAY_TEXT)
+    assert embedded == 0  # embed failed — nothing stored
+    assert retriever.stats()["chunks"] == 0  # no dedupe row blocking a retry
+    # Next reindex retries the embed and succeeds.
+    assert retriever.reindex_file("2026-08.md", DAY_TEXT) == 1
+    assert retriever.stats()["chunks"] == 1
+
+
+def test_edited_subsection_supersedes_the_old_chunk(retriever):
+    retriever.reindex_file("2026-08.md", DAY_TEXT)
+    assert retriever.stats()["chunks"] == 1
+    edited = DAY_TEXT.replace("Slept badly again, third night this week.", "Slept well after new medication.")
+    assert retriever.reindex_file("2026-08.md", edited) == 1
+    # The stale version must be gone, not accumulated next to the new one.
+    assert retriever.stats()["chunks"] == 1
+    if not retriever.vec_available:
+        pytest.skip("sqlite-vec not available in this environment")
+    results = retriever.search("new medication", top_k=3, min_score=0.0)
+    assert results and "new medication" in results[0]["text"]
+    assert all("Slept badly" not in r["text"] for r in results)
+
+
+def test_removed_subsection_is_cleaned_up(retriever):
+    second_day = DAY_TEXT.replace("Saturday, August 29, 2026", "Sunday, August 30, 2026").replace(
+        "Morning coffee", "Evening walk"
+    )
+    retriever.reindex_file("2026-08.md", DAY_TEXT + second_day)
+    assert retriever.stats()["chunks"] == 2
+    # The August 29 day disappears from the file entirely.
+    retriever.reindex_file("2026-08.md", second_day)
+    assert retriever.stats()["chunks"] == 1
+
+
 def _cfg(**overrides):
     base = {
         "context": {"max_today_tokens": 4500, "max_standing_tokens": 2200},
