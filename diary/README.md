@@ -31,10 +31,46 @@ Configuration defaults live in `config/config.yaml`. Environment variables overr
 - `POST /api/chat`
 - `GET /api/day`
 - `GET /api/months`
+- `GET /api/insights` — standing sections + `last_change` badge metadata (read-only)
+- `POST /api/insights/reflect` — on-demand AI reflection (see Commentary below)
+- `POST /api/insights/about-question` — reflection anchored to one Open Question
+- `POST /api/entries/edit` — guarded correction of one logged exchange (see Editing below)
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
 Set `DIARY_AUTH_TOKEN` before network exposure. The SQLite database contains the retrieval index and durable write journal and must live on persistent storage.
+
+## Editing — the integrity guarantee
+
+The logger keeps the user's own words near-verbatim; that guarantee extends to
+corrections. Past entries are editable in the app, but only through
+`POST /api/entries/edit`, which:
+
+- targets **exactly one** logged exchange, identified by its hidden `xid` marker —
+  nothing else in the file can be touched;
+- routes through the same write-ahead journal and ETag-guarded write as every
+  other corpus mutation (there is no separate, unguarded write path), so a crash
+  before or after the underlying PUT replays idempotently;
+- refreshes the retrieval index afterward, so a superseded chunk can never be
+  served alongside the corrected text.
+
+Editing is a human-initiated, visible action in the UI. The assistant never
+rewrites the user's words on its own, and no pipeline step edits corpus text.
+
+## Commentary — never part of the diary
+
+The commentator (`agent/commentator.py`) generates reflections **only on
+explicit request** (the web app's Insights view; nothing runs in the
+background). Prompts ground each reflection in the INDEX.md standing sections
+and corpus chunks from the sqlite-vec retrieval index — never a full-corpus
+rescan — and the response reports which day/header pairs it drew from, plus an
+honest `degraded` flag when retrieval is unavailable.
+
+The structural rule: **commentary is rendered, never stored.** The commentator
+has no write path — no corpus mutation, no journal entry, no index update — so
+a reflection can never re-enter the diary as if the user had written it. The
+optional "new insights" badge in the web app is opt-in per user and fires only
+from the journal's standing-section activity; it generates nothing.
 
 ### Trust model: never expose this service directly
 
