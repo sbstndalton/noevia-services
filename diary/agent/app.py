@@ -200,6 +200,17 @@ def _tenant_state(request: Request) -> AppState:
             _set_cfg(cfg, "corpus.webdav.username", storage.get("username", ""))
             _set_cfg(cfg, "corpus.webdav.password", storage.get("secret", ""))
             _set_cfg(cfg, "corpus.root", storage.get("corpusRoot", ""))
+        elif storage and storage.get("kind") == "s3":
+            _set_cfg(cfg, "corpus.backend", "s3")
+            _set_cfg(cfg, "corpus.s3.endpoint_url", storage.get("baseUrl", ""))
+            _set_cfg(cfg, "corpus.s3.bucket", storage.get("bucket", ""))
+            _set_cfg(cfg, "corpus.s3.access_key", storage.get("username", ""))
+            _set_cfg(cfg, "corpus.s3.secret_key", storage.get("secret", ""))
+            # The user's chosen folder inside the bucket maps to a key prefix;
+            # corpus paths stay bare keys under that prefix.
+            _set_cfg(cfg, "corpus.s3.prefix", storage.get("corpusRoot", ""))
+            _set_cfg(cfg, "corpus.root", "")
+            _set_cfg(cfg, "corpus.monthly_prefix", "")
         elif not legacy_owner:
             _set_cfg(cfg, "corpus.backend", "local")
             _set_cfg(cfg, "corpus.local.root", str(tenant_root / "corpus"))

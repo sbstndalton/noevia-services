@@ -42,4 +42,17 @@ def create_backend(cfg: Config) -> CorpusBackend:
             password=cfg.get("corpus.webdav.password") or "",
             timeout_s=float(cfg.get("corpus.webdav.timeout_s", 60)),
         )
-    raise ValueError(f"unsupported corpus backend: {kind!r} (expected 'local' or 'webdav')")
+    if kind == "s3":
+        from .s3_storage import S3CorpusBackend
+
+        return S3CorpusBackend(
+            endpoint_url=cfg.get("corpus.s3.endpoint_url"),
+            bucket=cfg.get("corpus.s3.bucket") or "",
+            access_key=cfg.get("corpus.s3.access_key") or "",
+            secret_key=cfg.get("corpus.s3.secret_key") or "",
+            session_token=cfg.get("corpus.s3.session_token") or "",
+            region=cfg.get("corpus.s3.region") or "us-east-1",
+            prefix=cfg.get("corpus.s3.prefix") or "",
+            timeout_s=float(cfg.get("corpus.s3.timeout_s", 60)),
+        )
+    raise ValueError(f"unsupported corpus backend: {kind!r} (expected 'local', 'webdav', or 's3')")

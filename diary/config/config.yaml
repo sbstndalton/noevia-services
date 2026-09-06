@@ -27,6 +27,17 @@ corpus:
     base_url: https://cloud.example.com/remote.php/dav/files/username/
     username: ""
     timeout_s: 60
+  # S3-compatible object storage (MinIO, Backblaze B2, AWS S3, Garage, ...).
+  # Path-style addressing; credentials optional (unsigned mode for public buckets).
+  s3:
+    endpoint_url: ""
+    bucket: ""
+    access_key: ""
+    secret_key: ""
+    session_token: ""
+    region: us-east-1
+    prefix: ""
+    timeout_s: 60
   monthly_prefix: ""
   month_file_template: "{year}-{month02}.md"
   index_enabled: false

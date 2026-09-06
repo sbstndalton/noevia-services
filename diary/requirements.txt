@@ -13,3 +13,6 @@ numpy>=1.26
 # Dev / tests
 pytest>=8.0
 pytest-asyncio>=0.23
+# Test-only: local S3-compatible server for backend contract tests (see
+# tests/test_s3_backend.py). The runtime S3 client is stdlib + httpx only.
+moto[server]>=5.0
