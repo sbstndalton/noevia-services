@@ -508,9 +508,15 @@ def api_months(request: Request) -> JSONResponse:
 
 
 def _standing_payload(st: AppState) -> dict:
-    """Standing sections serialized for the Insights view."""
+    """Standing sections serialized for the Insights view.
+
+    last_change (epoch seconds, or None) is the newest applied standing-section
+    journal update — the signal the web server compares against the user's
+    seen-marker for the opt-in "insights have something new" badge. It is a
+    read-only metadata field; nothing here generates anything.
+    """
     if not st.store.index_enabled:
-        return {"questions": [], "timeline": [], "index_enabled": False}
+        return {"questions": [], "timeline": [], "index_enabled": False, "last_change": None}
     try:
         text, _ = st.store.read_index()
     except Exception as exc:  # noqa: BLE001 — display-only read
@@ -535,7 +541,16 @@ def _standing_payload(st: AppState) -> dict:
         m = re.match(r"^-\s*\*\*([^*]+)\*\*\s+—\s+(.+)$", line)
         if m:
             timeline.append({"date": m.group(1).strip(), "text": m.group(2).strip()})
-    return {"questions": questions, "timeline": timeline, "index_enabled": True}
+    last_change = None
+    try:
+        row = st.journal._conn.execute(
+            "SELECT MAX(applied_at) FROM journal WHERE kind = 'index_update' AND applied = 1"
+        ).fetchone()
+        if row and row[0]:
+            last_change = datetime.fromisoformat(row[0]).timestamp()
+    except Exception as exc:  # noqa: BLE001 — metadata only, never fail the read
+        log.warning("insights: last_change lookup failed: %s", exc)
+    return {"questions": questions, "timeline": timeline, "index_enabled": True, "last_change": last_change}
 
 
 @app.get("/api/insights")

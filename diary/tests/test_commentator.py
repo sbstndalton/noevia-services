@@ -267,3 +267,18 @@ def test_insights_endpoint_serves_standing_sections(client):
     assert body["questions"][0]["text"] == "Open thing"
     assert body["questions"][0]["resolved"] is False
     assert body["timeline"][0] == {"date": "2026-09-01", "text": "Key event"}
+
+
+def test_insights_reports_last_change_from_journal(client):
+    """last_change (the badge signal) is the newest applied index_update."""
+    before = client.get("/api/insights").json()["last_change"]
+    # The endpoint reads the TENANT state's journal (separate SQLite file from
+    # the global state's), so the standing-section update must go through the
+    # tenant the same way a real proxied request would.
+    tenant = next(iter(appmod._tenant_states.values()))
+    tenant.store.update_standing_sections([{"action": "add", "text": "Fresh question"}], [], "2026-09-06")
+    after = client.get("/api/insights").json()["last_change"]
+    assert after is not None
+    if before is not None:
+        assert after >= before
+    # With no activity at all the field is None (badge logic treats it as never).
