@@ -44,9 +44,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import corpus as fmt
 from .config import load_config
 from .context import ContextAssembler
 from .corpus_store import CorpusError, CorpusStore
+from .commentator import Commentator
 from .external_sources import (
     external_source_paths,
     infer_date,
@@ -96,6 +98,9 @@ class AppState:
         templates_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "logging.md"
         templates = yaml.safe_load(templates_path.read_text(encoding="utf-8"))
         self.pipeline = LoggingPipeline(self.store, self.llm_main, self.llm_aux, templates)
+        commentary_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "commentary.md"
+        commentary_templates = yaml.safe_load(commentary_path.read_text(encoding="utf-8"))
+        self.commentator = Commentator(self.store, self.retrieval, self.llm_aux, commentary_templates)
 
 
 _state: Optional[AppState] = None
@@ -500,6 +505,94 @@ def api_months(request: Request) -> JSONResponse:
     st = _tenant_state(request)
     months = run_in_threadpool_sync(st.store.list_months)
     return JSONResponse({"months": months})
+
+
+def _standing_payload(st: AppState) -> dict:
+    """Standing sections serialized for the Insights view."""
+    if not st.store.index_enabled:
+        return {"questions": [], "timeline": [], "index_enabled": False}
+    try:
+        text, _ = st.store.read_index()
+    except Exception as exc:  # noqa: BLE001 — display-only read
+        log.warning("insights: index read failed (degrading to empty): %s", exc)
+        text = None
+    idx = fmt.parse_index(text)
+    questions = []
+    for bullet in idx.sections.get("Open Questions", []):
+        line = bullet.strip()
+        m = re.match(r"^-\s*\[([ xX])\]\s*(.+)$", line)
+        if m:
+            questions.append({"text": m.group(2).strip(), "resolved": m.group(1).lower() == "x"})
+            continue
+        if line.startswith("<!--"):
+            continue
+        plain = re.sub(r"^-\s*", "", line).strip()
+        if plain:
+            questions.append({"text": plain, "resolved": False})
+    timeline = []
+    for bullet in idx.sections.get("Timeline of Key Events", []):
+        line = bullet.strip()
+        m = re.match(r"^-\s*\*\*([^*]+)\*\*\s+—\s+(.+)$", line)
+        if m:
+            timeline.append({"date": m.group(1).strip(), "text": m.group(2).strip()})
+    return {"questions": questions, "timeline": timeline, "index_enabled": True}
+
+
+@app.get("/api/insights")
+def api_insights(request: Request) -> JSONResponse:
+    """Standing sections for the Insights view (read-only; no generation here)."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    st = _tenant_state(request)
+    return JSONResponse(run_in_threadpool_sync(_standing_payload, st))
+
+
+class ReflectRequest(BaseModel):
+    focus: Optional[str] = None
+
+
+@app.post("/api/insights/reflect")
+def api_insights_reflect(req: ReflectRequest, request: Request) -> JSONResponse:
+    """On-demand AI reflection over the diary. Commentator output is rendered
+    only — it is never written to the corpus, journal, or index, so it can
+    never re-enter the diary as if the user had written it."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    st = _tenant_state(request)
+    result = run_in_threadpool_sync(st.commentator.reflect, (req.focus or "").strip() or None)
+    return JSONResponse({
+        "kind": result.kind,
+        "text": result.text,
+        "used_chunks": result.used_chunks,
+        "sources": result.sources or [],
+        "degraded": result.degraded,
+        **({"error": result.error} if result.error else {}),
+    })
+
+
+class AboutQuestionRequest(BaseModel):
+    question: str
+
+
+@app.post("/api/insights/about-question")
+def api_insights_about_question(req: AboutQuestionRequest, request: Request) -> JSONResponse:
+    """Reflection anchored to one Open Question; retrieval finds the entries."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    question = (req.question or "").strip()
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+    st = _tenant_state(request)
+    result = run_in_threadpool_sync(st.commentator.about_question, question)
+    return JSONResponse({
+        "kind": result.kind,
+        "text": result.text,
+        "question": result.question,
+        "used_chunks": result.used_chunks,
+        "sources": result.sources or [],
+        "degraded": result.degraded,
+        **({"error": result.error} if result.error else {}),
+    })
 
 
 @app.post("/api/entries/edit")
