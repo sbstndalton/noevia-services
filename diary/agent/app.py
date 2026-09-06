@@ -28,8 +28,10 @@ import os
 import re
 import shutil
 import secrets
+import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -91,8 +93,10 @@ class AppState:
 
 
 _state: Optional[AppState] = None
-_tenant_states: Dict[str, AppState] = {}
+_tenant_states: "OrderedDict[str, AppState]" = OrderedDict()
 _tenant_lock = threading.Lock()
+_TENANT_STATE_CAP = 32
+_TENANT_STATE_TTL_S = 24 * 60 * 60
 _base_cfg = load_config()
 
 
@@ -109,6 +113,33 @@ def get_state() -> AppState:
     if _state is None:
         _state = AppState(_base_cfg)
     return _state
+
+
+def _snapshot_sqlite(source: Path, target: Path) -> None:
+    """Copy a live SQLite database safely.
+
+    A plain shutil.copy2 of a database that may be mid-write can produce a
+    corrupt snapshot (torn pages, missing WAL content). The sqlite3 backup
+    API takes a consistent, restartable copy instead; an integrity check on
+    the result guarantees the tenant migration starts from a valid database.
+    """
+    src = sqlite3.connect(str(source))
+    try:
+        dst = sqlite3.connect(str(target))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+        check = sqlite3.connect(str(target))
+        try:
+            result = check.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            check.close()
+        if result != "ok":
+            target.unlink(missing_ok=True)
+            raise RuntimeError(f"snapshot integrity check failed: {result}")
+    finally:
+        src.close()
 
 
 def _tenant_state(request: Request) -> AppState:
@@ -136,8 +167,12 @@ def _tenant_state(request: Request) -> AppState:
     storage_header = request.headers.get("X-Cowork-Storage", "")
     state_key = f"{user_id}:{hashlib.sha256(storage_header.encode()).hexdigest()[:16]}"
     with _tenant_lock:
-        if state_key in _tenant_states:
-            return _tenant_states[state_key]
+        cached = _tenant_states.get(state_key)
+        if cached is not None:
+            # LRU touch: move to the most-recently-used end.
+            _tenant_states.move_to_end(state_key)
+            cached.last_used = time.monotonic()
+            return cached
         cfg = copy.deepcopy(_base_cfg)
         tenant_root = Path(cfg.get("retrieval.db_path")).parent / "users" / user_id
         tenant_root.mkdir(parents=True, exist_ok=True)
@@ -145,7 +180,7 @@ def _tenant_state(request: Request) -> AppState:
         legacy_owner = request.headers.get("X-Cowork-Legacy-Owner") == "1" or bool(os.environ.get("DIARY_LEGACY_USER_ID"))
         source_db = Path(cfg.get("retrieval.db_path"))
         if legacy_owner and source_db.exists() and not tenant_db.exists():
-            shutil.copy2(source_db, tenant_db)
+            _snapshot_sqlite(source_db, tenant_db)
         _set_cfg(cfg, "retrieval.db_path", str(tenant_db))
         storage = None
         if storage_header:
@@ -165,8 +200,41 @@ def _tenant_state(request: Request) -> AppState:
             _set_cfg(cfg, "corpus.root", "")
         state = AppState(cfg)
         state.store.apply_pending()
+        state.last_used = time.monotonic()
         _tenant_states[state_key] = state
+        _evict_tenant_states_locked()
         return state
+
+
+def _close_state(state: AppState) -> None:
+    """Release a tenant AppState's heavyweight resources (SQLite connections,
+    HTTP clients). Errors are ignored: eviction must never take the service
+    down, and a half-closed state is simply rebuilt from scratch if a later
+    request needs the same tenant again."""
+    try:
+        state.backend.close()
+        state.llm_main.close()
+        state.llm_aux.close()
+        state.retrieval.close()
+        state.journal.close()
+    except Exception:  # noqa: BLE001
+        log.exception("failed to close evicted tenant state")
+
+
+def _evict_tenant_states_locked() -> None:
+    """TTL + LRU eviction of cached tenant states. Caller must hold
+    _tenant_lock. Without this, every distinct storage-config change mints a
+    new heavyweight entry (SQLite connections, HTTP clients) that is never
+    released except via the explicit tenant-delete route."""
+    now = time.monotonic()
+    stale = [k for k, s in _tenant_states.items() if now - getattr(s, "last_used", now) > _TENANT_STATE_TTL_S]
+    for key in stale:
+        _close_state(_tenant_states.pop(key))
+        log.info("evicted tenant state %s (TTL expired)", key.split(":")[0])
+    while len(_tenant_states) > _TENANT_STATE_CAP:
+        key, state = _tenant_states.popitem(last=False)  # least recently used
+        _close_state(state)
+        log.info("evicted tenant state %s (LRU cap)", key.split(":")[0])
 
 
 @asynccontextmanager
@@ -222,25 +290,46 @@ def delete_tenant(request: Request) -> JSONResponse:
     with _tenant_lock:
         for key, state in list(_tenant_states.items()):
             if key.startswith(f"{user_id}:"):
-                try:
-                    state.backend.close(); state.llm_main.close(); state.llm_aux.close(); state.retrieval.close(); state.journal.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                _close_state(state)
                 _tenant_states.pop(key, None)
         shutil.rmtree(root, ignore_errors=True)
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True})# ---------------- in-memory session (per tenant, bounded) ----------------
 
-
-# ---------------- in-memory session (single user) ----------------
-
-SESSIONS: Dict[str, dict] = {}
+SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
+_SESSION_CAP = 256
+_SESSION_TTL_S = 24 * 60 * 60
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def _session(session_id: str, tenant_id: str = "legacy") -> dict:
-    key = f"{tenant_id}:{session_id}"
-    if key not in SESSIONS:
-        SESSIONS[key] = {"turns": [], "log_status": []}
-    return SESSIONS[key]
+    """Conversation scratch state, keyed by tenant + client-supplied session id.
+
+    Both key parts are validated/normalized and the map is TTL+LRU bounded:
+    SESSIONS used to grow without limit because both parts were unvalidated
+    client input and entries were never evicted. Validation also keeps keys
+    to one line (a header cannot smuggle ':' collisions or weird bytes).
+    """
+    sid = str(session_id or "default")
+    if not _SESSION_ID_RE.fullmatch(sid):
+        sid = "default"
+    tid = str(tenant_id or "legacy")
+    if not _SESSION_ID_RE.fullmatch(tid):
+        tid = "legacy"
+    key = f"{tid}:{sid}"
+    now = time.monotonic()
+    if key in SESSIONS:
+        SESSIONS.move_to_end(key)
+        SESSIONS[key]["last_used"] = now
+        return SESSIONS[key]
+    if len(SESSIONS) >= _SESSION_CAP:
+        expired = [k for k, v in SESSIONS.items() if now - v.get("last_used", now) > _SESSION_TTL_S]
+        for k in expired:
+            SESSIONS.pop(k, None)
+    while len(SESSIONS) >= _SESSION_CAP:
+        SESSIONS.popitem(last=False)  # least recently used
+    entry = {"turns": [], "log_status": [], "last_used": now}
+    SESSIONS[key] = entry
+    return entry
 
 
 # ---------------- request/response models ----------------

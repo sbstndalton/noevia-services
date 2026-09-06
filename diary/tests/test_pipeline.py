@@ -222,6 +222,44 @@ def test_v1_models_endpoint(client):
     assert any(m["id"] == "diary-companion" for m in data["data"])
 
 
+def test_sqlite_snapshot_produces_valid_copy(tmp_path):
+    import sqlite3
+    src = tmp_path / "src.db"
+    conn = sqlite3.connect(src)
+    conn.execute("CREATE TABLE t (x TEXT)")
+    conn.execute("INSERT INTO t VALUES ('hello')")
+    conn.commit()
+    conn.close()
+    dst = tmp_path / "dst.db"
+    appmod._snapshot_sqlite(src, dst)
+    check = sqlite3.connect(dst)
+    try:
+        assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert check.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+    finally:
+        check.close()
+
+
+def test_sqlite_snapshot_rejects_a_corrupt_source(tmp_path):
+    import sqlite3
+    src = tmp_path / "bad.db"
+    src.write_bytes(b"this is not a sqlite database at all........")
+    dst = tmp_path / "bad-copy.db"
+    with pytest.raises(Exception):
+        appmod._snapshot_sqlite(src, dst)
+
+
+def test_session_cache_is_bounded_and_validates_ids():
+    appmod.SESSIONS.clear()
+    for i in range(appmod._SESSION_CAP + 50):
+        appmod._session(f"s{i}", "tenant")
+    assert len(appmod.SESSIONS) <= appmod._SESSION_CAP
+    # Unvalidatable session ids normalize to the default slot instead of
+    # minting unbounded cache keys.
+    assert appmod._session("not valid!!", "tenant") is appmod._session("default", "tenant")
+    appmod.SESSIONS.clear()
+
+
 def test_missing_tenant_header_fails_closed(client, monkeypatch):
     """A request with no (or a malformed) tenant identity must be rejected,
     never silently served from the process-wide legacy state. (/api/health is
