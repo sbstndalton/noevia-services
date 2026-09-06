@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -112,9 +112,27 @@ def get_state() -> AppState:
 
 
 def _tenant_state(request: Request) -> AppState:
+    """Resolve the tenant AppState for this request.
+
+    SECURITY: fails CLOSED. A request with a missing, malformed, or non-UUID
+    X-Cowork-User-ID is rejected with 400 — it must never fall back to the
+    process-wide legacy AppState, which in a partially-migrated deployment is
+    a real user's live corpus, not an empty default. The legacy AppState is
+    reachable only via the explicit DIARY_LEGACY_USER_ID env mapping (one
+    user, deliberately configured by the operator).
+
+    TRUST MODEL (hard requirement): tenant isolation is enforced by network
+    topology plus the shared DIARY_AUTH_TOKEN — any holder of that token can
+    act as ANY tenant by supplying an arbitrary X-Cowork-User-ID, including
+    permanently deleting that tenant's corpus via DELETE /api/internal/tenant.
+    This is safe only while the service is reachable exclusively from the
+    apps/web server on an internal network, which authenticates its own users
+    before proxying. NEVER expose this service directly to a browser or the
+    public internet. See services/diary/README.md.
+    """
     user_id = request.headers.get("X-Cowork-User-ID", "") or os.environ.get("DIARY_LEGACY_USER_ID", "")
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
-        return get_state()
+        raise HTTPException(status_code=400, detail="missing or invalid X-Cowork-User-ID")
     storage_header = request.headers.get("X-Cowork-Storage", "")
     state_key = f"{user_id}:{hashlib.sha256(storage_header.encode()).hexdigest()[:16]}"
     with _tenant_lock:
@@ -179,7 +197,13 @@ def _client_token(request: Request) -> Optional[str]:
 
 
 def check_auth(request: Request) -> bool:
-    """True when the request may proceed. Open mode when no token is configured."""
+    """True when the request may proceed. Open mode when no token is configured.
+
+    This validates only the shared service token. It does NOT authenticate the
+    specific tenant: tenant identity comes from the X-Cowork-User-ID header
+    supplied by the trusted apps/web proxy (see _tenant_state for the full
+    trust model and why direct exposure is forbidden).
+    """
     st = get_state()
     if not st.auth_token:
         return True
@@ -298,8 +322,11 @@ def api_chat(req: ChatRequest, request: Request) -> JSONResponse:
     message = req.message.strip()
     if not message:
         return JSONResponse({"error": "empty message"}, status_code=400)
+    st = _tenant_state(request)  # fail-closed: outside the try so an identity error is not masked as a model error
     try:
-        result = _run_exchange(_tenant_state(request), message, req.session_id, request.headers.get("X-Cowork-User-ID", "legacy"))
+        result = _run_exchange(st, message, req.session_id, request.headers.get("X-Cowork-User-ID", "legacy"))
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         log.exception("chat failed")
         return JSONResponse({"error": f"model error: {exc}"}, status_code=502)

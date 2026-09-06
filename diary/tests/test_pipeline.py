@@ -115,10 +115,15 @@ def client(tmp_path, monkeypatch):
         "ui": {"host": "127.0.0.1", "port": 8010},
     }), encoding="utf-8")
     monkeypatch.setenv("DIARY_CONFIG", str(cfg_path))
+    # Endpoints are fail-closed: requests must resolve to a tenant. These
+    # tests exercise the documented legacy-direct-client path via the
+    # DIARY_LEGACY_USER_ID env mapping (one deliberate operator-set UUID).
+    monkeypatch.setenv("DIARY_LEGACY_USER_ID", "22222222-2222-4222-8222-222222222222")
 
     fake = FakeWebDAV()
     appmod.SESSIONS.clear()
     appmod._state = None
+    appmod._tenant_states.clear()
 
     def patched_init(self, cfg_inner):
         from pathlib import Path as _P
@@ -215,6 +220,18 @@ def test_v1_models_endpoint(client):
     data = r.json()
     assert data["object"] == "list"
     assert any(m["id"] == "diary-companion" for m in data["data"])
+
+
+def test_missing_tenant_header_fails_closed(client, monkeypatch):
+    """A request with no (or a malformed) tenant identity must be rejected,
+    never silently served from the process-wide legacy state. (/api/health is
+    service-level and deliberately does not require tenant identity.)"""
+    monkeypatch.delenv("DIARY_LEGACY_USER_ID", raising=False)
+    appmod._tenant_states.clear()
+    assert client.post("/api/chat", json={"message": "hi"}).status_code == 400
+    assert client.get("/api/day").status_code == 400
+    assert client.get("/api/months").status_code == 400
+    assert client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}).status_code == 400
 
 
 def test_v1_chat_completions_logs_exchange(client):

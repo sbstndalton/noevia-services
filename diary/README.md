@@ -35,3 +35,20 @@ Configuration defaults live in `config/config.yaml`. Environment variables overr
 - `POST /v1/chat/completions`
 
 Set `DIARY_AUTH_TOKEN` before network exposure. The SQLite database contains the retrieval index and durable write journal and must live on persistent storage.
+
+### Trust model: never expose this service directly
+
+**This service MUST only ever be reachable from the Cowork web server's
+container/proxy on an internal network. Do not publish its port, do not route
+public traffic to it, and do not put it behind a shared reverse proxy that
+forwards arbitrary requests.**
+
+Tenant isolation here is a network-topology property, not a code property:
+`DIARY_AUTH_TOKEN` is a single shared service token. Any holder of that token
+can impersonate **any** tenant by supplying an arbitrary `X-Cowork-User-ID`
+header — including permanently deleting that tenant's entire corpus via
+`DELETE /api/internal/tenant`. The web server is what authenticates real users
+and decides which tenant ID to forward. Because this service has no per-tenant
+authentication of its own, direct exposure would let anyone with the token
+act as anyone. This is a deliberate trade-off documented here as a hard
+requirement; keep the service internal.
