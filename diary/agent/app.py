@@ -47,6 +47,12 @@ from pydantic import BaseModel
 from .config import load_config
 from .context import ContextAssembler
 from .corpus_store import CorpusStore
+from .external_sources import (
+    external_source_paths,
+    infer_date,
+    resolve_import_target,
+    scan_source,
+)
 from .journal import Journal
 from .llm import LLMClient
 from .pipeline import LoggingPipeline
@@ -476,6 +482,89 @@ def api_months(request: Request) -> JSONResponse:
     st = _tenant_state(request)
     months = run_in_threadpool_sync(st.store.list_months)
     return JSONResponse({"months": months})
+
+
+@app.get("/api/external-sources")
+def api_external_sources(request: Request) -> JSONResponse:
+    """Detect diary-like files in operator-configured external folders.
+
+    Read-only: reports filename, size, and best-guess date per file, plus a
+    total count, so the UI can say "we found N entries in other sources".
+    Never mutates anything in the source folders.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    st = _tenant_state(request)  # tenant resolution first: consistent auth surface
+    paths = external_source_paths()
+    if not paths:
+        return JSONResponse({"configured": False, "sources": [], "total": 0})
+    results = []
+    total = 0
+    for p in paths:
+        scan = run_in_threadpool_sync(scan_source, p)
+        total += scan["total"]
+        results.append(scan)
+    return JSONResponse({"configured": True, "sources": results, "total": total})
+
+
+class ImportRequest(BaseModel):
+    source_path: str
+    rel_path: str
+
+
+@app.post("/api/external-sources/import")
+def api_external_sources_import(body: ImportRequest, request: Request) -> JSONResponse:
+    """Import ONE external source file into the corpus, explicitly.
+
+    The file's full text becomes the entry body (verbatim), dated by the same
+    inference the scan reported. Runs through the journal-durable store
+    applier exactly like a chat-logged exchange — but skips the AI classifier
+    and summarizer: the user explicitly asked to import this file, so its
+    text is kept as-is. The original file is only ever read.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    st = _tenant_state(request)
+
+    # The named source must be one of the configured ones — no path smuggling.
+    configured = external_source_paths()
+    if body.source_path not in configured:
+        raise HTTPException(status_code=400, detail="source path is not configured")
+    target = resolve_import_target(body.source_path, body.rel_path)
+    if target is None:
+        raise HTTPException(status_code=404, detail="file not found in source")
+
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"file unreadable: {exc}")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="file is empty")
+
+    file_date, _method = infer_date(target)
+    day = file_date or datetime.now().date()
+    try:
+        xid = st.store.log_exchange(
+            day=day,
+            sub_header=f"Imported: {target.name}",
+            me_text=text,
+            claude_text="",
+            now=datetime.now().replace(hour=12, minute=0, second=0, microsecond=0),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"import failed: {exc}")
+
+    threading.Thread(
+        target=_reindex_today,
+        args=(st, day),
+        daemon=True,
+    ).start()
+    return JSONResponse({
+        "imported": True,
+        "xid": xid,
+        "day": day.isoformat(),
+        "date_source": _method if file_date else "today",
+    })
 
 
 @app.get("/api/health")
