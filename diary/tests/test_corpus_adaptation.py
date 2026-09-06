@@ -183,6 +183,25 @@ def test_list_months_numeric_template(tmp_path):
     assert [m["id"] for m in months] == ["2026-09"]
 
 
+def test_default_template_round_trips_through_list_months(tmp_path):
+    """Regression: the historical default used a str.format spec ({month:02d})
+    that list_months never recognized, so a default-configured corpus wrote
+    2026-09.md but listed no months. The default is now the recognized
+    {month02} field (identical rendered output), and list_months normalizes
+    the old format-spec style for configs that still carry it."""
+    store = _store(tmp_path, {})  # no explicit template — the default must work
+    store.log_exchange(day=date(2026, 9, 3), sub_header="b", me_text="september", claude_text="c")
+    text, _ = store.read_month(date(2026, 9, 3))
+    assert text is not None
+    assert [m["id"] for m in store.list_months()] == ["2026-09"]
+
+
+def test_list_months_normalizes_format_spec_template(tmp_path):
+    store = _store(tmp_path, {"month_file_template": "{year}-{month:02d}.md"})
+    store.log_exchange(day=date(2026, 9, 3), sub_header="b", me_text="september", claude_text="c")
+    assert [m["id"] for m in store.list_months()] == ["2026-09"]
+
+
 def test_clean_etag_strips_compression_suffix():
     assert clean_etag('"abc123-gzip"') == '"abc123"'
     assert clean_etag('"abc123-br"') == '"abc123"'

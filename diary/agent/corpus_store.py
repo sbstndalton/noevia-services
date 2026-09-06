@@ -41,7 +41,13 @@ class CorpusStore:
         self.index_file = cfg.get("corpus.index_file") or "INDEX.md"
         # Month-file naming template (default preserves the original 2026-09 style).
         # Example for human-named corpora: "Diary - {month_name} {year}.md"
-        self.month_file_template = cfg.get("corpus.month_file_template") or "{year}-{month:02d}.md"
+        # Recognized fields: {year} {month02} {month} {month_name}. The default
+        # uses {month02} (NOT the old {month:02d} format-spec style): the two
+        # render identically, but only named fields are recognized by
+        # list_months, so a format-spec default would write files it could
+        # never list back. Legacy format-spec templates are normalized below.
+        raw_template = cfg.get("corpus.month_file_template") or "{year}-{month02}.md"
+        self.month_file_template = raw_template.replace("{month:02d}", "{month02}")
         # INDEX.md standing sections can be disabled entirely (corpora that manage
         # their own index / don't use one). Default: enabled (original behavior).
         self.index_enabled = bool(cfg.get("corpus.index_enabled", True))
