@@ -173,7 +173,8 @@ class WebDAVCorpusBackend:
             parent_dir = parent.rsplit("/", 1)[0] if "/" in parent else ""
             if parent_dir != remote_dir.strip("/"):
                 continue
-            is_dir = "<d:collection/>" in block or "<D:collection/>" in block
+            # Case-insensitive, consistent with the rest of the XML parsing.
+            is_dir = re.search(r"<d:collection\s*/?>", block, re.I) is not None
             etag_m = re.search(r"<d:getetag[^>]*>(&quot;)?([^<&]*)", block, re.I)
             etag = etag_m.group(2) if etag_m else None
             lm_m = re.search(r"<d:getlastmodified>(.*?)</d:getlastmodified>", block, re.S | re.I)

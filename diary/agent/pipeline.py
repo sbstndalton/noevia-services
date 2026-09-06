@@ -66,7 +66,15 @@ class LoggingPipeline:
         except Exception as exc:  # noqa: BLE001 — classifier failure must never lose a diary entry
             log.warning("skip classifier failed (%s); defaulting to LOG", exc)
             return True
-        return "SKIP" not in verdict.upper()[:12]
+        # Judge the verdict by its first token, not a fixed-width slice:
+        # verdict.upper()[:12] misfires on leading whitespace or on phrasing
+        # like "I would not skip this" ("skip" lands inside the first 12
+        # chars). The classifier is prompted to answer LOG or SKIP; anything
+        # unparseable defaults to LOG (fail-open, keep the entry).
+        first_line = verdict.strip().splitlines()[0] if verdict.strip() else ""
+        tokens = first_line.split()
+        first_token = tokens[0].strip(".,:;!").upper() if tokens else ""
+        return first_token != "SKIP"
 
     def summarize(self, assistant_message: str) -> str:
         try:

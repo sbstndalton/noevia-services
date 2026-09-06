@@ -38,6 +38,28 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {api_key}"
         self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, headers=headers)
 
+    # ---------------- shared retry plumbing ----------------
+
+    def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse) -> Any:
+        """POST with bounded retries; `parse` validates the response body and
+        returns the result. Shared by chat() and embed(), which previously
+        duplicated the retry loop (including its bug of sleeping after the
+        final failed attempt before raising)."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = self._client.post(path, json=payload)
+                resp.raise_for_status()
+                return parse(resp.json())
+            except Exception as exc:  # noqa: BLE001 - retry any transport/parse failure
+                last_exc = exc
+                if attempt == self.max_retries - 1:
+                    break  # last attempt: no point sleeping before raising
+                wait = self.retry_backoff_s * (2**attempt)
+                log.warning("%s attempt %d failed (%s); retrying in %.1fs", describe, attempt + 1, exc, wait)
+                time.sleep(wait)
+        raise LLMError(f"{describe} failed after {self.max_retries} attempts: {last_exc}") from last_exc
+
     # ---------------- chat ----------------
 
     def chat(
@@ -59,22 +81,13 @@ class LLMClient:
         if stop:
             payload["stop"] = stop
 
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries):
-            try:
-                resp = self._client.post("/chat/completions", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                if not isinstance(content, str):
-                    raise LLMError(f"unexpected chat response shape: {data!r}")
-                return content
-            except Exception as exc:  # noqa: BLE001 - retry any transport/parse failure
-                last_exc = exc
-                wait = self.retry_backoff_s * (2**attempt)
-                log.warning("chat attempt %d failed (%s); retrying in %.1fs", attempt + 1, exc, wait)
-                time.sleep(wait)
-        raise LLMError(f"chat failed after {self.max_retries} attempts: {last_exc}") from last_exc
+        def parse_chat(data: Any) -> str:
+            content = data["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise LLMError(f"unexpected chat response shape: {data!r}")
+            return content
+
+        return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
 
     # ---------------- log-marker handling ----------------
 
@@ -95,27 +108,21 @@ class LLMClient:
     def embed(self, texts: List[str], model: Optional[str] = None) -> List[List[float]]:
         if not texts:
             return []
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries):
-            try:
-                resp = self._client.post(
-                    "/embeddings",
-                    json={"model": model or self.embed_model, "input": texts},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                items = data.get("data", [])
-                if len(items) != len(texts):
-                    raise LLMError(f"embedding count mismatch: sent {len(texts)}, got {len(items)}")
-                # API may return embeddings out of order; 'index' restores order.
-                items = sorted(items, key=lambda d: d.get("index", 0))
-                return [item["embedding"] for item in items]
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                wait = self.retry_backoff_s * (2**attempt)
-                log.warning("embed attempt %d failed (%s); retrying in %.1fs", attempt + 1, exc, wait)
-                time.sleep(wait)
-        raise LLMError(f"embeddings failed after {self.max_retries} attempts: {last_exc}") from last_exc
+
+        def parse_embed(data: Any) -> List[List[float]]:
+            items = data.get("data", [])
+            if len(items) != len(texts):
+                raise LLMError(f"embedding count mismatch: sent {len(texts)}, got {len(items)}")
+            # API may return embeddings out of order; 'index' restores order.
+            items = sorted(items, key=lambda d: d.get("index", 0))
+            return [item["embedding"] for item in items]
+
+        return self._post_with_retries(
+            "/embeddings",
+            {"model": model or self.embed_model, "input": texts},
+            "embeddings",
+            parse_embed,
+        )
 
     def close(self) -> None:
         self._client.close()

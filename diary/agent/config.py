@@ -2,7 +2,7 @@
 
 Env overrides:
   LLM_BASE_URL, LLM_API_KEY, LLM_CHAT_MODEL, LLM_EMBED_MODEL,
-  LLM_AUX_BASE_URL, LLM_AUX_MODEL,
+  LLM_AUX_BASE_URL, LLM_AUX_MODEL, LLM_AUX_API_KEY,
   CORPUS_BACKEND, CORPUS_ROOT, CORPUS_LOCAL_ROOT,
   WEBDAV_BASE_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD, CORPUS_REMOTE_ROOT (legacy),
   DIARY_MONTH_FILE_TEMPLATE, DIARY_INDEX_ENABLED,
@@ -71,6 +71,7 @@ def _apply_env(cfg: Config) -> None:
         "LLM_EMBED_MODEL": "llm.embed_model",
         "LLM_AUX_BASE_URL": "llm.aux.base_url",
         "LLM_AUX_MODEL": "llm.aux.model",
+        "LLM_AUX_API_KEY": "llm.aux.api_key",
         "CORPUS_BACKEND": "corpus.backend",
         "CORPUS_ROOT": "corpus.root",
         "CORPUS_LOCAL_ROOT": "corpus.local.root",
