@@ -337,6 +337,18 @@ def _bullet_text(bullet: str) -> str:
     return re.sub(r"^\s*-\s*(\[\s*\]\s*)?", "", bullet)
 
 
+def _check_bullet(bullet: str, checked: bool) -> str:
+    """Rewrite a bullet's checkbox prefix leniently (spacing-insensitive),
+    preserving leading whitespace and post-bracket spacing. A bullet without
+    a checkbox prefix is returned unchanged."""
+    mark = "x" if checked else " "
+    return re.sub(
+        r"^(\s*-\s*)\[[ \t]*\](\s*)",
+        lambda m: f"{m.group(1)}[{mark}]{m.group(2)}",
+        bullet,
+    )
+
+
 def apply_index_edits(
     idx: IndexFile,
     open_question_ops: Optional[List[dict]] = None,
@@ -359,11 +371,12 @@ def apply_index_edits(
             changed = True
         elif action == "resolve":
             hits = _bullet_match_indices(bullets, text)
-            new_bullets = [
-                re.sub(r"^\s*-\s*\[\s\]\s*", "- [x] ", b) if i in hits else b
-                for i, b in enumerate(bullets)
-            ]
-            if hits:
+            new_bullets = [_check_bullet(b, True) if i in hits else b for i, b in enumerate(bullets)]
+            # Derive changed from actual mutation, not from match existence:
+            # a lenient match against non-canonical checkbox spacing (e.g. a
+            # hand-edit in Nextcloud) must still rewrite the bullet, and an
+            # already-resolved bullet must not report a phantom change.
+            if any(new_bullets[i] != bullets[i] for i in hits):
                 changed = True
             idx.sections["Open Questions"] = new_bullets
         elif action == "edit":
@@ -372,7 +385,7 @@ def apply_index_edits(
                 f"- [ ] {op.get('replacement', text)}" if i in hits else b
                 for i, b in enumerate(bullets)
             ]
-            if hits:
+            if any(new_bullets[i] != bullets[i] for i in hits):
                 changed = True
             idx.sections["Open Questions"] = new_bullets
     for op in timeline_ops or []:
@@ -396,7 +409,7 @@ def apply_index_edits(
                 f"- **{stamp}** — {repl}" if i in hits else b
                 for i, b in enumerate(bullets)
             ]
-            if hits:
+            if any(new_bullets[i] != bullets[i] for i in hits):
                 changed = True
             idx.sections["Timeline of Key Events"] = new_bullets
     return changed

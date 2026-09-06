@@ -129,3 +129,35 @@ def test_resolve_prefers_exact_bullet_match():
     oq = idx.sections["Open Questions"]
     assert oq[0].startswith("- [x] ")
     assert oq[1].startswith("- [ ] ")
+
+
+def test_resolve_handles_noncanonical_checkbox_spacing():
+    """INDEX.md hand-edited in Nextcloud can carry '-[ ]', '- [  ]', or tab
+    spacing. Resolve must still rewrite the bullet (leniently, like the match
+    helper) and must report changed=True — the old exact '- [ ] ' mutation
+    regex silently did nothing here."""
+    for spacing, resolved in [
+        ("-[ ] Should I switch jobs?", "-[x] Should I switch jobs?"),
+        ("- [  ] Should I switch jobs?", "- [x] Should I switch jobs?"),
+        ("-\t[ ] Should I switch jobs?", "-\t[x] Should I switch jobs?"),
+    ]:
+        idx = fmt.parse_index("")
+        idx.sections["Open Questions"] = [spacing]
+        changed = fmt.apply_index_edits(
+            idx,
+            open_question_ops=[{"action": "resolve", "text": "switch jobs"}],
+            today="2026-09-04",
+        )
+        assert changed, f"resolve must count as a change for {spacing!r}"
+        assert idx.sections["Open Questions"] == [resolved]
+
+
+def test_resolve_of_already_resolved_bullet_reports_no_change():
+    idx = fmt.parse_index("")
+    idx.sections["Open Questions"] = ["- [x] Should I switch jobs?"]
+    changed = fmt.apply_index_edits(
+        idx,
+        open_question_ops=[{"action": "resolve", "text": "switch jobs"}],
+        today="2026-09-04",
+    )
+    assert not changed
