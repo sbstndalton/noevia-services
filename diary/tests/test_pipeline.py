@@ -194,6 +194,17 @@ def test_health_endpoint(client):
     assert "journal_pending" in body and "retrieval" in body
 
 
+def test_health_probe_without_tenant_succeeds(client, monkeypatch):
+    """Container healthchecks probe without any X-Cowork headers: the probe
+    must still get a 200 (process-level health), minus tenant detail."""
+    monkeypatch.delenv("DIARY_LEGACY_USER_ID", raising=False)
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "journal_pending" not in body and "retrieval" not in body
+
+
 # ---------------- auth + OpenAI-compatible endpoint ----------------
 
 

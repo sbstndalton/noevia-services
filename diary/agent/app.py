@@ -733,14 +733,32 @@ def api_external_sources_import(body: ImportRequest, request: Request) -> JSONRe
 def api_health(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = _tenant_state(request)
-    return JSONResponse({
+    # Health answers for the *process*: the Docker/compose healthchecks probe
+    # without an X-Cowork-User-ID header, and a liveness probe must not depend
+    # on tenant resolution. Tenant detail is added only when a valid header is
+    # supplied (the web server's proxy calls always carry one).
+    user_id = request.headers.get("X-Cowork-User-ID", "") or os.environ.get("DIARY_LEGACY_USER_ID", "")
+    legacy_user = os.environ.get("DIARY_LEGACY_USER_ID", "")
+    # Same two resolution paths _tenant_state supports: an explicit proxy
+    # header (user + storage), or the operator-set legacy direct-client map.
+    has_tenant = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", user_id)) and (
+        bool(request.headers.get("X-Cowork-Storage", "")) or (bool(legacy_user) and user_id == legacy_user)
+    )
+    payload: dict = {
         "ok": True,
-        "journal_pending": st.journal.pending_count(),
-        "retrieval": st.retrieval.stats(),
-        "model": st.cfg.get("llm.chat_model"),
-        "auth_required": bool(st.auth_token),
-    })
+        "model": _base_cfg.get("llm.chat_model"),
+        "auth_required": bool(get_state().auth_token),
+    }
+    if has_tenant:
+        try:
+            st = _tenant_state(request)
+            payload.update({
+                "journal_pending": st.journal.pending_count(),
+                "retrieval": st.retrieval.stats(),
+            })
+        except HTTPException:
+            pass  # tenant detail unavailable; probe-level health is still ok
+    return JSONResponse(payload)
 
 
 # ---------------- OpenAI-compatible surface (Solair AI & friends) ----------------
