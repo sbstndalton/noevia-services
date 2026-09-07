@@ -66,11 +66,11 @@ log = logging.getLogger("diary")
 
 
 class AppState:
-    def __init__(self, cfg):
+    def __init__(self, cfg, backend=None):
         self.cfg = cfg
         self.auth_token = (cfg.get("ui.auth_token") or "").strip()
         self.journal = Journal(Path(cfg.get("retrieval.db_path")))
-        self.backend = create_backend(cfg)
+        self.backend = backend if backend is not None else create_backend(cfg)
         self.llm_main = LLMClient(
             base_url=cfg.get("llm.base_url"),
             api_key=cfg.get("llm.api_key") or "",
@@ -392,11 +392,12 @@ def index() -> str:
 # ---------------- shared conversation core (UI + /v1 both use this) ----------------
 
 
-def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy") -> dict:
+def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy", entry_time=None, entry_day=None, background=True) -> dict:
     """One full exchange: context build -> main model -> strip marker -> log -> return payload."""
     _reindex_dirty(st)
     sess = _session(session_id, tenant_id)
-    day = datetime.now().date()
+    now = entry_time or datetime.now()
+    day = entry_day or now.date()
     messages = st.assembler.build(day, message, session_turns=sess["turns"])
     reply = st.llm_main.chat(messages, temperature=0.7)
 
@@ -404,7 +405,7 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     if marker is None:
         marker = "ok"  # model omitted the marker — default to logging (never lose content)
 
-    outcome = st.pipeline.log_exchange(user_message=message, assistant_message=visible, now=datetime.now())
+    outcome = st.pipeline.log_exchange(user_message=message, assistant_message=visible, now=now, day=day)
 
     sess["turns"].extend([
         {"role": "user", "content": message},
@@ -420,7 +421,8 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
 
     del sess["turns"][:-32]
     del sess["log_status"][:-32]
-    threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
+    if background:
+        threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
     return {"reply": visible, "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
 
 
@@ -730,7 +732,10 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
 
     try:
         # _run_exchange does blocking inference I/O — keep the event loop free.
-        result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id)
+        entry_time, entry_day = entry_target(body)
+        result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day)
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
@@ -764,3 +769,85 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host=os.environ.get("DIARY_HOST", "0.0.0.0"), port=int(os.environ.get("DIARY_PORT", "8010")))
+
+
+# Diary workspace routes share the same tenant resolution as the conversation.
+from .workspace_files import file_list, file_read, file_write, MemoryBackend, reference_text
+
+
+def entry_target(body):
+    """Use the browser's explicit offset, never the container timezone."""
+    try:
+        raw = body.get("entryTime")
+        now = datetime.fromisoformat(raw) if raw else datetime.now().astimezone()
+        if raw and now.tzinfo is None:
+            raise ValueError("timezone offset required")
+        selected = body.get("entryDay")
+        day = date.fromisoformat(selected) if selected else now.date()
+        if not 1900 <= day.year <= 2100 or day > now.date():
+            raise ValueError("choose today or a past date")
+        return now, day
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Invalid diary date/time; include a timezone offset")
+
+
+@app.get("/api/files")
+def workspace_files(request: Request, path: str = ""):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    return {"files": file_list(_tenant_state(request).store, path)}
+
+
+@app.post("/api/file")
+def workspace_file(body: dict, request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    return file_read(_tenant_state(request).store, body.get("path", ""))
+
+
+@app.put("/api/file")
+def workspace_file_save(body: dict, request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    st = _tenant_state(request)
+    result = file_write(st.store, body)
+    _reindex_dirty(st)
+    return result
+
+
+@app.post("/api/local-exchange")
+def local_exchange(body: dict, request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    # Resolve/authenticate the owner but never read/write their online corpus.
+    tenant_id = request.headers.get("X-Cowork-User-ID", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", tenant_id):
+        raise HTTPException(400, "invalid tenant")
+    backend = MemoryBackend(body.get("files"))
+    message = body.get("message")
+    if not isinstance(message, str) or not message.strip() or len(message) > 32000:
+        raise HTTPException(400, "message required (maximum 32000 characters)")
+    now, day = entry_target(body)
+    cfg = copy.deepcopy(_base_cfg)
+    _set_cfg(cfg, "retrieval.db_path", ":memory:")
+    _set_cfg(cfg, "corpus.root", "")
+    _set_cfg(cfg, "corpus.webdav.remote_root", "")
+    _set_cfg(cfg, "corpus.monthly_prefix", "")
+    _set_cfg(cfg, "corpus.index_enabled", False)
+    st = AppState(cfg, backend=backend)
+    sid = secrets.token_hex(16)
+    try:
+        sess = _session(sid, tenant_id)
+        sess["turns"] = [{"role": m["role"], "content": m["content"][:32000]}
+                         for m in body.get("history", [])[-16:]
+                         if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
+        # Local context is bounded and selected without durable indexing.
+        st.assembler.local_reference = reference_text(backend.files, message)
+        result = _run_exchange(st, message, sid, tenant_id, now, day, False)
+        if result["decision"] == "error":
+            raise HTTPException(503, result["reason"])
+        result["files"] = {p: t for p, t in backend.files.items() if backend.original.get(p) != t}
+        return result
+    finally:
+        _close_state(st)
+        SESSIONS.pop(f"{tenant_id}:{sid}", None)

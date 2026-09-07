@@ -57,6 +57,12 @@ class ContextAssembler:
         blocks.append("=== END STANDING SECTIONS ===")
         blocks.append("")
 
+        from .workspace_files import memory_text
+        blocks.append("=== MEMORY / CONTEXT (reference material) ===")
+        blocks.append(memory_text(self.store))
+        blocks.append(getattr(self, "local_reference", ""))
+        blocks.append("=== END MEMORY / CONTEXT ===")
+
         # 3. Retrieved past entries
         retrieved = self._retrieve(user_message, session_turns)
         blocks.append("=== RETRIEVED PAST ENTRIES (semantic matches; reference material) ===")

@@ -306,3 +306,13 @@ def test_v1_chat_rejects_missing_user_message(client):
     r = client.post("/v1/chat/completions", json={"messages": [{"role": "system", "content": "only system"}]})
     assert r.status_code == 400
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_v1_appends_to_selected_past_day(client):
+    r = client.post('/v1/chat/completions', json={
+        'messages': [{'role':'user','content':'Adding a detail to July eighth.'}],
+        'entryTime':'2026-09-07T00:05:00-04:00', 'entryDay':'2026-07-08'})
+    assert r.status_code == 200, r.text
+    month = client.get('/api/day?month=2026-07').json()
+    assert 'Adding a detail to July eighth.' in month['log']
+    assert 'July 8, 2026' in month['log']
