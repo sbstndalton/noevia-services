@@ -11,6 +11,7 @@ def make_client(
     timeout_s: float = 300.0,
     auth: Optional[tuple] = None,
     headers: Optional[dict] = None,
+    follow_redirects: bool = False,
 ) -> httpx.Client:
     """Shared httpx.Client factory — connection pooling, explicit timeouts.
 
@@ -18,6 +19,11 @@ def make_client(
     Requests uncompressed responses (Accept-Encoding: identity): Apache-side gzip
     makes Nextcloud return compression-variant ETags ("...-gzip") whose If-Match
     comparisons then fail with spurious 412s on every conditional write.
+
+    follow_redirects defaults to False: a server the user configures must not be
+    able to bounce a request inward (RFC1918, cloud metadata) and have us follow.
+    Configure such a server by its final URL instead. Callers that talk to an
+    operator-controlled endpoint (not user-supplied) may opt back in.
     """
     merged = {"Accept-Encoding": "identity"}
     if headers:
@@ -28,8 +34,23 @@ def make_client(
         auth=auth,
         headers=merged,
         trust_env=False,
-        follow_redirects=True,
+        follow_redirects=follow_redirects,
     )
+
+
+def ensure_not_redirect(resp) -> None:
+    """Refuse 3xx responses from user-configured storage endpoints.
+
+    Clients are built with follow_redirects=False (see make_client), and httpx
+    then *returns* the 3xx response instead of raising — while raise_for_status()
+    treats 3xx as success. Without this check a redirecting server would feed
+    empty content (or an empty listing) into the corpus as if it were real.
+    """
+    if 300 <= resp.status_code < 400:
+        raise RuntimeError(
+            f"storage endpoint redirected (HTTP {resp.status_code}) — configure the "
+            "server by its final URL instead; redirects are refused for security"
+        )
 
 
 def estimate_tokens(text: str) -> int:

@@ -15,7 +15,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
-from .util import make_client
+from .util import ensure_not_redirect, make_client
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +43,17 @@ class WebDAVCorpusBackend:
         self.base_path = unquote(urlparse(self.base_url).path).rstrip("/") + "/"
         self.auth = (username, password) if username else None
         self.timeout_s = timeout_s
+        # follow_redirects=False (see util.make_client): a user-configured server
+        # must not bounce requests inward. httpx with redirects disabled returns
+        # the 3xx response rather than raising, and raise_for_status() does not
+        # treat 3xx as an error — so every call site checks explicitly below.
         self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, auth=self.auth)
         self._etag_cache: Dict[str, Optional[str]] = {}
         self._lm_cache: Dict[str, Optional[str]] = {}
+
+    @staticmethod
+    def _ensure_not_redirect(resp) -> None:
+        ensure_not_redirect(resp)
 
     # ---------------- path helpers ----------------
 
@@ -65,6 +73,7 @@ class WebDAVCorpusBackend:
         resp = self._client.get(url, headers={"Accept": "*/*"})
         if resp.status_code == 404:
             return None, None
+        self._ensure_not_redirect(resp)
         resp.raise_for_status()
         etag = clean_etag(resp.headers.get("ETag"))
         self._etag_cache[remote_path] = etag
@@ -88,6 +97,7 @@ class WebDAVCorpusBackend:
         for index in range(1, len(parts) + 1):
             directory = "/".join(parts[:index])
             resp = self._client.request("MKCOL", self._url(directory + "/"))
+            self._ensure_not_redirect(resp)
             if resp.status_code in (201, 405):
                 continue
             resp.raise_for_status()
@@ -116,6 +126,7 @@ class WebDAVCorpusBackend:
 
         for attempt in range(max_retries):
             resp = self._client.put(url, content=data, headers=headers)
+            self._ensure_not_redirect(resp)
             if resp.status_code in (200, 201, 204):
                 etag = clean_etag(resp.headers.get("ETag"))
                 self._etag_cache[remote_path] = etag
@@ -133,6 +144,7 @@ class WebDAVCorpusBackend:
     def exists(self, remote_path: str) -> bool:
         url = self._url(remote_path)
         resp = self._client.head(url)
+        self._ensure_not_redirect(resp)
         if resp.status_code == 200:
             return True
         if resp.status_code == 404:
@@ -151,6 +163,7 @@ class WebDAVCorpusBackend:
         )
         if resp.status_code == 404:
             return []
+        self._ensure_not_redirect(resp)
         resp.raise_for_status()
         body = resp.text
         entries: list = []

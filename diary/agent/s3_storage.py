@@ -32,7 +32,7 @@ from xml.etree import ElementTree
 
 import httpx
 
-from .util import make_client
+from .util import ensure_not_redirect, make_client
 
 log = logging.getLogger(__name__)
 
@@ -163,9 +163,13 @@ class S3CorpusBackend:
         path = self._path(key)
         if not self.secret_key:
             # Unsigned mode: no credentials configured (public/position-authed buckets).
-            return self._client.request(method, path, params=query, content=data, headers=dict(headers or {}))
-        signed = self._signed_headers(method, path, query, data, headers)
-        return self._client.request(method, path, params=query, content=data, headers=signed)
+            resp = self._client.request(method, path, params=query, content=data, headers=dict(headers or {}))
+        else:
+            signed = self._signed_headers(method, path, query, data, headers)
+            resp = self._client.request(method, path, params=query, content=data, headers=signed)
+        # User-configured endpoint: refuse bounced requests (see util.ensure_not_redirect).
+        ensure_not_redirect(resp)
+        return resp
 
     # ---------------- primitives ----------------
 

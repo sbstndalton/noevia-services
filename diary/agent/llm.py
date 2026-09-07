@@ -36,7 +36,8 @@ class LLMClient:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, headers=headers)
+        # Operator-configured endpoint (not user-supplied), so redirects stay allowed.
+        self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, headers=headers, follow_redirects=True)
 
     # ---------------- shared retry plumbing ----------------
 
