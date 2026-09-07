@@ -1,16 +1,8 @@
 """S3-compatible corpus backend with guarded conditional writes.
 
-Design (irreplaceable-data discipline, mirroring webdav.py):
-  - Writes are conditional: the backend re-GETs the current object + ETag before
-    every PUT attempt, then sends the PUT with If-Match (overwrite) or
-    If-None-Match:"*" (create-only). On 412/409 (or 404 on a guarded overwrite,
-    i.e. the object vanished), it re-reads and retries, bounded — the
-    read-verify-write loop required for stores whose conditional-write support
-    varies (some S3-compatible servers accept the headers but ignore them).
-  - Bytes never written blind: every PUT carries a precondition, and every
-    precondition is verified against a fresh read, never a cached ETag alone.
-  - Journal replay safety comes from CorpusStore (xid dedupe on append), so
-    replays after a crash mid-write are idempotent exactly as for local/WebDAV.
+Durability requires atomic If-Match / If-None-Match enforcement by the server.
+Before the first corpus write, a disposable probe checks both preconditions.
+Unsupported stores fail closed; a read-before-write is not an atomic lock.
 
 Addressing: path-style only (endpoint/bucket/key) — the form every
 self-hosted S3-compatible server (MinIO, Garage, SeaweedFS, B2's S3 API)
@@ -26,6 +18,8 @@ import hashlib
 import hmac
 import logging
 import time
+import uuid
+import threading
 from typing import Dict, Optional, Tuple
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree
@@ -76,6 +70,8 @@ class S3CorpusBackend:
         self.session_token = session_token
         self.timeout_s = timeout_s
         self._client = make_client(base_url=self.base, timeout_s=timeout_s)
+        self._conditions_checked = False
+        self._condition_lock = threading.Lock()
         self._etag_cache: Dict[str, Optional[str]] = {}
 
     # ---------------- paths ----------------
@@ -190,6 +186,28 @@ class S3CorpusBackend:
             return None, None
         return data.decode("utf-8", errors="replace"), etag
 
+    def _verify_conditions(self) -> None:
+        with self._condition_lock:
+            if self._conditions_checked:
+                return
+            key = self._key(f".cowork-probes/{uuid.uuid4().hex}")
+            created = False
+            try:
+                response = self._request("PUT", key, data=b"probe", headers={"If-None-Match": "*"})
+                response.raise_for_status()
+                created = True
+                for condition in ({"If-None-Match": "*"}, {"If-Match": '"not-the-object-etag"'}):
+                    response = self._request("PUT", key, data=b"probe", headers=condition)
+                    if response.status_code != 412:
+                        raise RuntimeError("S3 storage must enforce atomic conditional writes (If-Match and If-None-Match)")
+                self._conditions_checked = True
+            finally:
+                if created:
+                    response = self._request("DELETE", key)
+                    if response.status_code not in (200, 204, 404):
+                        self._conditions_checked = False
+                        raise RuntimeError("S3 storage needs DeleteObject permission to clean up its conditional-write probe")
+
     def put(
         self,
         remote_path: str,
@@ -202,11 +220,11 @@ class S3CorpusBackend:
 
         - if_match given   -> overwrite only if the stored object still matches (412 => conflict).
         - if_none_match='* -> create-only (412 => someone created it concurrently).
-        Each attempt re-reads the stored object and verifies the precondition holds
-        before sending — read-verify-write, so a server that ignores conditional
-        headers still cannot lose an update silently.
+        The server must enforce preconditions atomically; the pre-read alone
+        provides no concurrency guarantee. Unsupported stores are refused.
         Returns (ok, new_etag, status_code).
         """
+        self._verify_conditions()
         headers_base = {"Content-Type": "text/markdown; charset=utf-8"}
         status = 0
         for attempt in range(max_retries):
@@ -255,6 +273,21 @@ class S3CorpusBackend:
             return []
         resp.raise_for_status()
         root = ElementTree.fromstring(resp.content)
+        page = root
+        tokens = set()
+        while True:
+            values = {n.tag.split("}")[-1]: n.text for n in page}
+            if values.get("IsTruncated") != "true":
+                break
+            token = values.get("NextContinuationToken")
+            if not token or token in tokens:
+                raise RuntimeError("S3 returned invalid listing pagination")
+            tokens.add(token)
+            query["continuation-token"] = token
+            response = self._request("GET", "", query=query)
+            response.raise_for_status()
+            page = ElementTree.fromstring(response.content)
+            root.extend(list(page))
         ns = {"s": root.tag.split("}")[0].lstrip("{")} if root.tag.startswith("{") else {}
 
         def _find(node, name):

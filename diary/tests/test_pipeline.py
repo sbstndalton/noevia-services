@@ -263,11 +263,11 @@ def test_sqlite_snapshot_rejects_a_corrupt_source(tmp_path):
 def test_session_cache_is_bounded_and_validates_ids():
     appmod.SESSIONS.clear()
     for i in range(appmod._SESSION_CAP + 50):
-        appmod._session(f"s{i}", "tenant")
+        appmod._session(f"s{i}", "11111111-1111-4111-8111-111111111111")
     assert len(appmod.SESSIONS) <= appmod._SESSION_CAP
     # Unvalidatable session ids normalize to the default slot instead of
     # minting unbounded cache keys.
-    assert appmod._session("not valid!!", "tenant") is appmod._session("default", "tenant")
+    assert appmod._session("not valid!!", "11111111-1111-4111-8111-111111111111") is appmod._session("default", "11111111-1111-4111-8111-111111111111")
     appmod.SESSIONS.clear()
 
 

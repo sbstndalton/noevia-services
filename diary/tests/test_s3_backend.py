@@ -75,6 +75,11 @@ class FakeS3Handler(BaseHTTPRequestHandler):
         else:
             self._respond(200, b"", {"ETag": f'"v{obj["version"]}"'})
 
+    def do_DELETE(self):
+        with STATE.lock:
+            STATE.objects.pop(self._obj(), None)
+        self._respond(204)
+
     def do_PUT(self):
         key = self._obj()
         if key is None:
@@ -263,3 +268,18 @@ def test_daily_layout_writes_and_lists_through_fake(s3_url, tmp_path):
     assert "September note" in store.read_month_text(2026, 9)
     assert "August note" not in store.read_month_text(2026, 9)
     assert "September note" in store.get_day_text(date(2026, 9, 4))
+
+
+def test_rejects_store_ignoring_conditional_headers(monkeypatch):
+    import httpx
+    backend = S3CorpusBackend('https://example.invalid', 'bucket')
+    calls = []
+    def request(method, key, **kwargs):
+        calls.append((method, key))
+        return httpx.Response(204 if method == 'DELETE' else 200, request=httpx.Request(method, 'https://example.invalid'))
+    monkeypatch.setattr(backend, '_request', request)
+    with pytest.raises(RuntimeError, match='atomic conditional'):
+        backend.put('real-diary.md', b'precious content')
+    assert all('.cowork-probes/' in key for _, key in calls)
+    assert calls[-1][0] == 'DELETE'
+    backend.close()

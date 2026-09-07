@@ -13,6 +13,16 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
+from functools import wraps
+
+def synchronized(fn):
+    @wraps(fn)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return call
+
 from datetime import date
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -23,6 +33,7 @@ from .llm import LLMClient
 log = logging.getLogger(__name__)
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS dirty_documents (document TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
     xid TEXT,                    -- exchange xid if the chunk came from a logged exchange
@@ -56,6 +67,8 @@ def _load_vec_extension(conn: sqlite3.Connection) -> bool:
 
 class Retriever:
     def __init__(self, db_path: Path, llm: LLMClient, embed_batch_size: int = 8):
+        self._lock = threading.RLock()
+        self.pending_embeddings = False
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.llm = llm
@@ -91,6 +104,7 @@ class Retriever:
     def _hash(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+    @synchronized
     def reindex_file(self, file_name: str, month_text: Optional[str], day_of_month: Optional[int] = None) -> int:
         """Parse one month file into chunks and upsert embeddings incrementally.
 
@@ -102,9 +116,8 @@ class Retriever:
 
         Returns the number of chunks embedded this pass.
         """
-        if not month_text:
-            return 0
-        days = fmt.parse_diary(month_text)
+        self.pending_embeddings = False
+        days = fmt.parse_diary(month_text or "")
         rows: List[Tuple[str, str, str, str]] = []  # (day, header, body, hash)
         for d in days:
             if d.date is None:
@@ -143,14 +156,21 @@ class Retriever:
                 "SELECT id FROM chunks WHERE file = ? AND content_hash = ?", (file_name, h)
             ).fetchone()
             if existing:
-                continue  # unchanged chunk — skip re-embedding
+                if not self.vec_available:
+                    continue
+                vector = self._conn.execute("SELECT chunk_id FROM vec_items WHERE chunk_id=?", (existing["id"],)).fetchone() if self._dim else None
+                if vector:
+                    continue
+                # Recover rows written while vector support was unavailable.
+                self._conn.execute("DELETE FROM chunks WHERE id=?", (existing["id"],))
             # Embed BEFORE inserting the chunk row: the hash-indexed row is
             # the dedupe record, so inserting it first would make a failed
             # embed skip this chunk on every future reindex (permanently
             # degrading retrieval while claiming it will retry). With no row,
             # the next reindex simply tries the embed again.
             emb = self._embed_one(chunk_text) if self.vec_available else None
-            if self.vec_available and emb is None:
+            if self.vec_available and (emb is None or (self._dim is not None and len(emb) != self._dim)):
+                self.pending_embeddings = True
                 log.warning("embedding failed for a chunk in %s — will retry on next reindex", file_name)
                 continue
             cur = self._conn.execute(
@@ -183,6 +203,7 @@ class Retriever:
 
     # ---------------- search ----------------
 
+    @synchronized
     def search(self, query: str, top_k: int = 8, min_score: float = 0.30) -> List[dict]:
         """Cosine-similarity search over past chunks. Returns [{'day','header','text','score'}]."""
         if not self.vec_available or self._dim is None:
@@ -197,7 +218,8 @@ class Retriever:
                        1.0 - vec_distance_cosine(vec_items.embedding, ?) AS score
                 FROM vec_items
                 JOIN chunks c ON c.id = vec_items.chunk_id
-                WHERE 1.0 - vec_distance_cosine(vec_items.embedding, ?) >= ?
+                WHERE c.file NOT IN (SELECT document FROM dirty_documents)
+                  AND 1.0 - vec_distance_cosine(vec_items.embedding, ?) >= ?
                 ORDER BY score DESC
                 LIMIT ?
                 """,
@@ -211,10 +233,12 @@ class Retriever:
             for r in rows
         ]
 
+    @synchronized
     def stats(self) -> dict:
         n = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         return {"chunks": n, "vec_available": self.vec_available, "dim": self._dim}
 
+    @synchronized
     def close(self) -> None:
         self._conn.close()
 

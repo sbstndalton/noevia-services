@@ -14,6 +14,16 @@ import json
 import logging
 import sqlite3
 import uuid
+import threading
+from functools import wraps
+
+def synchronized(fn):
+    @wraps(fn)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return call
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +32,7 @@ from typing import List, Optional
 log = logging.getLogger(__name__)
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS dirty_documents (document TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS journal (
     id          TEXT PRIMARY KEY,
     created_at  TEXT NOT NULL,
@@ -49,6 +60,7 @@ class JournalEntry:
 
 class Journal:
     def __init__(self, db_path: Path):
+        self._lock = threading.RLock()
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -58,6 +70,7 @@ class Journal:
 
     # ---------------- write-ahead ----------------
 
+    @synchronized
     def enqueue(self, kind: str, payload: dict) -> str:
         jid = str(uuid.uuid4())
         now = datetime.now().isoformat(timespec="seconds")
@@ -69,6 +82,7 @@ class Journal:
         log.info("journal enqueue %s kind=%s", jid, kind)
         return jid
 
+    @synchronized
     def mark_applied(self, jid: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -76,6 +90,7 @@ class Journal:
                 (datetime.now().isoformat(timespec="seconds"), jid),
             )
 
+    @synchronized
     def mark_failed(self, jid: str, error: str) -> None:
         with self._conn:
             self._conn.execute(
@@ -85,9 +100,10 @@ class Journal:
 
     # ---------------- recovery ----------------
 
+    @synchronized
     def unapplied(self, limit: int = 100) -> List[JournalEntry]:
         rows = self._conn.execute(
-            "SELECT * FROM journal WHERE applied = 0 ORDER BY created_at LIMIT ?", (limit,)
+            "SELECT * FROM journal WHERE applied = 0 ORDER BY created_at, rowid LIMIT ?", (limit,)
         ).fetchall()
         return [
             JournalEntry(
@@ -102,8 +118,29 @@ class Journal:
             for r in rows
         ]
 
+    @synchronized
+    def mark_dirty(self, document: str) -> None:
+        with self._conn:
+            self._conn.execute("INSERT OR IGNORE INTO dirty_documents(document) VALUES (?)", (document,))
+
+    @synchronized
+    def dirty_documents(self) -> list:
+        return [r[0] for r in self._conn.execute("SELECT document FROM dirty_documents")]
+
+    @synchronized
+    def clear_dirty(self, document: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM dirty_documents WHERE document=?", (document,))
+
+    @synchronized
+    def is_applied(self, jid: str) -> bool:
+        row = self._conn.execute("SELECT applied FROM journal WHERE id=?", (jid,)).fetchone()
+        return bool(row and row[0])
+
+    @synchronized
     def pending_count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM journal WHERE applied = 0").fetchone()[0])
 
+    @synchronized
     def close(self) -> None:
         self._conn.close()

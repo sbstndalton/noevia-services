@@ -10,6 +10,16 @@ import calendar
 import logging
 import re
 import uuid
+import threading
+from functools import wraps
+
+def serialized(fn):
+    @wraps(fn)
+    def call(self, *args, **kwargs):
+        with self._write_lock:
+            return fn(self, *args, **kwargs)
+    return call
+
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -28,6 +38,7 @@ class CorpusError(RuntimeError):
 
 class CorpusStore:
     def __init__(self, cfg: Config, backend: CorpusBackend, journal: Journal):
+        self._write_lock = threading.RLock()
         self.cfg = cfg
         self.backend = backend
         self.dav = backend  # one-release compatibility for integrations/tests
@@ -51,11 +62,6 @@ class CorpusStore:
         # INDEX.md standing sections can be disabled entirely (corpora that manage
         # their own index / don't use one). Default: enabled (original behavior).
         self.index_enabled = bool(cfg.get("corpus.index_enabled", True))
-        # (document path, owning day) of the most recently applied exchange_edit
-        # (not durable state — a same-process communication channel from
-        # _apply_exchange_edit back to edit_exchange so the endpoint can report
-        # what was touched and reindex exactly that document).
-        self._last_edit_result: Optional[Tuple[str, date]] = None
 
     # ---------------- paths ----------------
 
@@ -271,6 +277,7 @@ class CorpusStore:
 
     # ---------------- exchange logging ----------------
 
+    @serialized
     def log_exchange(
         self,
         day: date,
@@ -307,6 +314,7 @@ class CorpusStore:
         self.apply_pending()
         return xid
 
+    @serialized
     def update_standing_sections(self, open_question_ops: list, timeline_ops: list, today: str) -> Optional[str]:
         """Enqueue + apply INDEX.md standing-section edits. Returns journal id."""
         if not self.index_enabled:
@@ -322,6 +330,7 @@ class CorpusStore:
 
     # ---------------- editing ----------------
 
+    @serialized
     def edit_exchange(self, xid: str, new_me: str, new_claude: str, month: Optional[str] = None) -> str:
         """Durably record + apply a human-initiated correction to one logged exchange.
 
@@ -344,13 +353,17 @@ class CorpusStore:
         found = self._find_document_with_xid(xid, month)
         if found is None:
             raise CorpusError(f"no corpus document contains exchange {xid}")
+        original, _ = self.backend.get_text(found[0])
+        if original is None or fmt.replace_exchange_text(original, xid, new_me, new_claude) is None:
+            raise CorpusError("The entry cannot be edited safely: malformed or missing block")
         payload = {"xid": xid, "new_me": new_me, "new_claude": new_claude}
         if month:
             payload["month"] = month
-        self.journal.enqueue("exchange_edit", payload)
+        jid = self.journal.enqueue("exchange_edit", payload)
         self.apply_pending()
-        path, day = self._last_edit_result
-        self._last_edit_result = None
+        if not self.journal.is_applied(jid):
+            raise CorpusError("Correction is queued but could not be saved yet. It will retry when storage is available.")
+        path, day = found
         return path, day.isoformat()
 
     def _documents_for_month(self, month_id: str) -> List[Tuple[str, date]]:
@@ -409,13 +422,15 @@ class CorpusStore:
         if found is None:
             raise CorpusError(f"no corpus document contains exchange {xid}")
         target, day = found
-        self._last_edit_result = (target, day)
+        self.journal.mark_dirty(target)
 
         def mutate(current: Optional[str]) -> Tuple[Optional[str], bool]:
             if current is None:
-                return current, False
+                raise CorpusError("The entry no longer exists")
             new_text = fmt.replace_exchange_text(current, xid, p["new_me"], p["new_claude"])
-            if new_text is None or new_text == current:
+            if new_text is None:
+                raise CorpusError("The entry cannot be edited safely: malformed or missing block")
+            if new_text == current:
                 return current, False  # nothing to do (already applied — replay safe)
             return new_text, True
 
@@ -424,6 +439,7 @@ class CorpusStore:
 
     # ---------------- appliers ----------------
 
+    @serialized
     def apply_pending(self, limit: int = 100) -> int:
         """Apply all unapplied journal entries in order. Returns count applied now."""
         applied = 0
@@ -435,6 +451,7 @@ class CorpusStore:
             except Exception as exc:  # noqa: BLE001 — keep trying remaining entries
                 log.error("journal entry %s failed: %s", entry.id, exc)
                 self.journal.mark_failed(entry.id, str(exc))
+                break  # preserve ordering: an older failed correction must not overwrite a newer one later
         return applied
 
     def _apply_entry(self, entry: JournalEntry) -> None:

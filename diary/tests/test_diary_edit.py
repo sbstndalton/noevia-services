@@ -320,3 +320,42 @@ def test_edit_endpoint_validates_input(client):
     assert client.post("/api/entries/edit", json={"xid": "11111111-1111-4111-8111-111111111111", "me": ""}).status_code == 400
     r = client.post("/api/entries/edit", json={"xid": "99999999-9999-4999-8999-999999999999", "me": "x"})
     assert r.status_code == 404
+
+
+def test_failed_edit_is_not_acknowledged(tmp_path):
+    st = _store(tmp_path)
+    xid = st.log_exchange(DAY, 'topic', 'original', 'reply')
+    st.backend.put = lambda *args, **kwargs: (False, None, 412)
+    with pytest.raises(CorpusError, match='queued'):
+        st.edit_exchange(xid, 'corrected', 'reply', month='2026-09')
+    assert 'original' in st.read_month(DAY)[0]
+    assert st.journal.pending_count() == 1
+
+
+def test_crash_recovery_invalidates_then_rebuilds_edited_retrieval(tmp_path):
+    from types import SimpleNamespace
+    st = _store(tmp_path)
+    retr = Retriever(tmp_path / 'j.db', StubLLM())
+    xid = st.log_exchange(DAY, 'topic', 'old words about sleep', 'reply')
+    document = st.document_path(DAY)
+    retr.reindex_file(document, st.read_month(DAY)[0])
+    # Crash after intent is durable: recover through the store, without HTTP.
+    st.journal.enqueue('exchange_edit', {'xid':xid, 'new_me':'corrected sleep words', 'new_claude':'reply', 'month':'2026-09'})
+    st.apply_pending()
+    assert st.journal.dirty_documents() == [document]
+    assert retr.search('sleep', min_score=-1) == []  # stale version cannot escape
+    appmod._reindex_dirty(SimpleNamespace(store=st, retrieval=retr, journal=st.journal))
+    assert st.journal.dirty_documents() == []
+    rows = retr._conn.execute('SELECT body FROM chunks').fetchall()
+    assert rows and all('old words about sleep' not in row[0] for row in rows)
+    assert any('corrected sleep words' in row[0] for row in rows)
+    retr.close()
+
+
+def test_empty_document_removes_retrieval_chunks(tmp_path):
+    retr = Retriever(tmp_path / 'idx.db', StubLLM())
+    retr.reindex_file('month.md', _month_text())
+    assert retr.stats()['chunks'] > 0
+    retr.reindex_file('month.md', '')
+    assert retr.stats()['chunks'] == 0
+    retr.close()

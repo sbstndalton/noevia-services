@@ -6,7 +6,7 @@ Diary Companion is Cowork's optional, independently runnable FastAPI service. It
 
 `CORPUS_BACKEND=local` is the default and uses `CORPUS_LOCAL_ROOT`. `CORPUS_BACKEND=webdav` uses `WEBDAV_BASE_URL`, `WEBDAV_USERNAME`, and `WEBDAV_PASSWORD`. `CORPUS_BACKEND=s3` uses any S3-compatible endpoint (MinIO, Backblaze B2, AWS S3, Garage, ...) via `S3_ENDPOINT_URL`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_SESSION_TOKEN`, `S3_REGION`, and `S3_PREFIX`. `CORPUS_ROOT` adds an optional subdirectory within any backend.
 
-All backends implement the same versioned storage contract. Local writes use locking, content hashes, `fsync`, and atomic replacement; WebDAV writes use ETag preconditions and bounded conflict retries; S3 writes use signed conditional PUTs with a read-verify-write loop (so servers that ignore conditional headers still cannot lose an update), the same bounded retry discipline, and stdlib-only SigV4 signing verified against AWS's official test vector.
+All backends implement the same versioned storage contract. Local writes use locking, content hashes, `fsync`, and atomic replacement; WebDAV writes use ETag preconditions and bounded conflict retries; S3 writes require atomic conditional PUTs. Before its first write, the backend tests If-Match and If-None-Match on a unique disposable object under `.cowork-probes/` and refuses incompatible stores. Credentials need GetObject, PutObject, DeleteObject and ListBucket permissions for the configured prefix. The probe is removed afterward. SigV4 signing uses the Python standard library.
 
 The default daily layout is `Entries/YYYY/Month/Month D, YYYY.md`; month views
 aggregate those files in calendar order. Existing monthly corpora remain
@@ -31,9 +31,6 @@ Configuration defaults live in `config/config.yaml`. Environment variables overr
 - `POST /api/chat`
 - `GET /api/day`
 - `GET /api/months`
-- `GET /api/insights` — standing sections + `last_change` badge metadata (read-only)
-- `POST /api/insights/reflect` — on-demand AI reflection (see Commentary below)
-- `POST /api/insights/about-question` — reflection anchored to one Open Question
 - `POST /api/entries/edit` — guarded correction of one logged exchange (see Editing below)
 - `GET /v1/models`
 - `POST /v1/chat/completions`
@@ -57,20 +54,20 @@ corrections. Past entries are editable in the app, but only through
 Editing is a human-initiated, visible action in the UI. The assistant never
 rewrites the user's words on its own, and no pipeline step edits corpus text.
 
-## Commentary — never part of the diary
+## Thoughtful diary conversations
 
-The commentator (`agent/commentator.py`) generates reflections **only on
-explicit request** (the web app's Insights view; nothing runs in the
-background). Prompts ground each reflection in the INDEX.md standing sections
-and corpus chunks from the sqlite-vec retrieval index — never a full-corpus
-rescan — and the response reports which day/header pairs it drew from, plus an
-honest `degraded` flag when retrieval is unavailable.
+Reflection is part of normal diary responses, not a separate screen or button.
+Ask a question in the diary composer; the companion uses today's log, standing
+sections, and retrieved older entries to respond in the same conversation.
+The system prompt asks for specific, grounded observations when useful, and
+brief acknowledgments for simple entries. It distinguishes facts from its own
+interpretations. Assistant responses remain visibly separate from the user's
+words; logging preserves that separation in the corpus.
 
-The structural rule: **commentary is rendered, never stored.** The commentator
-has no write path — no corpus mutation, no journal entry, no index update — so
-a reflection can never re-enter the diary as if the user had written it. The
-optional "new insights" badge in the web app is opt-in per user and fires only
-from the journal's standing-section activity; it generates nothing.
+Edits mark their document dirty in the durable SQLite journal before writing.
+Dirty documents are excluded from retrieval until reindexing succeeds, including
+after a crash. A failed correction reports that it is queued instead of claiming
+it has been saved. Journal replay preserves operation ordering.
 
 ### Trust model: never expose this service directly
 

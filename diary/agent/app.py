@@ -48,7 +48,6 @@ from . import corpus as fmt
 from .config import load_config
 from .context import ContextAssembler
 from .corpus_store import CorpusError, CorpusStore
-from .commentator import Commentator
 from .external_sources import (
     external_source_paths,
     infer_date,
@@ -98,9 +97,16 @@ class AppState:
         templates_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "logging.md"
         templates = yaml.safe_load(templates_path.read_text(encoding="utf-8"))
         self.pipeline = LoggingPipeline(self.store, self.llm_main, self.llm_aux, templates)
-        commentary_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "commentary.md"
-        commentary_templates = yaml.safe_load(commentary_path.read_text(encoding="utf-8"))
-        self.commentator = Commentator(self.store, self.retrieval, self.llm_aux, commentary_templates)
+
+
+    def __del__(self):
+        for name in ("backend", "llm_main", "llm_aux", "retrieval", "journal"):
+            try:
+                resource = getattr(self, name, None)
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
 
 
 _state: Optional[AppState] = None
@@ -173,7 +179,7 @@ def _tenant_state(request: Request) -> AppState:
     public internet. See services/diary/README.md.
     """
     user_id = request.headers.get("X-Cowork-User-ID", "") or os.environ.get("DIARY_LEGACY_USER_ID", "")
-    if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         raise HTTPException(status_code=400, detail="missing or invalid X-Cowork-User-ID")
     storage_header = request.headers.get("X-Cowork-Storage", "")
     state_key = f"{user_id}:{hashlib.sha256(storage_header.encode()).hexdigest()[:16]}"
@@ -188,7 +194,7 @@ def _tenant_state(request: Request) -> AppState:
         tenant_root = Path(cfg.get("retrieval.db_path")).parent / "users" / user_id
         tenant_root.mkdir(parents=True, exist_ok=True)
         tenant_db = tenant_root / "index.db"
-        legacy_owner = request.headers.get("X-Cowork-Legacy-Owner") == "1" or bool(os.environ.get("DIARY_LEGACY_USER_ID"))
+        legacy_owner = request.headers.get("X-Cowork-Legacy-Owner") == "1" or user_id == os.environ.get("DIARY_LEGACY_USER_ID")
         source_db = Path(cfg.get("retrieval.db_path"))
         if legacy_owner and source_db.exists() and not tenant_db.exists():
             _snapshot_sqlite(source_db, tenant_db)
@@ -222,6 +228,7 @@ def _tenant_state(request: Request) -> AppState:
             _set_cfg(cfg, "corpus.root", "")
         state = AppState(cfg)
         state.store.apply_pending()
+        _reindex_dirty(state)
         state.last_used = time.monotonic()
         _tenant_states[state_key] = state
         _evict_tenant_states_locked()
@@ -251,11 +258,10 @@ def _evict_tenant_states_locked() -> None:
     now = time.monotonic()
     stale = [k for k, s in _tenant_states.items() if now - getattr(s, "last_used", now) > _TENANT_STATE_TTL_S]
     for key in stale:
-        _close_state(_tenant_states.pop(key))
+        _tenant_states.pop(key)
         log.info("evicted tenant state %s (TTL expired)", key.split(":")[0])
     while len(_tenant_states) > _TENANT_STATE_CAP:
         key, state = _tenant_states.popitem(last=False)  # least recently used
-        _close_state(state)
         log.info("evicted tenant state %s (LRU cap)", key.split(":")[0])
 
 
@@ -306,7 +312,7 @@ def delete_tenant(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     user_id = request.headers.get("X-Cowork-User-ID", "")
-    if not re.fullmatch(r"[0-9a-fA-F-]{36}", user_id):
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         return JSONResponse({"error": "invalid user"}, status_code=400)
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     with _tenant_lock:
@@ -335,8 +341,8 @@ def _session(session_id: str, tenant_id: str = "legacy") -> dict:
     if not _SESSION_ID_RE.fullmatch(sid):
         sid = "default"
     tid = str(tenant_id or "legacy")
-    if not _SESSION_ID_RE.fullmatch(tid):
-        tid = "legacy"
+    if tid != "legacy" and not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", tid):
+        raise HTTPException(status_code=400, detail="invalid tenant")
     key = f"{tid}:{sid}"
     now = time.monotonic()
     if key in SESSIONS:
@@ -388,6 +394,7 @@ def index() -> str:
 
 def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy") -> dict:
     """One full exchange: context build -> main model -> strip marker -> log -> return payload."""
+    _reindex_dirty(st)
     sess = _session(session_id, tenant_id)
     day = datetime.now().date()
     messages = st.assembler.build(day, message, session_turns=sess["turns"])
@@ -411,8 +418,23 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
         "assistant": visible,
     })
 
+    del sess["turns"][:-32]
+    del sess["log_status"][:-32]
     threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
     return {"reply": visible, "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
+
+
+def _reindex_dirty(st: AppState) -> None:
+    # Serialize against writes; never acknowledge a newer invalidation accidentally.
+    with st.store._write_lock:
+        for document in st.journal.dirty_documents():
+            try:
+                text, _ = st.store.backend.get_text(document)
+                st.retrieval.reindex_file(document, text)
+                if not getattr(st.retrieval, "pending_embeddings", False):
+                    st.journal.clear_dirty(document)
+            except Exception as exc:
+                log.warning("edit reindex pending: %s", exc)
 
 
 def _reindex_today(st: AppState, day) -> None:
@@ -507,109 +529,6 @@ def api_months(request: Request) -> JSONResponse:
     return JSONResponse({"months": months})
 
 
-def _standing_payload(st: AppState) -> dict:
-    """Standing sections serialized for the Insights view.
-
-    last_change (epoch seconds, or None) is the newest applied standing-section
-    journal update — the signal the web server compares against the user's
-    seen-marker for the opt-in "insights have something new" badge. It is a
-    read-only metadata field; nothing here generates anything.
-    """
-    if not st.store.index_enabled:
-        return {"questions": [], "timeline": [], "index_enabled": False, "last_change": None}
-    try:
-        text, _ = st.store.read_index()
-    except Exception as exc:  # noqa: BLE001 — display-only read
-        log.warning("insights: index read failed (degrading to empty): %s", exc)
-        text = None
-    idx = fmt.parse_index(text)
-    questions = []
-    for bullet in idx.sections.get("Open Questions", []):
-        line = bullet.strip()
-        m = re.match(r"^-\s*\[([ xX])\]\s*(.+)$", line)
-        if m:
-            questions.append({"text": m.group(2).strip(), "resolved": m.group(1).lower() == "x"})
-            continue
-        if line.startswith("<!--"):
-            continue
-        plain = re.sub(r"^-\s*", "", line).strip()
-        if plain:
-            questions.append({"text": plain, "resolved": False})
-    timeline = []
-    for bullet in idx.sections.get("Timeline of Key Events", []):
-        line = bullet.strip()
-        m = re.match(r"^-\s*\*\*([^*]+)\*\*\s+—\s+(.+)$", line)
-        if m:
-            timeline.append({"date": m.group(1).strip(), "text": m.group(2).strip()})
-    last_change = None
-    try:
-        row = st.journal._conn.execute(
-            "SELECT MAX(applied_at) FROM journal WHERE kind = 'index_update' AND applied = 1"
-        ).fetchone()
-        if row and row[0]:
-            last_change = datetime.fromisoformat(row[0]).timestamp()
-    except Exception as exc:  # noqa: BLE001 — metadata only, never fail the read
-        log.warning("insights: last_change lookup failed: %s", exc)
-    return {"questions": questions, "timeline": timeline, "index_enabled": True, "last_change": last_change}
-
-
-@app.get("/api/insights")
-def api_insights(request: Request) -> JSONResponse:
-    """Standing sections for the Insights view (read-only; no generation here)."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = _tenant_state(request)
-    return JSONResponse(run_in_threadpool_sync(_standing_payload, st))
-
-
-class ReflectRequest(BaseModel):
-    focus: Optional[str] = None
-
-
-@app.post("/api/insights/reflect")
-def api_insights_reflect(req: ReflectRequest, request: Request) -> JSONResponse:
-    """On-demand AI reflection over the diary. Commentator output is rendered
-    only — it is never written to the corpus, journal, or index, so it can
-    never re-enter the diary as if the user had written it."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = _tenant_state(request)
-    result = run_in_threadpool_sync(st.commentator.reflect, (req.focus or "").strip() or None)
-    return JSONResponse({
-        "kind": result.kind,
-        "text": result.text,
-        "used_chunks": result.used_chunks,
-        "sources": result.sources or [],
-        "degraded": result.degraded,
-        **({"error": result.error} if result.error else {}),
-    })
-
-
-class AboutQuestionRequest(BaseModel):
-    question: str
-
-
-@app.post("/api/insights/about-question")
-def api_insights_about_question(req: AboutQuestionRequest, request: Request) -> JSONResponse:
-    """Reflection anchored to one Open Question; retrieval finds the entries."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    question = (req.question or "").strip()
-    if not question:
-        return JSONResponse({"error": "question is required"}, status_code=400)
-    st = _tenant_state(request)
-    result = run_in_threadpool_sync(st.commentator.about_question, question)
-    return JSONResponse({
-        "kind": result.kind,
-        "text": result.text,
-        "question": result.question,
-        "used_chunks": result.used_chunks,
-        "sources": result.sources or [],
-        "degraded": result.degraded,
-        **({"error": result.error} if result.error else {}),
-    })
-
-
 @app.post("/api/entries/edit")
 def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
     """Edit one logged exchange, matched by its hidden xid marker.
@@ -632,17 +551,11 @@ def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
     try:
         path, day_iso = run_in_threadpool_sync(st.store.edit_exchange, xid, req.me, req.assistant, req.month)
     except CorpusError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=404)
+        return JSONResponse({"error": str(exc)}, status_code=503 if "queued" in str(exc) else 404)
     except Exception as exc:  # noqa: BLE001 — persistent write conflict etc.
         log.exception("entry edit failed")
         return JSONResponse({"error": f"edit failed: {exc}"}, status_code=502)
-    # Refresh retrieval for the edited document: reindex_file's supersede pass
-    # removes the stale chunk so the corrected text is the only searchable one.
-    try:
-        month_text, _ = st.store.read_month(date.fromisoformat(day_iso))
-        st.retrieval.reindex_file(path, month_text)
-    except Exception as exc:  # noqa: BLE001 — reindex failure never fails the edit
-        log.warning("post-edit reindex failed: %s", exc)
+    _reindex_dirty(st)
     return JSONResponse({"ok": True, "document": path, "day": day_iso})
 
 
@@ -697,7 +610,11 @@ def api_external_sources_import(body: ImportRequest, request: Request) -> JSONRe
         raise HTTPException(status_code=404, detail="file not found in source")
 
     try:
-        text = target.read_text(encoding="utf-8")
+        with target.open("rb") as source:
+            raw = source.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Source file exceeds 2 MiB")
+        text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=f"file unreadable: {exc}")
     if not text.strip():
@@ -741,7 +658,7 @@ def api_health(request: Request) -> JSONResponse:
     legacy_user = os.environ.get("DIARY_LEGACY_USER_ID", "")
     # Same two resolution paths _tenant_state supports: an explicit proxy
     # header (user + storage), or the operator-set legacy direct-client map.
-    has_tenant = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", user_id)) and (
+    has_tenant = bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id)) and (
         bool(request.headers.get("X-Cowork-Storage", "")) or (bool(legacy_user) and user_id == legacy_user)
     )
     payload: dict = {
@@ -801,9 +718,10 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
     if not user_msgs or not str(user_msgs[-1]).strip():
         return JSONResponse({"error": {"message": "no user message", "type": "invalid_request_error"}}, status_code=400)
     last = str(user_msgs[-1]).strip()
-    prior = [{"role": "user", "content": str(m)} for m in user_msgs[:-1] if str(m).strip()][-6:]
+    prior = [{"role": m["role"], "content": m["content"]} for m in messages_in[:-1]
+             if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)][-16:]
 
-    session_id = "openai-client"
+    session_id = str(body.get("session_id") or "openai-client")
     tenant_id = request.headers.get("X-Cowork-User-ID", "legacy")
     st = _tenant_state(request)
     sess = _session(session_id, tenant_id)
