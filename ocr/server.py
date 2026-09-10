@@ -1,6 +1,7 @@
 """Private, stateless PDF OCR worker. No corpus credentials or persistent volume."""
 import json
 from docx_text import extract_docx
+from pdf_reduce import reduce_pdf, INPUT_LIMIT
 import subprocess
 import tempfile
 import threading
@@ -54,12 +55,12 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200 if self.path == "/health" else 404, {"service": "ocr"})
 
     def do_POST(self):
-        if self.path not in ("/extract", "/extract-docx"):
+        if self.path not in ("/extract", "/extract-docx", "/reduce-pdf"):
             return self.reply(404, {"error": "not found"})
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            pages = [1] if self.path == "/extract-docx" else json.loads(self.headers.get("X-OCR-Pages", "[]"))
-            if not 0 < size <= LIMIT or not isinstance(pages, list) or not 0 < len(pages) <= 50:
+            pages = [1] if self.path in ("/extract-docx", "/reduce-pdf") else json.loads(self.headers.get("X-OCR-Pages", "[]"))
+            if not 0 < size <= (INPUT_LIMIT if self.path == "/reduce-pdf" else LIMIT) or not isinstance(pages, list) or not 0 < len(pages) <= 50:
                 raise ValueError()
             if any(type(p) is not int or not 1 <= p <= 300 for p in pages) or len(set(pages)) != len(pages):
                 raise ValueError()
@@ -72,7 +73,12 @@ class Handler(BaseHTTPRequestHandler):
             data = self.rfile.read(size)
             if len(data) != size:
                 return self.reply(400, {"error": "Incomplete document body."})
-            if self.path == "/extract-docx":
+            if self.path == "/reduce-pdf":
+                try:
+                    self.reply(200, reduce_pdf(data))
+                except Exception:
+                    self.reply(422, {"error": "PDF could not be reduced below 25 MB or extracted within limits. Split or compress it locally and retry."})
+            elif self.path == "/extract-docx":
                 try:
                     self.reply(200, extract_docx(data))
                 except Exception:
