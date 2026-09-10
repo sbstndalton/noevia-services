@@ -80,7 +80,7 @@ def memory_text(store):
     """Explicit memory area, bounded; treat contents as reference, not code."""
     texts = {}
     try:
-        for folder in ('', 'memory', 'Memory', 'context', 'Context'):
+        for folder in ('', 'AI Memory', 'memory', 'Memory', 'context', 'Context'):
             try:
                 entries = file_list(store, folder)
             except Exception:

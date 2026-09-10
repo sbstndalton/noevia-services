@@ -292,9 +292,13 @@ class CorpusStore:
         rendered_header = fmt.render_subsection_header(now=now, topic=sub_header)
         # store the header TEXT (no '### ' prefix) — the appender adds the prefix
         header_text = rendered_header[4:] if rendered_header.startswith("### ") else rendered_header
+        # Existing journals/corpora are not migrated. Persist the decision with
+        # the exchange so partial scaffold writes are retried after a crash.
+        scaffold = not self.journal.has_exchange() and not self.list_months()
         self.journal.enqueue(
             "exchange",
             {
+                "scaffold": scaffold,
                 "xid": xid,
                 "day": day.isoformat(),
                 "sub_header": header_text,
@@ -511,7 +515,22 @@ class CorpusStore:
             return fmt.append_to_month_text(current, day, sub_header, body), True
 
         self._guarded_write(path, mutate)
+        if p.get("scaffold"):
+            self._scaffold()
         log.info("exchange %s logged to %s", xid, path)
+
+    def _scaffold(self) -> None:
+        """Create-only seed files, inside the exchange's existing durable intent."""
+        seeds = {
+            self.entries_prefix: "Diary entries are saved in the configured daily or monthly layout.\n",
+            "AI Memory": "Keep durable diary memory and context as Markdown files here.\n",
+            "Raw Sources": "Keep original reference material for your diary here.\n",
+        }
+        for folder, seed in seeds.items():
+            self._guarded_write(
+                self._join(folder, "README.md"),
+                lambda current, seed=seed: (seed, True) if current is None else (current, False),
+            )
 
     def _apply_month_registration(self, entry: JournalEntry) -> None:
         p = entry.payload

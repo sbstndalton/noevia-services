@@ -133,6 +133,11 @@ class Journal:
             self._conn.execute("DELETE FROM dirty_documents WHERE document=?", (document,))
 
     @synchronized
+    def has_exchange(self) -> bool:
+        """Includes pending intents so first-entry initialization is replayable."""
+        return self._conn.execute("SELECT 1 FROM journal WHERE kind='exchange' LIMIT 1").fetchone() is not None
+
+    @synchronized
     def is_applied(self, jid: str) -> bool:
         row = self._conn.execute("SELECT applied FROM journal WHERE id=?", (jid,)).fetchone()
         return bool(row and row[0])
