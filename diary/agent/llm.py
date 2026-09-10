@@ -105,12 +105,18 @@ class LLMClient:
         """Stream real provider output once; retain log markers only for capture."""
         payload = {"model": self.chat_model, "messages": messages,
                    "temperature": temperature, "stream": True}
+        def telemetry(data):
+            timings = data.get("timings")
+            if isinstance(timings, dict) and "draft_n" in timings and "draft_n_accepted" in timings:
+                emit({"type": "mtp", "model": data.get("model") or self.chat_model,
+                      "timings": {"draft_n": timings["draft_n"], "draft_n_accepted": timings["draft_n_accepted"]}})
         content, reasoning, sent = "", "", 0
         completed = False
         with self._client.stream("POST", "/chat/completions", json=payload) as response:
             response.raise_for_status()
             if "text/event-stream" not in response.headers.get("content-type", ""):
                 data = json.loads(response.read())
+                telemetry(data)
                 completed = True
                 message = data["choices"][0]["message"]
                 content = message.get("content") or ""
@@ -128,6 +134,7 @@ class LLMClient:
                         completed = True
                         break
                     data = json.loads(raw)
+                    telemetry(data)
                     if data.get("error"):
                         raise LLMError("provider stream failed")
                     choices = data.get("choices") or []

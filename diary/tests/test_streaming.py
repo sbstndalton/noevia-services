@@ -91,3 +91,16 @@ def test_v1_stream_keeps_tenant_and_one_exchange(monkeypatch):
     events=[json.loads(line[6:]) for line in r.text.splitlines() if line.startswith('data: ')]
     assert [e['type'] for e in events]==['status','status','reasoning','answer','diary','done']
     appmod.SESSIONS.pop(f'{tenant}:stream-test',None)
+
+
+def test_diary_forwards_only_numeric_timing_fields_for_acceptance():
+    client=LLMClient('http://synthetic/v1',chat_model='Native')
+    client._client.close()
+    def provider(request):
+        return httpx.Response(200,json={'model':'Native','choices':[{'message':{'content':'Synthetic answer'}}],
+            'timings':{'draft_n':40,'draft_n_accepted':30,'unrelated':'not forwarded'}})
+    client._client=httpx.Client(base_url='http://synthetic/v1',transport=httpx.MockTransport(provider))
+    events=[];client.chat_stream([],events.append)
+    event=next(e for e in events if e['type']=='mtp')
+    assert event=={'type':'mtp','model':'Native','timings':{'draft_n':40,'draft_n_accepted':30}}
+    client.close()
