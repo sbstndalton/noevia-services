@@ -108,6 +108,44 @@ def _apply_env(cfg: Config) -> None:
         log.warning("CORPUS_REMOTE_ROOT is deprecated; use CORPUS_ROOT")
 
 
+# "default" is the placeholder every compose file falls back to when the operator
+# has not chosen a model. It is not a model any backend actually serves, so a
+# deployment that never set DIARY_AUX_MODEL sent the literal string "default" as
+# the model name and every aux call 404d. Nothing broke loudly: the summariser
+# falls back to logging the verbatim reply, so entries kept being written and
+# only silently lost their topic headers. That went unnoticed for days.
+#
+# The aux model exists to be a cheaper model than the chat one, not a different
+# capability — so the chat model is always a safe substitute. This mirrors what
+# compose.yaml already does for llm.aux.base_url and api_key, which fall back to
+# their main-endpoint counterparts; the model was simply never given the same
+# treatment.
+_PLACEHOLDER_MODEL = "default"
+
+
+def _resolve_aux_model(cfg: Config) -> None:
+    aux = (cfg.get("llm.aux.model") or "").strip()
+    chat = (cfg.get("llm.chat_model") or "").strip()
+    if aux and aux != _PLACEHOLDER_MODEL:
+        return
+    if not chat or chat == _PLACEHOLDER_MODEL:
+        # Both unset: leave it alone rather than inventing a name. The operator
+        # has configured nothing, and a 404 naming "default" is at least a
+        # legible symptom of that.
+        return
+    parts = "llm.aux.model".split(".")
+    node = cfg._data
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    node[parts[-1]] = chat
+    log.warning(
+        "DIARY_AUX_MODEL is unset (or %r); falling back to the chat model %r. "
+        "Set DIARY_AUX_MODEL to a smaller model the endpoint serves to make "
+        "summarising and skip-classification cheaper.",
+        _PLACEHOLDER_MODEL, chat,
+    )
+
+
 def load_config(path: Optional[str] = None) -> Config:
     if path is None:
         path = os.environ.get("DIARY_CONFIG", str(Path(__file__).resolve().parent.parent / "config" / "config.yaml"))
@@ -118,4 +156,5 @@ def load_config(path: Optional[str] = None) -> Config:
         data = {}
     cfg = Config(data)
     _apply_env(cfg)
+    _resolve_aux_model(cfg)
     return cfg
