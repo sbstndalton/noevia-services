@@ -1,5 +1,6 @@
 """Private, stateless PDF OCR worker. No corpus credentials or persistent volume."""
 import json
+from docx_text import extract_docx
 import subprocess
 import tempfile
 import threading
@@ -53,11 +54,11 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200 if self.path == "/health" else 404, {"service": "ocr"})
 
     def do_POST(self):
-        if self.path != "/extract":
+        if self.path not in ("/extract", "/extract-docx"):
             return self.reply(404, {"error": "not found"})
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            pages = json.loads(self.headers.get("X-OCR-Pages", "[]"))
+            pages = [1] if self.path == "/extract-docx" else json.loads(self.headers.get("X-OCR-Pages", "[]"))
             if not 0 < size <= LIMIT or not isinstance(pages, list) or not 0 < len(pages) <= 50:
                 raise ValueError()
             if any(type(p) is not int or not 1 <= p <= 300 for p in pages) or len(set(pages)) != len(pages):
@@ -70,8 +71,14 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(30)
             data = self.rfile.read(size)
             if len(data) != size:
-                return self.reply(400, {"error": "Incomplete PDF body."})
-            self.reply(200, {"pages": process(data, pages)})
+                return self.reply(400, {"error": "Incomplete document body."})
+            if self.path == "/extract-docx":
+                try:
+                    self.reply(200, extract_docx(data))
+                except Exception:
+                    self.reply(422, {"error": "DOCX is malformed, encrypted or exceeds its processing limits; the original is retained."})
+            else:
+                self.reply(200, {"pages": process(data, pages)})
         finally:
             slot.release()
 
