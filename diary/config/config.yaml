@@ -54,6 +54,9 @@ retrieval:
 context:
   max_today_tokens: 4500
   max_standing_tokens: 2200
+  # Used only when semantic retrieval yields no matches or is unavailable.
+  direct_past_days: 3
+  max_direct_past_tokens: 1200
 
 ui:
   host: 0.0.0.0
