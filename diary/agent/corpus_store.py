@@ -439,6 +439,30 @@ class CorpusStore:
 
     # ---------------- appliers ----------------
 
+    _KNOWN_KINDS = ("exchange", "exchange_edit", "index_month", "index_update")
+
+    def _is_permanent_failure(self, entry: JournalEntry) -> bool:
+        """Return True if the entry will never succeed on retry (bad kind or payload)."""
+        if entry.kind not in self._KNOWN_KINDS:
+            return True
+        p = entry.payload
+        try:
+            if entry.kind == "exchange":
+                date.fromisoformat(p["day"])
+                p["xid"]
+                p["sub_header"]
+                p["body"]
+            elif entry.kind == "exchange_edit":
+                p["xid"]
+                p["new_me"]
+                p["new_claude"]
+            elif entry.kind == "index_month":
+                p["label"]
+                p["month"]
+        except (KeyError, ValueError, TypeError):
+            return True
+        return False
+
     @serialized
     def apply_pending(self, limit: int = 100) -> int:
         """Apply all unapplied journal entries in order. Returns count applied now."""
@@ -449,9 +473,16 @@ class CorpusStore:
                 self.journal.mark_applied(entry.id)
                 applied += 1
             except Exception as exc:  # noqa: BLE001 — keep trying remaining entries
-                log.error("journal entry %s failed: %s", entry.id, exc)
-                self.journal.mark_failed(entry.id, str(exc))
-                break  # preserve ordering: an older failed correction must not overwrite a newer one later
+                if self._is_permanent_failure(entry):
+                    log.error(
+                        "journal entry %s (kind=%s) quarantined — permanent failure: %s",
+                        entry.id, entry.kind, exc,
+                    )
+                    self.journal.mark_applied(entry.id)
+                else:
+                    log.error("journal entry %s failed: %s", entry.id, exc)
+                    self.journal.mark_failed(entry.id, str(exc))
+                    break  # preserve ordering: an older failed correction must not overwrite a newer one later
         return applied
 
     def _apply_entry(self, entry: JournalEntry) -> None:

@@ -185,3 +185,60 @@ def test_monthly_rollover(store):
     idx_text, _ = store.read_index()
     assert "[August 2026](2026-08.md)" in idx_text
     assert "[September 2026](2026-09.md)" in idx_text
+
+
+def test_poison_pill_unknown_kind_does_not_block_subsequent_entries(store):
+    """A journal entry with an unknown kind is quarantined and does not block later entries."""
+    day = date(2026, 9, 10)
+
+    # Enqueue a poison pill: unknown kind that will always raise CorpusError
+    store.journal.enqueue("bogus_kind", {"foo": "bar"})
+
+    # Enqueue a valid exchange after the poison pill
+    xid = store.new_xid()
+    body = fmt.render_exchange("me", "claude", xid)
+    store.journal.enqueue("exchange", {
+        "xid": xid, "day": day.isoformat(), "sub_header": "### 10:00",
+        "body": body, "month": store.month_filename(day),
+        "month_label": store.month_label(day),
+    })
+
+    assert store.journal.pending_count() == 2
+
+    applied = store.apply_pending()
+
+    # The valid exchange should have been applied despite the poison pill before it
+    text, _ = store.read_month(day)
+    assert xid in text
+    assert "**Me:** me" in text
+
+    # Both entries are now marked applied (poison pill quarantined, exchange succeeded)
+    assert store.journal.pending_count() == 0
+
+
+def test_poison_pill_malformed_payload_does_not_block_subsequent_entries(store):
+    """A journal entry with a malformed payload is quarantined and does not block later entries."""
+    day = date(2026, 9, 11)
+
+    # Enqueue a poison pill: exchange kind but missing required "day" key
+    store.journal.enqueue("exchange", {"xid": "x-123", "sub_header": "### 11:00", "body": "test"})
+
+    # Enqueue a valid exchange after the poison pill
+    xid = store.new_xid()
+    body = fmt.render_exchange("me", "claude", xid)
+    store.journal.enqueue("exchange", {
+        "xid": xid, "day": day.isoformat(), "sub_header": "### 12:00",
+        "body": body, "month": store.month_filename(day),
+        "month_label": store.month_label(day),
+    })
+
+    assert store.journal.pending_count() == 2
+
+    applied = store.apply_pending()
+
+    # The valid exchange should have been applied despite the malformed entry before it
+    text, _ = store.read_month(day)
+    assert xid in text
+
+    # Both entries are now marked applied (malformed quarantined, exchange succeeded)
+    assert store.journal.pending_count() == 0
