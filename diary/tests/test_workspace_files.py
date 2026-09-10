@@ -68,7 +68,9 @@ def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch):
     class LLM:
         strip_log_marker = staticmethod(strip_marker)
         def __init__(self, **kwargs): pass
-        def chat(self, *args, **kwargs): return 'A reply. [LOG: ok]'
+        def chat(self, *args, **kwargs):
+            from agent.llm import ChatReply
+            return ChatReply('A reply. [LOG: ok]', 'Synthetic provider reasoning')
         def embed(self, *args, **kwargs): return []
         def close(self): pass
     monkeypatch.setattr(appmod, 'LLMClient', LLM)
@@ -81,7 +83,9 @@ def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch):
         'files':original, 'message':'A good day outside.', 'entryTime':'2026-09-07T10:05:00-04:00', 'entryDay':'2026-07-08', 'history':[]})
     assert r.status_code == 200, r.text
     assert r.json()['decision'] == 'logged'
+    assert r.json()['reasoning'] == 'Synthetic provider reasoning'
     changed = r.json()['files']
+    assert all('Synthetic provider reasoning' not in text for text in changed.values())
     assert changed
     assert 'MEMORY.md' not in changed
     assert any('July 8, 2026' in text for text in changed.values())

@@ -13,6 +13,14 @@ log = logging.getLogger(__name__)
 _LOG_MARKER_RE = re.compile(r"\n?\s*\[LOG:\s*(ok|skip)\s*\]\s*$")
 
 
+class ChatReply(str):
+    """Answer text with optional provider reasoning, never part of stored prose."""
+    def __new__(cls, content: str, reasoning: str = ""):
+        reply = super().__new__(cls, content)
+        reply.reasoning = reasoning
+        return reply
+
+
 class LLMError(RuntimeError):
     pass
 
@@ -86,7 +94,9 @@ class LLMClient:
             content = data["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 raise LLMError(f"unexpected chat response shape: {data!r}")
-            return content
+            message = data["choices"][0]["message"]
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+            return ChatReply(content, reasoning if isinstance(reasoning, str) else "")
 
         return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
 

@@ -165,3 +165,23 @@ def test_marker_mid_text_is_not_treated_as_marker():
 def test_missing_marker_defaults_to_none():
     visible, decision = LLMClient.strip_log_marker("Just prose.")
     assert decision is None and visible == "Just prose."
+
+
+def test_chat_retains_request_local_provider_reasoning(monkeypatch):
+    import httpx
+    llm = LLMClient("http://synthetic.invalid/v1", max_retries=1)
+    messages = iter([
+        {"content": "First [LOG: ok]", "reasoning_content": "First reasoning"},
+        {"content": "Second", "reasoning": "Second reasoning"},
+        {"content": "Third"},
+    ])
+    def post(*args, **kwargs):
+        return httpx.Response(200, json={"choices": [{"message": next(messages)}]},
+                              request=httpx.Request("POST", "http://synthetic.invalid/v1/chat/completions"))
+    monkeypatch.setattr(llm._client, "post", post)
+    first, second, third = [llm.chat([]) for _ in range(3)]
+    assert first.reasoning == "First reasoning"
+    assert second.reasoning == "Second reasoning"
+    assert third.reasoning == ""
+    assert LLMClient.strip_log_marker(first) == ("First", "ok")
+    llm.close()

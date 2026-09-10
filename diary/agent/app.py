@@ -432,7 +432,7 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     del sess["log_status"][:-32]
     if background:
         threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
-    return {"reply": visible, "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
+    return {"reply": visible, "reasoning": getattr(reply, "reasoning", ""), "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
 
 
 def _reindex_dirty(st: AppState) -> None:
@@ -760,7 +760,7 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": result["reply"]},
+                "message": {"role": "assistant", "content": result["reply"], "reasoning_content": result.get("reasoning", "")},
                 "finish_reason": "stop",
             }
         ],
