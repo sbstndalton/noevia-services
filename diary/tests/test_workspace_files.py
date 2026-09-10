@@ -61,7 +61,8 @@ def test_local_backend_copies_and_enforces_limits():
     assert backend.original == original
     with pytest.raises(HTTPException): MemoryBackend({'big.md':'x'*(512*1024+1)})
 
-def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch):
+@pytest.mark.parametrize("stream", [False, True])
+def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch, stream):
     import agent.app as appmod
     from fastapi.testclient import TestClient
     strip_marker = appmod.LLMClient.strip_log_marker
@@ -71,6 +72,11 @@ def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch):
         def chat(self, *args, **kwargs):
             from agent.llm import ChatReply
             return ChatReply('A reply. [LOG: ok]', 'Synthetic provider reasoning')
+        def chat_stream(self, messages, emit, **kwargs):
+            reply = self.chat()
+            emit({'type':'reasoning','text':reply.reasoning})
+            emit({'type':'answer','text':'A reply.'})
+            return reply
         def embed(self, *args, **kwargs): return []
         def close(self): pass
     monkeypatch.setattr(appmod, 'LLMClient', LLM)
@@ -80,11 +86,17 @@ def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch):
     client = TestClient(appmod.app)
     original = {'MEMORY.md':'I prefer short answers.'}
     r = client.post('/api/local-exchange', headers={'X-Cowork-User-ID':'11111111-1111-4111-8111-111111111111'}, json={
-        'files':original, 'message':'A good day outside.', 'entryTime':'2026-09-07T10:05:00-04:00', 'entryDay':'2026-07-08', 'history':[]})
+        'stream':stream, 'files':original, 'message':'A good day outside.', 'entryTime':'2026-09-07T10:05:00-04:00', 'entryDay':'2026-07-08', 'history':[]})
     assert r.status_code == 200, r.text
-    assert r.json()['decision'] == 'logged'
-    assert r.json()['reasoning'] == 'Synthetic provider reasoning'
-    changed = r.json()['files']
+    import json
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith('data: ')] if stream else []
+    value = next(e for e in events if e['type']=='diary') if stream else r.json()
+    if stream:
+        assert [e['type'] for e in events].index('answer') < next(i for i,e in enumerate(events) if e.get('text')=='Saving diary entry…')
+        assert events[-1]['type']=='done'
+    assert value['decision'] == 'logged'
+    assert value['reasoning'] == 'Synthetic provider reasoning'
+    changed = value['files']
     assert all('Synthetic provider reasoning' not in text for text in changed.values())
     assert changed
     assert 'MEMORY.md' not in changed

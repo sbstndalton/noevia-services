@@ -1,6 +1,7 @@
 """LLM client for OpenAI-compatible chat and embedding endpoints."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -99,6 +100,61 @@ class LLMClient:
             return ChatReply(content, reasoning if isinstance(reasoning, str) else "")
 
         return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
+
+    def chat_stream(self, messages, emit, temperature=0.7):
+        """Stream real provider output once; retain log markers only for capture."""
+        payload = {"model": self.chat_model, "messages": messages,
+                   "temperature": temperature, "stream": True}
+        content, reasoning, sent = "", "", 0
+        completed = False
+        with self._client.stream("POST", "/chat/completions", json=payload) as response:
+            response.raise_for_status()
+            if "text/event-stream" not in response.headers.get("content-type", ""):
+                data = json.loads(response.read())
+                completed = True
+                message = data["choices"][0]["message"]
+                content = message.get("content") or ""
+                reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+                if not isinstance(content, str) or not isinstance(reasoning, str):
+                    raise LLMError("invalid provider answer")
+                if reasoning:
+                    emit({"type": "reasoning", "text": reasoning})
+            else:
+                for line in response.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        completed = True
+                        break
+                    data = json.loads(raw)
+                    if data.get("error"):
+                        raise LLMError("provider stream failed")
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    if choices[0].get("finish_reason"):
+                        completed = True
+                    delta = choices[0].get("delta") or {}
+                    thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    if isinstance(thought, str) and thought:
+                        reasoning += thought
+                        emit({"type": "reasoning", "text": thought})
+                    text = delta.get("content") or ""
+                    if isinstance(text, str):
+                        content += text
+                        # Keep the trailing protocol marker out of visible tokens.
+                        end = max(sent, len(content) - 128)
+                        if end > sent:
+                            emit({"type": "delta", "text": content[sent:end]})
+                            sent = end
+        if not completed:
+            raise LLMError("provider stream ended before completion")
+        visible, _ = self.strip_log_marker(content)
+        if not visible:
+            raise LLMError("provider returned no final answer")
+        emit({"type": "answer", "text": visible})
+        return ChatReply(content, reasoning)
 
     # ---------------- log-marker handling ----------------
 

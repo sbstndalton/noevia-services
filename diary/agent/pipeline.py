@@ -130,14 +130,21 @@ class LoggingPipeline:
         topic: str = "",
         now: Optional[datetime] = None,
         day: Optional[date] = None,
+        progress=None,
     ) -> LogOutcome:
         now = now or datetime.now()
         day = day or now.date()
 
+        if progress:
+            progress({"type": "status", "text": "Checking whether to save this exchange…"})
         if not self.classify(user_message, assistant_message):
             return LogOutcome(decision="skipped", xid=None, reason="meta/administrative or non-substantive")
 
+        if progress:
+            progress({"type": "status", "text": "Summarizing the saved diary entry…"})
         summary = self.summarize(assistant_message)
+        if progress:
+            progress({"type": "status", "text": "Saving diary entry…"})
         try:
             xid = self.store.log_exchange(
                 day=day,
@@ -151,6 +158,8 @@ class LoggingPipeline:
             return LogOutcome(decision="error", xid=None, reason=str(exc))
 
         # Standing sections: opportunistic; failures never affect the logged exchange.
+        if progress:
+            progress({"type": "status", "text": "Checking diary memory updates…"})
         self.maintain_index(user_message, summary, day.isoformat())
         return LogOutcome(decision="logged", xid=xid, reason="")
 
