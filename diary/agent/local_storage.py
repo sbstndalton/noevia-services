@@ -8,15 +8,24 @@ import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from .dedicated_storage import check_volume
+
 
 class LocalCorpusBackend:
-    def __init__(self, root: str):
+    def __init__(self, root: str, volume_identity: str | None = None, reader_uid: int | None = None):
         self.root = Path(root).expanduser().resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.volume_identity = volume_identity
+        self.reader_uid = reader_uid
+        if volume_identity:
+            check_volume(self.root, volume_identity)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
         self._locks: Dict[Path, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
     def _path(self, relative: str) -> Path:
+        if self.volume_identity:
+            check_volume(self.root, self.volume_identity)
         candidate = (self.root / relative.lstrip("/")).resolve()
         if candidate != self.root and self.root not in candidate.parents:
             raise ValueError(f"corpus path escapes configured root: {relative!r}")
@@ -63,6 +72,10 @@ class LocalCorpusBackend:
             fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
             try:
                 with os.fdopen(fd, "wb") as handle:
+                    # Atomic replacement must retain access for the dedicated
+                    # SMB reader even when the companion runs as root.
+                    if self.reader_uid is not None:
+                        os.fchown(handle.fileno(), self.reader_uid, -1)
                     handle.write(data)
                     handle.flush()
                     os.fsync(handle.fileno())

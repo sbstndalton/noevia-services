@@ -32,7 +32,11 @@ def create_backend(cfg: Config) -> CorpusBackend:
     if kind == "local":
         from .local_storage import LocalCorpusBackend
 
-        return LocalCorpusBackend(cfg.get("corpus.local.root") or "data/corpus")
+        return LocalCorpusBackend(
+            cfg.get("corpus.local.root") or "data/corpus",
+            volume_identity=cfg.get("corpus.local.volume_identity"),
+            reader_uid=cfg.get("corpus.local.reader_uid"),
+        )
     if kind == "webdav":
         from .webdav import WebDAVCorpusBackend
 

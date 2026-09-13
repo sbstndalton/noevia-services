@@ -60,6 +60,7 @@ from .llm import LLMClient
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .storage import create_backend
+from .dedicated_storage import StorageUnavailable, tenant_volume
 
 log = logging.getLogger("diary")
 
@@ -183,7 +184,10 @@ def _tenant_state(request: Request) -> AppState:
     if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         raise HTTPException(status_code=400, detail="missing or invalid X-Cowork-User-ID")
     storage_header = request.headers.get("X-Cowork-Storage", "")
-    state_key = f"{user_id}:{hashlib.sha256(storage_header.encode()).hexdigest()[:16]}"
+    volume = tenant_volume(user_id)
+    # A dedicated volume owns one state/lock domain even if general storage changes.
+    storage_key = json.dumps(volume, sort_keys=True) if volume else storage_header
+    state_key = f"{user_id}:{hashlib.sha256(storage_key.encode()).hexdigest()[:16]}"
     with _tenant_lock:
         cached = _tenant_states.get(state_key)
         if cached is not None:
@@ -206,7 +210,13 @@ def _tenant_state(request: Request) -> AppState:
                 storage = json.loads(base64.urlsafe_b64decode(storage_header + "=" * (-len(storage_header) % 4)))
             except Exception:  # noqa: BLE001
                 storage = None
-        if storage and storage.get("kind") in ("nextcloud", "webdav"):
+        if volume:
+            _set_cfg(cfg, "corpus.backend", "local")
+            _set_cfg(cfg, "corpus.local.root", volume["root"])
+            _set_cfg(cfg, "corpus.local.volume_identity", user_id)
+            _set_cfg(cfg, "corpus.local.reader_uid", volume.get("reader_uid"))
+            _set_cfg(cfg, "corpus.root", volume["prefix"])
+        elif storage and storage.get("kind") in ("nextcloud", "webdav"):
             _set_cfg(cfg, "corpus.backend", "webdav")
             _set_cfg(cfg, "corpus.webdav.base_url", storage.get("baseUrl", ""))
             _set_cfg(cfg, "corpus.webdav.username", storage.get("username", ""))
@@ -281,6 +291,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
+
+@app.exception_handler(StorageUnavailable)
+async def storage_unavailable(request: Request, exc: StorageUnavailable):
+    return JSONResponse({"detail": str(exc)}, status_code=503)
 
 
 # ---------------- auth ----------------
