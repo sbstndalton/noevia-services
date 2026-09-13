@@ -92,6 +92,17 @@ class LocalCorpusBackend:
                     pass
         return True, self._version(data), 201 if current is None else 204
 
+    def create_directory(self, path: str) -> None:
+        """Create exactly one collection; never create missing ancestors or replace."""
+        target = self._path(path)
+        with self._lock(target):
+            target.mkdir(mode=0o755, parents=False, exist_ok=False)
+            parent_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+
     def exists(self, path: str) -> bool:
         return self._path(path).is_file()
 

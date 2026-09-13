@@ -103,3 +103,55 @@ def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch, stream):
     assert any('July 8, 2026' in text for text in changed.values())
     assert original == {'MEMORY.md':'I prefer short answers.'}
     assert not any(key.startswith('11111111-1111-4111-8111-111111111111:') for key in appmod.SESSIONS)
+
+def test_local_directory_create_is_exclusive_and_tenant_relative(tmp_path):
+    from agent.local_storage import LocalCorpusBackend
+    from agent.workspace_files import directory_create
+    backend = LocalCorpusBackend(str(tmp_path))
+    (tmp_path / 'tenant').mkdir()
+    st = store({})
+    st.backend = backend
+    assert directory_create(st, 'Research') == {'path': 'Research', 'isDir': True}
+    assert (tmp_path / 'tenant/Research').is_dir()
+    for path, status in [('Research', 405), ('', 405), ('missing/child', 409), ('../escape', 400)]:
+        with pytest.raises(HTTPException) as exc:
+            directory_create(st, path)
+        assert exc.value.status_code == status
+    assert not (tmp_path / 'tenant/missing').exists()
+    assert st.journal.dirty == []
+    file_write(st, {'path':'Research/a.md', 'content':'Synthetic text', 'version':None})
+    assert file_read(st, 'Research/a.md')['content'] == 'Synthetic text'
+    assert not (tmp_path / 'Research').exists()
+
+
+def test_directory_create_refuses_other_backends_and_outside_symlinks(tmp_path):
+    from agent.local_storage import LocalCorpusBackend
+    from agent.workspace_files import directory_create
+    st = store({})
+    with pytest.raises(HTTPException) as exc:
+        directory_create(st, 'folder')
+    assert exc.value.status_code == 405
+    root = tmp_path / 'root'
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    st.backend = LocalCorpusBackend(str(root))
+    (root / 'tenant').symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError):
+        directory_create(st, 'folder')
+    assert not (outside / 'folder').exists()
+
+
+def test_directory_endpoint_checks_auth_and_uses_tenant_store(monkeypatch, tmp_path):
+    import agent.app as appmod
+    from agent.local_storage import LocalCorpusBackend
+    from fastapi.testclient import TestClient
+    st = store({}); st.backend = LocalCorpusBackend(str(tmp_path))
+    (tmp_path / 'tenant').mkdir()
+    monkeypatch.setattr(appmod, '_tenant_state', lambda request: SimpleNamespace(store=st))
+    monkeypatch.setattr(appmod, 'check_auth', lambda request: False)
+    client = TestClient(appmod.app)
+    assert client.post('/api/directory', json={'path':'folder'}).status_code == 401
+    assert not (tmp_path / 'tenant/folder').exists()
+    monkeypatch.setattr(appmod, 'check_auth', lambda request: True)
+    assert client.post('/api/directory', json={'path':'folder'}).status_code == 200
+    assert client.post('/api/directory', json={'path':'folder'}).status_code == 405

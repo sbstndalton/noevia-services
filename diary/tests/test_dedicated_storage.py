@@ -116,3 +116,14 @@ def test_atomic_replacement_preserves_reader_access(volume):
     target = volume / PREFIX / 'reader.md'
     assert target.stat().st_uid == os.getuid()
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_directory_creation_fails_closed_when_volume_identity_changes(volume):
+    from agent.workspace_files import directory_create
+    state = appmod._tenant_state(request())
+    directory_create(state.store, 'SyntheticFolder')
+    assert (volume / PREFIX / 'SyntheticFolder').is_dir()
+    (volume / '.noevia-diary-volume').write_text(B)
+    with pytest.raises(StorageUnavailable):
+        directory_create(state.store, 'MustNotExist')
+    assert not (volume / PREFIX / 'MustNotExist').exists()

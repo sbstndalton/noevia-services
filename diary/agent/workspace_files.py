@@ -70,6 +70,24 @@ def file_write(store, body):
     return {'path': path, 'content': content, 'version': version(content)}
 
 
+def directory_create(store, path):
+    safe_path(path, True)
+    if not path:
+        raise HTTPException(405, 'The diary root already exists')
+    create = getattr(store.backend, 'create_directory', None)
+    if create is None:
+        raise HTTPException(405, 'Directory creation requires server-local storage')
+    with store._write_lock:
+        try:
+            create(store._join(path))
+        except FileExistsError:
+            raise HTTPException(405, 'A file or directory already exists at this path')
+        except (FileNotFoundError, NotADirectoryError):
+            raise HTTPException(409, 'Parent directory does not exist')
+    # Empty collections have no document to index or capture operation to replay.
+    return {'path': path, 'isDir': True}
+
+
 def reference_text(files, query=''):
     words = set(re.findall(r'\w{3,}', query.lower()))
     ordered = sorted(files.items(), key=lambda item: -sum(w in item[1].lower() for w in words))

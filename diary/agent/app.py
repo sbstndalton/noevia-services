@@ -812,7 +812,7 @@ if __name__ == "__main__":
 
 
 # Diary workspace routes share the same tenant resolution as the conversation.
-from .workspace_files import file_list, file_read, file_write, MemoryBackend, reference_text
+from .workspace_files import file_list, file_read, file_write, directory_create, MemoryBackend, reference_text
 
 
 def entry_target(body):
@@ -853,6 +853,13 @@ def workspace_file_save(body: dict, request: Request):
     result = file_write(st.store, body)
     _reindex_dirty(st)
     return result
+
+
+@app.post("/api/directory")
+def workspace_directory_create(body: dict, request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    return directory_create(_tenant_state(request).store, body.get("path", ""))
 
 
 @app.post("/api/local-exchange")
