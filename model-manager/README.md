@@ -1,0 +1,301 @@
+# Model Loader
+
+A browser UI for managing llama.cpp GGUF models and containers on a personal homelab box. FastAPI + HTMX + Alpine + Tailwind, no build step, one Docker container.
+
+![The Model Loader overview page: disk and backend summary, live GPU utilisation and VRAM sparklines, per-GPU breakdown, recent downloads, and the models.ini sections](docs/model_loader.png)
+
+## What it does
+
+- **Search + download GGUFs from Hugging Face** — parallel-range downloader (8 chunks by default), live per-chunk speed sparklines, resume-on-restart, HF token stored locally for gated repos.
+- **Manage `models.ini`** (the llama-server `--models-preset` file) with a 98-field form organized into 10 tiers (Core → Reasoning → Sampling → Server → …). Tooltips on every field. Atomic writes with 10 rolling backups.
+- **Autoconfig** — reads a GGUF's metadata + probes your live GPU VRAM, then picks `ctx-size`, `n-gpu-layers`, RoPE extension, cache quant, the prompt-cache budget and reasoning-effort flags that actually fit. Handles single-GPU, multi-GPU (`-sm layer`), hybrid attention+SSM (Qwen 3.5/3.6), sliding-window attention (Gemma), and MoE (GPT-OSS, Qwen3-Coder). For MoE models that overflow VRAM it stops guessing and hands placement to llama.cpp's own `--fit`, which is both safer and measurably faster than the split we used to compute.
+- **Benchmarking** — a fixed prompt suite run through the live server (first-token latency, draft acceptance, VRAM), and throughput sweeps driven by llama.cpp's own `llama bench`. Charts and stat panels; every response's text is kept so a run can be read, not just measured. Nothing is written back to any config.
+- **Capability badges** — rate a model yourself, out of five, per category (coding, creative writing, reasoning, tool use, vision), from the benchmark run where you just read its output. The models list shows what each model is good at, or says `not rated`.
+- **Measured throughput, not just predicted** — llama-server already reports prompt speed, generation speed and speculative acceptance for every request it serves. Model Loader reads those back out of the container logs and shows the median in the Autoconfig panel, alongside a comparison of every configuration that model has actually run under.
+- **Per-backend hardware dashboard** — GPU util, VRAM used/total, temperature, power draw; container CPU% and RSS; log tail with grep filter; one-click restart.
+- **Auto-discovers llama containers** on your Docker socket (any `ghcr.io/ggml-org/llama.cpp:*` image). Add a new backend to your compose file, run `docker compose up -d`, it appears in the UI within 2 seconds.
+- **OpenWebUI integration** — detects backends OpenWebUI doesn't know about (or points at containers that no longer exist), and one-click reconciles by writing directly to OpenWebUI's `webui.db` (which is what its PersistentConfig actually reads). Also:
+  - **Per-connection and per-model visibility** — pick which models each backend offers, so a CPU backend only serves the small ones it can actually run.
+  - **Dead-id detection** — OpenWebUI *renders* its model whitelist rather than intersecting it with what the backend reports, so a deleted or renamed model keeps appearing in the picker and fails with "model not found" only when someone selects it. Model Loader flags those and removes them in one click.
+  - **Vision capability sync** — a model can accept images only if its section declares an `mmproj`, but OpenWebUI's default is permissive and it offers the image-upload control on everything. Model Loader derives the flag from the projector's own metadata (`clip.vision.*` vs `clip.audio.*`, since llama.cpp uses the same `--mmproj` slot for audio encoders) and writes it per model.
+- **Prompt library** — saved system prompts with copy-to-clipboard, stored in the app's sqlite.
+- **Command palette** (Cmd/Ctrl-K) — jump to any page or model.
+
+### Downloading
+
+![The Downloads page: two concurrent jobs, each split into eight byte-range chunks with an individual speed readout, an aggregate throughput sparkline and an ETA](docs/downloader.png)
+
+Each file is fetched as eight concurrent byte-range requests, so a single slow chunk doesn't gate the whole transfer — the per-chunk readouts make that visible, and they are rarely even. Jobs survive a restart of Model Loader and resume from the last completed chunk rather than starting over.
+
+The two jobs above are one action: downloading a multimodal model auto-queues the matching `mmproj` projector from the same repo into the same directory, because the model is not much use without it.
+
+### Autoconfig, in practice
+
+![The Autoconfig panel: a concurrent-sessions picker, four priority presets (Fast, Balanced, Long context, Custom) each showing context size, GPU layers and a relative speed estimate, and a per-backend table marking which context sizes fit and which do not](docs/model_performance_selector.png)
+
+Pick how many chats will hit the model at once, then pick a priority. Each preset shows what you are trading: context size against GPU layers against speed. The table underneath marks every context size as fitting or not on each backend, and names the cost when it doesn't — `9L on CPU` means nine layers had to move off the GPU to make that context fit.
+
+The speed figures are an **ordering hint, not a benchmark**. They come from a calibrated penalty per CPU-resident layer; they will tell you Fast beats Long context, and they will not tell you your tokens per second. The panel says so too — and where real requests have been served, it shows the measured median beside the estimate.
+
+### The models.ini editor
+
+![The models.ini page: one card per section showing every set option as a chip — model path, ctx-size, ngl, cache types, tensor-split, n-cpu-moe — with Copy CLI, Edit and Delete per section](docs/models_ini.png)
+
+One card per section, with every option you have set shown as a chip, so the whole file is readable at a glance rather than by scrolling a text editor. **Copy CLI** renders the section as the equivalent `llama-server` command line, which is useful for reproducing a config outside Model Loader or pasting into a bug report.
+
+`file present` confirms the section resolves to a GGUF on disk. That check follows the section's `model =` path rather than matching its name against a filename, so renaming a section to give a model a short API id does not break the link.
+
+### Benchmarking
+
+![The Benchmark page: stat panels for fastest generation, quickest first token and peak VRAM, above charts for generation speed and first-token latency by model](docs/benchmarks.png)
+
+Two engines, because they answer different questions and neither can answer the other's.
+
+The **prompt suite** sends real prompts through the running server and records what happened: time to first token, time until the answer proper begins (on a thinking model those are far apart), generation speed, speculative draft acceptance, and peak VRAM per card. It measures the configuration you actually run.
+
+The **throughput sweep** shells out to llama.cpp's own `llama bench`, which warms up, repeats, reports a standard deviation and measures the model directly rather than the HTTP path. It starts from a `models.ini` section and carries that section's real settings across, rather than measuring llama-bench defaults nobody runs.
+
+The gap between them is the point. On a model running `draft-mtp`, `llama bench` reports 133 tok/s and the server delivers 208 — llama-bench has no speculative decoding, no projector and no server slots, so it cannot see them. Both tables say so rather than letting the two numbers be compared naively.
+
+A run is disruptive: the router holds one model at a time, so benchmarking several means evicting and reloading each in turn while everything else on the box stalls. The confirmation dialog states the cost in terms of your actual selection, a banner appears on every page for the duration (the job outlives the tab that started it), and stopping is safe — results already collected are kept. **Nothing is ever written to `models.ini`.**
+
+Results are raw, one row per request, with cold and contended requests flagged rather than averaged in. Each row also keeps **the text the model actually produced**, collapsed underneath it — the table is about speed, but a run whose output you cannot read is one you have to take on trust.
+
+There is still no "apply these findings" button and nothing is scored automatically. What you do with a run is read it, and optionally rate the model on the strength of it.
+
+### Rating what a model is good at
+
+Speed is measurable. "Is this any good at prose" is not, so Model Loader does not pretend to measure it.
+
+Every model in a benchmark run gets a rating control beside its results: a category — coding, creative writing, reasoning, tool use, vision — and a score out of five, with an optional note. It lives on the run detail because that is where the model's output is on screen. Rating it from anywhere else would be rating a memory. The run id is stored alongside, so a badge traces back to the evidence that produced it rather than being an opinion from nowhere.
+
+The models list shows the result as a **good at** row, or **not rated** — spelled out rather than left blank, because a row that vanishes when empty makes "never judged" and "judged and poor" look identical.
+
+This is deliberately manual, and an automated version was built as far as the schema before being deleted. The public coding benchmarks (HumanEval, MBPP) sit in nearly every model's training data, so their scores compress into a band that barely separates one local model from another; creative writing has no execution oracle at all, so an automated score there is one LLM judging another — circular when the judge is weaker than the subject, biased when it is the same family. Four responses read by the person who has to live with the answer is better evidence, and it costs no GPU time.
+
+### Routing models to backends
+
+![The Models directory: each downloaded GGUF with its status, whether it is in models.ini and under what alias, a vision capability chip, and per-backend "serves on" toggles](docs/models_available.png)
+
+Every llama.cpp backend reads the same `models.ini`, which means by default every backend offers every model — including the CPU one being asked for a 27B. The **serves on** toggles fix that per model: click a backend to include or exclude it, and Model Loader writes the change into OpenWebUI's per-connection whitelist.
+
+Companion files fold into the model they belong to rather than listing as models of their own: `mmproj` projectors, and also MTP and draft heads, which are not independently servable. An explicit `noMTP` variant is left alone, since that is a real model choice rather than a companion.
+
+The row also shows what each model actually is. **`in models.ini · as wheatley-voice`** means that file is served under an alias rather than its filename — one GGUF can back several sections with different settings, and each gets its own toggles. The **vision** chip reads `capable` or `text-only` depending on whether the section declares a projector, and that flag is pushed into OpenWebUI so the image-upload control only appears where it can work.
+
+## Security posture
+
+**This is a personal, LAN-only tool. There is no authentication.** It mounts `/var/run/docker.sock`, which is root-equivalent on the host — anyone who can reach the port can `docker exec` into any container. Do not expose port 8090 to the internet. Do not run this on a shared machine. If you need multi-user, add a reverse-proxy with auth in front, and understand that authenticated users still get docker-socket-level power.
+
+## Requirements
+
+**Model Loader manages an existing llama.cpp setup — it does not install or replace one.** If you have no llama.cpp container running, there is nothing for it to discover and the dashboard will be empty. Set that up first.
+
+- **Linux host** (tested on Ubuntu/Debian, should work anywhere Docker runs)
+- **Docker Engine + Compose plugin (v2)**
+- **At least one running llama.cpp server container**, see below
+- **A shared models directory** bind-mounted into both llama.cpp and Model Loader
+- **A GPU backend** — NVIDIA (CUDA), AMD (ROCm), Vulkan, or CPU-only. See the support table below; what differs between them is how much Model Loader can *measure*, not whether it works.
+
+### Backend support
+
+Model Loader manages any llama.cpp container. What varies is whether it can read GPU telemetry, because that depends on a vendor tool being present *inside* the image.
+
+| | NVIDIA (`server-cuda`) | AMD (`server-rocm`) | Vulkan (`server-vulkan`) | CPU (`server`) |
+|---|---|---|---|---|
+| Discovery, restart, logs | yes | yes | yes | yes |
+| `models.ini` editing | yes | yes | yes | yes |
+| Live util / VRAM / temp / power | yes | yes | only if an SMI tool is present | n/a |
+| Fit verdict | vs VRAM | vs VRAM | vs VRAM, **needs `GPU_VRAM`** | vs usable **RAM** |
+| Autoconfig sizing | yes | yes | **needs `GPU_VRAM`** | n/a |
+| Per-card fit + `tensor-split` | yes | yes | no per-card data | n/a |
+
+CPU backends are sized against system RAM rather than VRAM, after subtracting `HOST_RAM_RESERVE_GB` (default 32) for the OS and page cache — planning against `MemTotal` produces configs that load and then swap. On CPU, `ctx-size` is the only fit lever: `ngl`, `n-cpu-moe` and `tensor-split` all presuppose a GPU.
+
+A model can fit in RAM and still be unusable there, because CPU generation is RAM-bandwidth-bound, so large models get a distinct "fits but will crawl" verdict rather than a green tick.
+
+Vendor is detected from the image tag, so a custom-built image may need `LLAMA_CONTAINERS` to be discovered and `GPU_VRAM` to be sized.
+
+**Vulkan needs one extra setting.** The Vulkan image ships neither `nvidia-smi` nor `rocm-smi`, so there is nothing to query for VRAM. Declare it on the model-loader service:
+
+```yaml
+    environment:
+      - GPU_VRAM=llama-vulkan:16      # container name : GB
+```
+
+Without it, Autoconfig says so plainly rather than claiming the model doesn't fit. You still get everything except live telemetry and the per-card split, which falls back to dividing pooled VRAM evenly.
+
+**A note on testing.** The CUDA path is what this has been developed and calibrated against. ROCm and Vulkan are implemented and exercised in code, but have had far less real-world use — if something looks wrong on those, it probably is, and a bug report is welcome.
+
+### The llama.cpp container
+
+Model Loader auto-discovers any container whose image matches `ghcr.io/ggml-org/llama.cpp:*`. For anything else — a self-built image, a fork — list it explicitly with the `LLAMA_CONTAINERS` env var.
+
+Two things have to line up or Model Loader can see the container but not steer it:
+
+1. **llama-server must be started with `--models-preset`**, pointing at the `models.ini` that Model Loader edits. Without it, llama-server never reads the file and your saved settings do nothing.
+2. **The models directory must be mounted at the same path in both containers.** Model Loader writes `model = /models/...` paths into the ini; llama-server has to resolve them identically.
+
+A minimal, working service:
+
+```yaml
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llama
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models:/models          # same path Model Loader uses
+    command: >
+      --models-preset /models/models.ini
+      --host 0.0.0.0 --port 8080
+      --models-max 1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+> **Keep model settings out of `command:`.** Anything you pass on the command line **overrides** the preset file, silently. A stray `--ctx-size` or `-np` in your compose beats whatever Model Loader writes into `models.ini`, and the symptom is a setting that appears saved but has no effect. Restrict `command:` to `--models-preset`, `--host`, `--port` and `--models-max`; everything per-model belongs in the ini.
+
+`--models-max 1` keeps one model resident at a time, which is usually what you want on a single box — llama-server swaps on demand. Raise it if you have VRAM to hold several.
+
+If you don't have a compose file yet, the **Containers** page has ready-made service blocks for CUDA, ROCm, Vulkan and CPU that you can copy after installing.
+
+![The Add another backend panel: tabs for NVIDIA CUDA, AMD ROCm, CPU only and Vulkan, each with a copyable compose service block, above a warning that inference flags on the container command line override models.ini](docs/add_a_backend.png)
+
+The panel repeats the warning above, because it is the mistake that costs the most time: flags like `-ngl`, `-fa`, `-ctk`, `-np` and `-sm` on the container command line **override** `models.ini` rather than acting as defaults, and a preset that disagrees is silently discarded. Keep the command to `--models-preset`, `--host`, `--port` and `--models-max`, and set everything per-model in the config form.
+
+## Install
+
+The fastest path — `bootstrap.sh` adds the `model-loader` service to your existing compose file and brings it up.
+
+```bash
+git clone https://github.com/scratchhax/model-loader.git ~/ai-lab/model_loader
+cd ~/ai-lab              # your compose project directory
+bash ~/ai-lab/model_loader/bootstrap.sh
+```
+
+Then open `http://<host>:8090`.
+
+**If you have existing GGUFs in a flat layout** (`/models/*.gguf`), run the one-shot migration to move them into per-model subdirectories:
+
+```bash
+docker exec model-loader python3 -m app.migrate_layout
+```
+
+This is safe to re-run; it skips anything already migrated. It also updates absolute paths in `models.ini` for you.
+
+### Manual install (if you don't want bootstrap.sh touching your compose)
+
+Paste this block into your `docker-compose.yaml`:
+
+```yaml
+  model-loader:
+    build: ./model_loader
+    container_name: model-loader
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - MODELS_DIR=/models
+      - MODELS_INI_PATH=/models/models.ini
+      - DATA_DIR=/data
+    volumes:
+      - ./models:/models
+      - ./model_loader_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+```
+
+Then `docker compose up -d --build model-loader`.
+
+## First-run walkthrough
+
+1. **Dashboard** (`/`) — you should see your llama.cpp containers listed under Backends with live GPU stats. If not, the container isn't running or its image isn't a `ghcr.io/ggml-org/llama.cpp:*` tag; use `LLAMA_CONTAINERS` env to force a whitelist.
+2. **Settings** (`/settings`) — paste a Hugging Face token here if you want to download gated models. Stored in the app's sqlite at `/data/model_loader.db`.
+3. **Search** (`/search`) — search HuggingFace, expand any repo, click Download on the GGUF file(s) you want. If the repo has a matching `*mmproj*.gguf` (vision projector), it's auto-queued into the same subdirectory.
+4. **Downloads** (`/downloads`) — live progress with per-chunk speed sparklines. Cancel, retry, or clear finished.
+5. **Models** (`/models`) — everything you've downloaded. Click a model to open its detail page (metadata, quant, size, chat template, README).
+6. **Config** (`/config`) — one section per model in `models.ini`. For a new model, click **Autoconfig**; it fills in every field based on live hardware probe + GGUF metadata. Review the diff before saving: Fill also *clears* the keys Autoconfig wants unset, so a hand-tuned value inside its domain will go. Anything outside that domain is untouched.
+7. **Benchmark** (`/benchmark`) — pick a backend, some models and some prompts. A run evicts and reloads each model in turn, so expect the box to stall for the duration. Afterwards, read each response and rate the model on what you see.
+8. **Containers** (`/containers`) — restart, view logs (with grep filter), see OpenWebUI drift and one-click reconcile.
+
+## Configuration (environment variables)
+
+All optional. Defaults in `app/config.py`.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MODELS_DIR` | `/models` | Where GGUFs live (inside the container). Bind-mount your host models dir here. |
+| `MODELS_INI_PATH` | `/models/models.ini` | Path to the llama-server preset file. |
+| `DATA_DIR` | `/data` | Sqlite state — HF token, prompts, avatar cache, download history. |
+| `LLAMA_CONTAINERS` | *(empty)* | Comma-separated whitelist. Empty = auto-discover any `ghcr.io/ggml-org/llama.cpp:*` container. |
+| `GPU_VRAM` | *(empty)* | Per-container VRAM overrides, e.g. `llama-7900xt:20,llama-5070:12`. Auto-probes via `nvidia-smi` / `rocm-smi` if unset. Useful when the reported total is wrong (some AMD stacks under-report). |
+| `MAX_CONCURRENT_DOWNLOADS` | `2` | Parallel download job cap. |
+| `BIND_PORT` | `8090` | HTTP port. |
+
+## Multi-GPU
+
+If a llama container sees two or more GPUs (via `count: all` or `device_ids`), Model Loader:
+
+- Aggregates their stats on the dashboard (VRAM sum, util avg, temp max, power sum, name shown as `2 × NVIDIA GeForce RTX 5070`).
+- Uses the pooled VRAM in Autoconfig with a small (~8%) overhead multiplier for cross-GPU handoffs, **and then re-checks every candidate against each card individually**. Pooled capacity is necessary but not sufficient: llama.cpp places each layer on one specific card, so a config can fit the pool comfortably and still OOM a single device.
+- Emits `-sm layer` so llama-server distributes layers across cards.
+- **Hands placement to llama.cpp when expert offload is in play.** Autoconfig used to compute its own `tensor-split` for MoE models, balancing by bytes rather than layer count. It stopped, because on a model that massively overflows VRAM that estimate has to be exactly right or nothing loads — and it was not: compute buffers were never in the budget and turn out to scale with *context* (672 MiB at 32K against 3608 MiB at 256K on the same card), and our `40,8` split was near-inverted against llama.cpp's own `20,29`. For the MoE-offload path it now emits `fit = on` and leaves `ngl`, `tensor-split` and `n-cpu-moe` unset, because `--fit` only adjusts arguments that are UNSET and pinning them is precisely what disabled it. A 177B model that used to OOM now runs at the full 262144 context. This is the *overflow* path only: a model that fits entirely still gets `ngl = 999`, which is both simpler and faster, because `ngl = 999` has nothing to estimate while `--fit` has to decide and errs conservative. Measured on gemma-4-26B-A4B, which was never overflowing: a bad pinned split gave 68.9 tok/s, `fit` gave 84.5, and plain `ngl = 999` gave **105.9**.
+
+See `docs/AUTOCONFIG.md` for the math and the empirical calibration.
+
+## Backups
+
+Model Loader's own state is two files, both small:
+
+1. **`./model_loader_data/model_loader.db`** — HF token, saved prompts, download history, avatar cache.
+2. **`./models/models.ini`** — the llama-server preset file. Model Loader already keeps 10 rolling copies beside it as `models.ini.bak-*` on every write.
+
+Back those up however you back up anything else. Two things worth knowing if you roll your own:
+
+- **Copy the sqlite file with the online backup API, not `cp`.** A plain copy of a live database can capture a torn page, and copying `foo.db` without its `foo.db-wal` silently loses every transaction still in the log. `python3 -c "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d)" src.db dest.db` does it correctly, with no need to stop the container.
+- **The GGUFs are excluded on purpose.** They are large and re-downloadable; back them up with rsync/borg/restic if you want, but they are not state.
+
+Restoring is just putting those two files back and running `docker compose restart model-loader`.
+
+## Documentation
+
+- [`docs/AUTOCONFIG.md`](docs/AUTOCONFIG.md) — how Autoconfig picks values: KV cache math, VRAM budget model, MoE offload strategy, RoPE extension policy, calibration data.
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — OOMs, "container not found", OpenWebUI drift, download stalls, dashboard blank.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — file layout, data flow, why each design choice.
+
+## Architecture at a glance
+
+```
+Browser (HTMX + Alpine + Tailwind CDN)
+   │
+   ▼
+FastAPI (app/main.py) ──── Jinja2 templates (app/templates/)
+   │
+   ├── app/services.py    docker SDK, models-dir helpers, OpenWebUI reconciler
+   ├── app/autoconfig.py  KV cache math, preset picker, VRAM fit
+   ├── app/hw.py          background sampler (nvidia-smi / rocm-smi via docker exec)
+   ├── app/hf.py          HF Hub API (search, repo tree, avatar cache)
+   ├── app/gguf_meta.py   hand-rolled GGUF v3 metadata reader
+   ├── app/downloader.py  parallel-range download engine + sqlite job history
+   ├── app/ini.py         models.ini schema + parser + atomic writes
+   ├── app/bench.py       benchmark harness + llama-bench driver
+   ├── app/telemetry.py   per-request timings scraped from llama-server logs
+   ├── app/db.py          sqlite prefs, download history, benchmark results, badges
+   ├── app/config.py      pydantic-settings for env vars
+   ├── app/utils.py       size formatting, shard/stem parsing
+   └── app/migrate_layout.py  one-shot flat → per-model-subdir migration
+```
+
+No frontend build step. No JS bundler. Everything ships from CDN or Jinja. Total footprint: ~10,000 lines of Python across 14 modules, 27 templates.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, fork it, ship it.
+
+Keeping it off the public internet is a **security** note, not a licence term: there is no auth and it mounts the Docker socket. See [Security posture](#security-posture).

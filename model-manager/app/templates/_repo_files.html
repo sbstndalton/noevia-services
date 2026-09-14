@@ -1,0 +1,111 @@
+{% if gated %}
+<div class="mb-3 rounded-md bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 px-3 py-2 text-xs">
+  <span class="font-semibold">No context estimates for this repo</span> — {{ gated }}.
+  File sizes still show, because the file listing is public while the weights are not.
+</div>
+{% endif %}
+{% from "_icons.html" import icon %}
+{% macro est_chips(est, native) %}
+  {% if est %}
+  <div class="mt-1.5 flex flex-wrap items-center gap-1">
+    <span class="text-[10px] uppercase tracking-wide text-slate-400">est. context</span>
+    {% for e in est %}
+    <span class="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-mono tabular-nums
+                 {% if e.offload %}bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300
+                 {% else %}bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300{% endif %}"
+          title="{{ e.label }}: {{ e.gpu_layers }}/{{ e.total_layers }} layers on GPU, ~{{ e.speed_pct }}% of full speed{% if e.offload %} — buys context by moving layers to CPU{% endif %}">
+      {{ e.label }} {{ e.ctx_h }}{% if e.offload %} <span class="opacity-70">{{ e.speed_pct }}%</span>{% endif %}
+    </span>
+    {% endfor %}
+    {% if native %}<span class="text-[10px] text-slate-400">native {{ (native // 1024) }}K</span>{% endif %}
+  </div>
+  {% endif %}
+{% endmacro %}
+{% macro fit_chips(chips) %}
+  {% for c in chips %}
+    {% if c.verdict == 'impossible' %}
+      {# Not a backend verdict but a machine one: too big for VRAM *and* RAM together, so no
+         amount of CPU offload helps. Deliberately louder and worded differently from the
+         per-backend cross, which only means "not on the GPU alone". #}
+      <span class="inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[10px] font-mono font-semibold
+                   bg-red-600 text-white dark:bg-red-700 dark:text-red-50 ring-1 ring-red-700 dark:ring-red-500"
+            title="Needs ~{{ c.needs_gb }} GB. This machine has {{ c.vram_gb }} GB VRAM + {{ c.host_ram_gb }} GB RAM = {{ c.ceiling_gb }} GB. CPU offload puts layers in system RAM, so there is no setting that makes this fit — only a smaller quantisation will.">
+        ✗ won't run on this machine
+        <span class="font-normal opacity-90">needs {{ c.needs_gb }}G &gt; {{ c.ceiling_gb }}G</span>
+      </span>
+    {% else %}
+    {% set unit = 'RAM' if c.is_cpu else 'VRAM' %}
+    <span class="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono
+      {% if c.verdict == 'fits' %}bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300
+      {% elif c.verdict == 'tight' %}bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300
+      {% elif c.verdict == 'slow' %}bg-orange-100 text-orange-800 dark:bg-orange-950 dark:text-orange-300
+      {% else %}bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300{% endif %}"
+      title="{{ c.ratio_pct }}% of {{ c.vram_gb }} GiB {{ unit }}{% if c.is_cpu %} (usable, after the OS reserve){% endif %}{% if c.verdict == 'oom' and not c.is_cpu %} — needs CPU offload, see the context estimates{% endif %}{% if c.verdict == 'slow' %} — fits in memory, but CPU generation is RAM-bandwidth-bound. A DENSE model this size will produce roughly a token per second; a mixture-of-experts model of the same size can be several times faster, because only the active experts are read per token. This verdict is size-based and cannot tell the two apart. Reduce ctx-size to make it fit; that will not make it faster.{% endif %}">
+      {% if c.verdict == 'fits' %}✓{% elif c.verdict == 'tight' %}~{% elif c.verdict == 'slow' %}🐢{% else %}✗{% endif %}
+      {{ c.name }} ({{ c.vram_gb }}G{% if c.is_cpu %} RAM{% endif %})
+    </span>
+    {% endif %}
+  {% endfor %}
+{% endmacro %}
+
+{% if error %}
+<p class="mx-4 mb-4 rounded-md bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 px-3 py-2 text-sm">{{ error }}</p>
+{% else %}
+<div class="border-t border-slate-200 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-800">
+  {# group by shard_base #}
+  {% for group in groups %}
+  <div class="px-4 py-3">
+    {% if group.shard_total %}
+    <div class="flex items-center justify-between gap-3">
+      <div class="min-w-0">
+        <div class="font-mono text-sm truncate">{{ group.shard_base }}</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-1.5">
+          <span>{{ group.shard_total }} shards ·</span>
+          <span class="tabular-nums">{{ group.total_size_h }}</span>
+          {% if group.quant %}<span>·</span><span class="rounded bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5">{{ group.quant }}</span>{% endif %}
+          {% if group.fit_chips %}<span>·</span>{{ fit_chips(group.fit_chips) }}{% endif %}
+        </div>
+        {{ est_chips(group.estimates, group.native_ctx) }}
+      </div>
+      <button hx-post="/download/multi"
+              hx-vals='{"repo_id": "{{ repo_id }}", "shard_base": "{{ group.shard_base }}"}'
+              hx-swap="outerHTML"
+              class="inline-flex items-center gap-1.5 shrink-0 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 text-xs font-medium shadow-card">
+        {{ icon('download', 12) }} Download all shards
+      </button>
+    </div>
+    <details class="mt-2">
+      <summary class="cursor-pointer text-xs text-slate-500 dark:text-slate-400">show individual shards</summary>
+      <ul class="mt-2 space-y-1">
+        {% for f in group.files %}
+        <li class="flex items-center justify-between gap-3 text-xs">
+          <span class="font-mono truncate">{{ f.path }}</span>
+          <span class="tabular-nums text-slate-500 dark:text-slate-400">{{ f.size_h }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </details>
+    {% else %}
+    {% set f = group.files[0] %}
+    <div class="flex items-center justify-between gap-3">
+      <div class="min-w-0">
+        <div class="font-mono text-sm truncate">{{ f.path }}</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-1.5">
+          <span class="tabular-nums">{{ f.size_h }}</span>
+          {% if f.quant %}<span>·</span><span class="rounded bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5">{{ f.quant }}</span>{% endif %}
+          {% if group.fit_chips %}<span>·</span>{{ fit_chips(group.fit_chips) }}{% endif %}
+        </div>
+        {{ est_chips(group.estimates, group.native_ctx) }}
+      </div>
+      <button hx-post="/download"
+              hx-vals='{"repo_id": "{{ repo_id }}", "path": "{{ f.path }}", "size": {{ f.size }} }'
+              hx-swap="outerHTML"
+              class="inline-flex items-center gap-1.5 shrink-0 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 text-xs font-medium shadow-card">
+        {{ icon('download', 12) }} Download
+      </button>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
