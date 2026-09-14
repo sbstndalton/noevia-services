@@ -62,7 +62,7 @@ def _schema() -> list[dict]:
             for label, group, opened in ini.FORM_TIERS]
 
 
-def _entry(g: services.GgufEntry, loaded: dict[str, list[str]]) -> dict:
+def _entry(g: services.GgufEntry, loaded: dict[str, list[str]], badges: dict | None = None) -> dict:
     shape = services.model_shape(g.parts[0]) if g.parts and not g.is_companion else services.ModelShape()
     return {
         "key": g.route_key, "name": g.display_name, "stem": g.stem, "subdir": g.subdir,
@@ -74,6 +74,7 @@ def _entry(g: services.GgufEntry, loaded: dict[str, list[str]]) -> dict:
                   "active": shape.expert_used, "label": shape.label} if shape.known else None,
         "loadedOn": loaded.get(g.model_id, []),
         "fit": services.vram_fit_chips(g.total_bytes) if not g.is_companion else [],
+        "badges": [_row(b) for b in badges.get(g.display_name, [])] if badges else [],
     }
 
 
@@ -110,7 +111,9 @@ async def overview() -> dict:
 async def models() -> dict:
     snap = services.snapshot_models_dir()
     loaded = await _loaded_map()
-    return {"models": [_entry(g, loaded) for g in snap.ggufs if not g.is_companion],
+    from .main import _badges_for_files
+    badges = _badges_for_files(snap)
+    return {"models": [_entry(g, loaded, badges) for g in snap.ggufs if not g.is_companion],
             "unregistered": ini.unregistered_gguf_stems(), "revision": revision()}
 
 
@@ -223,7 +226,7 @@ def delete_section(name: str, baseRevision: str = Query("")) -> dict:
 
 
 @router.get("/sections/{name}/autoconfig")
-def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "") -> dict:
+def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True) -> dict:
     from .main import _backend_list
     sessions = max(1, min(int(sessions or 1), 8))
     gguf_path, model_rel, rel = _resolve_section_gguf(name)
@@ -249,7 +252,8 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
     rec = autoconfig.analyze(summary=summary, file_size=file_size, backends=_backend_list(),
                              model_rel=model_rel, current_section=ini.get_section(name), preset=preset,
                              n_sessions=sessions, models_dir=settings.models_dir, section_name=name,
-                             model_subdir=rel.split("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec)
+                             model_subdir=rel.split("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec,
+                             vision=vision)
     return {"section": name, "arch": summary.get("arch"), "params": (summary.get("general") or {}).get("params"),
             "fileBytes": file_size, "model": model_rel or rel or f"{name}.gguf",
             "recommendation": _plain(rec), "measured": _plain(measured), "history": _plain(history),
@@ -305,3 +309,321 @@ async def backend_test(name: str, body: dict = Body(...)) -> dict:
     if not prompt:
         raise HTTPException(400, "prompt is required")
     return await services.test_prompt(name, prompt, max_tokens=max(1, min(int(body.get("maxTokens") or 256), 4096)))
+
+
+# ---------- host, diagnosis ----------
+
+def _row(r: Any) -> dict:
+    return dict(r) if r is not None else {}
+
+
+@router.get("/host")
+def host() -> dict:
+    points = hw.host_history()
+    return {"current": _plain(points[-1]) if points else None, "history": _plain(points[-180:])}
+
+
+def _logs_since_start(name: str) -> str:
+    client = services._docker_client()
+    if client is None:
+        return ""
+    try:
+        c = client.containers.get(name)
+        started = ((c.attrs or {}).get("State") or {}).get("StartedAt") or ""
+        from datetime import datetime
+        since = datetime.fromisoformat(started[:26].rstrip("Z").split(".")[0]) if started else None
+        data = c.logs(since=since, tail=40000) if since else c.logs(tail=40000)
+        return data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - diagnosis is best effort
+        return ""
+
+
+@router.get("/backends/{name}/diagnose")
+def backend_diagnose(name: str) -> dict:
+    if name not in services._effective_container_names():
+        raise HTTPException(404, "unknown backend")
+    from .diagnose import analyse
+    return {"failures": _plain(analyse(_logs_since_start(name)))}
+
+
+# ---------- Hugging Face settings ----------
+
+@router.get("/settings")
+def get_settings() -> dict:
+    token = db.get_setting("hf_token", "")
+    return {"hasToken": bool(token), "tokenHint": f"…{token[-4:]}" if len(token) > 8 else ""}
+
+
+@router.put("/settings")
+async def put_settings(body: dict = Body(...)) -> dict:
+    from . import hf
+    if "hfToken" in body:
+        db.set_setting("hf_token", str(body.get("hfToken") or "").strip())
+    result = get_settings()
+    if body.get("test"):
+        try:
+            ok, message = await hf.validate_token(db.get_setting("hf_token", ""))
+        except Exception as e:  # noqa: BLE001
+            ok, message = False, f"Test failed: {e}"
+        result["test"] = {"ok": ok, "message": message}
+    return result
+
+
+# ---------- search and downloads ----------
+
+@router.get("/search")
+async def search(q: str = "", sort: str = "downloads", limit: int = 30) -> dict:
+    import httpx
+    from . import hf
+    from .main import _downloaded_and_still_present
+    try:
+        results = await hf.search_models(q.strip(), sort=sort, limit=max(1, min(int(limit or 30), 60)))
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Hugging Face returned HTTP {e.response.status_code}", "results": []}
+    except httpx.HTTPError as e:
+        return {"error": f"Network error: {e}", "results": []}
+    owners = [(m.id.split("/", 1)[0] if "/" in m.id else m.id) for m in results]
+    avatars = await hf.owner_avatars(owners)
+    have = _downloaded_and_still_present()
+    return {"results": [{**_plain(m), "owner": o, "avatar": avatars.get(o, ""), "downloaded": have.get(m.id, [])}
+                        for m, o in zip(results, owners)]}
+
+
+@router.get("/search/repo")
+async def search_repo(repo: str = Query(...)) -> dict:
+    import httpx
+    from . import hf
+    from .main import _preset_estimates
+    groups: list[dict] = []
+    gated = ""
+    try:
+        detail = await hf.repo_detail(repo)
+        by_base: dict[str, list] = {}
+        for f in detail.files:
+            by_base.setdefault(f.shard_base, []).append(f)
+        for base, files in by_base.items():
+            files.sort(key=lambda x: (x.shard_index or 0, x.path))
+            total = sum(x.size for x in files)
+            groups.append({"shardBase": base, "shards": files[0].shard_total if files[0].shard_index else None,
+                           "bytes": total, "size": human_bytes(total),
+                           "quant": next((x.quant for x in files if x.quant), None),
+                           "fit": services.vram_fit_chips(total),
+                           "projector": "mmproj" in files[0].path.lower(),
+                           "files": [{"path": x.path, "bytes": x.size, "size": human_bytes(x.size), "quant": x.quant} for x in files]})
+        groups.sort(key=lambda g: (0 if g["files"][0]["path"].lower().endswith(".gguf") else 1, g["projector"], g["shardBase"].lower()))
+        probe = next((g for g in groups if g["files"][0]["path"].lower().endswith(".gguf") and not g["projector"]), None)
+        mm = [g["bytes"] for g in groups if g["projector"]]
+        if probe:
+            summary = await hf.gguf_header(repo, probe["files"][0]["path"])
+            gated = hf.gated_reason(repo) if not summary else ""
+            if summary:
+                for g in groups:
+                    if g["files"][0]["path"].lower().endswith(".gguf") and not g["projector"]:
+                        g["estimates"] = _preset_estimates(summary, g["bytes"], (min(mm) / 1024 ** 3) if mm else 0.0)
+                        g["nativeCtx"] = (summary.get("model") or {}).get("context_length") or 0
+    except httpx.HTTPStatusError as e:
+        return {"repo": repo, "error": f"Hugging Face returned HTTP {e.response.status_code}", "groups": []}
+    except httpx.HTTPError as e:
+        return {"repo": repo, "error": f"Network error: {e}", "groups": []}
+    return {"repo": repo, "groups": groups, "gated": gated}
+
+
+def _job(j) -> dict:
+    return {"id": j.id, "repo": j.repo_id, "filename": j.filename, "status": j.status, "error": j.error,
+            "bytes": j.total_bytes, "downloaded": j.downloaded_bytes, "pct": round(j.pct, 1),
+            "speed": j.speed_bps, "speedH": j.speed_h, "eta": j.eta_seconds, "etaH": j.eta_h,
+            "startedAt": j.started_at, "completedAt": j.completed_at, "parallel": j.parallel,
+            "history": j.speed_history_mbps[-60:],
+            "chunks": [{"index": c.idx, "pct": round(c.pct, 1), "status": c.status, "speed": c.speed_bps} for c in j.chunks]}
+
+
+@router.get("/downloads")
+def downloads() -> dict:
+    return {"jobs": [_job(j) for j in manager.snapshot()]}
+
+
+@router.post("/downloads")
+async def start_download(body: dict = Body(...)) -> dict:
+    import httpx
+    from . import hf
+    from .main import _dest_for_companion, _dest_for_main, _model_stem
+    repo, path, url = str(body.get("repo") or ""), str(body.get("path") or ""), str(body.get("url") or "").strip()
+    queued: list[str] = []
+    if url:
+        if not url.startswith(("https://", "http://")):
+            raise HTTPException(400, "URL must start with http:// or https://")
+        from urllib.parse import unquote, urlparse
+        name = str(body.get("filename") or "").strip() or unquote(urlparse(url).path.rsplit("/", 1)[-1])
+        if not name or "/" in name or ".." in name:
+            raise HTTPException(400, "Set a plain file name for this URL")
+        total = 0
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                r = await client.head(url)
+                total = int(r.headers.get("content-length") or 0) if r.status_code < 400 else 0
+        except httpx.HTTPError:
+            pass
+        manager.enqueue_url(url=url, filename=f"{_model_stem(name)}/{name}", total_bytes=total)
+        return {"queued": [name]}
+    if not repo or "/" not in repo:
+        raise HTTPException(400, "Choose a Hugging Face repository")
+    detail = await hf.repo_detail(repo)
+    shard_base = str(body.get("shardBase") or "")
+    if shard_base:
+        subdir = Path(shard_base).stem
+        for f in detail.files:
+            if f.shard_base == shard_base:
+                manager.enqueue(repo_id=repo, hf_path=f.path, filename=f"{subdir}/{Path(f.path).name}", total_bytes=f.size)
+                queued.append(f.path)
+        main_stem = subdir
+    else:
+        match = next((f for f in detail.files if f.path == path), None)
+        if match is None:
+            raise HTTPException(404, "That file is not in the repository")
+        base = Path(path).name
+        if "mmproj" in base.lower():
+            manager.enqueue(repo_id=repo, hf_path=path, filename=f"{_model_stem(base)}/{base}", total_bytes=match.size)
+            return {"queued": [path]}
+        main_stem, filename = _dest_for_main(base)
+        manager.enqueue(repo_id=repo, hf_path=path, filename=filename, total_bytes=match.size)
+        queued.append(path)
+    # Companions from the same repo: its vision projector(s) and the smallest draft head.
+    for f in [f for f in detail.files if "mmproj" in Path(f.path).name.lower()][:4]:
+        manager.enqueue(repo_id=repo, hf_path=f.path, filename=_dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size)
+        queued.append(f.path)
+    heads = [f for f in detail.files if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
+             and autoconfig._looks_like_draft(Path(f.path).name)]
+    if heads and not shard_base:
+        head = min(heads, key=lambda f: f.size or 0)
+        manager.enqueue(repo_id=repo, hf_path=head.path, filename=_dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size)
+        queued.append(head.path)
+    return {"queued": queued}
+
+
+@router.post("/downloads/{job_id}/cancel")
+def cancel_download(job_id: str) -> dict:
+    return {"ok": manager.cancel(job_id)}
+
+
+@router.post("/downloads/clear")
+def clear_downloads() -> dict:
+    return {"cleared": manager.clear_finished()}
+
+
+@router.post("/models/check-updates")
+async def check_updates() -> dict:
+    from . import hf
+    from .main import _update_status_map
+    records = db.download_records()
+    if records:
+        await hf.check_updates_for(records)
+    return {"checked": len(records), "status": _update_status_map(services.snapshot_models_dir())}
+
+
+@router.get("/models/updates")
+def update_status() -> dict:
+    from .main import _update_status_map
+    return {"status": _update_status_map(services.snapshot_models_dir())}
+
+
+# ---------- prompts ----------
+
+@router.get("/prompts")
+def prompts() -> dict:
+    return {"prompts": [dict(p) for p in db.list_prompts()]}
+
+
+@router.post("/prompts")
+def add_prompt(body: dict = Body(...)) -> dict:
+    name, text = str(body.get("name") or "").strip(), str(body.get("body") or "").strip()
+    if not name or not text:
+        raise HTTPException(400, "A name and prompt text are required")
+    return {"id": db.add_prompt(name, text), "prompts": [dict(p) for p in db.list_prompts()]}
+
+
+@router.delete("/prompts/{pid}")
+def delete_prompt(pid: int) -> dict:
+    if not db.delete_prompt(pid):
+        raise HTTPException(404, "prompt not found")
+    return {"prompts": [dict(p) for p in db.list_prompts()]}
+
+
+# ---------- benchmarks and ratings ----------
+
+def _bench_job() -> dict:
+    from . import bench
+    j = bench.state()
+    return {**_plain(j), "pct": j.pct, "elapsed": j.elapsed_s, "eta": j.eta_s, "active": j.active}
+
+
+@router.get("/benchmark")
+def benchmark_overview() -> dict:
+    from . import bench
+    names = ini.section_names()
+    return {"sections": names, "sweepArgs": {n: " ".join(bench.sweep_args_for_section(n)) for n in names},
+            "prompts": [dict(p) for p in db.list_prompts()], "backends": services._effective_container_names(),
+            "maxTokensDefault": bench.DEFAULT_MAX_TOKENS, "maxTokensCeiling": bench.MAX_TOKENS_CEILING,
+            "job": _bench_job(), "runs": [_row(r) for r in db.bench_runs(limit=25)],
+            "categories": [{"key": k, "label": v} for k, v in db.BADGE_CATEGORIES]}
+
+
+@router.post("/benchmark/start")
+def benchmark_start(body: dict = Body(...)) -> dict:
+    from . import bench
+    ok, err = bench.start(backend=str(body.get("backend") or ""), aliases=[str(a) for a in body.get("aliases") or []],
+                          prompt_ids=[int(p) for p in body.get("promptIds") or []], reps=int(body.get("reps") or 3),
+                          max_tokens=int(body.get("maxTokens") or bench.DEFAULT_MAX_TOKENS))
+    if not ok:
+        raise HTTPException(409, err or "The benchmark could not start")
+    return {"job": _bench_job()}
+
+
+@router.post("/benchmark/sweep")
+def benchmark_sweep(body: dict = Body(...)) -> dict:
+    from . import bench
+    ok, err = bench.start_sweep(backend=str(body.get("backend") or ""), aliases=[str(a) for a in body.get("aliases") or []],
+                                n_prompt=int(body.get("nPrompt") or 512), n_gen=int(body.get("nGen") or 128),
+                                depths=str(body.get("depths") or "0,4096,16384"), reps=int(body.get("reps") or 3))
+    if not ok:
+        raise HTTPException(409, err or "The sweep could not start")
+    return {"job": _bench_job()}
+
+
+@router.get("/benchmark/progress")
+def benchmark_progress() -> dict:
+    return {"job": _bench_job()}
+
+
+@router.post("/benchmark/cancel")
+def benchmark_cancel() -> dict:
+    from . import bench
+    bench.cancel()
+    return {"job": _bench_job()}
+
+
+@router.get("/benchmark/runs/{run_id}")
+def benchmark_run(run_id: int) -> dict:
+    from .main import _bench_charts
+    run = db.bench_run(run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    results, sweeps, variants = db.bench_results(run_id), db.bench_sweeps(run_id), db.bench_variants(run_id)
+    return {"run": _row(run), "variants": [_row(v) for v in variants], "results": [_row(r) for r in results],
+            "sweeps": [_row(w) for w in sweeps], "charts": _bench_charts(run_id, results, sweeps),
+            "badges": {v["alias"]: [_row(b) for b in db.badges_for(v["alias"])] for v in variants}}
+
+
+@router.put("/badges")
+def set_badge(body: dict = Body(...)) -> dict:
+    alias = str(body.get("alias") or "")
+    ok, err = db.badge_set(alias, str(body.get("category") or ""), int(body.get("rating") or 0),
+                           str(body.get("note") or ""), int(body.get("runId") or 0) or None)
+    if not ok:
+        raise HTTPException(400, err)
+    return {"badges": [_row(b) for b in db.badges_for(alias)]}
+
+
+@router.delete("/badges")
+def clear_badge(alias: str = Query(...), category: str = Query(...)) -> dict:
+    db.badge_clear(alias, category)
+    return {"badges": [_row(b) for b in db.badges_for(alias)]}

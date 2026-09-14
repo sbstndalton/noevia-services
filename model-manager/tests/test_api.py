@@ -1,0 +1,85 @@
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from conftest import INI, ROOT
+from app.main import app
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture(autouse=True)
+def reset_ini():
+    (ROOT / "models" / "models.ini").write_text(INI)
+
+
+def test_health_models_and_sections(client):
+    assert client.get("/api/v1/health").json() == {"ok": True}
+    models = client.get("/api/v1/models").json()
+    [m] = models["models"]
+    assert m["name"] == "tiny-Q4_K_M.gguf" and m["sections"] == ["tiny"] and m["shape"]["label"] == "dense"
+    sections = client.get("/api/v1/sections").json()
+    assert [s["name"] for s in sections["sections"]] == ["tiny"]
+    assert sections["schema"][0]["tier"] == "Common" and any(f["key"] == "ctx-size" for f in sections["schema"][0]["fields"])
+
+
+def test_save_is_pinned_to_the_revision_and_keeps_the_preamble(client):
+    current = client.get("/api/v1/sections/tiny").json()
+    assert current["values"]["ctx-size"] == "4096"
+    stale = current["revision"]
+    ok = client.put("/api/v1/sections/tiny", json={"baseRevision": stale, "values": {**current["values"], "ctx-size": "8192"}, "extras": ""})
+    assert ok.status_code == 200
+    text = (ROOT / "models" / "models.ini").read_text()
+    assert text.startswith("version = 1\n") and "ctx-size = 8192" in text
+    again = client.put("/api/v1/sections/tiny", json={"baseRevision": stale, "values": {"ctx-size": "2048"}})
+    assert again.status_code == 409
+    assert client.put("/api/v1/sections/tiny", json={"values": {}}).status_code == 400
+    bad = client.put("/api/v1/sections/tiny", json={"baseRevision": ok.json()["revision"], "values": {"ctx-size": "1\n[evil]"}})
+    assert bad.status_code == 400
+    extras = client.put("/api/v1/sections/tiny", json={"baseRevision": ok.json()["revision"], "values": {}, "extras": "[evil]\nx = 1"})
+    assert extras.status_code == 400
+
+
+def test_rename_and_delete(client):
+    rev = client.get("/api/v1/sections").json()["revision"]
+    assert client.post("/api/v1/sections/tiny/rename", json={"newName": "tiny-chat", "baseRevision": rev}).status_code == 200
+    rev = client.get("/api/v1/sections").json()["revision"]
+    assert [s["name"] for s in client.get("/api/v1/sections").json()["sections"]] == ["tiny-chat"]
+    assert client.delete(f"/api/v1/sections/tiny-chat?baseRevision={rev}").status_code == 200
+    assert client.get("/api/v1/sections").json()["sections"] == []
+    assert (ROOT / "models" / "models.ini").read_text().startswith("version = 1")
+
+
+def test_autoconfig_without_a_gpu_backend_explains_itself(client):
+    r = client.get("/api/v1/sections/tiny/autoconfig?sessions=2&vision=false").json()
+    assert r["arch"] == "llama"
+    assert "No GPU backend" in r["recommendation"]["error"]
+    assert client.get("/api/v1/sections/missing/autoconfig").json()["error"].startswith("No model file")
+
+
+def test_prompts_badges_downloads_and_host(client):
+    added = client.post("/api/v1/prompts", json={"name": "Synthetic", "body": "Say OK."}).json()
+    pid = added["id"]
+    assert any(p["name"] == "Synthetic" for p in added["prompts"])
+    assert client.post("/api/v1/prompts", json={"name": "", "body": ""}).status_code == 400
+    assert all(p["id"] != pid for p in client.delete(f"/api/v1/prompts/{pid}").json()["prompts"])
+    badges = client.put("/api/v1/badges", json={"alias": "tiny", "category": "coding", "rating": 4, "note": "synthetic"}).json()["badges"]
+    assert badges[0]["rating"] == 4
+    assert client.put("/api/v1/badges", json={"alias": "tiny", "category": "nonsense", "rating": 4}).status_code == 400
+    assert client.delete("/api/v1/badges?alias=tiny&category=coding").json()["badges"] == []
+    assert client.get("/api/v1/downloads").json() == {"jobs": []}
+    assert client.post("/api/v1/downloads", json={"url": "ftp://x"}).status_code == 400
+    assert "history" in client.get("/api/v1/host").json()
+    assert client.get("/api/v1/backends/nope/diagnose").status_code == 404
+    assert client.get("/api/v1/benchmark").json()["categories"][0]["key"] == "coding"
+
+
+def test_model_keys_cannot_escape_the_models_dir(client):
+    assert client.get("/api/v1/models/detail?key=../etc").status_code == 400
+    assert client.get("/api/v1/models/detail?key=tiny/tiny-Q4_K_M.gguf").json()["summary"]["arch"] == "llama"
+    assert client.post("/api/v1/models/delete", json={"models": ["../x"]}).json()["results"][0]["ok"] is False

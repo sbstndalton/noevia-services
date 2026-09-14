@@ -486,6 +486,9 @@ class Recommendation:
     current_spec_profile: str = ""                              # what the SAVED section has
     spec_head_rel: str = ""                                     # matched draft head, "" if none
     error: str = ""
+    # noevia: projector found for this model (the vision switch applies) and the switch state.
+    vision_available: str = ""
+    vision: bool = True
 
 
 def _fmt_ctx(n: int) -> str:
@@ -1087,7 +1090,8 @@ def analyze(*,
             section_name: str = "",
             model_subdir: str = "",
             spec_profile: str = "",
-            mmproj_gb_override: float | None = None) -> Recommendation:
+            mmproj_gb_override: float | None = None,
+            vision: bool = True) -> Recommendation:
     # Clamp n_sessions to a sensible range for a homelab. Above 8 the per-slot ctx
     # shrinks below usability for real chat, and llama-server continuous batching
     # overhead starts dominating.
@@ -1237,7 +1241,12 @@ def analyze(*,
     # Callers that can see a projector but have no local file (the HF search estimator, which
     # knows sizes from the repo tree but hasn't downloaded anything) pass its size directly.
     # Without this the estimate silently ignores the projector and reads optimistically high.
-    if mmproj_gb_override is not None and mmproj_gb_override > 0:
+    # noevia: vision is a switch. Off, the projector is neither budgeted nor kept in the
+    # section, so the fit table shows the context that frees up.
+    available_mmproj = mmproj_rel
+    if not vision:
+        mmproj_rel, mmproj_gb = "", 0.0
+    if vision and mmproj_gb_override is not None and mmproj_gb_override > 0:
         mmproj_gb = mmproj_gb_override
         mmproj_rel = mmproj_rel or "(remote projector)"
 
@@ -1475,7 +1484,7 @@ def analyze(*,
         values["jinja"] = "true"
 
     # Multimodal: look for an adjacent mmproj file the user hasn't already set
-    if section_name:
+    if section_name and vision:
         current_mmproj = (current_section or {}).get("mmproj", "").strip()
         if current_mmproj:
             # Respect user's existing choice — echo it so Fill preserves it
@@ -2092,6 +2101,8 @@ def analyze(*,
         active_spec_profile=_spec_key if section_name else "",
         current_spec_profile=_saved_spec,
         spec_head_rel=_resolved_head,
+        vision_available=available_mmproj,
+        vision=vision,
     )
 
 
