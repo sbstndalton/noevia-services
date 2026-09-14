@@ -11,7 +11,7 @@ def corpus_settings(cfg):
     return {key: cfg.get('corpus.' + key) for key in SETTING_KEYS if cfg.get('corpus.' + key) is not None}
 
 
-def snapshot(backend, prefix):
+def snapshot(backend, prefix, *, allow_empty=False):
     prefix = prefix.strip('/')
     files = {}
     directories = [prefix]
@@ -49,7 +49,7 @@ def snapshot(backend, prefix):
                 raise ValueError('Import exceeds the 5,000 file / 256 MiB safety limit')
             relative = path[len(prefix) + 1:] if prefix else path
             files[relative] = data
-    if not files:
+    if not files and not allow_empty:
         raise ValueError('No source files found. Verify the original connection and folder before importing.')
     listing = [{'path': path, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()} for path, data in sorted(files.items())]
     fingerprint = hashlib.sha256(json.dumps({'files': listing, 'directories': sorted(folders)}, sort_keys=True).encode()).hexdigest()

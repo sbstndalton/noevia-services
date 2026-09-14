@@ -163,7 +163,7 @@ def _snapshot_sqlite(source: Path, target: Path) -> None:
         src.close()
 
 
-def _tenant_state(request: Request) -> AppState:
+def _tenant_state(request: Request, *, recover=True) -> AppState:
     """Resolve the tenant AppState for this request.
 
     SECURITY: fails CLOSED. A request with a missing, malformed, or non-UUID
@@ -202,6 +202,10 @@ def _tenant_state(request: Request) -> AppState:
             # LRU touch: move to the most-recently-used end.
             _tenant_states.move_to_end(state_key)
             cached.last_used = time.monotonic()
+            if recover and not getattr(cached, 'recovered', True):
+                cached.store.apply_pending()
+                _reindex_dirty(cached)
+                cached.recovered = True
             return cached
         cfg = copy.deepcopy(_base_cfg)
         tenant_root = Path(cfg.get("retrieval.db_path")).parent / "users" / user_id
@@ -270,8 +274,11 @@ def _tenant_state(request: Request) -> AppState:
             with managed.db() as db:
                 for row in db.execute("SELECT path FROM files WHERE lower(path) LIKE '%.md'"):
                     state.journal.mark_dirty(row[0])
-        state.store.apply_pending()
-        _reindex_dirty(state)
+        state.recovered = False
+        if recover:
+            state.store.apply_pending()
+            _reindex_dirty(state)
+            state.recovered = True
         state.last_used = time.monotonic()
         _tenant_states[state_key] = state
         _evict_tenant_states_locked()
@@ -749,6 +756,25 @@ def api_storage_backup(request: Request):
         return managed.backup(remote, storage)
     finally:
         remote.close()
+
+
+@app.get("/api/workspace-export")
+def api_workspace_export(request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    from .workspace_export import archive
+    from fastapi.responses import Response
+    st = _tenant_state(request, recover=False)
+    with st.store._write_lock, st.managed.migration_lock():
+        if st.journal.pending_count():
+            raise HTTPException(409, "Finish pending Diary writes before exporting.")
+        try:
+            content = archive(st.backend, st.store.remote_root, corpus_settings(st.cfg))
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+    return Response(content, media_type="application/zip", headers={
+        "Content-Disposition": 'attachment; filename="noevia-workspace.zip"',
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @app.post("/api/storage-import")
