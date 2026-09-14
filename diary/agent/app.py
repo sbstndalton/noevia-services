@@ -498,6 +498,8 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
 def _reindex_dirty(st: AppState) -> None:
     # Serialize against writes; never acknowledge a newer invalidation accidentally.
     with st.store._write_lock:
+        from .workspace_import import drain_index_outbox
+        drain_index_outbox(st.store.backend, st.journal)
         for document in st.journal.dirty_documents():
             try:
                 text, _ = st.store.backend.get_text(document)
@@ -756,6 +758,49 @@ def api_storage_backup(request: Request):
         return managed.backup(remote, storage)
     finally:
         remote.close()
+
+
+@app.post("/api/workspace-import")
+async def api_workspace_import(request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    action = request.query_params.get('action', '')
+    name = request.query_params.get('name', '')
+    reviewed = request.query_params.get('fingerprint', '')
+    if action not in ('preview', 'apply') or (action == 'apply' and not re.fullmatch(r'[0-9a-f]{64}', reviewed)):
+        raise HTTPException(400, 'Invalid import action or preview fingerprint')
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 32 * 1024 * 1024:
+            raise HTTPException(413, 'Browser imports support ZIP files up to 32 MiB')
+        chunks.append(chunk)
+    content = b''.join(chunks)
+    st = await run_in_threadpool(_tenant_state, request, recover=False)
+    def perform():
+        from .workspace_import import prepare, apply, drain_index_outbox
+        with st.store._write_lock, st.managed.migration_lock():
+            if not isinstance(st.backend, ManagedCorpusBackend):
+                raise HTTPException(409, 'ZIP import requires app-managed Diary storage. Use isolated operator restore for legacy storage.')
+            if st.journal.pending_count():
+                raise HTTPException(409, 'Finish pending Diary writes before importing.')
+            try:
+                if action == 'preview':
+                    result = prepare(st.backend, content, name)[2]
+                else:
+                    result = apply(st.backend, content, name, reviewed)
+                    # No embeddings/model call during import. The durable outbox
+                    # covers a failed transfer; ordinary recovery performs indexing.
+                    try:
+                        drain_index_outbox(st.store.backend, st.journal)
+                    except Exception:
+                        log.warning('Workspace import index transfer pending')
+                    st.recovered = False
+                    result['indexPending'] = True
+                return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+            except ValueError as exc:
+                raise HTTPException(409 if action == 'apply' else 400, str(exc))
+    return await run_in_threadpool(perform)
 
 
 @app.get("/api/workspace-export")

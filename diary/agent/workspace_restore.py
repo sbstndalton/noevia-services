@@ -13,11 +13,18 @@ import shutil
 import stat
 import zipfile
 from .managed_storage import safe_key
-from .workspace_export import MAX_FILE, MAX_TOTAL
+from .workspace_export import MAX_ARCHIVE, MAX_FILE, MAX_TOTAL
 
 
 def verify(body):
-    if len(body) > 272 * 1024 * 1024:
+    try:
+        return _verify(body)
+    except (zipfile.BadZipFile, KeyError, TypeError, AttributeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid workspace archive or manifest") from exc
+
+
+def _verify(body):
+    if len(body) > MAX_ARCHIVE:
         raise ValueError('Archive exceeds 272 MiB')
     with zipfile.ZipFile(io.BytesIO(body)) as bundle:
         entries = bundle.infolist()
@@ -31,12 +38,18 @@ def verify(body):
                 raise ValueError('Links, special files and encrypted entries are unsupported')
             if entry.file_size > MAX_FILE or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
                 raise ValueError('Archive entry exceeds limits or uses unsupported compression')
+            if entry.is_dir() and entry.file_size != 0:
+                raise ValueError('Directory entries must be empty')
+            if (stat.S_IFMT(mode) == stat.S_IFDIR and not entry.is_dir()) or (stat.S_IFMT(mode) == stat.S_IFREG and entry.is_dir()):
+                raise ValueError('Archive entry type does not match its path')
             total += entry.file_size
         if total > MAX_TOTAL + 8 * 1024 * 1024:
             raise ValueError('Expanded archive exceeds limits')
         if bundle.getinfo('manifest.json').file_size > 8 * 1024 * 1024:
             raise ValueError('Manifest exceeds 8 MiB')
         manifest = json.loads(bundle.read('manifest.json'))
+        if not isinstance(manifest, dict):
+            raise ValueError('Invalid manifest object')
         if manifest.get('format') != 'noevia-workspace-v1':
             raise ValueError('Unsupported workspace format')
         rows, directories = manifest.get('files'), manifest.get('directories')
@@ -50,6 +63,8 @@ def verify(body):
             dirs.add(directory)
         files = {}
         for row in rows:
+            if not isinstance(row, dict) or type(row.get('bytes')) is not int or row['bytes'] < 0 or not isinstance(row.get('sha256'), str):
+                raise ValueError('Invalid manifest file record')
             path = safe_key(row['path'])
             if path in files or path in dirs:
                 raise ValueError('Duplicate or overlapping path')
@@ -64,6 +79,8 @@ def verify(body):
         if {e.filename for e in entries} != expected:
             raise ValueError('Archive contains missing or unlisted entries')
         total = sum(map(len, files.values()))
+        if type(manifest.get('fileCount')) is not int or type(manifest.get('bytes')) is not int:
+            raise ValueError('Invalid manifest totals')
         if total > MAX_TOTAL or manifest.get('fileCount') != len(files) or manifest.get('bytes') != total:
             raise ValueError('Manifest totals mismatch')
     return files, dirs, manifest

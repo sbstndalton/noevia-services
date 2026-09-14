@@ -109,3 +109,12 @@ def test_export_caps_checked_before_loading_blobs(tmp_path, monkeypatch):
     monkeypatch.setattr(export, 'MAX_FILE', 3)
     with pytest.raises(ValueError, match='safety limit'):
         archive(backend, '', {})
+
+
+def test_final_archive_transport_limit(tmp_path, monkeypatch):
+    import agent.workspace_export as export
+    backend = ManagedCorpusBackend(tmp_path, B)
+    backend.activate({}, {})
+    monkeypatch.setattr(export, 'MAX_ARCHIVE', 20)
+    with pytest.raises(ValueError, match='archive exceeds'):
+        archive(backend, '', {})

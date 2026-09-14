@@ -63,3 +63,46 @@ def test_interrupted_restore_removes_only_new_destination(bundle, tmp_path, monk
         restore(bundle, target, report['fingerprint'])
     assert not target.exists()
     assert original.read_bytes() == b'keep'
+
+
+@pytest.mark.parametrize('path', ['workspace/', 'workspace/empty/'])
+def test_directory_payload_refused_before_restore(bundle, tmp_path, path):
+    changed = mutate(bundle, lambda rows: rows.update({path: b'unchecked payload'}))
+    with pytest.raises(ValueError, match='must be empty'):
+        preview(changed)
+    target = tmp_path / 'refused'
+    import hashlib
+    with pytest.raises(ValueError):
+        restore(changed, target, hashlib.sha256(changed).hexdigest())
+    assert not target.exists()
+
+
+@pytest.mark.parametrize('manifest', [[], None, {'format': 'noevia-workspace-v1', 'files': [None], 'directories': []},
+    {'format': 'noevia-workspace-v1', 'files': [], 'directories': [], 'fileCount': False, 'bytes': 0}])
+def test_malformed_manifest_is_validation_error(bundle, manifest):
+    changed = mutate(bundle, lambda rows: rows.update({'manifest.json': json.dumps(manifest).encode()}))
+    with pytest.raises(ValueError):
+        preview(changed)
+
+
+def test_invalid_zip_is_validation_error():
+    with pytest.raises(ValueError, match='Invalid workspace archive'):
+        preview(b'not a zip')
+
+
+def test_missing_manifest_is_validation_error(bundle):
+    with pytest.raises(ValueError, match='Invalid workspace archive'):
+        preview(mutate(bundle, lambda rows: rows.pop('manifest.json')))
+
+
+def test_directory_mode_without_directory_path_refused(bundle):
+    import stat
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(bundle)) as source, zipfile.ZipFile(output, 'w') as dest:
+        for info in source.infolist():
+            data = source.read(info)
+            if info.filename == 'workspace/assets/image.bin':
+                info.external_attr = (stat.S_IFDIR | 0o700) << 16
+            dest.writestr(info, data)
+    with pytest.raises(ValueError, match='type does not match'):
+        preview(output.getvalue())

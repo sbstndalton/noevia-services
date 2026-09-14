@@ -6,6 +6,7 @@ import zipfile
 from .diary_migration import snapshot
 from .managed_storage import ManagedCorpusBackend, safe_key
 
+MAX_ARCHIVE = 272 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
 MAX_TOTAL = 256 * 1024 * 1024
 
@@ -59,4 +60,6 @@ def archive(backend, prefix, settings):
             bundle.writestr('workspace/' + directory + '/', b'')
         for path, data in sorted(files.items()):
             bundle.writestr('workspace/' + path, data)
+    if output.tell() > MAX_ARCHIVE:
+        raise ValueError('Export archive exceeds 272 MiB')
     return output.getvalue()
