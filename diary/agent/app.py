@@ -760,6 +760,40 @@ def api_storage_backup(request: Request):
         remote.close()
 
 
+@app.get("/api/workspace-trash")
+def api_workspace_trash_list(request: Request, after: str = ''):
+    if not check_auth(request):
+        raise HTTPException(401, 'unauthorized')
+    from .workspace_trash import list_trash
+    st = _tenant_state(request, recover=False)
+    try:
+        return JSONResponse(list_trash(st.store, after), headers={'Cache-Control': 'no-store'})
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.post("/api/workspace-trash")
+def api_workspace_trash_change(body: dict, request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, 'unauthorized')
+    from .workspace_trash import change
+    from .workspace_import import drain_index_outbox
+    st = _tenant_state(request, recover=False)
+    with st.store._write_lock, st.managed.migration_lock():
+        if st.journal.pending_count():
+            raise HTTPException(409, 'Finish pending Diary writes before changing Trash.')
+        try:
+            result = change(st.store, body)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        try:
+            drain_index_outbox(st.backend, st.journal)
+        except Exception:
+            log.warning('Workspace trash index transfer pending')
+        st.recovered = False
+        return JSONResponse({**result, 'indexPending': True}, headers={'Cache-Control': 'no-store'})
+
+
 @app.post("/api/workspace-import")
 async def api_workspace_import(request: Request):
     if not check_auth(request):

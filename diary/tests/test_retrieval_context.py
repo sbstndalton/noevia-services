@@ -183,3 +183,11 @@ def test_context_budget_truncates_today():
     block = messages[1]["content"]
     assert "(earlier exchanges today truncated)" in block
     assert len(block) < 40000
+
+
+def test_missing_file_removes_all_indexed_chunks(retriever):
+    retriever.reindex_file('notes.md', DAY_TEXT)
+    assert retriever.stats()['chunks'] == 1
+    retriever.reindex_file('notes.md', None)
+    assert retriever.stats()['chunks'] == 0
+    assert not retriever.pending_embeddings
