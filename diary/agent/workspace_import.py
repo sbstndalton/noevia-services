@@ -36,13 +36,14 @@ def prepare(backend, body, name):
     destination = destination_path(name)
     with backend.db() as db:
         db.execute('BEGIN')
+        applied = bool(db.execute('SELECT 1 FROM workspace_imports WHERE fingerprint=?', (fingerprint(body, destination),)).fetchone())
         blocked = conflicts(db, destination)
         hashes = {r[0] for r in db.execute('SELECT version FROM files')}
     return files, directories, {'fingerprint': fingerprint(body, destination),
         'destination': destination, 'fileCount': len(files), 'bytes': manifest['bytes'],
         'files': sorted(files), 'directories': sorted(directories), 'conflicts': blocked,
         'duplicates': sorted(path for path, data in files.items() if digest(data) in hashes),
-        'mode': 'new-folder-only'}
+        'mode': 'new-folder-only', 'alreadyApplied': applied}
 
 
 def apply(backend, body, name, reviewed):

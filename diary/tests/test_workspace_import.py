@@ -23,6 +23,7 @@ def test_preview_apply_and_uncertain_retry(setup):
     assert target.get('Imports/Copy/raw/note.md')[0] is None
     result = apply(target, body, 'Copy', report['fingerprint'])
     assert not result['alreadyApplied']
+    assert prepare(target, body, 'Copy')[2]['alreadyApplied']
     assert target.get('Imports/Copy/image.bin')[0] == b'\x00\xff'
     assert target.get('Imports/Copy/raw/note.md')[0] == b'original\r\n'
     assert target.settings() == {'entry_layout': 'monthly'}
