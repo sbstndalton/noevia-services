@@ -15,6 +15,12 @@ from .downloader import manager
 from .utils import human_bytes, shard_key
 
 app = FastAPI(title="Model Loader")
+
+# noevia: browser libraries are bundled into the image (see Dockerfile), never loaded from CDNs.
+from fastapi.staticfiles import StaticFiles as _StaticFiles  # noqa: E402
+import os as _os  # noqa: E402
+if _os.path.isdir("/srv/vendor"):
+    app.mount("/_vendor", _StaticFiles(directory="/srv/vendor"), name="vendor")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 templates.env.globals["hue"] = lambda s: sum(ord(c) for c in (s or "")) % 360
 templates.env.globals["badge_categories"] = db.BADGE_CATEGORIES
@@ -32,6 +38,10 @@ def _fmt_ts(v) -> str:
 
 
 templates.env.filters["ts"] = _fmt_ts
+
+
+from . import api as _api  # noqa: E402
+app.include_router(_api.router)
 
 
 @app.on_event("startup")

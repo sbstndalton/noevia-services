@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import threading
 import time
 from collections import deque
@@ -25,6 +27,11 @@ class GpuCard:
     vram_total_gb: float
     temp_c: float
     power_w: float
+    # Shared (GTT) memory: on integrated/APU GPUs the model lives here, drawn from system RAM.
+    shared_used_gb: float = 0.0
+    shared_total_gb: float = 0.0
+    clock_mhz: float = 0.0
+    device: str = ""
 
     @property
     def vram_free_gb(self) -> float:
@@ -46,6 +53,14 @@ class GpuStats:
     power_w: float
     gpu_count: int = 1
     cards: list[GpuCard] = field(default_factory=list)  # per-device detail
+    # "dedicated" (discrete card) or "unified" (small carve-out plus shared system memory).
+    memory_kind: str = "dedicated"
+    shared_used_gb: float = 0.0
+    shared_total_gb: float = 0.0
+    clock_mhz: float = 0.0
+    # Where the numbers came from: nvidia-smi | rocm-smi | sysfs | declared.
+    source: str = ""
+    measured: bool = True
 
 
 @dataclass
@@ -57,6 +72,18 @@ class HistoryPoint:
     mem_used_gb: float
     per_gpu_util: list[float] = field(default_factory=list)
     per_gpu_vram_used_gb: list[float] = field(default_factory=list)
+    shared_used_gb: float = 0.0
+    temp_c: float = 0.0
+    power_w: float = 0.0
+
+
+@dataclass
+class HostPoint:
+    ts: float
+    cpu_pct: float
+    mem_used_gb: float
+    mem_total_gb: float
+    mem_available_gb: float
 
 
 @dataclass
@@ -185,6 +212,99 @@ def _read_nvidia(container) -> GpuStats | None:
         return None
 
 
+_DRM_ROOT = "/sys/class/drm"
+# PCI ids for names the kernel does not provide. Anything else shows its vendor and id.
+_GPU_NAMES = {
+    ("0x1002", "0x150e"): "AMD Radeon 880M/890M",
+    ("0x1002", "0x1900"): "AMD Radeon 780M",
+    ("0x1002", "0x15bf"): "AMD Radeon 780M",
+    ("0x1002", "0x164e"): "AMD Radeon (Raphael iGPU)",
+}
+_VENDOR_NAMES = {"0x1002": "AMD", "0x10de": "NVIDIA", "0x8086": "Intel"}
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _read_int(path: str) -> int:
+    try:
+        return int(_read_text(path) or 0)
+    except ValueError:
+        return 0
+
+
+def _container_drm_cards(container) -> list[str]:
+    """DRM card names (card0, card1, ...) mapped into the container, in device order.
+
+    Taken from the container's own device list, never from "whatever card exists": a
+    host can have several GPUs (here an Intel card serving video and an AMD APU serving
+    llama.cpp) and the wrong one would report someone else's workload.
+    """
+    devices = ((container.attrs or {}).get("HostConfig") or {}).get("Devices") or []
+    cards = []
+    for d in devices:
+        m = re.match(r"^/dev/dri/(card\d+)$", str(d.get("PathOnHost") or ""))
+        if m:
+            cards.append(m.group(1))
+    return cards
+
+
+def _read_drm(container) -> GpuStats | None:
+    """Kernel-reported stats for amdgpu devices, readable from sysfs inside any container.
+
+    Works where no vendor tool exists in the image (Vulkan builds). On an APU the dedicated
+    "VRAM" is a small firmware carve-out and model weights live in GTT, memory shared with
+    the system, so both are reported and the memory is labelled unified.
+    """
+    cards: list[GpuCard] = []
+    for i, card in enumerate(_container_drm_cards(container)):
+        dev = f"{_DRM_ROOT}/{card}/device"
+        vendor, device = _read_text(f"{dev}/vendor"), _read_text(f"{dev}/device")
+        if vendor != "0x1002" or not os.path.exists(f"{dev}/mem_info_vram_total"):
+            continue
+        hwmon = ""
+        try:
+            hw_dirs = sorted(os.listdir(f"{dev}/hwmon"))
+            hwmon = f"{dev}/hwmon/{hw_dirs[0]}" if hw_dirs else ""
+        except OSError:
+            pass
+        power = (_read_int(f"{hwmon}/power1_average") or _read_int(f"{hwmon}/power1_input")) if hwmon else 0
+        gib = 1024 ** 3
+        cards.append(GpuCard(
+            index=i,
+            name=_GPU_NAMES.get((vendor, device), f"{_VENDOR_NAMES.get(vendor, vendor)} GPU ({device})"),
+            util_pct=float(_read_int(f"{dev}/gpu_busy_percent")),
+            vram_used_gb=round(_read_int(f"{dev}/mem_info_vram_used") / gib, 2),
+            vram_total_gb=round(_read_int(f"{dev}/mem_info_vram_total") / gib, 2),
+            temp_c=round(_read_int(f"{hwmon}/temp1_input") / 1000.0, 1) if hwmon else 0.0,
+            power_w=round(power / 1_000_000.0, 1),
+            shared_used_gb=round(_read_int(f"{dev}/mem_info_gtt_used") / gib, 2),
+            shared_total_gb=round(_read_int(f"{dev}/mem_info_gtt_total") / gib, 2),
+            clock_mhz=round(_read_int(f"{hwmon}/freq1_input") / 1_000_000.0) if hwmon else 0.0,
+            device=card,
+        ))
+    if not cards:
+        return None
+    unified = all(c.vram_total_gb <= 4 and c.shared_total_gb > c.vram_total_gb * 2 for c in cards)
+    return GpuStats(
+        vendor="amd", name=", ".join(dict.fromkeys(c.name for c in cards)),
+        util_pct=round(sum(c.util_pct for c in cards) / len(cards), 1),
+        vram_used_gb=round(sum(c.vram_used_gb for c in cards), 2),
+        vram_total_gb=round(sum(c.vram_total_gb for c in cards), 2),
+        temp_c=max(c.temp_c for c in cards), power_w=round(sum(c.power_w for c in cards), 1),
+        gpu_count=len(cards), cards=cards,
+        memory_kind="unified" if unified else "dedicated",
+        shared_used_gb=round(sum(c.shared_used_gb for c in cards), 2),
+        shared_total_gb=round(sum(c.shared_total_gb for c in cards), 2),
+        clock_mhz=max(c.clock_mhz for c in cards), source="sysfs",
+    )
+
+
 def _read_vulkan(container, container_name: str) -> GpuStats | None:
     """Best-effort stats for a Vulkan backend.
 
@@ -201,6 +321,9 @@ def _read_vulkan(container, container_name: str) -> GpuStats | None:
     Returns None only when we have neither a probe nor a declared size — the caller then
     surfaces the "declare GPU_VRAM" message instead of silently showing nothing.
     """
+    drm = _read_drm(container)
+    if drm is not None:
+        return replace(drm, vendor="vulkan")
     probed = _read_amd(container, container_name) or _read_nvidia(container)
     if probed is not None:
         return replace(probed, vendor="vulkan")
@@ -216,6 +339,8 @@ def _read_vulkan(container, container_name: str) -> GpuStats | None:
         vram_total_gb=round(declared, 1),
         temp_c=0.0,
         power_w=0.0,
+        source="declared",
+        measured=False,
     )
 
 
@@ -302,7 +427,7 @@ def _collect(name: str) -> BackendStats:
     if vendor == "nvidia":
         gpu = _read_nvidia(c)
     elif vendor == "amd":
-        gpu = _read_amd(c, name)
+        gpu = _read_amd(c, name) or _read_drm(c)
     elif vendor == "vulkan":
         gpu = _read_vulkan(c, name)
     else:
@@ -358,12 +483,49 @@ def _record_history(name: str, s: BackendStats) -> None:
         mem_used_gb=c.mem_used_gb if c else 0.0,
         per_gpu_util=[card.util_pct for card in (g.cards if g else [])],
         per_gpu_vram_used_gb=[card.vram_used_gb for card in (g.cards if g else [])],
+        shared_used_gb=g.shared_used_gb if g else 0.0,
+        temp_c=g.temp_c if g else 0.0,
+        power_w=g.power_w if g else 0.0,
     )
     with _LOCK:
         buf = _HISTORY.get(name)
         if buf is None:
             buf = _HISTORY[name] = deque(maxlen=_HISTORY_MAXLEN)
         buf.append(pt)
+
+
+_HOST_HISTORY: deque = deque(maxlen=_HISTORY_MAXLEN)
+_last_cpu: tuple[int, int] | None = None
+
+
+def _read_host() -> HostPoint | None:
+    """Whole-machine CPU and memory from /proc, which a container sees for the host."""
+    global _last_cpu
+    try:
+        with open("/proc/stat", encoding="utf-8") as fh:
+            parts = [int(x) for x in fh.readline().split()[1:]]
+        idle, total = parts[3] + (parts[4] if len(parts) > 4 else 0), sum(parts)
+        cpu = 0.0
+        if _last_cpu is not None and total > _last_cpu[1]:
+            cpu = 100.0 * (1 - (idle - _last_cpu[0]) / (total - _last_cpu[1]))
+        _last_cpu = (idle, total)
+        info: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    info[key] = int(rest.split()[0])
+        total_gb = info.get("MemTotal", 0) / 1024 / 1024
+        avail_gb = info.get("MemAvailable", 0) / 1024 / 1024
+        return HostPoint(ts=time.time(), cpu_pct=round(max(0.0, cpu), 1), mem_used_gb=round(total_gb - avail_gb, 2),
+                         mem_total_gb=round(total_gb, 2), mem_available_gb=round(avail_gb, 2))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def host_history() -> list[HostPoint]:
+    with _LOCK:
+        return list(_HOST_HISTORY)
 
 
 def history_for(name: str) -> list[HistoryPoint]:
@@ -408,6 +570,10 @@ def _sample_loop() -> None:
             names = services._effective_container_names()
         except Exception:  # noqa: BLE001
             names, discovery_ok = [], False
+        host = _read_host()
+        if host is not None:
+            with _LOCK:
+                _HOST_HISTORY.append(host)
         for name in names:
             try:
                 s = _collect(name)

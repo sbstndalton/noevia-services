@@ -303,10 +303,27 @@ def _new_parser() -> configparser.ConfigParser:
     return cp
 
 
-def read_ini() -> configparser.ConfigParser:
+def split_preamble(text: str) -> tuple[str, str]:
+    """(preamble, sections). llama.cpp preset files may start with top-level keys such as
+    `version = 1` before the first section, which configparser rejects. The preamble is kept
+    verbatim so saving the file never drops it."""
+    lines = text.splitlines(keepends=True)
+    first = next((i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+    return "".join(lines[:first]), "".join(lines[first:])
+
+
+def parse_ini_text(text: str, source: str = "<models.ini>") -> configparser.ConfigParser:
     cp = _new_parser()
+    cp._noevia_preamble, body = split_preamble(text)
+    cp.read_string(body, source=source)
+    return cp
+
+
+def read_ini() -> configparser.ConfigParser:
     if settings.models_ini_path.exists():
-        cp.read(settings.models_ini_path, encoding="utf-8")
+        return parse_ini_text(settings.models_ini_path.read_text(encoding="utf-8"), str(settings.models_ini_path))
+    cp = _new_parser()
+    cp._noevia_preamble = ""
     return cp
 
 
@@ -640,7 +657,10 @@ def _atomic_write(cp: configparser.ConfigParser) -> None:
 
     buf = io.StringIO()
     cp.write(buf, space_around_delimiters=True)
-    text = buf.getvalue()
+    preamble = getattr(cp, "_noevia_preamble", "")
+    if preamble and not preamble.endswith("\n"):
+        preamble += "\n"
+    text = preamble + buf.getvalue()
 
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")

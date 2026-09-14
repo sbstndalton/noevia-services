@@ -165,9 +165,8 @@ def read_ini_aliases(ini_path: Path) -> list[str]:
     if not ini_path.exists():
         return []
     try:
-        cp = configparser.ConfigParser(strict=False)
-        cp.read(ini_path, encoding="utf-8")
-        return cp.sections()
+        from . import ini
+        return ini.parse_ini_text(ini_path.read_text(encoding="utf-8"), str(ini_path)).sections()
     except (OSError, configparser.Error):
         return []
 
