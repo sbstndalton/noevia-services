@@ -61,6 +61,8 @@ from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .storage import create_backend
 from .dedicated_storage import StorageUnavailable, tenant_volume
+from .managed_storage import ManagedCorpusBackend
+from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
 
 log = logging.getLogger("diary")
 
@@ -183,10 +185,16 @@ def _tenant_state(request: Request) -> AppState:
     user_id = request.headers.get("X-Cowork-User-ID", "") or os.environ.get("DIARY_LEGACY_USER_ID", "")
     if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         raise HTTPException(status_code=400, detail="missing or invalid X-Cowork-User-ID")
+    user_id = user_id.lower()
     storage_header = request.headers.get("X-Cowork-Storage", "")
-    volume = tenant_volume(user_id)
+    managed_root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    managed = ManagedCorpusBackend(managed_root, user_id)
+    is_managed = managed.active()
+    if request.headers.get("X-Cowork-Storage-Blocked") == "1" and not is_managed:
+        raise HTTPException(403, "The original storage endpoint is not approved. Ask an administrator to review the connection.")
+    volume = None if is_managed else tenant_volume(user_id)
     # A dedicated volume owns one state/lock domain even if general storage changes.
-    storage_key = json.dumps(volume, sort_keys=True) if volume else storage_header
+    storage_key = "managed" if is_managed else json.dumps(volume, sort_keys=True) if volume else storage_header
     state_key = f"{user_id}:{hashlib.sha256(storage_key.encode()).hexdigest()[:16]}"
     with _tenant_lock:
         cached = _tenant_states.get(state_key)
@@ -237,7 +245,31 @@ def _tenant_state(request: Request) -> AppState:
             _set_cfg(cfg, "corpus.backend", "local")
             _set_cfg(cfg, "corpus.local.root", str(tenant_root / "corpus"))
             _set_cfg(cfg, "corpus.root", "")
-        state = AppState(cfg)
+        # Fresh accounts start inside the app. An existing index/corpus or remote
+        # connection always requires the explicit copy-and-verify import path.
+        fresh = not legacy_owner and not volume and not tenant_db.exists() and not (storage and storage.get("kind") != "local")
+        local_root = Path(cfg.get("corpus.local.root") or str(tenant_root / "corpus"))
+        fresh = fresh and not (local_root.exists() and any(local_root.iterdir()))
+        if fresh and not is_managed:
+            with managed.migration_lock():
+                if not managed.active():
+                    managed.activate({}, corpus_settings(cfg))
+            is_managed = True
+            state_key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
+        if is_managed:
+            _set_cfg(cfg, "corpus.backend", "managed")
+            _set_cfg(cfg, "corpus.root", "")
+            _set_cfg(cfg, "corpus.webdav.remote_root", "")
+            _set_cfg(cfg, "retrieval.db_path", str(tenant_root / "managed-index.db"))
+            for key, value in managed.settings().items():
+                _set_cfg(cfg, "corpus." + key, value)
+        backend = managed if is_managed else LegacyWriteGuard(create_backend(cfg), managed)
+        state = AppState(cfg, backend=backend)
+        state.managed = managed
+        if is_managed:
+            with managed.db() as db:
+                for row in db.execute("SELECT path FROM files WHERE lower(path) LIKE '%.md'"):
+                    state.journal.mark_dirty(row[0])
         state.store.apply_pending()
         _reindex_dirty(state)
         state.last_used = time.monotonic()
@@ -279,8 +311,8 @@ def _evict_tenant_states_locked() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     st = get_state()
-    applied = st.store.apply_pending()
-    log.info("startup: applied %d pending journal entries (%d still pending)", applied, st.journal.pending_count())
+    # Replay is tenant-scoped in _tenant_state. Never replay the retired global
+    # corpus after a tenant has explicitly moved into app storage.
     yield
     st.backend.close()
     st.llm_main.close()
@@ -330,6 +362,7 @@ def delete_tenant(request: Request) -> JSONResponse:
     user_id = request.headers.get("X-Cowork-User-ID", "")
     if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         return JSONResponse({"error": "invalid user"}, status_code=400)
+    user_id = user_id.lower()
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     with _tenant_lock:
         for key, state in list(_tenant_states.items()):
@@ -675,6 +708,77 @@ def api_external_sources_import(body: ImportRequest, request: Request) -> JSONRe
         "day": day.isoformat(),
         "date_source": _method if file_date else "today",
     })
+
+
+def _request_storage(request):
+    try:
+        raw = request.headers.get("X-Cowork-Storage", "")
+        value = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+@app.get("/api/storage-status")
+def api_storage_status(request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    st = _tenant_state(request)
+    return st.managed.status(_request_storage(request))
+
+
+@app.post("/api/storage-backup")
+def api_storage_backup(request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    # A worker must not replay legacy writes, initialize empty diaries, or load
+    # inference clients merely because it is checking for durable backup work.
+    user_id = request.headers.get("X-Cowork-User-ID", "")
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", user_id):
+        raise HTTPException(400, "invalid tenant")
+    root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    if not (root / 'managed-diary.db').exists():
+        return {"mode": "legacy"}
+    managed = ManagedCorpusBackend(root, user_id)
+    storage = _request_storage(request)
+    if not managed.destination(storage) or not managed.active():
+        return managed.status(storage)
+    from .webdav import WebDAVCorpusBackend
+    remote = WebDAVCorpusBackend(storage.get('baseUrl', ''), storage.get('username', ''), storage.get('secret', ''), timeout_s=15)
+    try:
+        return managed.backup(remote, storage)
+    finally:
+        remote.close()
+
+
+@app.post("/api/storage-import")
+async def api_storage_import(request: Request):
+    if not check_auth(request):
+        raise HTTPException(401, "unauthorized")
+    body = await request.json()
+    if not isinstance(body, dict) or ("fingerprint" in body and not re.fullmatch(r"[0-9a-f]{64}", str(body["fingerprint"]))):
+        raise HTTPException(400, "Invalid import request")
+    st = await run_in_threadpool(_tenant_state, request)
+    def perform():
+        with st.store._write_lock, st.managed.migration_lock():
+            if st.managed.active():
+                raise HTTPException(409, "The app diary is already active. Reload to see it.")
+            if st.journal.pending_count():
+                raise HTTPException(409, "Finish pending diary writes before importing.")
+            try:
+                files, report = snapshot(st.backend, st.store.remote_root)
+                if body.get('fingerprint'):
+                    if body['fingerprint'] != report['fingerprint']:
+                        raise HTTPException(409, "Source files changed. Review a fresh import preview.")
+                    verified, second = snapshot(st.backend, st.store.remote_root)
+                    if second['fingerprint'] != report['fingerprint']:
+                        raise HTTPException(409, "Source files changed during verification. Try a fresh preview.")
+                    st.managed.activate(verified, corpus_settings(st.cfg), second['directories'])
+                    return {"imported": True, "fileCount": len(files)}
+                return report
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
+    return await run_in_threadpool(perform)
 
 
 @app.get("/api/health")

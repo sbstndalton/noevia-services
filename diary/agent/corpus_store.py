@@ -12,11 +12,13 @@ import re
 import uuid
 import threading
 from functools import wraps
+from contextlib import nullcontext
 
 def serialized(fn):
     @wraps(fn)
     def call(self, *args, **kwargs):
-        with self._write_lock:
+        guard = getattr(self.backend, "write_transaction", nullcontext)
+        with self._write_lock, guard():
             return fn(self, *args, **kwargs)
     return call
 

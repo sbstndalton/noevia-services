@@ -47,6 +47,16 @@ class LocalCorpusBackend:
             return None, None
         return data, self._version(data)
 
+    def get_bounded(self, path: str, limit: int):
+        try:
+            with self._path(path).open('rb') as source:
+                data = source.read(limit + 1)
+        except FileNotFoundError:
+            return None, None
+        if len(data) > limit:
+            raise ValueError('Import file exceeds its safety limit')
+        return data, self._version(data)
+
     def get_text(self, path: str) -> Tuple[Optional[str], Optional[str]]:
         data, version = self.get(path)
         return (None, None) if data is None else (data.decode("utf-8", errors="replace"), version)

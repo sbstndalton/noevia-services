@@ -62,7 +62,7 @@ def test_s3_storage_header_builds_s3_backend_and_lands_object(moto_s3, tenant_cf
                "username": "AKIAIOSFODNN7EXAMPLE", "secret": "secret-here", "corpusRoot": "tenant-a"}
     state = appmod._tenant_state(_tenant_request(user_id, storage))
 
-    assert isinstance(state.backend, S3CorpusBackend)
+    assert isinstance(state.backend.backend, S3CorpusBackend)
     assert state.backend.bucket == "tenant-bucket"
     assert state.backend.prefix == "tenant-a"
     assert moto_s3.split("//", 1)[1] in state.backend.base
@@ -80,7 +80,7 @@ def test_s3_storage_header_builds_s3_backend_and_lands_object(moto_s3, tenant_cf
 
 
 def test_local_fallback_when_no_storage_header(moto_s3, tenant_cfg):
-    from agent.local_storage import LocalCorpusBackend
+    from agent.managed_storage import ManagedCorpusBackend
 
     state = appmod._tenant_state(_tenant_request(str(uuid.uuid4()), None))
-    assert isinstance(state.backend, LocalCorpusBackend)
+    assert isinstance(state.backend, ManagedCorpusBackend)

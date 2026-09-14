@@ -80,6 +80,20 @@ class WebDAVCorpusBackend:
         self._lm_cache[remote_path] = resp.headers.get("Last-Modified")
         return resp.content, etag
 
+    def get_bounded(self, remote_path: str, limit: int):
+        """Stream import bytes with a strict decoded-size budget."""
+        with self._client.stream('GET', self._url(remote_path), headers={'Accept': '*/*'}) as resp:
+            if resp.status_code == 404:
+                return None, None
+            self._ensure_not_redirect(resp)
+            resp.raise_for_status()
+            data = bytearray()
+            for chunk in resp.iter_bytes(65536):
+                if len(data) + len(chunk) > limit:
+                    raise ValueError('Import file exceeds its safety limit')
+                data.extend(chunk)
+            return bytes(data), clean_etag(resp.headers.get('ETag'))
+
     def get_text(self, remote_path: str) -> Tuple[Optional[str], Optional[str]]:
         data, etag = self.get(remote_path)
         if data is None:
@@ -165,41 +179,41 @@ class WebDAVCorpusBackend:
             return []
         self._ensure_not_redirect(resp)
         resp.raise_for_status()
-        body = resp.text
-        entries: list = []
-        # Lightweight XML extraction for the flat Depth-1 response shape.
-        for m in re.finditer(r"<d:response>(.*?)</d:response>", body, re.S | re.I):
-            block = m.group(1)
-            href_m = re.search(r"<d:href>(.*?)</d:href>", block, re.S | re.I)
-            if not href_m:
-                continue
-            href = href_m.group(1)
+        from xml.etree import ElementTree as ET
+        try:
+            tree = ET.fromstring(resp.text)
+        except ET.ParseError as exc:
+            raise ValueError("Invalid WebDAV directory response") from exc
+        if tree.tag != '{DAV:}multistatus':
+            raise ValueError("Invalid WebDAV directory response")
+        entries = []
+        for response in tree.findall('{DAV:}response'):
+            href = response.findtext('{DAV:}href')
+            if not href:
+                raise ValueError("WebDAV directory response omitted a path")
             href_path = unquote(urlparse(href).path)
             if not href_path.startswith(self.base_path):
+                raise ValueError("WebDAV directory response escaped its root")
+            path = href_path[len(self.base_path):].rstrip('/')
+            if path == remote_dir.strip('/'):
                 continue
-            path = href_path[len(self.base_path):]
-            name = path.rstrip("/").rsplit("/", 1)[-1]
-            if not name:
-                continue
-            # keep only direct children of the requested dir
-            parent = path.rstrip("/")
-            parent_dir = parent.rsplit("/", 1)[0] if "/" in parent else ""
-            if parent_dir != remote_dir.strip("/"):
-                continue
-            # Case-insensitive, consistent with the rest of the XML parsing.
-            is_dir = re.search(r"<d:collection\s*/?>", block, re.I) is not None
-            etag_m = re.search(r"<d:getetag[^>]*>(&quot;)?([^<&]*)", block, re.I)
-            etag = etag_m.group(2) if etag_m else None
-            lm_m = re.search(r"<d:getlastmodified>(.*?)</d:getlastmodified>", block, re.S | re.I)
-            entries.append(
-                {
-                    "name": name,
-                    "path": path.rstrip("/") if is_dir else path,
-                    "etag": etag,
-                    "lastmod": lm_m.group(1) if lm_m else None,
-                    "is_dir": is_dir,
-                }
-            )
+            parent = path.rsplit('/', 1)[0] if '/' in path else ''
+            if parent != remote_dir.strip('/'):
+                raise ValueError("WebDAV directory response contained an unrelated path")
+            props = None
+            for propstat in response.findall('{DAV:}propstat'):
+                if ' 200 ' in (propstat.findtext('{DAV:}status') or ''):
+                    props = propstat.find('{DAV:}prop')
+                    break
+            if props is None:
+                raise ValueError("WebDAV directory properties could not be read")
+            resource = props.find('{DAV:}resourcetype')
+            entries.append({
+                'name': path.rsplit('/', 1)[-1], 'path': path,
+                'is_dir': resource is not None and resource.find('{DAV:}collection') is not None,
+                'etag': clean_etag(props.findtext('{DAV:}getetag')),
+                'lastmod': props.findtext('{DAV:}getlastmodified'),
+            })
         return entries
 
     def close(self) -> None:

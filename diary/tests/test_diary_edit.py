@@ -244,7 +244,7 @@ def client(tmp_path, monkeypatch):
     appmod._tenant_states.clear()
     _FakeRetriever.calls = []
 
-    def patched_init(self, cfg_inner):
+    def patched_init(self, cfg_inner, backend=None):
         from pathlib import Path as _P
 
         self.cfg = cfg_inner

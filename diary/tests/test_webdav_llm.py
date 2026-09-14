@@ -96,8 +96,8 @@ def test_list_dir_uses_generic_webdav_base_path(monkeypatch):
         status_code = 207
         text = """<?xml version="1.0"?>
         <d:multistatus xmlns:d="DAV:">
-          <d:response><d:href>/dav/user/Notes/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
-          <d:response><d:href>/dav/user/Notes/2026-09.md</d:href><d:propstat><d:prop><d:getetag>\"abc\"</d:getetag><d:getlastmodified>now</d:getlastmodified><d:resourcetype/></d:prop></d:propstat></d:response>
+          <d:response><d:href>/dav/user/Notes/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+          <d:response><d:href>/dav/user/Notes/2026-09.md</d:href><d:propstat><d:prop><d:getetag>\"abc\"</d:getetag><d:getlastmodified>now</d:getlastmodified><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
         </d:multistatus>"""
 
         def raise_for_status(self):
