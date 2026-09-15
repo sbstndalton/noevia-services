@@ -118,7 +118,7 @@ async def models() -> dict:
 
 
 def _find_entry(key: str) -> services.GgufEntry:
-    if ".." in key or key.startswith("/") or key.count("/") > 1:
+    if ".." in key or key.startswith("/") or key.count("/") > 4:
         raise HTTPException(400, "bad model key")
     snap = services.snapshot_models_dir()
     for g in snap.ggufs:
@@ -252,7 +252,7 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
     rec = autoconfig.analyze(summary=summary, file_size=file_size, backends=_backend_list(),
                              model_rel=model_rel, current_section=ini.get_section(name), preset=preset,
                              n_sessions=sessions, models_dir=settings.models_dir, section_name=name,
-                             model_subdir=rel.split("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec,
+                             model_subdir=rel.rsplit("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec,
                              vision=vision)
     return {"section": name, "arch": summary.get("arch"), "params": (summary.get("general") or {}).get("params"),
             "fileBytes": file_size, "model": model_rel or rel or f"{name}.gguf",

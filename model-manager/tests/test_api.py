@@ -83,3 +83,31 @@ def test_model_keys_cannot_escape_the_models_dir(client):
     assert client.get("/api/v1/models/detail?key=../etc").status_code == 400
     assert client.get("/api/v1/models/detail?key=tiny/tiny-Q4_K_M.gguf").json()["summary"]["arch"] == "llama"
     assert client.post("/api/v1/models/delete", json={"models": ["../x"]}).json()["results"][0]["ok"] is False
+
+
+def test_hugging_face_cache_layout_is_listed_configured_and_deleted(client):
+    import os
+    from conftest import _gguf
+    repo = ROOT / "models" / "models--acme--cache-GGUF"
+    snap = repo / "snapshots" / "abc123"
+    (repo / "blobs").mkdir(parents=True)
+    snap.mkdir(parents=True)
+    (repo / "refs").mkdir()
+    blob = repo / "blobs" / "sha-model"
+    blob.write_bytes(_gguf({"general.architecture": "llama", "llama.context_length": 4096, "llama.embedding_length": 256,
+                            "llama.block_count": 2, "llama.attention.head_count": 4, "llama.attention.head_count_kv": 2,
+                            "tokenizer.chat_template": "x"}) + b"\0" * 2048)
+    (repo / "blobs" / "sha-proj").write_bytes(b"GGUF" + b"\0" * 64)
+    os.symlink("../../blobs/sha-model", snap / "cache-Q4_K_M.gguf")
+    os.symlink("../../blobs/sha-proj", snap / "mmproj-F16.gguf")
+    listed = client.get("/api/v1/models").json()
+    entry = next(m for m in listed["models"] if m["name"] == "cache-Q4_K_M.gguf")
+    assert entry["subdir"] == "models--acme--cache-GGUF/snapshots/abc123" and entry["projector"]["name"] == "mmproj-F16.gguf"
+    assert "cache-Q4_K_M" in listed["unregistered"]
+    defaults = client.get("/api/v1/sections/cache-Q4_K_M?defaults=true").json()
+    assert defaults["values"]["model"] == "/models/models--acme--cache-GGUF/snapshots/abc123/cache-Q4_K_M.gguf"
+    assert defaults["values"]["mmproj"] == "/models/models--acme--cache-GGUF/snapshots/abc123/mmproj-F16.gguf"
+    assert client.get(f"/api/v1/models/detail?key={entry['key']}").json()["summary"]["arch"] == "llama"
+    result = client.post("/api/v1/models/delete", json={"models": [entry["key"]]}).json()["results"][0]
+    assert result["ok"] and result["freed"] >= 2048
+    assert not repo.exists()

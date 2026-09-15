@@ -329,14 +329,14 @@ async def model_local_detail(request: Request, filename: str) -> HTMLResponse:
     from datetime import datetime, timezone
     from fastapi import HTTPException
 
-    if ".." in filename or filename.startswith("/") or filename.count("/") > 1:
+    if ".." in filename or filename.startswith("/") or filename.count("/") > 4:
         raise HTTPException(status_code=400, detail="bad filename")
 
     # Resolve: filename may be "flat.gguf" OR "subdir/flat.gguf" OR "subdir" (routes to first shard).
     snap = services.snapshot_models_dir()
     entry = None
     if "/" in filename:
-        sub, base = filename.split("/", 1)
+        sub, base = filename.rsplit("/", 1)
         entry = next((g for g in snap.ggufs if g.subdir == sub and g.display_name == base), None)
     else:
         entry = next((g for g in snap.ggufs if g.display_name == filename and g.subdir == ""), None)
@@ -919,7 +919,7 @@ def _resolve_section_gguf(name: str) -> tuple[Path | None, str, str | None]:
         return settings.models_dir / rel, (explicit if "/" in rel else ""), rel
 
     if rel is not None and "/" in rel:
-        subdir_name = rel.split("/", 1)[0]
+        subdir_name = rel.rsplit("/", 1)[0]
         subdir_path = settings.models_dir / subdir_name
         if subdir_path.is_dir():
             # Prefer non-mmproj as the main GGUF (mmproj is the companion multimodal projector)
@@ -952,7 +952,7 @@ def _gguf_hints_for(name: str) -> tuple[dict[str, str], list[str]]:
         try:
             for p in Path(str(subdir_path).replace("/models", str(settings.models_dir), 1)).iterdir():
                 if p.is_file() and p.suffix.lower() == ".gguf" and "mmproj" in p.name.lower():
-                    values["mmproj"] = f"/models/{Path(model_rel).parts[-2]}/{p.name}"
+                    values["mmproj"] = f"{Path(model_rel).parent.as_posix()}/{p.name}"
                     hints.insert(0, f"Companion mmproj found → `mmproj = {values['mmproj']}` pre-filled.")
                     break
         except OSError:
@@ -1104,7 +1104,7 @@ def _predicted_vram_gb(section: str) -> float | None:
         backends = _backend_list()
         if not backends:
             return None
-        subdir = rel.split("/", 1)[0] if rel and "/" in rel else ""
+        subdir = rel.rsplit("/", 1)[0] if rel and "/" in rel else ""
         vals = ini.get_section(section) or {}
         rec = autoconfig.analyze(
             summary=summary, file_size=gguf_path.stat().st_size, backends=backends,
@@ -1175,7 +1175,7 @@ async def config_autoconfig(request: Request, name: str, preset: str = "",
     # Detect subdir (if the resolved rel had one)
     model_subdir = ""
     if rel and "/" in rel:
-        model_subdir = rel.split("/", 1)[0]
+        model_subdir = rel.rsplit("/", 1)[0]
 
     # Fold in whatever llama-server has logged since the last look. Rate-limited internally and
     # wrapped so a log-format change or a docker hiccup costs the panel its measurements rather

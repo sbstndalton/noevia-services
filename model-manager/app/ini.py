@@ -411,25 +411,13 @@ def _stems_present() -> dict[str, str]:
     root = settings.models_dir
     from .utils import shard_key as _sk
     try:
-        for p in root.iterdir():
-            if p.is_file() and p.suffix.lower() == ".gguf":
-                if _is_companion(p.name):
-                    continue
-                base, _, _ = _sk(p.name)
-                stem = base[:-5] if base.lower().endswith(".gguf") else base
-                out[stem] = base
-            elif p.is_dir() and not p.name.startswith("."):
-                try:
-                    kids = list(p.iterdir())
-                except OSError:
-                    continue
-                for sp in kids:
-                    if sp.is_file() and sp.suffix.lower() == ".gguf":
-                        if _is_companion(sp.name):
-                            continue
-                        base, _, _ = _sk(sp.name)
-                        stem = base[:-5] if base.lower().endswith(".gguf") else base
-                        out[stem] = f"{p.name}/{base}"
+        from .utils import iter_gguf
+        for reldir, p in iter_gguf(root):
+            if _is_companion(p.name):
+                continue
+            base, _, _ = _sk(p.name)
+            stem = base[:-5] if base.lower().endswith(".gguf") else base
+            out[stem] = f"{reldir}/{p.name}" if reldir else p.name
     except OSError:
         pass
     return out

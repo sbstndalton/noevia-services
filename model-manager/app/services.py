@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import re
 import shutil
 import threading
 from dataclasses import dataclass, field
@@ -195,19 +196,10 @@ def snapshot_models_dir() -> ModelsDirSnapshot:
     # Key = (subdir, shard_base). subdir="" for flat.
     groups: dict[tuple[str, str], list[Path]] = {}
     try:
-        for p in path.iterdir():
-            if p.is_file() and p.suffix.lower() == ".gguf":
-                base, _, _ = shard_key(p.name)
-                groups.setdefault(("", base), []).append(p)
-            elif p.is_dir() and not p.name.startswith("."):
-                try:
-                    subparts = list(p.iterdir())
-                except OSError:
-                    continue
-                for sp in subparts:
-                    if sp.is_file() and sp.suffix.lower() == ".gguf":
-                        base, _, _ = shard_key(sp.name)
-                        groups.setdefault((p.name, base), []).append(sp)
+        from .utils import iter_gguf
+        for reldir, p in iter_gguf(path):
+            base, _, _ = shard_key(p.name)
+            groups.setdefault((reldir, base), []).append(p)
     except OSError as e:
         snap.error = f"listing failed: {e}"
         return snap
@@ -293,6 +285,9 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
     #
     # Guarded on there being no OTHER main GGUF present, so a directory someone has put two
     # models into degrades to per-file deletion rather than taking the neighbour with it.
+    hf = re.match(r"^(models--[^/]+)/snapshots/[^/]+$", match.subdir or "")
+    if hf:
+        return _delete_hf_snapshot(match, hf.group(1))
     if match.subdir:
         subpath = settings.models_dir / match.subdir
         own = {p.resolve() for p in list(match.parts) + list(match.companion_parts)}
@@ -333,6 +328,51 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
                 subpath.rmdir()
         except OSError:
             pass
+    return True, f"deleted {len(removed)} file(s)", freed
+
+
+def _delete_hf_snapshot(match: "GgufEntry", repo_dir: str) -> tuple[bool, str, int]:
+    """Delete a model stored in Hugging Face's cache layout.
+
+    Snapshot files are links into blobs/, so removing the link alone frees nothing. Remove
+    this model's files and the blobs they point to (unless another snapshot still uses a
+    blob), and the whole repository folder once no snapshot is left.
+    """
+    root = settings.models_dir
+    snapshot = root / match.subdir
+    repo = root / repo_dir
+    own = list(match.parts) + list(match.companion_parts)
+    try:
+        others = [q for q in snapshot.iterdir() if q.suffix.lower() == ".gguf" and not ini._is_companion(q.name) and q not in own]
+    except OSError:
+        others = []
+    victims = own if others else [q for q in snapshot.iterdir() if q.is_file() or q.is_symlink()]
+    in_use: set[Path] = set()
+    for snap_dir in (repo / "snapshots").iterdir() if (repo / "snapshots").is_dir() else []:
+        if snap_dir == snapshot:
+            continue
+        for q in snap_dir.rglob("*"):
+            if q.is_symlink():
+                in_use.add(q.resolve())
+    freed, removed = 0, []
+    try:
+        for q in victims:
+            target = q.resolve()
+            if target.is_file() and target not in in_use and target != q:
+                freed += target.stat().st_size
+                target.unlink()
+            elif q.is_file() and not q.is_symlink():
+                freed += q.stat().st_size
+            q.unlink()
+            removed.append(q.name)
+        if snapshot.is_dir() and not any(snapshot.iterdir()):
+            snapshot.rmdir()
+        snaps = repo / "snapshots"
+        if not snaps.is_dir() or not any(snaps.iterdir()):
+            shutil.rmtree(repo)
+            return True, f"deleted {len(removed)} file(s), removed {repo_dir}/", freed
+    except OSError as e:
+        return False, f"failed while deleting {match.display_name}: {e}", freed
     return True, f"deleted {len(removed)} file(s)", freed
 
 
