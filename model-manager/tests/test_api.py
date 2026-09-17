@@ -111,3 +111,41 @@ def test_hugging_face_cache_layout_is_listed_configured_and_deleted(client):
     result = client.post("/api/v1/models/delete", json={"models": [entry["key"]]}).json()["results"][0]
     assert result["ok"] and result["freed"] >= 2048
     assert not repo.exists()
+
+
+def _fresh_download(stem: str, ctx: int, head: bool = False) -> None:
+    from conftest import _gguf
+    folder = ROOT / "models" / stem
+    folder.mkdir(exist_ok=True)
+    (folder / f"{stem}-Q4_K_M.gguf").write_bytes(_gguf({
+        "general.architecture": "llama", "llama.context_length": ctx, "llama.embedding_length": 256,
+        "llama.block_count": 4, "llama.attention.head_count": 4, "llama.attention.head_count_kv": 2,
+        "tokenizer.chat_template": "{{ messages }}"}) + b"\0" * 4096)
+    if head:
+        (folder / f"{stem}-mtp-Q8_0.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+
+
+def test_safe_defaults_register_once_with_capped_context_and_detected_mtp(client):
+    _fresh_download("big", 131072, head=True)
+    r = client.post("/api/v1/sections/big-Q4_K_M/safe-defaults")
+    assert r.status_code == 200, r.text
+    section = r.json()["section"]
+    assert section["ctx-size"] == "8192" and section["jinja"] == "true"
+    assert section["spec-type"] == "draft-mtp" and section["spec-draft-model"].endswith("big-mtp-Q8_0.gguf")
+    assert not any(k in section for k in ("temp", "top-k", "top-p", "min-p"))
+    assert client.post("/api/v1/sections/big-Q4_K_M/safe-defaults").status_code == 409
+
+
+def test_safe_defaults_keep_small_context_and_skip_mtp_without_a_head(client):
+    _fresh_download("small", 2048)
+    section = client.post("/api/v1/sections/small-Q4_K_M/safe-defaults").json()["section"]
+    assert section["ctx-size"] == "2048" and "spec-type" not in section
+
+
+def test_safe_defaults_never_touch_existing_or_unrelated_files(client):
+    before = (ROOT / "models" / "models.ini").read_text()
+    assert client.post("/api/v1/sections/tiny/safe-defaults").status_code == 409
+    assert client.post("/api/v1/sections/tiny-Q4_K_M/safe-defaults").status_code == 409
+    assert client.post("/api/v1/sections/absent/safe-defaults").status_code == 404
+    assert client.post("/api/v1/sections/big-mtp-Q8_0/safe-defaults").status_code == 400
+    assert (ROOT / "models" / "models.ini").read_text() == before

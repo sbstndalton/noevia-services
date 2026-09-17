@@ -204,6 +204,47 @@ def save_section(name: str, body: dict = Body(...)) -> dict:
     return {"ok": True, "revision": revision(), "section": ini.get_section(name)}
 
 
+SAFE_DEFAULT_CTX = 8192
+
+
+@router.post("/sections/{name}/safe-defaults")
+def register_safe_defaults(name: str) -> dict:
+    """Register a freshly downloaded GGUF with conservative settings, once.
+
+    8k context (or less if the model is smaller), draft-mtp only when a draft head sits
+    beside the model, `jinja` so the GGUF's own chat template is used, and no sampler keys,
+    so the model's own sampling metadata stays in charge. Never overwrites: an existing
+    section, or a file another section already points at, is left to the operator.
+    """
+    if not ini.valid_section_name(name):
+        raise HTTPException(400, "invalid section name")
+    if autoconfig._looks_like_draft(f"{name}.gguf") or "mmproj" in name.lower():
+        raise HTTPException(400, "draft heads and projectors are not registered on their own")
+    if ini.get_section(name) is not None:
+        raise HTTPException(409, "settings already exist for this model")
+    gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    if gguf_path is None or rel is None:
+        raise HTTPException(404, "no downloaded GGUF matches this name")
+    if rel in ini._files_claimed_by_sections():
+        raise HTTPException(409, "another settings section already uses this file")
+    from .main import _gguf_hints_for
+    values, _hints = _gguf_hints_for(name)
+    if not values.get("model"):
+        values["model"] = f"/models/{rel}"
+    try:
+        native = int(values.get("ctx-size") or 0)
+    except ValueError:
+        native = 0
+    values["ctx-size"] = str(min(native, SAFE_DEFAULT_CTX) if native > 0 else SAFE_DEFAULT_CTX)
+    subdir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    head = autoconfig._find_mtp(settings.models_dir, name, subdir)
+    if head:
+        values["spec-type"] = "draft-mtp"
+        values["spec-draft-model"] = head
+    ini.upsert_section(name, values, "")
+    return {"ok": True, "revision": revision(), "section": ini.get_section(name), "mtp": bool(head)}
+
+
 @router.post("/sections/{name}/rename")
 def rename_section(name: str, body: dict = Body(...)) -> dict:
     new = str(body.get("newName") or "").strip()
