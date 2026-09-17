@@ -64,7 +64,9 @@ def test_autoconfig_without_a_gpu_backend_explains_itself(client):
 
 
 def test_overview_reports_models_folder_disk_space(client):
-    disk = client.get("/api/v1/overview").json()["modelsDir"]["disk"]
+    models_dir = client.get("/api/v1/overview").json()["modelsDir"]
+    assert models_dir["hostPath"] is None
+    disk = models_dir["disk"]
     assert disk["free"] > 0 and disk["total"] >= disk["free"] and disk["freeH"]
 
 
@@ -177,3 +179,18 @@ def test_engine_log_lines_are_scrubbed_before_leaving_the_server(client, monkeyp
     # Filtering on a secret's value must not reveal that the line held it.
     assert client.get("/api/v1/backends/cowork-llama-1/logs?q=hunter2").json()["lines"] == []
     assert api.redact_log_line("token: abc123xyz") == "token: [redacted]"
+
+
+def test_download_targets_are_limited_to_declared_folders_inside_models(client, monkeypatch):
+    from app.config import settings
+    (ROOT / "models" / "archive").mkdir(exist_ok=True)
+    monkeypatch.setattr(settings, "model_download_targets", "archive,missing,../etc,.hidden")
+    targets = client.get("/api/v1/download-targets").json()["targets"]
+    assert [t["id"] for t in targets] == ["", "archive"]
+    queued = []
+    from app import api
+    monkeypatch.setattr(api.manager, "enqueue_url", lambda **kw: queued.append(kw["filename"]))
+    assert client.post("/api/v1/downloads", json={"url": "https://example.invalid/x.gguf", "target": "archive"}).status_code == 200
+    assert queued == ["archive/x/x.gguf"]
+    for bad in ("missing", "../etc", "/abs", "tiny"):
+        assert client.post("/api/v1/downloads", json={"url": "https://example.invalid/x.gguf", "target": bad}).status_code == 400

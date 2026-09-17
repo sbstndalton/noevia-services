@@ -97,7 +97,7 @@ async def overview() -> dict:
     snap = services.snapshot_models_dir()
     backends = await services.snapshot_llama_backends()
     return {
-        "modelsDir": {"path": str(snap.path), "exists": snap.exists, "error": snap.error,
+        "modelsDir": {"path": str(snap.path), "hostPath": settings.models_host_path or None, "exists": snap.exists, "error": snap.error,
                       "disk": {"total": snap.disk.total, "free": snap.disk.free, "usedPct": snap.disk.used_pct,
                                "totalH": snap.disk.total_h, "freeH": snap.disk.free_h} if snap.disk else None},
         "models": sum(1 for g in snap.ggufs if not g.is_companion),
@@ -510,12 +510,42 @@ def downloads() -> dict:
     return {"jobs": [_job(j) for j in manager.snapshot()]}
 
 
+def download_targets() -> list[dict]:
+    """Where downloads may land: the models folder itself, plus declared or mounted
+    folders directly inside it (the engine reads the whole tree, four levels deep)."""
+    import os
+    root = settings.models_dir
+    out = [{"id": "", "label": "Models folder", "path": str(root)}]
+    names = {n.strip() for n in settings.model_download_targets.split(",") if n.strip()}
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir(follow_symlinks=False) and os.path.ismount(entry.path):
+                names.add(entry.name)
+    except OSError:
+        pass
+    for name in sorted(names):
+        path = root / name
+        if "/" in name or name.startswith(".") or not path.is_dir() or path.is_symlink():
+            continue
+        out.append({"id": name, "label": name, "path": str(path)})
+    return out
+
+
+@router.get("/download-targets")
+def list_download_targets() -> dict:
+    return {"targets": download_targets()}
+
+
 @router.post("/downloads")
 async def start_download(body: dict = Body(...)) -> dict:
     import httpx
     from . import hf
     from .main import _dest_for_companion, _dest_for_main, _model_stem
     repo, path, url = str(body.get("repo") or ""), str(body.get("path") or ""), str(body.get("url") or "").strip()
+    target = str(body.get("target") or "")
+    if target not in {t["id"] for t in download_targets()}:
+        raise HTTPException(400, "Choose one of the offered download locations")
+    prefix = f"{target}/" if target else ""
     queued: list[str] = []
     if url:
         if not url.startswith(("https://", "http://")):
@@ -531,7 +561,7 @@ async def start_download(body: dict = Body(...)) -> dict:
                 total = int(r.headers.get("content-length") or 0) if r.status_code < 400 else 0
         except httpx.HTTPError:
             pass
-        manager.enqueue_url(url=url, filename=f"{_model_stem(name)}/{name}", total_bytes=total)
+        manager.enqueue_url(url=url, filename=prefix + f"{_model_stem(name)}/{name}", total_bytes=total)
         return {"queued": [name]}
     if not repo or "/" not in repo:
         raise HTTPException(400, "Choose a Hugging Face repository")
@@ -541,7 +571,7 @@ async def start_download(body: dict = Body(...)) -> dict:
         subdir = Path(shard_base).stem
         for f in detail.files:
             if f.shard_base == shard_base:
-                manager.enqueue(repo_id=repo, hf_path=f.path, filename=f"{subdir}/{Path(f.path).name}", total_bytes=f.size)
+                manager.enqueue(repo_id=repo, hf_path=f.path, filename=prefix + f"{subdir}/{Path(f.path).name}", total_bytes=f.size)
                 queued.append(f.path)
         main_stem = subdir
     else:
@@ -550,20 +580,20 @@ async def start_download(body: dict = Body(...)) -> dict:
             raise HTTPException(404, "That file is not in the repository")
         base = Path(path).name
         if "mmproj" in base.lower():
-            manager.enqueue(repo_id=repo, hf_path=path, filename=f"{_model_stem(base)}/{base}", total_bytes=match.size)
+            manager.enqueue(repo_id=repo, hf_path=path, filename=prefix + f"{_model_stem(base)}/{base}", total_bytes=match.size)
             return {"queued": [path]}
         main_stem, filename = _dest_for_main(base)
-        manager.enqueue(repo_id=repo, hf_path=path, filename=filename, total_bytes=match.size)
+        manager.enqueue(repo_id=repo, hf_path=path, filename=prefix + filename, total_bytes=match.size)
         queued.append(path)
     # Companions from the same repo: its vision projector(s) and the smallest draft head.
     for f in [f for f in detail.files if "mmproj" in Path(f.path).name.lower()][:4]:
-        manager.enqueue(repo_id=repo, hf_path=f.path, filename=_dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size)
+        manager.enqueue(repo_id=repo, hf_path=f.path, filename=prefix + _dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size)
         queued.append(f.path)
     heads = [f for f in detail.files if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
              and autoconfig._looks_like_draft(Path(f.path).name)]
     if heads and not shard_base:
         head = min(heads, key=lambda f: f.size or 0)
-        manager.enqueue(repo_id=repo, hf_path=head.path, filename=_dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size)
+        manager.enqueue(repo_id=repo, hf_path=head.path, filename=prefix + _dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size)
         queued.append(head.path)
     return {"queued": queued}
 
