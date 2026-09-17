@@ -373,19 +373,23 @@ async def put_settings(body: dict = Body(...)) -> dict:
 
 @router.get("/search")
 async def search(q: str = "", sort: str = "downloads", limit: int = 30) -> dict:
-    import httpx
     from . import hf
     from .main import _downloaded_and_still_present
     try:
         results = await hf.search_models(q.strip(), sort=sort, limit=max(1, min(int(limit or 30), 60)))
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Hugging Face returned HTTP {e.response.status_code}", "results": []}
-    except httpx.HTTPError as e:
-        return {"error": f"Network error: {e}", "results": []}
+    except hf.HfSearchError as e:
+        return {"error": str(e), "results": []}
     owners = [(m.id.split("/", 1)[0] if "/" in m.id else m.id) for m in results]
-    avatars = await hf.owner_avatars(owners)
+    # Avatars are decoration, and this endpoint's caller (noevia's Download tab) does not even
+    # render them. A hub hiccup or a cache write failure here must never turn a good search
+    # into an error page.
+    try:
+        avatars = await hf.owner_avatars(owners)
+    except Exception:  # noqa: BLE001
+        avatars = {}
     have = _downloaded_and_still_present()
-    return {"results": [{**_plain(m), "owner": o, "avatar": avatars.get(o, ""), "downloaded": have.get(m.id, [])}
+    return {"query": q.strip(), "sort": sort,
+            "results": [{**_plain(m), "owner": o, "avatar": avatars.get(o, ""), "downloaded": have.get(m.id, [])}
                         for m, o in zip(results, owners)]}
 
 
