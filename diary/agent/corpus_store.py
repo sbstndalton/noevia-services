@@ -144,13 +144,36 @@ class CorpusStore:
                 day_number = int(match.group(1))
                 if 1 <= day_number <= calendar.monthrange(year, month)[1]:
                     dated.append((day_number, entry.get("path") or self.daily_path(date(year, month, day_number))))
-            for _, path in sorted(dated):
-                text, _ = self.backend.get_text(path)
+            texts = self._read_many([path for _, path in sorted(dated)])
+            for text in texts:
+                if isinstance(text, Exception):
+                    raise text
                 if text:
                     parts.append((text if include_xids else fmt.strip_markers(text)).strip())
         except Exception as exc:  # noqa: BLE001
             log.warning("daily month read failed (degrading to partial/empty): %s", exc)
         return "\n\n".join(part for part in parts if part)
+
+    def _read_many(self, paths: List[str]) -> list:
+        """Read files in order. Remote backends that declare concurrent_reads fetch
+        several at once: a month of daily files was up to 31 sequential round trips.
+        A failed read is returned in place so callers keep their partial-read policy."""
+        def one(path):
+            try:
+                return self.backend.get_text(path)[0]
+            except Exception as exc:  # noqa: BLE001
+                return exc
+        workers = int(getattr(self.backend, "concurrent_reads", 0) or 0)
+        if workers <= 1 or len(paths) <= 1:
+            out = []
+            for path in paths:
+                out.append(one(path))
+                if isinstance(out[-1], Exception):
+                    break
+            return out
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as pool:
+            return list(pool.map(one, paths))
 
     def list_months(self) -> List[dict]:
         """Months that actually have a corpus file, oldest first.

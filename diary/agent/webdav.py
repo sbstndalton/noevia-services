@@ -38,6 +38,9 @@ def clean_etag(etag: Optional[str]) -> Optional[str]:
 
 
 class WebDAVCorpusBackend:
+    # httpx.Client is thread-safe; the corpus store may fetch a month's daily files together.
+    concurrent_reads = 6
+
     def __init__(self, base_url: str, username: str, password: str, timeout_s: float = 60.0):
         self.base_url = base_url.rstrip("/") + "/"
         self.base_path = unquote(urlparse(self.base_url).path).rstrip("/") + "/"
