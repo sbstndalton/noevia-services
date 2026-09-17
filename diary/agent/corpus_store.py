@@ -310,9 +310,19 @@ class CorpusStore:
         me_text: str,
         claude_text: str,
         now: Optional[datetime] = None,
+        xid: Optional[str] = None,
     ) -> str:
-        """Durably record the intent to log an exchange, then apply it. Returns the xid."""
-        xid = str(uuid.uuid4())
+        """Durably record the intent to log an exchange, then apply it. Returns the xid.
+
+        A caller-chosen ``xid`` makes a retried request idempotent: the applier skips a document
+        that already carries the marker, so a replay never logs the text twice.
+        """
+        if xid is None:
+            xid = str(uuid.uuid4())
+        else:
+            existing, _ = self.backend.get_text(self.document_path(day))
+            if existing is not None and fmt.has_marker(existing, xid):
+                return xid
         body = fmt.render_exchange(me_text, claude_text, xid)
         rendered_header = fmt.render_subsection_header(now=now, topic=sub_header)
         # store the header TEXT (no '### ' prefix) — the appender adds the prefix
