@@ -44,37 +44,96 @@ class HfModel:
     gguf_count: int | None  # None if unknown from search response
 
 
-async def search_models(query: str, limit: int = 30, sort: str = "downloads") -> list[HfModel]:
-    """Search HF hub for models tagged gguf. sort: downloads|likes|lastModified|trendingScore.
-    Empty query is valid — returns the top N gguf models under the given sort (browse mode)."""
-    params: dict[str, str] = {
-        "filter": "gguf",
-        "limit": str(limit),
-        "sort": sort,
-        "direction": "-1",
-        "full": "true",
-    }
-    if query:
-        params["search"] = query
-    async with httpx.AsyncClient(timeout=20.0, headers=_auth_headers()) as client:
-        r = await client.get(f"{HF_API}/models", params=params)
-        r.raise_for_status()
-        data = r.json()
+SEARCH_TIMEOUT_S = 45.0
 
-    out: list[HfModel] = []
-    for item in data:
-        siblings = item.get("siblings") or []
-        gguf_count = sum(1 for s in siblings if str(s.get("rfilename", "")).lower().endswith(".gguf")) if siblings else None
-        out.append(HfModel(
-            id=item.get("id") or item.get("modelId") or "",
-            downloads=int(item.get("downloads") or 0),
-            likes=int(item.get("likes") or 0),
-            last_modified=str(item.get("lastModified") or ""),
-            pipeline_tag=item.get("pipeline_tag"),
-            tags=list(item.get("tags") or []),
-            gguf_count=gguf_count,
-        ))
-    return out
+# Sorts the hub understands. Anything else makes it fall back to relevance order, which is
+# indistinguishable from "the sort silently did nothing", so an unknown value is normalised.
+SEARCH_SORTS = ("downloads", "likes", "lastModified", "trendingScore")
+
+
+class HfSearchError(RuntimeError):
+    """Search could not be completed upstream. The message is safe to show a user."""
+
+
+def _model_from_item(item: dict[str, Any]) -> HfModel:
+    siblings = item.get("siblings") or []
+    gguf_count = (sum(1 for s in siblings if str(s.get("rfilename", "")).lower().endswith(".gguf"))
+                  if siblings else None)
+    return HfModel(
+        id=item.get("id") or item.get("modelId") or "",
+        downloads=int(item.get("downloads") or 0),
+        likes=int(item.get("likes") or 0),
+        last_modified=str(item.get("lastModified") or ""),
+        pipeline_tag=item.get("pipeline_tag"),
+        tags=[str(t) for t in (item.get("tags") or [])],
+        gguf_count=gguf_count,
+    )
+
+
+def looks_like_gguf(model: HfModel) -> bool:
+    """A repo the untagged fallback should keep. Deliberately generous: the repo page that
+    opens next lists the actual files, so a false positive costs one click, while a false
+    negative hides a model the user asked for by name."""
+    if any(t.lower() == "gguf" or t.lower().startswith("gguf") for t in model.tags):
+        return True
+    return "gguf" in model.id.lower()
+
+
+async def _get_models(client: httpx.AsyncClient, params: dict[str, str]) -> list[dict[str, Any]]:
+    r = await client.get(f"{HF_API}/models", params=params)
+    if r.status_code >= 400:
+        # The bare status told the user nothing actionable. 401/403 means the saved token is
+        # wrong, 429 means rate limiting (which a token fixes), and those need different fixes.
+        detail = r.text.strip()[:200]
+        hint = {401: " Check the Hugging Face token.", 403: " Check the Hugging Face token.",
+                429: " Hugging Face is rate limiting this server; add a token to raise the limit."}
+        raise HfSearchError(f"Hugging Face returned HTTP {r.status_code}."
+                            f"{hint.get(r.status_code, '')}{(' ' + detail) if detail else ''}")
+    data = r.json()
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+
+async def search_models(query: str, limit: int = 30, sort: str = "downloads") -> list[HfModel]:
+    """Search the HF hub for GGUF models. sort: downloads|likes|lastModified|trendingScore.
+    Empty query is valid — returns the top N GGUF models under the given sort (browse mode).
+
+    Two things this deliberately does NOT do any more, because both produced the same
+    user-visible symptom of an empty results list:
+
+    - It does not ask for `full=true`. That was only ever used to fill in `gguf_count`,
+      which is cosmetic (the field is documented as optional and the UI hides it when it is
+      None), and it makes the hub serialise every sibling file of every hit. It is by far
+      the slowest part of the query, and against a 20 s client timeout an ordinary browse
+      of the top 30 GGUF repos would time out and surface as "Network error" with no results.
+
+    - It does not treat `filter=gguf` as the only way to find a GGUF repo. The tag is
+      applied by the hub's library detection and plenty of repos carrying .gguf files do
+      not have it. A tag-filtered query that came back empty used to be reported as
+      "No GGUF repositories match" rather than retried, which is why a search for a model
+      that plainly exists could return nothing at all.
+    """
+    if sort not in SEARCH_SORTS:
+        sort = "downloads"
+    base: dict[str, str] = {"limit": str(limit), "sort": sort, "direction": "-1"}
+    query = query.strip()
+    if query:
+        base["search"] = query
+
+    async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT_S, headers=_auth_headers()) as client:
+        try:
+            items = await _get_models(client, {**base, "filter": "gguf"})
+            if not items:
+                # Second pass without the tag filter. Browse mode (no query) is left alone:
+                # an untagged "top 30 models overall" is not a GGUF browse, it is noise.
+                if query:
+                    loose = [_model_from_item(i) for i in await _get_models(client, base)]
+                    kept = [m for m in loose if looks_like_gguf(m)]
+                    return kept or loose
+                return []
+        except httpx.HTTPError as e:
+            raise HfSearchError(f"Could not reach Hugging Face: {e}") from e
+
+    return [_model_from_item(i) for i in items]
 
 
 @dataclass

@@ -235,3 +235,40 @@ def test_token_guards_every_route_except_health(client, monkeypatch):
     assert client.get("/api/v1/sections", headers={"X-Model-Loader-Token": "synthetic-loader-token"}).status_code == 200
     monkeypatch.setattr(settings, "model_loader_token", "")
     assert client.get("/api/v1/sections").status_code == 200
+
+
+def test_search_reports_a_hub_failure_instead_of_raising(client, monkeypatch):
+    """Discover must catch what search_models actually raises.
+
+    search_models used to surface httpx errors; it now raises HfSearchError with a message
+    that names the fix. An `except httpx.…` here would match nothing, so a rate-limited or
+    unreachable hub would 500 instead of returning a readable error — and it would fail
+    silently, because the types simply stop lining up.
+    """
+    from app import hf
+
+    async def boom(*args, **kwargs):
+        raise hf.HfSearchError("Hugging Face returned HTTP 429. Hugging Face is rate limiting this server; add a token to raise the limit.")
+
+    monkeypatch.setattr(hf, "search_models", boom)
+    r = client.get("/api/v1/search", params={"q": "qwen"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["results"] == []
+    assert "429" in body["error"] and "token" in body["error"]
+
+
+def test_search_survives_an_avatar_failure(client, monkeypatch):
+    """Avatars are decoration and must never fail the search that carries them."""
+    from app import hf
+
+    async def no_models(*args, **kwargs):
+        return []
+
+    async def bad_avatars(*args, **kwargs):
+        raise RuntimeError("avatar cache is unavailable")
+
+    monkeypatch.setattr(hf, "search_models", no_models)
+    monkeypatch.setattr(hf, "owner_avatars", bad_avatars)
+    r = client.get("/api/v1/search", params={"q": "qwen"})
+    assert r.status_code == 200 and r.json()["results"] == []

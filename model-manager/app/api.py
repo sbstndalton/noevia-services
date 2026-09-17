@@ -506,16 +506,16 @@ async def search(q: str = "", sort: str = "fit", limit: int = 30, trustedOnly: b
     carries no file sizes.
     """
     import asyncio
-    import httpx
     from . import discover, hf
     from .main import _backend_list, _downloaded_and_still_present
     hub_sort = "trendingScore" if sort in ("fit", "trending") else sort
     try:
         found = await hf.search_models(q.strip(), sort=hub_sort, limit=max(1, min(int(limit or 30), 60)))
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Hugging Face returned HTTP {e.response.status_code}", "results": []}
-    except httpx.HTTPError as e:
-        return {"error": f"Network error: {e}", "results": []}
+    except hf.HfSearchError as e:
+        # search_models raises this and only this: it already turns the hub's HTTP statuses
+        # and transport failures into a sentence that names the fix (a token, a rate limit).
+        # Catching httpx here instead would match nothing and 500 on every hub outage.
+        return {"error": str(e), "results": []}
 
     budget = max((float(b.get("vram_gb") or 0) for b in _backend_list()), default=0.0)
     budget_gb = max(1.0, (budget * 1.073 - 2.5)) if budget else 1e6   # GiB reported, GB compared; leave KV room
@@ -540,7 +540,12 @@ async def search(q: str = "", sort: str = "fit", limit: int = 30, trustedOnly: b
                                       license_contains=license, owner=owner)
     ranked = discover.rank(filtered) if sort in ("fit", "trending") else filtered
     owners = [r["owner"] for r in ranked]
-    avatars = await hf.owner_avatars(owners)
+    # Avatars are decoration. A hub hiccup or a cache write failure must never turn a good
+    # search into an error page.
+    try:
+        avatars = await hf.owner_avatars(owners)
+    except Exception:  # noqa: BLE001
+        avatars = {}
     have = _downloaded_and_still_present()
     return {"budgetGb": round(budget_gb, 1), "hubUrl": discover.hub_url(q.strip(), owner=owner),
             "counts": {"found": len(judged), "shown": len(ranked),
