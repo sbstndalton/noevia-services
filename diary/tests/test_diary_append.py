@@ -70,3 +70,13 @@ def test_store_replay_with_same_xid_is_safe(tmp_path):
 def test_append_requires_auth(client, monkeypatch):
     monkeypatch.setattr(appmod, "check_auth", lambda r: False)
     assert client.post("/api/entries/append", json=_body()).status_code == 401
+
+
+def test_append_reports_queued_when_storage_refuses_the_write(client, monkeypatch):
+    st = appmod.get_state()
+    monkeypatch.setattr(st.store.backend, "put", lambda *a, **k: (False, None, 503))
+    body = _body()
+    r = client.post("/api/entries/append", json=body)
+    assert r.status_code == 202, r.text
+    assert r.json()["queued"] is True and r.json()["xid"] == body["requestId"]
+    # Replay of queued journal entries is covered by the journal tests; here the API must not claim success.

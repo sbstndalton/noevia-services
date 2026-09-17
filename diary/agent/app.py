@@ -640,8 +640,16 @@ def api_entries_append(body: dict, request: Request) -> JSONResponse:
         xid = st.store.log_exchange(day=day, sub_header=title.strip(), me_text=text, claude_text="", now=now, xid=request_id)
     except CorpusError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
+    document = st.store.document_path(day)
+    try:
+        current, _ = st.store.backend.get_text(document)
+    except Exception:  # noqa: BLE001 — unreadable storage: the write is not confirmed
+        current = None
+    if current is None or not fmt.has_marker(current, xid):
+        # The journal holds the note and will apply it when storage accepts writes; say so.
+        return JSONResponse({"ok": True, "queued": True, "xid": xid, "day": day.isoformat(), "document": document}, status_code=202)
     threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
-    return JSONResponse({"ok": True, "xid": xid, "day": day.isoformat(), "document": st.store.document_path(day)})
+    return JSONResponse({"ok": True, "queued": False, "xid": xid, "day": day.isoformat(), "document": document})
 
 
 @app.post("/api/entries/edit")
