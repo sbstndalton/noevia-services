@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -321,6 +322,30 @@ def restart_backend(name: str) -> dict:
     return {"ok": ok, "message": message}
 
 
+_SECRET_PATTERNS = (
+    # Authorization headers and bare bearer tokens.
+    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s,;\"']+"), r"\1[redacted]"),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1[redacted]"),
+    # key=value / "key": "value" for secret-shaped names.
+    (re.compile(r"(?i)(\b[\w.-]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|cookie|session)[\w.-]*[\"']?\s*[:=]\s*[\"']?)[^\s,;&\"']+"), r"\1[redacted]"),
+    # Credentials embedded in URLs.
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@"), r"\1[redacted]@"),
+    # Well-known token shapes: Hugging Face, OpenAI/Anthropic-style, GitHub, AWS access keys, JWTs.
+    (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "[redacted]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted]"),
+)
+
+
+def redact_log_line(line: str) -> str:
+    """Scrub secret-shaped substrings before a log line leaves the server."""
+    for pattern, replacement in _SECRET_PATTERNS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
 @router.get("/backends/{name}/logs")
 def backend_logs(name: str, q: str = "", level: str = "", tail: int = 400) -> dict:
     if name not in services._effective_container_names():
@@ -330,7 +355,9 @@ def backend_logs(name: str, q: str = "", level: str = "", tail: int = 400) -> di
         return {"ok": False, "error": text, "lines": []}
     needle = q.lower()
     lines = []
-    for line in text.splitlines():
+    for raw_line in text.splitlines():
+        # Redact first, so a filter can never be used to probe a secret's value.
+        line = redact_log_line(raw_line)
         low = line.lower()
         if needle and needle not in low:
             continue

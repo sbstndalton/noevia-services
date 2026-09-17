@@ -155,3 +155,25 @@ def test_safe_defaults_never_touch_existing_or_unrelated_files(client):
     assert client.post("/api/v1/sections/absent/safe-defaults").status_code == 404
     assert client.post("/api/v1/sections/big-mtp-Q8_0/safe-defaults").status_code == 400
     assert (ROOT / "models" / "models.ini").read_text() == before
+
+
+def test_engine_log_lines_are_scrubbed_before_leaving_the_server(client, monkeypatch):
+    from app import api, services
+    leaked = "\n".join([
+        "srv  load_model: loading /models/q/Qwen.gguf",
+        "request headers: Authorization: Bearer abcdefghijklmnop123456",
+        "HF_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123",
+        'config {"api_key": "sk-live-abcdefghijklmnopqrstuv", "ctx": 8192}',
+        "remote https://admin:hunter2secret@nextcloud.example/remote.php",
+        "cookie cowork_session=deadbeefcafebabe1234 ok",
+    ])
+    monkeypatch.setattr(services, "_effective_container_names", lambda: ["cowork-llama-1"])
+    monkeypatch.setattr(services, "container_logs", lambda name, tail=400: (True, leaked))
+    body = client.get("/api/v1/backends/cowork-llama-1/logs").json()
+    text = "\n".join(body["lines"])
+    for secret in ("abcdefghijklmnop123456", "hf_abcdefghijklmnopqrstuvwxyz0123", "sk-live-abcdefghijklmnopqrstuv", "hunter2secret", "deadbeefcafebabe1234"):
+        assert secret not in text
+    assert "loading /models/q/Qwen.gguf" in text and '"ctx": 8192' in text
+    # Filtering on a secret's value must not reveal that the line held it.
+    assert client.get("/api/v1/backends/cowork-llama-1/logs?q=hunter2").json()["lines"] == []
+    assert api.redact_log_line("token: abc123xyz") == "token: [redacted]"
