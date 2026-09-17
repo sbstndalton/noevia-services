@@ -496,21 +496,82 @@ async def put_settings(body: dict = Body(...)) -> dict:
 # ---------- search and downloads ----------
 
 @router.get("/search")
-async def search(q: str = "", sort: str = "downloads", limit: int = 30) -> dict:
+async def search(q: str = "", sort: str = "fit", limit: int = 30, trustedOnly: bool = True, showUnsuitable: bool = False,
+                 minGb: float | None = None, maxGb: float | None = None, quants: str = "", minParams: float | None = None,
+                 maxParams: float | None = None, moe: str = "any", vision: bool = False, license: str = "", owner: str = "") -> dict:
+    """Search the hub, then judge each repository against this server (see app/discover.py).
+
+    Ranking is fit first, then trusted publishers, then popularity weighted towards recent activity.
+    File listings are fetched for the top results only, and cached, because the hub's search response
+    carries no file sizes.
+    """
+    import asyncio
     import httpx
-    from . import hf
-    from .main import _downloaded_and_still_present
+    from . import discover, hf
+    from .main import _backend_list, _downloaded_and_still_present
+    hub_sort = "trendingScore" if sort in ("fit", "trending") else sort
     try:
-        results = await hf.search_models(q.strip(), sort=sort, limit=max(1, min(int(limit or 30), 60)))
+        found = await hf.search_models(q.strip(), sort=hub_sort, limit=max(1, min(int(limit or 30), 60)))
     except httpx.HTTPStatusError as e:
         return {"error": f"Hugging Face returned HTTP {e.response.status_code}", "results": []}
     except httpx.HTTPError as e:
         return {"error": f"Network error: {e}", "results": []}
-    owners = [(m.id.split("/", 1)[0] if "/" in m.id else m.id) for m in results]
+
+    budget = max((float(b.get("vram_gb") or 0) for b in _backend_list()), default=0.0)
+    budget_gb = max(1.0, (budget * 1.073 - 2.5)) if budget else 1e6   # GiB reported, GB compared; leave KV room
+
+    async def detail(model) -> discover.Candidate:
+        owner_id = model.id.split("/", 1)[0] if "/" in model.id else model.id
+        cand = discover.Candidate(id=model.id, owner=owner_id, downloads=model.downloads, likes=model.likes,
+                                  last_modified=model.last_modified, tags=list(model.tags or []),
+                                  license=next((t.split(":", 1)[1] for t in (model.tags or []) if t.startswith("license:")), None))
+        try:
+            files = await _repo_files_cached(model.id)
+            cand.files = files
+        except Exception:  # noqa: BLE001 - a repo that will not list is judged on its name alone
+            cand.files = []
+        return cand
+
+    candidates = await asyncio.gather(*[detail(m) for m in found[:40]])
+    judged = [discover.judge(c, budget_gb=budget_gb, trusted=_trusted_quantisers()) for c in candidates]
+    filtered = discover.apply_filters(judged, trusted_only=trustedOnly, show_unsuitable=showUnsuitable,
+                                      min_gb=minGb, max_gb=maxGb, quants=[x for x in quants.split(",") if x],
+                                      min_params=minParams, max_params=maxParams, moe=moe, vision=vision,
+                                      license_contains=license, owner=owner)
+    ranked = discover.rank(filtered) if sort in ("fit", "trending") else filtered
+    owners = [r["owner"] for r in ranked]
     avatars = await hf.owner_avatars(owners)
     have = _downloaded_and_still_present()
-    return {"results": [{**_plain(m), "owner": o, "avatar": avatars.get(o, ""), "downloaded": have.get(m.id, [])}
-                        for m, o in zip(results, owners)]}
+    return {"budgetGb": round(budget_gb, 1), "hubUrl": discover.hub_url(q.strip(), owner=owner),
+            "counts": {"found": len(judged), "shown": len(ranked),
+                       "hiddenUntrusted": sum(1 for r in judged if not r["trusted"]) if trustedOnly else 0,
+                       "hiddenUnsuitable": sum(1 for r in judged if not r["suitable"]) if not showUnsuitable else 0},
+            "trusted": sorted(_trusted_quantisers() | discover.TRUSTED_LABS),
+            "results": [{**r, "avatar": avatars.get(r["owner"], ""), "downloaded": have.get(r["id"], [])} for r in ranked]}
+
+
+def _trusted_quantisers() -> set:
+    from . import discover
+    extra = {x.strip().lower() for x in (db.get_setting("trusted_quantisers", "") or "").split(",") if x.strip()}
+    return discover.TRUSTED_QUANTISERS | extra
+
+
+_REPO_FILES: dict[str, tuple[float, list[dict]]] = {}
+_REPO_FILES_TTL = 3600.0
+
+
+async def _repo_files_cached(repo: str) -> list[dict]:
+    """GGUF file list for a repo, cached: a search shows many repos and the hub rate-limits."""
+    import time
+    hit = _REPO_FILES.get(repo)
+    if hit and time.time() - hit[0] < _REPO_FILES_TTL:
+        return hit[1]
+    detail = await hf.repo_detail(repo)
+    files = [{"path": f.path, "size": f.size or 0} for f in detail.files if f.path.lower().endswith(".gguf")]
+    if len(_REPO_FILES) > 400:
+        _REPO_FILES.clear()
+    _REPO_FILES[repo] = (time.time(), files)
+    return files
 
 
 @router.get("/search/repo")
