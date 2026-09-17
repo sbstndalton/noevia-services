@@ -794,6 +794,31 @@ def api_workspace_trash_change(body: dict, request: Request):
         return JSONResponse({**result, 'indexPending': True}, headers={'Cache-Control': 'no-store'})
 
 
+@app.post("/api/workspace-ops")
+def api_workspace_ops(body: dict, request: Request):
+    """DAV DELETE/MOVE/COPY (docs/dav.md § Storage contract): bounded, protected, one transaction."""
+    if not check_auth(request):
+        raise HTTPException(401, 'unauthorized')
+    from .workspace_ops import OpError, operate
+    from .workspace_import import drain_index_outbox
+    st = _tenant_state(request, recover=False)
+    try:
+        if body.get('op') == 'stat':
+            return JSONResponse(operate(st.store, body), headers={'Cache-Control': 'no-store'})
+        with st.store._write_lock, st.managed.migration_lock():
+            if st.journal.pending_count():
+                raise HTTPException(409, 'Finish pending Diary writes before changing files.')
+            result = operate(st.store, body)
+            try:
+                drain_index_outbox(st.backend, st.journal)
+            except Exception:
+                log.warning('Workspace operation index transfer pending')
+            st.recovered = False
+            return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+    except OpError as exc:
+        raise HTTPException(exc.status, str(exc))
+
+
 @app.post("/api/workspace-import")
 async def api_workspace_import(request: Request):
     if not check_auth(request):
