@@ -119,3 +119,27 @@ def test_a_large_mtp_build_registers_as_a_model(client):
     os.truncate(main, autoconfig.HEAD_MAX_BYTES + 4096)
     r = client.post("/api/v1/sections/Huge-MTP-Q4/safe-defaults")
     assert r.status_code == 200, r.text
+
+
+def test_draft_head_download_only_takes_a_head_from_the_models_own_repo(client, monkeypatch):
+    from types import SimpleNamespace
+    from app import api, db
+    _nextn_model("repo-model", 0)
+    queued = []
+    monkeypatch.setattr(db, "repo_for_file", lambda base: "synthetic/repo-model-GGUF" if base == "repo-model.gguf" else None)
+    files = [SimpleNamespace(path="mtp-repo-model-Q8_0.gguf", size=120_000_000),
+             SimpleNamespace(path="repo-model-MTP-Q4.gguf", size=autoconfig.HEAD_MAX_BYTES + 1),
+             SimpleNamespace(path="mmproj-BF16.gguf", size=900_000_000)]
+
+    async def repo_detail(repo, revision="main"):
+        assert repo == "synthetic/repo-model-GGUF"
+        return SimpleNamespace(files=files)
+    monkeypatch.setattr(api.hf, "repo_detail", repo_detail)
+    monkeypatch.setattr(api.manager, "enqueue", lambda **kw: queued.append(kw))
+    heads = client.get("/api/v1/sections/repo-model/draft-heads").json()
+    assert [h["path"] for h in heads["remote"]] == ["mtp-repo-model-Q8_0.gguf"]
+    ok = client.post("/api/v1/sections/repo-model/draft-heads/download", json={"path": "mtp-repo-model-Q8_0.gguf"})
+    assert ok.status_code == 200 and queued[0]["filename"] == "repo-model/mtp-repo-model-Q8_0.gguf"
+    for bad in ("repo-model-MTP-Q4.gguf", "mmproj-BF16.gguf", "../../etc/passwd"):
+        assert client.post("/api/v1/sections/repo-model/draft-heads/download", json={"path": bad}).status_code == 400
+    assert len(queued) == 1

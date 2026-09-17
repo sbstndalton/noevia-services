@@ -285,7 +285,8 @@ async def section_draft_heads(name: str) -> dict:
         detail = await hf.repo_detail(repo)
         out["remote"] = sorted(({"repo": repo, "path": f.path, "size": f.size} for f in detail.files
                                 if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
-                                and autoconfig._looks_like_draft(Path(f.path).name)), key=lambda x: x["size"] or 0)
+                                and autoconfig._looks_like_draft(Path(f.path).name)
+                                and 0 < (f.size or 0) <= autoconfig.HEAD_MAX_BYTES), key=lambda x: x["size"] or 0)
         if not out["remote"] and not builtin and not repo.lower().endswith("-mtp-gguf") and repo.lower().endswith("-gguf"):
             sibling = repo[:-5] + "-MTP-GGUF"
             try:
@@ -589,6 +590,30 @@ def download_targets() -> list[dict]:
 @router.get("/download-targets")
 def list_download_targets() -> dict:
     return {"targets": download_targets()}
+
+
+@router.post("/sections/{name}/draft-heads/download")
+async def download_draft_head(name: str, body: dict = Body(...)) -> dict:
+    """Fetch a draft head for THIS section from the repo its weights came from, into its folder.
+
+    Only a head-sized draft file from the model's own source repository is accepted: heads are
+    trained per base model, so a head from anywhere else is not offered and not allowed.
+    """
+    gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    if gguf_path is None or rel is None or "/" not in rel:
+        raise HTTPException(404, "no model folder for this section")
+    repo = db.repo_for_file(Path(rel).name)
+    if not repo:
+        raise HTTPException(409, "this model was not downloaded from Hugging Face here, so its source repository is unknown")
+    path = str(body.get("path") or "")
+    detail = await hf.repo_detail(repo)
+    match = next((f for f in detail.files if f.path == path), None)
+    if match is None or not autoconfig._looks_like_draft(Path(path).name) or "mmproj" in path.lower() \
+            or not (match.size or 0) or match.size > autoconfig.HEAD_MAX_BYTES:
+        raise HTTPException(400, "that file is not a draft head for this model")
+    folder = rel.rsplit("/", 1)[0]
+    manager.enqueue(repo_id=repo, hf_path=path, filename=f"{folder}/{Path(path).name}", total_bytes=match.size)
+    return {"queued": [path], "folder": folder}
 
 
 @router.post("/downloads")
