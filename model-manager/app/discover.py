@@ -34,6 +34,7 @@ QUANT = re.compile(r"(?:^|[-_.])((?:UD-)?(?:IQ\d\w*|Q\d(?:_[\w]+)*|MXFP4|F16|BF1
 PARAMS = re.compile(r"(?:^|[-_.])(\d+(?:\.\d+)?)\s*B(?:-A(\d+(?:\.\d+)?)B)?(?:[-_.]|$)", re.I)
 COMPANION = re.compile(r"mmproj|projector|\bmtp\b|draft", re.I)
 SUB_Q4_PARAM_LIMIT = 100.0  # billions
+MIN_MODEL_GB = 0.3          # below this it is not a servable model file
 
 
 @dataclass
@@ -104,6 +105,10 @@ def build_options(candidate: Candidate, budget_gb: float) -> list[dict]:
     for row in grouped.values():
         gb = row["bytes"] / 1e9
         quant = quant_of(row["path"])
+        # Repos carry stray GGUFs (index shards, tiny extras). A model has a quantisation in its
+        # name and real size; without both, offering it as a download only misleads.
+        if quant is None or gb < MIN_MODEL_GB:
+            continue
         params = total_b or params_from(row["path"])[0]
         sub_q4 = bool(SUB_Q4.search(row["path"].rsplit("/", 1)[-1])) and (params is None or params < SUB_Q4_PARAM_LIMIT)
         reasons = []

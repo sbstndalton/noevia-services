@@ -128,3 +128,13 @@ def test_search_endpoint_judges_against_this_server(client, monkeypatch):
     wide = client.get("/api/v1/search?q=fits&trustedOnly=false&showUnsuitable=true").json()
     assert [r["id"] for r in wide["results"]] == ["unsloth/fits-8B-GGUF", "stranger/huge-70B-GGUF"]
     assert wide["results"][1]["suitable"] is False and "does not fit" in wide["results"][1]["reasons"][0]
+
+
+def test_stray_files_without_a_quantisation_are_not_offered_as_models():
+    judged = discover.judge(cand("unsloth/M-27B-GGUF", "unsloth", [
+        ("M-27B-UD-IQ3_XXS.gguf", 10.9), ("M-27B-UD-Q3_K_XL.gguf", 13.1),
+        ("M-27B-index.gguf", 0.01), ("extras/notes.gguf", 0.2)]), budget_gb=12.5, trusted=discover.TRUSTED_QUANTISERS)
+    assert [o["path"] for o in judged["options"]] == ["M-27B-UD-Q3_K_XL.gguf", "M-27B-UD-IQ3_XXS.gguf"]
+    assert not judged["suitable"], "its only fitting file is below Q4"
+    assert judged["best"] is None
+    assert "below Q4" in judged["reasons"][0] or "does not fit" in judged["reasons"][0]
