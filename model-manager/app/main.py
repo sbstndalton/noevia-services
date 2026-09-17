@@ -505,12 +505,14 @@ async def search_results(request: Request, q: str = "", sort: str = "downloads",
     try:
         # Empty query is now valid — HF returns the top-N gguf models under `sort`
         results = await hf.search_models(q.strip(), sort=sort, limit=limit)
+    except hf.HfSearchError as e:
+        error = str(e)
+    else:
         owners = [(m.id.split("/", 1)[0] if "/" in m.id else m.id) for m in results]
-        avatars = await hf.owner_avatars(owners)
-    except httpx.HTTPStatusError as e:
-        error = f"HF returned HTTP {e.response.status_code}"
-    except httpx.HTTPError as e:
-        error = f"network error: {e}"
+        try:
+            avatars = await hf.owner_avatars(owners)
+        except Exception:  # noqa: BLE001 — decoration must not fail the search
+            avatars = {}
     # Cross-check against local downloads so we can flag repos the user already has.
     # Must be checked against the FILESYSTEM, not just the history log — see the helper.
     downloaded = _downloaded_and_still_present()
