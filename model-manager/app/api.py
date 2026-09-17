@@ -157,7 +157,7 @@ def sections() -> dict:
     return {"revision": revision(), "schema": _schema(),
             "sections": [{"name": s.name, "items": s.items, "hasFile": s.has_file,
                           "file": s.matched_file, "cli": s.cli} for s in ini.list_sections()],
-            "unregistered": ini.unregistered_gguf_stems(), "backups": ini.list_backups()}
+            "unregistered": ini.unregistered_gguf_stems(), "backups": ini.list_backups(), "raw": ini.raw_text()}
 
 
 def _resolve_section_gguf(name: str) -> tuple[Path | None, str, str | None]:

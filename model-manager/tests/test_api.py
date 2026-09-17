@@ -25,6 +25,7 @@ def test_health_models_and_sections(client):
     assert m["name"] == "tiny-Q4_K_M.gguf" and m["sections"] == ["tiny"] and m["shape"]["label"] == "dense"
     sections = client.get("/api/v1/sections").json()
     assert [s["name"] for s in sections["sections"]] == ["tiny"]
+    assert sections["raw"].startswith("version = 1") and "[tiny]" in sections["raw"]
     assert sections["schema"][0]["tier"] == "Common" and any(f["key"] == "ctx-size" for f in sections["schema"][0]["fields"])
 
 
@@ -60,6 +61,11 @@ def test_autoconfig_without_a_gpu_backend_explains_itself(client):
     assert r["arch"] == "llama"
     assert "No GPU backend" in r["recommendation"]["error"]
     assert client.get("/api/v1/sections/missing/autoconfig").json()["error"].startswith("No model file")
+
+
+def test_overview_reports_models_folder_disk_space(client):
+    disk = client.get("/api/v1/overview").json()["modelsDir"]["disk"]
+    assert disk["free"] > 0 and disk["total"] >= disk["free"] and disk["freeH"]
 
 
 def test_prompts_badges_downloads_and_host(client):
