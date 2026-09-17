@@ -5,6 +5,7 @@ baseline flags parsed from the container's CLI), produce a Recommendation
 that says: which backend, at what ctx, with which values — and why.
 """
 from __future__ import annotations
+import re
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -481,6 +482,8 @@ class Recommendation:
     # bound: a context this machine cannot read in reasonable time is not a usable context.
     estimated_ctx: int = 0
     ctx_cap_reason: str = ""
+    # Policy warnings (small context, sub-Q4 quantisation) — advice, not refusals.
+    warnings: list[str] = field(default_factory=list)
     # Which preset (if any) the CURRENTLY SAVED ini section corresponds to. Selecting a chip
     # only previews a recommendation — nothing is written until Fill form + Save — so the UI
     # needs to distinguish "previewing" from "actually running" or the two look identical.
@@ -1099,6 +1102,27 @@ def _find_mmproj(models_dir: "Path | None", section_name: str, subdir: str = "")
     except OSError:
         pass
     return ""
+
+
+# Operator policy (2026-09-17): a context this small leaves no room for tool definitions, results and
+# a conversation, and a quantisation below Q4 costs more quality than it saves memory on a model
+# this size. Both are warnings on the recommendation, never silent refusals.
+MIN_USEFUL_CTX = 16384
+SUB_Q4_PARAM_LIMIT = 100_000_000_000
+_SUB_Q4 = re.compile(r'(?:^|[-_.])(?:UD-)?(IQ[123]\w*|Q[123](?:_[\w]+)*)(?:[-_.]|$)', re.I)
+
+
+def quality_warnings(*, model_rel: str, params: float | int | None, recommended_ctx: int, native_ctx: int = 0) -> list[str]:
+    """Settings that will disappoint before they are measured: too little context, too few bits."""
+    out = []
+    name = (model_rel or "").rsplit("/", 1)[-1]
+    quant = (_SUB_Q4.search(name) or [None, None])[1] if name else None
+    if quant and (not params or float(params) < SUB_Q4_PARAM_LIMIT):
+        out.append(f"{quant.upper()} is below Q4; on a model this size that usually costs more quality than the memory it saves.")
+    usable = recommended_ctx or native_ctx
+    if usable and usable < MIN_USEFUL_CTX:
+        out.append(f"{usable:,} tokens of context is little use once tool definitions and results are in the prompt; {MIN_USEFUL_CTX:,} is a sensible floor.")
+    return out
 
 
 # Without a prompt-speed measurement, never propose more than this: the memory estimate alone
@@ -2155,6 +2179,7 @@ def analyze(*,
         displaced=displaced,
         recommended_backend=(recommended.name if recommended else ""),
         recommended_ctx=rec_ctx,
+        warnings=quality_warnings(model_rel=model_rel, params=(summary.get("general") or {}).get("params_raw"), recommended_ctx=rec_ctx, native_ctx=native_ctx),
         estimated_ctx=estimated_ctx,
         ctx_cap_reason=ctx_cap_reason,
         recommended_total_ctx=rec_ctx * n_sessions if rec_ctx > 0 else 0,

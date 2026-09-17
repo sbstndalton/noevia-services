@@ -143,3 +143,30 @@ def test_draft_head_download_only_takes_a_head_from_the_models_own_repo(client, 
     for bad in ("repo-model-MTP-Q4.gguf", "mmproj-BF16.gguf", "../../etc/passwd"):
         assert client.post("/api/v1/sections/repo-model/draft-heads/download", json={"path": bad}).status_code == 400
     assert len(queued) == 1
+
+
+def test_quality_warnings_flag_sub_q4_and_tiny_contexts():
+    warn = autoconfig.quality_warnings(model_rel="/models/x/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf", params=35e9, recommended_ctx=32768)
+    assert len(warn) == 1 and "IQ3_XXS is below Q4" in warn[0]
+    assert autoconfig.quality_warnings(model_rel="/models/x/gpt-oss-20b-Q4_K_M.gguf", params=20e9, recommended_ctx=49152) == []
+    small = autoconfig.quality_warnings(model_rel="/models/x/tiny-Q4_K_M.gguf", params=4e9, recommended_ctx=8192)
+    assert len(small) == 1 and "8,192 tokens of context" in small[0]
+    both = autoconfig.quality_warnings(model_rel="/models/x/m-Q2_K.gguf", params=9e9, recommended_ctx=8192)
+    assert len(both) == 2
+    # A model above the size limit is expected to be quantised hard; only the context is flagged.
+    assert autoconfig.quality_warnings(model_rel="/models/x/huge-UD-IQ2_M.gguf", params=671e9, recommended_ctx=65536) == []
+    # No recommendation yet: fall back to the model's native window.
+    assert autoconfig.quality_warnings(model_rel="/models/x/m-Q5_K_M.gguf", params=8e9, recommended_ctx=0, native_ctx=8192)
+
+
+def test_analyze_reports_warnings_with_the_recommendation():
+    path = ROOT / "models" / "tiny" / "small-ctx-Q3_K_M.gguf"
+    path.write_bytes(_gguf({
+        "general.architecture": "llama", "llama.context_length": 8192, "llama.embedding_length": 256,
+        "llama.block_count": 4, "llama.attention.head_count": 4, "llama.attention.head_count_kv": 2,
+        "tokenizer.chat_template": "{{ messages }}"}) + b"\0" * 4096)
+    summary = gguf_meta.summarize(gguf_meta.read_raw(path))
+    backend = [{"name": "engine", "vendor": "unknown", "vram_gb": 14.0, "gpu_count": 1, "card_vram_gb": [14.0], "host_ram_gb": 29.0, "baseline": {}}]
+    rec = autoconfig.analyze(summary=summary, file_size=4096, backends=backend, vision=False, model_rel="/models/tiny/small-ctx-Q3_K_M.gguf")
+    assert any("below Q4" in w for w in rec.warnings)
+    assert any("little use once tool definitions" in w for w in rec.warnings)
