@@ -327,7 +327,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s,;\"']+"), r"\1[redacted]"),
     (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1[redacted]"),
     # key=value / "key": "value" for secret-shaped names.
-    (re.compile(r"(?i)(\b[\w.-]*(?:api[_-]?key|apikey|token|secret|password|passwd|pwd|credential|cookie|session)[\w.-]*[\"']?\s*[:=]\s*[\"']?)[^\s,;&\"']+"), r"\1[redacted]"),
+    (re.compile(r"(?i)(\b(?!n_)[\w.-]*(?:api[_-]?key|apikey|token(?!s\b|_count)|secret|password|passwd|pwd|credential|cookie|session)[\w.-]*[\"']?\s*[:=]\s*[\"']?)(?![\d.]+\b)[^\s,;&\"']+"), r"\1[redacted]"),
     # Credentials embedded in URLs.
     (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@"), r"\1[redacted]@"),
     # Well-known token shapes: Hugging Face, OpenAI/Anthropic-style, GitHub, AWS access keys, JWTs.

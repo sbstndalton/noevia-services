@@ -179,6 +179,9 @@ def test_engine_log_lines_are_scrubbed_before_leaving_the_server(client, monkeyp
     # Filtering on a secret's value must not reveal that the line held it.
     assert client.get("/api/v1/backends/cowork-llama-1/logs?q=hunter2").json()["lines"] == []
     assert api.redact_log_line("token: abc123xyz") == "token: [redacted]"
+    # Counters and numeric fields are not secrets.
+    for line in ("n_tokens = 512", "prompt tokens: 40", "slot session: 3", "n_ctx_slot = 8192"):
+        assert api.redact_log_line(line) == line
 
 
 def test_download_targets_are_limited_to_declared_folders_inside_models(client, monkeypatch):
