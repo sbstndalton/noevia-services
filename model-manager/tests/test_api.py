@@ -219,3 +219,16 @@ def test_hugging_face_cache_layout_never_surfaces_hex_names(client):
     unregistered = client.get("/api/v1/sections").json()["unregistered"]
     assert not any(hexlike(n) for n in unregistered), unregistered
     print("HF-CACHE", [(m["name"], m.get("modelId"), m.get("subdir")) for m in models], unregistered)
+
+
+def test_token_guards_every_route_except_health(client, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "model_loader_token", "synthetic-loader-token")
+    assert client.get("/api/v1/health").status_code == 200
+    for path in ("/api/v1/sections", "/api/v1/backends", "/api/v1/downloads", "/", "/containers"):
+        assert client.get(path).status_code == 401, path
+    assert client.post("/api/v1/backends/x/restart").status_code == 401
+    assert client.get("/api/v1/sections", headers={"X-Model-Loader-Token": "wrong"}).status_code == 401
+    assert client.get("/api/v1/sections", headers={"X-Model-Loader-Token": "synthetic-loader-token"}).status_code == 200
+    monkeypatch.setattr(settings, "model_loader_token", "")
+    assert client.get("/api/v1/sections").status_code == 200
