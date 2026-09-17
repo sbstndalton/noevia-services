@@ -194,3 +194,28 @@ def test_download_targets_are_limited_to_declared_folders_inside_models(client, 
     assert queued == ["archive/x/x.gguf"]
     for bad in ("missing", "../etc", "/abs", "tiny"):
         assert client.post("/api/v1/downloads", json={"url": "https://example.invalid/x.gguf", "target": bad}).status_code == 400
+
+
+def test_hugging_face_cache_layout_never_surfaces_hex_names(client):
+    """models--org--repo/snapshots/<commit>/file.gguf are symlinks into blobs/<sha256>."""
+    import os
+    from conftest import _gguf
+    repo = ROOT / "models" / "models--synthetic--cache-GGUF"
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    sha = "a" * 64
+    (repo / "blobs").mkdir(parents=True, exist_ok=True)
+    (repo / "snapshots" / commit).mkdir(parents=True, exist_ok=True)
+    (repo / "refs").mkdir(exist_ok=True)
+    (repo / "refs" / "main").write_text(commit)
+    (repo / "blobs" / sha).write_bytes(_gguf({"general.architecture": "llama", "llama.context_length": 4096, "llama.embedding_length": 64,
+        "llama.block_count": 2, "llama.attention.head_count": 2, "llama.attention.head_count_kv": 1}) + b"\0" * 1024)
+    link = repo / "snapshots" / commit / "cache-model-Q4_K_M.gguf"
+    if not link.exists():
+        os.symlink(os.path.join("..", "..", "blobs", sha), link)
+    hexlike = lambda s: bool(__import__("re").fullmatch(r"[0-9a-f]{32,64}", s or ""))
+    models = client.get("/api/v1/models").json()["models"]
+    names = [m["name"] for m in models] + [m.get("modelId") or "" for m in models] + [s for m in models for s in m.get("sections", [])]
+    assert not any(hexlike(n) or hexlike(n.rsplit(".", 1)[0]) for n in names), names
+    unregistered = client.get("/api/v1/sections").json()["unregistered"]
+    assert not any(hexlike(n) for n in unregistered), unregistered
+    print("HF-CACHE", [(m["name"], m.get("modelId"), m.get("subdir")) for m in models], unregistered)
