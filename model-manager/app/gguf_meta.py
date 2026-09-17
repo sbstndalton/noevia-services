@@ -255,6 +255,8 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
             "rope_scaling_original_context": _scalar_int(a("rope.scaling.original_context_length")),
             "vocab_size": _scalar_int(vocab_size),
             "expert_count": _scalar_int(a("expert_count")),
+            # Built-in multi-token-prediction layers (llama.cpp "nextn"): draft-mtp needs no head file.
+            "nextn_predict_layers": _scalar_int(a("nextn_predict_layers")),
             "expert_used_count": _scalar_int(a("expert_used_count")),
             "key_length": _scalar_int(a("attention.key_length")),
             "value_length": _scalar_int(a("attention.value_length")),

@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from . import autoconfig, db, gguf_meta, hw, ini, services, telemetry
+from . import autoconfig, db, gguf_meta, hf, hw, ini, services, telemetry
 from .config import settings
 from .downloader import manager
 from .utils import human_bytes
@@ -219,11 +219,15 @@ def register_safe_defaults(name: str) -> dict:
     """
     if not ini.valid_section_name(name):
         raise HTTPException(400, "invalid section name")
-    if autoconfig._looks_like_draft(f"{name}.gguf") or "mmproj" in name.lower():
+    if "mmproj" in name.lower():
         raise HTTPException(400, "draft heads and projectors are not registered on their own")
     if ini.get_section(name) is not None:
         raise HTTPException(409, "settings already exist for this model")
     gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    # A name alone can't tell a head from an "-MTP-" model build; size can.
+    is_mtp_build = gguf_path is not None and gguf_path.stem == name and gguf_path.is_file() and not autoconfig._head_sized(gguf_path)
+    if autoconfig._looks_like_draft(f"{name}.gguf") and not is_mtp_build:
+        raise HTTPException(400, "draft heads and projectors are not registered on their own")
     if gguf_path is None or rel is None:
         raise HTTPException(404, "no downloaded GGUF matches this name")
     if rel in ini._files_claimed_by_sections():
@@ -239,11 +243,59 @@ def register_safe_defaults(name: str) -> dict:
     values["ctx-size"] = str(min(native, SAFE_DEFAULT_CTX) if native > 0 else SAFE_DEFAULT_CTX)
     subdir = rel.rsplit("/", 1)[0] if "/" in rel else ""
     head = autoconfig._find_mtp(settings.models_dir, name, subdir)
+    builtin = _builtin_mtp_layers(gguf_path) > 0
     if head:
         values["spec-type"] = "draft-mtp"
         values["spec-draft-model"] = head
+    elif builtin:
+        values["spec-type"] = "draft-mtp"
     ini.upsert_section(name, values, "")
-    return {"ok": True, "revision": revision(), "section": ini.get_section(name), "mtp": bool(head)}
+    return {"ok": True, "revision": revision(), "section": ini.get_section(name), "mtp": bool(head or builtin)}
+
+
+def _builtin_mtp_layers(gguf_path) -> int:
+    try:
+        return int((gguf_meta.summarize(gguf_meta.read_raw(gguf_path)).get("model") or {}).get("nextn_predict_layers") or 0)
+    except (gguf_meta.GgufMetaError, OSError, ValueError):
+        return 0
+
+
+@router.get("/sections/{name}/draft-heads")
+async def section_draft_heads(name: str) -> dict:
+    """Which speculative-decoding heads this model can use, best first, and where to get one.
+
+    Local evidence only decides what is *available*: a head file beside the weights or built-in
+    nextn layers. The source repository (from download history) is asked for heads that exist
+    but were not downloaded, so the UI can offer them. Heads are trained per base model, so
+    nothing is ever suggested from another repository except the same model's "-MTP" build.
+    """
+    gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    if gguf_path is None or rel is None:
+        raise HTTPException(404, "no model file for this section")
+    subdir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    local = autoconfig._find_mtp(settings.models_dir, name, subdir)
+    builtin = _builtin_mtp_layers(gguf_path)
+    out = {"section": name, "local": local, "builtinLayers": builtin, "available": bool(local or builtin),
+           "remote": [], "mtpBuild": None, "repo": None, "modes": autoconfig.MODE_SPEC_PROFILE}
+    repo = db.repo_for_file(Path(rel).name)
+    if not repo:
+        return out
+    out["repo"] = repo
+    try:
+        detail = await hf.repo_detail(repo)
+        out["remote"] = sorted(({"repo": repo, "path": f.path, "size": f.size} for f in detail.files
+                                if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
+                                and autoconfig._looks_like_draft(Path(f.path).name)), key=lambda x: x["size"] or 0)
+        if not out["remote"] and not builtin and not repo.lower().endswith("-mtp-gguf") and repo.lower().endswith("-gguf"):
+            sibling = repo[:-5] + "-MTP-GGUF"
+            try:
+                await hf.repo_detail(sibling)
+                out["mtpBuild"] = sibling
+            except Exception:  # noqa: BLE001 - no MTP build published
+                pass
+    except Exception as e:  # noqa: BLE001 - offline or rate limited: local answer still stands
+        out["remoteError"] = str(e)[:160]
+    return out
 
 
 @router.post("/sections/{name}/rename")
@@ -268,7 +320,8 @@ def delete_section(name: str, baseRevision: str = Query("")) -> dict:
 
 
 @router.get("/sections/{name}/autoconfig")
-def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True) -> dict:
+def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True,
+                       verified_ctx: int = 0, prompt_budget_s: float = 120.0, mode: str = "") -> dict:
     from .main import _backend_list
     sessions = max(1, min(int(sessions or 1), 8))
     gguf_path, model_rel, rel = _resolve_section_gguf(name)
@@ -295,7 +348,9 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
                              model_rel=model_rel, current_section=ini.get_section(name), preset=preset,
                              n_sessions=sessions, models_dir=settings.models_dir, section_name=name,
                              model_subdir=rel.rsplit("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec,
-                             vision=vision)
+                             vision=vision, prompt_tps=float(getattr(measured, "prompt_p50", 0) or 0),
+                             prompt_budget_s=max(10.0, min(float(prompt_budget_s or 120), 3600.0)),
+                             verified_ctx=max(0, int(verified_ctx or 0)), mode=(mode or "").strip().lower())
     return {"section": name, "arch": summary.get("arch"), "params": (summary.get("general") or {}).get("params"),
             "fileBytes": file_size, "model": model_rel or rel or f"{name}.gguf",
             "recommendation": _plain(rec), "measured": _plain(measured), "history": _plain(history),
