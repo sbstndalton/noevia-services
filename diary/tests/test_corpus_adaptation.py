@@ -215,3 +215,53 @@ def test_shared_client_requests_uncompressed():
     client = make_client(base_url="http://example.invalid")
     assert client.headers.get("Accept-Encoding") == "identity"
     client.close()
+
+
+class SlowDailyWebDAV(FakeWebDAV):
+    def __init__(self, delay, workers):
+        super().__init__()
+        self.delay, self.concurrent_reads, self.fail = delay, workers, None
+
+    def get_text(self, path):
+        import time
+        time.sleep(self.delay)
+        if self.fail and path.endswith(self.fail):
+            raise RuntimeError("synthetic read failure")
+        return super().get_text(path)
+
+    def list_dir(self, remote_dir):
+        return [{**e, "is_dir": False} for e in super().list_dir(remote_dir)]
+
+
+def _daily_month(backend, tmp_path, days):
+    cfg = Config({"corpus": {"root": "Notes/Journal", "monthly_prefix": "", "index_file": "INDEX.md", "entry_layout": "daily", "entries_prefix": "Entries"},
+                  "retrieval": {"db_path": str(tmp_path / "j.db")}})
+    store = CorpusStore(cfg, backend, Journal(tmp_path / "j.db"))
+    for day in days:
+        backend.files[store.daily_path(date(2026, 9, day)).strip("/")] = (f"# Day {day}\n\nSynthetic entry {day}.", f'"{day}"')
+    return store
+
+
+def test_daily_month_reads_run_concurrently_and_keep_order(tmp_path):
+    import time
+    days = list(range(1, 21))
+    slow = _daily_month(SlowDailyWebDAV(0.05, 6), tmp_path, days)
+    started = time.perf_counter()
+    text = slow.read_month_text(2026, 9)
+    concurrent_s = time.perf_counter() - started
+    assert [int(n) for n in __import__("re").findall(r"Synthetic entry (\d+)", text)] == days
+    serial = _daily_month(SlowDailyWebDAV(0.05, 0), tmp_path / "s", days)
+    started = time.perf_counter()
+    assert serial.read_month_text(2026, 9) == text
+    serial_s = time.perf_counter() - started
+    # 20 reads x 50 ms: ~1 s one at a time, ~0.2 s six at a time.
+    assert serial_s >= 0.9 and concurrent_s < serial_s / 3, (serial_s, concurrent_s)
+
+
+def test_daily_month_read_failure_keeps_partial_policy(tmp_path):
+    backend = SlowDailyWebDAV(0, 6)
+    store = _daily_month(backend, tmp_path, [1, 2, 3, 4])
+    backend.fail = "September 3, 2026.md"
+    text = store.read_month_text(2026, 9)
+    assert "Synthetic entry 1" in text and "Synthetic entry 2" in text
+    assert "Synthetic entry 3" not in text and "Synthetic entry 4" not in text

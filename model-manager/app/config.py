@@ -6,6 +6,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
 
     models_dir: Path = Path("/models")
+    # Host folder mounted at models_dir, shown to the user as where downloads land.
+    models_host_path: str = ""
+    # Extra download destinations: comma-separated folder names directly under models_dir
+    # (e.g. another share mounted at /models/archive). Mount points there are offered too.
+    model_download_targets: str = ""
+    # Shared secret the web proxy sends. When set, every route except /api/v1/health needs it:
+    # this service holds the Docker socket, so network reachability alone must not be enough.
+    model_loader_token: str = ""
     models_ini_path: Path = Path("/models/models.ini")
     data_dir: Path = Path("/data")
     llama_containers: str = ""  # empty = auto-discover any ghcr.io/ggml-org/llama.cpp:* container

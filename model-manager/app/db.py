@@ -712,3 +712,13 @@ def badges_by_alias() -> dict[str, list[sqlite3.Row]]:
         for r in c.execute("SELECT * FROM model_badge ORDER BY alias, category"):
             out.setdefault(r["alias"], []).append(r)
     return out
+
+
+def repo_for_file(basename: str) -> str | None:
+    """Hugging Face repo a downloaded file came from, newest download first, or None."""
+    with _LOCK, _conn() as c:
+        row = c.execute(
+            "SELECT repo_id FROM download_history WHERE status = 'done' AND (filename = ? OR filename LIKE ?) "
+            "AND repo_id LIKE '%/%' ORDER BY id DESC LIMIT 1", (basename, f"%/{basename}")
+        ).fetchone()
+    return row["repo_id"] if row else None

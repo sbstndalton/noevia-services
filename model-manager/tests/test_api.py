@@ -25,6 +25,7 @@ def test_health_models_and_sections(client):
     assert m["name"] == "tiny-Q4_K_M.gguf" and m["sections"] == ["tiny"] and m["shape"]["label"] == "dense"
     sections = client.get("/api/v1/sections").json()
     assert [s["name"] for s in sections["sections"]] == ["tiny"]
+    assert sections["raw"].startswith("version = 1") and "[tiny]" in sections["raw"]
     assert sections["schema"][0]["tier"] == "Common" and any(f["key"] == "ctx-size" for f in sections["schema"][0]["fields"])
 
 
@@ -60,6 +61,13 @@ def test_autoconfig_without_a_gpu_backend_explains_itself(client):
     assert r["arch"] == "llama"
     assert "No GPU backend" in r["recommendation"]["error"]
     assert client.get("/api/v1/sections/missing/autoconfig").json()["error"].startswith("No model file")
+
+
+def test_overview_reports_models_folder_disk_space(client):
+    models_dir = client.get("/api/v1/overview").json()["modelsDir"]
+    assert models_dir["hostPath"] is None
+    disk = models_dir["disk"]
+    assert disk["free"] > 0 and disk["total"] >= disk["free"] and disk["freeH"]
 
 
 def test_prompts_badges_downloads_and_host(client):
@@ -111,3 +119,156 @@ def test_hugging_face_cache_layout_is_listed_configured_and_deleted(client):
     result = client.post("/api/v1/models/delete", json={"models": [entry["key"]]}).json()["results"][0]
     assert result["ok"] and result["freed"] >= 2048
     assert not repo.exists()
+
+
+def _fresh_download(stem: str, ctx: int, head: bool = False) -> None:
+    from conftest import _gguf
+    folder = ROOT / "models" / stem
+    folder.mkdir(exist_ok=True)
+    (folder / f"{stem}-Q4_K_M.gguf").write_bytes(_gguf({
+        "general.architecture": "llama", "llama.context_length": ctx, "llama.embedding_length": 256,
+        "llama.block_count": 4, "llama.attention.head_count": 4, "llama.attention.head_count_kv": 2,
+        "tokenizer.chat_template": "{{ messages }}"}) + b"\0" * 4096)
+    if head:
+        (folder / f"{stem}-mtp-Q8_0.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+
+
+def test_safe_defaults_register_once_with_capped_context_and_detected_mtp(client):
+    _fresh_download("big", 131072, head=True)
+    r = client.post("/api/v1/sections/big-Q4_K_M/safe-defaults")
+    assert r.status_code == 200, r.text
+    section = r.json()["section"]
+    assert section["ctx-size"] == "8192" and section["jinja"] == "true"
+    assert section["spec-type"] == "draft-mtp" and section["spec-draft-model"].endswith("big-mtp-Q8_0.gguf")
+    assert not any(k in section for k in ("temp", "top-k", "top-p", "min-p"))
+    assert client.post("/api/v1/sections/big-Q4_K_M/safe-defaults").status_code == 409
+
+
+def test_safe_defaults_keep_small_context_and_skip_mtp_without_a_head(client):
+    _fresh_download("small", 2048)
+    section = client.post("/api/v1/sections/small-Q4_K_M/safe-defaults").json()["section"]
+    assert section["ctx-size"] == "2048" and "spec-type" not in section
+
+
+def test_safe_defaults_never_touch_existing_or_unrelated_files(client):
+    before = (ROOT / "models" / "models.ini").read_text()
+    assert client.post("/api/v1/sections/tiny/safe-defaults").status_code == 409
+    assert client.post("/api/v1/sections/tiny-Q4_K_M/safe-defaults").status_code == 409
+    assert client.post("/api/v1/sections/absent/safe-defaults").status_code == 404
+    assert client.post("/api/v1/sections/big-mtp-Q8_0/safe-defaults").status_code == 400
+    assert (ROOT / "models" / "models.ini").read_text() == before
+
+
+def test_engine_log_lines_are_scrubbed_before_leaving_the_server(client, monkeypatch):
+    from app import api, services
+    leaked = "\n".join([
+        "srv  load_model: loading /models/q/Qwen.gguf",
+        "request headers: Authorization: Bearer abcdefghijklmnop123456",
+        "HF_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123",
+        'config {"api_key": "sk-live-abcdefghijklmnopqrstuv", "ctx": 8192}',
+        "remote https://admin:hunter2secret@nextcloud.example/remote.php",
+        "cookie cowork_session=deadbeefcafebabe1234 ok",
+    ])
+    monkeypatch.setattr(services, "_effective_container_names", lambda: ["cowork-llama-1"])
+    monkeypatch.setattr(services, "container_logs", lambda name, tail=400: (True, leaked))
+    body = client.get("/api/v1/backends/cowork-llama-1/logs").json()
+    text = "\n".join(body["lines"])
+    for secret in ("abcdefghijklmnop123456", "hf_abcdefghijklmnopqrstuvwxyz0123", "sk-live-abcdefghijklmnopqrstuv", "hunter2secret", "deadbeefcafebabe1234"):
+        assert secret not in text
+    assert "loading /models/q/Qwen.gguf" in text and '"ctx": 8192' in text
+    # Filtering on a secret's value must not reveal that the line held it.
+    assert client.get("/api/v1/backends/cowork-llama-1/logs?q=hunter2").json()["lines"] == []
+    assert api.redact_log_line("token: abc123xyz") == "token: [redacted]"
+    # Counters and numeric fields are not secrets.
+    for line in ("n_tokens = 512", "prompt tokens: 40", "slot session: 3", "n_ctx_slot = 8192"):
+        assert api.redact_log_line(line) == line
+
+
+def test_download_targets_are_limited_to_declared_folders_inside_models(client, monkeypatch):
+    from app.config import settings
+    (ROOT / "models" / "archive").mkdir(exist_ok=True)
+    monkeypatch.setattr(settings, "model_download_targets", "archive,missing,../etc,.hidden")
+    targets = client.get("/api/v1/download-targets").json()["targets"]
+    assert [t["id"] for t in targets] == ["", "archive"]
+    queued = []
+    from app import api
+    monkeypatch.setattr(api.manager, "enqueue_url", lambda **kw: queued.append(kw["filename"]))
+    assert client.post("/api/v1/downloads", json={"url": "https://example.invalid/x.gguf", "target": "archive"}).status_code == 200
+    assert queued == ["archive/x/x.gguf"]
+    for bad in ("missing", "../etc", "/abs", "tiny"):
+        assert client.post("/api/v1/downloads", json={"url": "https://example.invalid/x.gguf", "target": bad}).status_code == 400
+
+
+def test_hugging_face_cache_layout_never_surfaces_hex_names(client):
+    """models--org--repo/snapshots/<commit>/file.gguf are symlinks into blobs/<sha256>."""
+    import os
+    from conftest import _gguf
+    repo = ROOT / "models" / "models--synthetic--cache-GGUF"
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    sha = "a" * 64
+    (repo / "blobs").mkdir(parents=True, exist_ok=True)
+    (repo / "snapshots" / commit).mkdir(parents=True, exist_ok=True)
+    (repo / "refs").mkdir(exist_ok=True)
+    (repo / "refs" / "main").write_text(commit)
+    (repo / "blobs" / sha).write_bytes(_gguf({"general.architecture": "llama", "llama.context_length": 4096, "llama.embedding_length": 64,
+        "llama.block_count": 2, "llama.attention.head_count": 2, "llama.attention.head_count_kv": 1}) + b"\0" * 1024)
+    link = repo / "snapshots" / commit / "cache-model-Q4_K_M.gguf"
+    if not link.exists():
+        os.symlink(os.path.join("..", "..", "blobs", sha), link)
+    hexlike = lambda s: bool(__import__("re").fullmatch(r"[0-9a-f]{32,64}", s or ""))
+    models = client.get("/api/v1/models").json()["models"]
+    names = [m["name"] for m in models] + [m.get("modelId") or "" for m in models] + [s for m in models for s in m.get("sections", [])]
+    assert not any(hexlike(n) or hexlike(n.rsplit(".", 1)[0]) for n in names), names
+    unregistered = client.get("/api/v1/sections").json()["unregistered"]
+    assert not any(hexlike(n) for n in unregistered), unregistered
+    print("HF-CACHE", [(m["name"], m.get("modelId"), m.get("subdir")) for m in models], unregistered)
+
+
+def test_token_guards_every_route_except_health(client, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "model_loader_token", "synthetic-loader-token")
+    assert client.get("/api/v1/health").status_code == 200
+    for path in ("/api/v1/sections", "/api/v1/backends", "/api/v1/downloads", "/", "/containers"):
+        assert client.get(path).status_code == 401, path
+    assert client.post("/api/v1/backends/x/restart").status_code == 401
+    assert client.get("/api/v1/sections", headers={"X-Model-Loader-Token": "wrong"}).status_code == 401
+    assert client.get("/api/v1/sections", headers={"X-Model-Loader-Token": "synthetic-loader-token"}).status_code == 200
+    monkeypatch.setattr(settings, "model_loader_token", "")
+    assert client.get("/api/v1/sections").status_code == 200
+
+
+def test_search_reports_a_hub_failure_instead_of_raising(client, monkeypatch):
+    """Discover must catch what search_models actually raises.
+
+    search_models used to surface httpx errors; it now raises HfSearchError with a message
+    that names the fix. An `except httpx.…` here would match nothing, so a rate-limited or
+    unreachable hub would 500 instead of returning a readable error — and it would fail
+    silently, because the types simply stop lining up.
+    """
+    from app import hf
+
+    async def boom(*args, **kwargs):
+        raise hf.HfSearchError("Hugging Face returned HTTP 429. Hugging Face is rate limiting this server; add a token to raise the limit.")
+
+    monkeypatch.setattr(hf, "search_models", boom)
+    r = client.get("/api/v1/search", params={"q": "qwen"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["results"] == []
+    assert "429" in body["error"] and "token" in body["error"]
+
+
+def test_search_survives_an_avatar_failure(client, monkeypatch):
+    """Avatars are decoration and must never fail the search that carries them."""
+    from app import hf
+
+    async def no_models(*args, **kwargs):
+        return []
+
+    async def bad_avatars(*args, **kwargs):
+        raise RuntimeError("avatar cache is unavailable")
+
+    monkeypatch.setattr(hf, "search_models", no_models)
+    monkeypatch.setattr(hf, "owner_avatars", bad_avatars)
+    r = client.get("/api/v1/search", params={"q": "qwen"})
+    assert r.status_code == 200 and r.json()["results"] == []

@@ -16,6 +16,17 @@ from .utils import human_bytes, shard_key
 
 app = FastAPI(title="Model Loader")
 
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    import hmac
+    token = settings.model_loader_token
+    if token and request.url.path != "/api/v1/health":
+        sent = request.headers.get("x-model-loader-token", "")
+        if not hmac.compare_digest(sent.encode(), token.encode()):
+            return Response('{"error":"unauthorized"}', status_code=401, media_type="application/json")
+    return await call_next(request)
+
 # noevia: browser libraries are bundled into the image (see Dockerfile), never loaded from CDNs.
 from fastapi.staticfiles import StaticFiles as _StaticFiles  # noqa: E402
 import os as _os  # noqa: E402

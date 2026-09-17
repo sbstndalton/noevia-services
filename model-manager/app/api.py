@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from . import autoconfig, db, gguf_meta, hw, ini, services, telemetry
+from . import autoconfig, db, gguf_meta, hf, hw, ini, services, telemetry
 from .config import settings
 from .downloader import manager
 from .utils import human_bytes
@@ -96,7 +97,7 @@ async def overview() -> dict:
     snap = services.snapshot_models_dir()
     backends = await services.snapshot_llama_backends()
     return {
-        "modelsDir": {"path": str(snap.path), "exists": snap.exists, "error": snap.error,
+        "modelsDir": {"path": str(snap.path), "hostPath": settings.models_host_path or None, "exists": snap.exists, "error": snap.error,
                       "disk": {"total": snap.disk.total, "free": snap.disk.free, "usedPct": snap.disk.used_pct,
                                "totalH": snap.disk.total_h, "freeH": snap.disk.free_h} if snap.disk else None},
         "models": sum(1 for g in snap.ggufs if not g.is_companion),
@@ -157,7 +158,7 @@ def sections() -> dict:
     return {"revision": revision(), "schema": _schema(),
             "sections": [{"name": s.name, "items": s.items, "hasFile": s.has_file,
                           "file": s.matched_file, "cli": s.cli} for s in ini.list_sections()],
-            "unregistered": ini.unregistered_gguf_stems(), "backups": ini.list_backups()}
+            "unregistered": ini.unregistered_gguf_stems(), "backups": ini.list_backups(), "raw": ini.raw_text()}
 
 
 def _resolve_section_gguf(name: str) -> tuple[Path | None, str, str | None]:
@@ -204,6 +205,100 @@ def save_section(name: str, body: dict = Body(...)) -> dict:
     return {"ok": True, "revision": revision(), "section": ini.get_section(name)}
 
 
+SAFE_DEFAULT_CTX = 8192
+
+
+@router.post("/sections/{name}/safe-defaults")
+def register_safe_defaults(name: str) -> dict:
+    """Register a freshly downloaded GGUF with conservative settings, once.
+
+    8k context (or less if the model is smaller), draft-mtp only when a draft head sits
+    beside the model, `jinja` so the GGUF's own chat template is used, and no sampler keys,
+    so the model's own sampling metadata stays in charge. Never overwrites: an existing
+    section, or a file another section already points at, is left to the operator.
+    """
+    if not ini.valid_section_name(name):
+        raise HTTPException(400, "invalid section name")
+    if "mmproj" in name.lower():
+        raise HTTPException(400, "draft heads and projectors are not registered on their own")
+    if ini.get_section(name) is not None:
+        raise HTTPException(409, "settings already exist for this model")
+    gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    # A name alone can't tell a head from an "-MTP-" model build; size can.
+    is_mtp_build = gguf_path is not None and gguf_path.stem == name and gguf_path.is_file() and not autoconfig._head_sized(gguf_path)
+    if autoconfig._looks_like_draft(f"{name}.gguf") and not is_mtp_build:
+        raise HTTPException(400, "draft heads and projectors are not registered on their own")
+    if gguf_path is None or rel is None:
+        raise HTTPException(404, "no downloaded GGUF matches this name")
+    if rel in ini._files_claimed_by_sections():
+        raise HTTPException(409, "another settings section already uses this file")
+    from .main import _gguf_hints_for
+    values, _hints = _gguf_hints_for(name)
+    if not values.get("model"):
+        values["model"] = f"/models/{rel}"
+    try:
+        native = int(values.get("ctx-size") or 0)
+    except ValueError:
+        native = 0
+    values["ctx-size"] = str(min(native, SAFE_DEFAULT_CTX) if native > 0 else SAFE_DEFAULT_CTX)
+    subdir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    head = autoconfig._find_mtp(settings.models_dir, name, subdir)
+    builtin = _builtin_mtp_layers(gguf_path) > 0
+    if head:
+        values["spec-type"] = "draft-mtp"
+        values["spec-draft-model"] = head
+    elif builtin:
+        values["spec-type"] = "draft-mtp"
+    ini.upsert_section(name, values, "")
+    return {"ok": True, "revision": revision(), "section": ini.get_section(name), "mtp": bool(head or builtin)}
+
+
+def _builtin_mtp_layers(gguf_path) -> int:
+    try:
+        return int((gguf_meta.summarize(gguf_meta.read_raw(gguf_path)).get("model") or {}).get("nextn_predict_layers") or 0)
+    except (gguf_meta.GgufMetaError, OSError, ValueError):
+        return 0
+
+
+@router.get("/sections/{name}/draft-heads")
+async def section_draft_heads(name: str) -> dict:
+    """Which speculative-decoding heads this model can use, best first, and where to get one.
+
+    Local evidence only decides what is *available*: a head file beside the weights or built-in
+    nextn layers. The source repository (from download history) is asked for heads that exist
+    but were not downloaded, so the UI can offer them. Heads are trained per base model, so
+    nothing is ever suggested from another repository except the same model's "-MTP" build.
+    """
+    gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    if gguf_path is None or rel is None:
+        raise HTTPException(404, "no model file for this section")
+    subdir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    local = autoconfig._find_mtp(settings.models_dir, name, subdir)
+    builtin = _builtin_mtp_layers(gguf_path)
+    out = {"section": name, "local": local, "builtinLayers": builtin, "available": bool(local or builtin),
+           "remote": [], "mtpBuild": None, "repo": None, "modes": autoconfig.MODE_SPEC_PROFILE}
+    repo = db.repo_for_file(Path(rel).name)
+    if not repo:
+        return out
+    out["repo"] = repo
+    try:
+        detail = await hf.repo_detail(repo)
+        out["remote"] = sorted(({"repo": repo, "path": f.path, "size": f.size} for f in detail.files
+                                if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
+                                and autoconfig._looks_like_draft(Path(f.path).name)
+                                and 0 < (f.size or 0) <= autoconfig.HEAD_MAX_BYTES), key=lambda x: x["size"] or 0)
+        if not out["remote"] and not builtin and not repo.lower().endswith("-mtp-gguf") and repo.lower().endswith("-gguf"):
+            sibling = repo[:-5] + "-MTP-GGUF"
+            try:
+                await hf.repo_detail(sibling)
+                out["mtpBuild"] = sibling
+            except Exception:  # noqa: BLE001 - no MTP build published
+                pass
+    except Exception as e:  # noqa: BLE001 - offline or rate limited: local answer still stands
+        out["remoteError"] = str(e)[:160]
+    return out
+
+
 @router.post("/sections/{name}/rename")
 def rename_section(name: str, body: dict = Body(...)) -> dict:
     new = str(body.get("newName") or "").strip()
@@ -226,7 +321,8 @@ def delete_section(name: str, baseRevision: str = Query("")) -> dict:
 
 
 @router.get("/sections/{name}/autoconfig")
-def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True) -> dict:
+def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True,
+                       verified_ctx: int = 0, prompt_budget_s: float = 120.0, mode: str = "") -> dict:
     from .main import _backend_list
     sessions = max(1, min(int(sessions or 1), 8))
     gguf_path, model_rel, rel = _resolve_section_gguf(name)
@@ -253,7 +349,9 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
                              model_rel=model_rel, current_section=ini.get_section(name), preset=preset,
                              n_sessions=sessions, models_dir=settings.models_dir, section_name=name,
                              model_subdir=rel.rsplit("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec,
-                             vision=vision)
+                             vision=vision, prompt_tps=float(getattr(measured, "prompt_p50", 0) or 0),
+                             prompt_budget_s=max(10.0, min(float(prompt_budget_s or 120), 3600.0)),
+                             verified_ctx=max(0, int(verified_ctx or 0)), mode=(mode or "").strip().lower())
     return {"section": name, "arch": summary.get("arch"), "params": (summary.get("general") or {}).get("params"),
             "fileBytes": file_size, "model": model_rel or rel or f"{name}.gguf",
             "recommendation": _plain(rec), "measured": _plain(measured), "history": _plain(history),
@@ -280,6 +378,30 @@ def restart_backend(name: str) -> dict:
     return {"ok": ok, "message": message}
 
 
+_SECRET_PATTERNS = (
+    # Authorization headers and bare bearer tokens.
+    (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*[^\s,;\"']+"), r"\1[redacted]"),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1[redacted]"),
+    # key=value / "key": "value" for secret-shaped names.
+    (re.compile(r"(?i)(\b(?!n_)[\w.-]*(?:api[_-]?key|apikey|token(?!s\b|_count)|secret|password|passwd|pwd|credential|cookie|session)[\w.-]*[\"']?\s*[:=]\s*[\"']?)(?![\d.]+\b)[^\s,;&\"']+"), r"\1[redacted]"),
+    # Credentials embedded in URLs.
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@"), r"\1[redacted]@"),
+    # Well-known token shapes: Hugging Face, OpenAI/Anthropic-style, GitHub, AWS access keys, JWTs.
+    (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "[redacted]"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"), "[redacted]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted]"),
+)
+
+
+def redact_log_line(line: str) -> str:
+    """Scrub secret-shaped substrings before a log line leaves the server."""
+    for pattern, replacement in _SECRET_PATTERNS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
 @router.get("/backends/{name}/logs")
 def backend_logs(name: str, q: str = "", level: str = "", tail: int = 400) -> dict:
     if name not in services._effective_container_names():
@@ -289,7 +411,9 @@ def backend_logs(name: str, q: str = "", level: str = "", tail: int = 400) -> di
         return {"ok": False, "error": text, "lines": []}
     needle = q.lower()
     lines = []
-    for line in text.splitlines():
+    for raw_line in text.splitlines():
+        # Redact first, so a filter can never be used to probe a secret's value.
+        line = redact_log_line(raw_line)
         low = line.lower()
         if needle and needle not in low:
             continue
@@ -372,25 +496,87 @@ async def put_settings(body: dict = Body(...)) -> dict:
 # ---------- search and downloads ----------
 
 @router.get("/search")
-async def search(q: str = "", sort: str = "downloads", limit: int = 30) -> dict:
-    from . import hf
-    from .main import _downloaded_and_still_present
+async def search(q: str = "", sort: str = "fit", limit: int = 30, trustedOnly: bool = True, showUnsuitable: bool = False,
+                 minGb: float | None = None, maxGb: float | None = None, quants: str = "", minParams: float | None = None,
+                 maxParams: float | None = None, moe: str = "any", vision: bool = False, license: str = "", owner: str = "") -> dict:
+    """Search the hub, then judge each repository against this server (see app/discover.py).
+
+    Ranking is fit first, then trusted publishers, then popularity weighted towards recent activity.
+    File listings are fetched for the top results only, and cached, because the hub's search response
+    carries no file sizes.
+    """
+    import asyncio
+    from . import discover, hf
+    from .main import _backend_list, _downloaded_and_still_present
+    hub_sort = "trendingScore" if sort in ("fit", "trending") else sort
     try:
-        results = await hf.search_models(q.strip(), sort=sort, limit=max(1, min(int(limit or 30), 60)))
+        found = await hf.search_models(q.strip(), sort=hub_sort, limit=max(1, min(int(limit or 30), 60)))
     except hf.HfSearchError as e:
+        # search_models raises this and only this: it already turns the hub's HTTP statuses
+        # and transport failures into a sentence that names the fix (a token, a rate limit).
+        # Catching httpx here instead would match nothing and 500 on every hub outage.
         return {"error": str(e), "results": []}
-    owners = [(m.id.split("/", 1)[0] if "/" in m.id else m.id) for m in results]
-    # Avatars are decoration, and this endpoint's caller (noevia's Download tab) does not even
-    # render them. A hub hiccup or a cache write failure here must never turn a good search
-    # into an error page.
+
+    budget = max((float(b.get("vram_gb") or 0) for b in _backend_list()), default=0.0)
+    budget_gb = max(1.0, (budget * 1.073 - 2.5)) if budget else 1e6   # GiB reported, GB compared; leave KV room
+
+    async def detail(model) -> discover.Candidate:
+        owner_id = model.id.split("/", 1)[0] if "/" in model.id else model.id
+        cand = discover.Candidate(id=model.id, owner=owner_id, downloads=model.downloads, likes=model.likes,
+                                  last_modified=model.last_modified, tags=list(model.tags or []),
+                                  license=next((t.split(":", 1)[1] for t in (model.tags or []) if t.startswith("license:")), None))
+        try:
+            files = await _repo_files_cached(model.id)
+            cand.files = files
+        except Exception:  # noqa: BLE001 - a repo that will not list is judged on its name alone
+            cand.files = []
+        return cand
+
+    candidates = await asyncio.gather(*[detail(m) for m in found[:40]])
+    judged = [discover.judge(c, budget_gb=budget_gb, trusted=_trusted_quantisers()) for c in candidates]
+    filtered = discover.apply_filters(judged, trusted_only=trustedOnly, show_unsuitable=showUnsuitable,
+                                      min_gb=minGb, max_gb=maxGb, quants=[x for x in quants.split(",") if x],
+                                      min_params=minParams, max_params=maxParams, moe=moe, vision=vision,
+                                      license_contains=license, owner=owner)
+    ranked = discover.rank(filtered) if sort in ("fit", "trending") else filtered
+    owners = [r["owner"] for r in ranked]
+    # Avatars are decoration. A hub hiccup or a cache write failure must never turn a good
+    # search into an error page.
     try:
         avatars = await hf.owner_avatars(owners)
     except Exception:  # noqa: BLE001
         avatars = {}
     have = _downloaded_and_still_present()
-    return {"query": q.strip(), "sort": sort,
-            "results": [{**_plain(m), "owner": o, "avatar": avatars.get(o, ""), "downloaded": have.get(m.id, [])}
-                        for m, o in zip(results, owners)]}
+    return {"budgetGb": round(budget_gb, 1), "hubUrl": discover.hub_url(q.strip(), owner=owner),
+            "counts": {"found": len(judged), "shown": len(ranked),
+                       "hiddenUntrusted": sum(1 for r in judged if not r["trusted"]) if trustedOnly else 0,
+                       "hiddenUnsuitable": sum(1 for r in judged if not r["suitable"]) if not showUnsuitable else 0},
+            "trusted": sorted(_trusted_quantisers() | discover.TRUSTED_LABS),
+            "results": [{**r, "avatar": avatars.get(r["owner"], ""), "downloaded": have.get(r["id"], [])} for r in ranked]}
+
+
+def _trusted_quantisers() -> set:
+    from . import discover
+    extra = {x.strip().lower() for x in (db.get_setting("trusted_quantisers", "") or "").split(",") if x.strip()}
+    return discover.TRUSTED_QUANTISERS | extra
+
+
+_REPO_FILES: dict[str, tuple[float, list[dict]]] = {}
+_REPO_FILES_TTL = 3600.0
+
+
+async def _repo_files_cached(repo: str) -> list[dict]:
+    """GGUF file list for a repo, cached: a search shows many repos and the hub rate-limits."""
+    import time
+    hit = _REPO_FILES.get(repo)
+    if hit and time.time() - hit[0] < _REPO_FILES_TTL:
+        return hit[1]
+    detail = await hf.repo_detail(repo)
+    files = [{"path": f.path, "size": f.size or 0} for f in detail.files if f.path.lower().endswith(".gguf")]
+    if len(_REPO_FILES) > 400:
+        _REPO_FILES.clear()
+    _REPO_FILES[repo] = (time.time(), files)
+    return files
 
 
 @router.get("/search/repo")
@@ -446,12 +632,66 @@ def downloads() -> dict:
     return {"jobs": [_job(j) for j in manager.snapshot()]}
 
 
+def download_targets() -> list[dict]:
+    """Where downloads may land: the models folder itself, plus declared or mounted
+    folders directly inside it (the engine reads the whole tree, four levels deep)."""
+    import os
+    root = settings.models_dir
+    out = [{"id": "", "label": "Models folder", "path": str(root)}]
+    names = {n.strip() for n in settings.model_download_targets.split(",") if n.strip()}
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir(follow_symlinks=False) and os.path.ismount(entry.path):
+                names.add(entry.name)
+    except OSError:
+        pass
+    for name in sorted(names):
+        path = root / name
+        if "/" in name or name.startswith(".") or not path.is_dir() or path.is_symlink():
+            continue
+        out.append({"id": name, "label": name, "path": str(path)})
+    return out
+
+
+@router.get("/download-targets")
+def list_download_targets() -> dict:
+    return {"targets": download_targets()}
+
+
+@router.post("/sections/{name}/draft-heads/download")
+async def download_draft_head(name: str, body: dict = Body(...)) -> dict:
+    """Fetch a draft head for THIS section from the repo its weights came from, into its folder.
+
+    Only a head-sized draft file from the model's own source repository is accepted: heads are
+    trained per base model, so a head from anywhere else is not offered and not allowed.
+    """
+    gguf_path, _model_rel, rel = _resolve_section_gguf(name)
+    if gguf_path is None or rel is None or "/" not in rel:
+        raise HTTPException(404, "no model folder for this section")
+    repo = db.repo_for_file(Path(rel).name)
+    if not repo:
+        raise HTTPException(409, "this model was not downloaded from Hugging Face here, so its source repository is unknown")
+    path = str(body.get("path") or "")
+    detail = await hf.repo_detail(repo)
+    match = next((f for f in detail.files if f.path == path), None)
+    if match is None or not autoconfig._looks_like_draft(Path(path).name) or "mmproj" in path.lower() \
+            or not (match.size or 0) or match.size > autoconfig.HEAD_MAX_BYTES:
+        raise HTTPException(400, "that file is not a draft head for this model")
+    folder = rel.rsplit("/", 1)[0]
+    manager.enqueue(repo_id=repo, hf_path=path, filename=f"{folder}/{Path(path).name}", total_bytes=match.size)
+    return {"queued": [path], "folder": folder}
+
+
 @router.post("/downloads")
 async def start_download(body: dict = Body(...)) -> dict:
     import httpx
     from . import hf
     from .main import _dest_for_companion, _dest_for_main, _model_stem
     repo, path, url = str(body.get("repo") or ""), str(body.get("path") or ""), str(body.get("url") or "").strip()
+    target = str(body.get("target") or "")
+    if target not in {t["id"] for t in download_targets()}:
+        raise HTTPException(400, "Choose one of the offered download locations")
+    prefix = f"{target}/" if target else ""
     queued: list[str] = []
     if url:
         if not url.startswith(("https://", "http://")):
@@ -467,7 +707,7 @@ async def start_download(body: dict = Body(...)) -> dict:
                 total = int(r.headers.get("content-length") or 0) if r.status_code < 400 else 0
         except httpx.HTTPError:
             pass
-        manager.enqueue_url(url=url, filename=f"{_model_stem(name)}/{name}", total_bytes=total)
+        manager.enqueue_url(url=url, filename=prefix + f"{_model_stem(name)}/{name}", total_bytes=total)
         return {"queued": [name]}
     if not repo or "/" not in repo:
         raise HTTPException(400, "Choose a Hugging Face repository")
@@ -477,7 +717,7 @@ async def start_download(body: dict = Body(...)) -> dict:
         subdir = Path(shard_base).stem
         for f in detail.files:
             if f.shard_base == shard_base:
-                manager.enqueue(repo_id=repo, hf_path=f.path, filename=f"{subdir}/{Path(f.path).name}", total_bytes=f.size)
+                manager.enqueue(repo_id=repo, hf_path=f.path, filename=prefix + f"{subdir}/{Path(f.path).name}", total_bytes=f.size)
                 queued.append(f.path)
         main_stem = subdir
     else:
@@ -486,20 +726,20 @@ async def start_download(body: dict = Body(...)) -> dict:
             raise HTTPException(404, "That file is not in the repository")
         base = Path(path).name
         if "mmproj" in base.lower():
-            manager.enqueue(repo_id=repo, hf_path=path, filename=f"{_model_stem(base)}/{base}", total_bytes=match.size)
+            manager.enqueue(repo_id=repo, hf_path=path, filename=prefix + f"{_model_stem(base)}/{base}", total_bytes=match.size)
             return {"queued": [path]}
         main_stem, filename = _dest_for_main(base)
-        manager.enqueue(repo_id=repo, hf_path=path, filename=filename, total_bytes=match.size)
+        manager.enqueue(repo_id=repo, hf_path=path, filename=prefix + filename, total_bytes=match.size)
         queued.append(path)
     # Companions from the same repo: its vision projector(s) and the smallest draft head.
     for f in [f for f in detail.files if "mmproj" in Path(f.path).name.lower()][:4]:
-        manager.enqueue(repo_id=repo, hf_path=f.path, filename=_dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size)
+        manager.enqueue(repo_id=repo, hf_path=f.path, filename=prefix + _dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size)
         queued.append(f.path)
     heads = [f for f in detail.files if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
              and autoconfig._looks_like_draft(Path(f.path).name)]
     if heads and not shard_base:
         head = min(heads, key=lambda f: f.size or 0)
-        manager.enqueue(repo_id=repo, hf_path=head.path, filename=_dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size)
+        manager.enqueue(repo_id=repo, hf_path=head.path, filename=prefix + _dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size)
         queued.append(head.path)
     return {"queued": queued}
 

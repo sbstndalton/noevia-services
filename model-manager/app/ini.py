@@ -387,7 +387,7 @@ class SectionView:
     cli: str = ""
 
 
-def _is_companion(filename: str) -> bool:
+def _is_companion(filename: str, path: "Path | None" = None) -> bool:
     """Return True for GGUFs that are companion artefacts, not standalone models.
     These are referenced from a main section (via `mmproj = ...`, `model-draft = ...`, etc.)
     and should not be offered as their own configurable ini sections.
@@ -400,8 +400,9 @@ def _is_companion(filename: str) -> bool:
     if "mmproj" in n:
         return True
     # Import lazily to avoid circular: autoconfig imports ini for ALL_KNOWN_KEYS.
-    from .autoconfig import _looks_like_draft
-    return _looks_like_draft(filename)
+    from .autoconfig import _head_sized, _looks_like_draft
+    # With a path, a multi-GB "-MTP-" model build is a model, not a head.
+    return _looks_like_draft(filename) and (path is None or _head_sized(path))
 
 
 def _stems_present() -> dict[str, str]:
@@ -413,7 +414,7 @@ def _stems_present() -> dict[str, str]:
     try:
         from .utils import iter_gguf
         for reldir, p in iter_gguf(root):
-            if _is_companion(p.name):
+            if _is_companion(p.name, p):
                 continue
             base, _, _ = _sk(p.name)
             stem = base[:-5] if base.lower().endswith(".gguf") else base

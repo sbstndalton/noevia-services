@@ -5,6 +5,7 @@ baseline flags parsed from the container's CLI), produce a Recommendation
 that says: which backend, at what ctx, with which values — and why.
 """
 from __future__ import annotations
+import re
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -410,6 +411,10 @@ SPEC_PROFILES: tuple[SpecProfile, ...] = (
 # for a head-free profile would write keys llama-server ignores.
 SPEC_PROFILE_BY_KEY: dict[str, SpecProfile] = {p.key: p for p in SPEC_PROFILES}
 
+# Default speculative profile per workload when a head (file or built-in) is available. Agent turns
+# are mostly tool JSON and short answers, which draft like code; chat is mixed.
+MODE_SPEC_PROFILE: dict[str, str] = {"chat": "balanced", "code": "coding", "agent": "coding", "writing": "writing"}
+
 # Keys a profile owns. Switching profiles must clear whatever the previous one set, or a move
 # from Coding to Writing would silently keep n-min = 1 from the profile that was abandoned.
 SPEC_PROFILE_KEYS: tuple[str, ...] = (
@@ -473,6 +478,12 @@ class Recommendation:
     # the UI shows a single option instead of three chips that would all be identical.
     fits_full_gpu: bool = False
     native_ctx: int = 0
+    # What memory alone would allow, before the caps in cap_context(). Memory is only an upper
+    # bound: a context this machine cannot read in reasonable time is not a usable context.
+    estimated_ctx: int = 0
+    ctx_cap_reason: str = ""
+    # Policy warnings (small context, sub-Q4 quantisation) — advice, not refusals.
+    warnings: list[str] = field(default_factory=list)
     # Which preset (if any) the CURRENTLY SAVED ini section corresponds to. Selecting a chip
     # only previews a recommendation — nothing is written until Fill form + Save — so the UI
     # needs to distinguish "previewing" from "actually running" or the two look identical.
@@ -940,6 +951,18 @@ def _presets_from_frontier(frontier: list[tuple[int, int, float, float]], backen
     return out
 
 
+# Real draft/MTP heads are tens to a few hundred MB; anything larger with "mtp" in its name is a
+# full model build that includes MTP layers (e.g. Unsloth's "-MTP-GGUF" repos), not a head.
+HEAD_MAX_BYTES = 2 * 1024 ** 3
+
+
+def _head_sized(path: "Path") -> bool:
+    try:
+        return path.stat().st_size <= HEAD_MAX_BYTES
+    except OSError:
+        return False
+
+
 def _looks_like_draft(filename: str) -> bool:
     """Heuristic: is this GGUF a speculative-decoding draft head?
 
@@ -984,6 +1007,9 @@ def _find_mtp(models_dir: "Path | None", section_name: str, subdir: str = "") ->
                 if not (p.is_file() and p.suffix.lower() == ".gguf"):
                     continue
                 if "mmproj" in p.name.lower() or not _looks_like_draft(p.name):
+                    continue
+                # The model itself is never its own head: "-MTP-" builds carry the name too.
+                if p.stem == section_name or not _head_sized(p):
                     continue
                 cands.append(p)
         except OSError:
@@ -1078,6 +1104,59 @@ def _find_mmproj(models_dir: "Path | None", section_name: str, subdir: str = "")
     return ""
 
 
+# Operator policy (2026-09-17): a context this small leaves no room for tool definitions, results and
+# a conversation, and a quantisation below Q4 costs more quality than it saves memory on a model
+# this size. Both are warnings on the recommendation, never silent refusals.
+MIN_USEFUL_CTX = 16384
+SUB_Q4_PARAM_LIMIT = 100_000_000_000
+_SUB_Q4 = re.compile(r'(?:^|[-_.])(?:UD-)?(IQ[123]\w*|Q[123](?:_[\w]+)*)(?:[-_.]|$)', re.I)
+
+
+def quality_warnings(*, model_rel: str, params: float | int | None, recommended_ctx: int, native_ctx: int = 0) -> list[str]:
+    """Settings that will disappoint before they are measured: too little context, too few bits."""
+    out = []
+    name = (model_rel or "").rsplit("/", 1)[-1]
+    quant = (_SUB_Q4.search(name) or [None, None])[1] if name else None
+    if quant and (not params or float(params) < SUB_Q4_PARAM_LIMIT):
+        out.append(f"{quant.upper()} is below Q4; on a model this size that usually costs more quality than the memory it saves.")
+    usable = recommended_ctx or native_ctx
+    if usable and usable < MIN_USEFUL_CTX:
+        out.append(f"{usable:,} tokens of context is little use once tool definitions and results are in the prompt; {MIN_USEFUL_CTX:,} is a sensible floor.")
+    return out
+
+
+# Without a prompt-speed measurement, never propose more than this: the memory estimate alone
+# happily recommends a model's full 262K window on hardware that reads ~500 tokens/s (9 min).
+UNMEASURED_CTX_CAP = 32768
+
+
+def cap_context(memory_ctx: int, candidates: list[int], *, prompt_tps: float = 0.0,
+                prompt_budget_s: float = 120.0, verified_ctx: int = 0) -> tuple[int, str]:
+    """Largest candidate context that memory allows AND this machine can use.
+
+    Order of evidence: a calibration-verified context (measured load + full prompt) wins outright
+    as an upper bound; otherwise the measured prompt rate × the time budget; otherwise a
+    conservative default until something is measured. Returns (ctx, reason) with reason "" when
+    memory was the binding limit.
+    """
+    if memory_ctx <= 0:
+        return memory_ctx, ""
+    limit, reason = memory_ctx, ""
+    if verified_ctx and verified_ctx > 0:
+        if verified_ctx < limit:
+            limit, reason = verified_ctx, f"verified on this machine at {verified_ctx:,} tokens"
+    elif prompt_tps and prompt_tps > 0:
+        by_time = int(prompt_tps * max(prompt_budget_s, 1))
+        if by_time < limit:
+            limit, reason = by_time, f"a full prompt must finish in {int(prompt_budget_s)} s at the measured {prompt_tps:.0f} tokens/s"
+    elif UNMEASURED_CTX_CAP < limit:
+        limit, reason = UNMEASURED_CTX_CAP, "prompt speed not measured yet; measure context to go higher"
+    fitting = sorted(c for c in candidates if 0 < c <= limit)
+    if not reason:
+        return memory_ctx, ""
+    return (fitting[-1] if fitting else min(limit, memory_ctx)), reason
+
+
 def analyze(*,
             summary: dict,
             file_size: int,
@@ -1091,7 +1170,11 @@ def analyze(*,
             model_subdir: str = "",
             spec_profile: str = "",
             mmproj_gb_override: float | None = None,
-            vision: bool = True) -> Recommendation:
+            vision: bool = True,
+            prompt_tps: float = 0.0,
+            prompt_budget_s: float = 120.0,
+            verified_ctx: int = 0,
+            mode: str = "") -> Recommendation:
     # Clamp n_sessions to a sensible range for a homelab. Above 8 the per-slot ctx
     # shrinks below usability for real chat, and llama-server continuous batching
     # overhead starts dominating.
@@ -1263,6 +1346,8 @@ def analyze(*,
                 mtp_gb = _mt.stat().st_size / (1024 ** 3)
             except OSError:
                 mtp_gb = 0.0
+    # Built-in MTP layers count as a head for profile purposes; there is no file to place.
+    builtin_mtp = int(m.get("nextn_predict_layers") or 0) > 0
     has_mmproj = bool(mmproj_rel)
     # VRAM pinned to the MAIN GPU for multimodal: projector weights + encoder compute buffer.
     mmproj_vram_gb = (mmproj_gb * _MMPROJ_VRAM_MULT + _MMPROJ_COMPUTE_GB) if has_mmproj else 0.0
@@ -1414,6 +1499,9 @@ def analyze(*,
     #   BUT if MoE requires offload at that ctx, prefer the bigger GPU (less offload = faster).
     recommended: BackendPlan | None = None
     rec_ctx = 0
+    estimated_ctx = 0
+    capped_ctx = 0
+    ctx_cap_reason = ""
     is_moe_now = isinstance(experts, int) and experts > 1
     fitting = [p for p in plans if p.fits_at_all]
     if fitting:
@@ -1430,6 +1518,10 @@ def analyze(*,
         else:
             recommended = sorted(top_plans, key=lambda p: p.vram_gb)[0]
         rec_ctx = recommended.max_ctx
+        estimated_ctx = rec_ctx
+        rec_ctx, ctx_cap_reason = cap_context(rec_ctx, [r.ctx for r in recommended.rows if r.ctx <= recommended.max_ctx],
+                                              prompt_tps=prompt_tps, prompt_budget_s=prompt_budget_s, verified_ctx=verified_ctx)
+        capped_ctx = rec_ctx
 
     # Resolved once, here, because three later blocks need it and each used to derive it for
     # itself inside its own conditional. That worked only while at least one of those branches
@@ -1518,12 +1610,12 @@ def analyze(*,
     if _spec_key not in SPEC_PROFILE_BY_KEY and _spec_key != "custom":
         # No explicit pick. Fall back to what is saved; a new section gets Balanced when a
         # head was found beside the weights and Off when there is nothing to draft with.
-        _spec_key = _saved_spec or ("balanced" if mtp_rel else "off")
+        _spec_key = _saved_spec or (MODE_SPEC_PROFILE.get(mode, "balanced") if (mtp_rel or builtin_mtp) else "off")
     # A profile that needs a head but has none cannot run — llama-server would start and then
     # fail to load the draft. Fall back rather than offering a configuration that cannot work.
     _resolved_head = (current_section or {}).get("spec-draft-model", "").strip() or mtp_rel
     _prof = SPEC_PROFILE_BY_KEY.get(_spec_key)
-    if _prof and _prof.needs_head and not _resolved_head:
+    if _prof and _prof.needs_head and not _resolved_head and not builtin_mtp:
         _prof = SPEC_PROFILE_BY_KEY["off"]
         _spec_key = "off"
 
@@ -1542,7 +1634,11 @@ def analyze(*,
             values["spec-type"] = _prof.spec_type
             for _k in SPEC_PROFILE_KEYS:
                 values[_k] = _prof.knobs.get(_k, "")
-            if _prof.spec_type and _prof.needs_head:
+            if _prof.spec_type and _prof.needs_head and not _resolved_head:
+                # Built-in nextn layers: the engine drafts from the model itself.
+                values["spec-draft-model"] = ""
+                values["spec-draft-ngl"] = ""
+            elif _prof.spec_type and _prof.needs_head:
                 values["spec-draft-model"] = _resolved_head
                 # Without this the head lands on the CPU, and a draft evaluated on the CPU is
                 # slower than the main model it is meant to be racing ahead of.
@@ -1670,6 +1766,10 @@ def analyze(*,
                     values["ngl"] = str(chosen.ngl)
                 # Same as the MoE branch: the table stays per-context rather than being
                 # recomputed at the chosen preset's offload level.
+        # The presets above pick from the memory frontier; the usable-context cap still binds.
+        if ctx_cap_reason and rec_ctx > capped_ctx:
+            rec_ctx = capped_ctx
+            values["ctx-size"] = str(rec_ctx * n_sessions)
         if off_kind in ("cpu-moe", "n-cpu-moe"):
             # Placement is handed to llama.cpp's own fitter rather than pinned here.
             #
@@ -2079,6 +2179,9 @@ def analyze(*,
         displaced=displaced,
         recommended_backend=(recommended.name if recommended else ""),
         recommended_ctx=rec_ctx,
+        warnings=quality_warnings(model_rel=model_rel, params=(summary.get("general") or {}).get("params_raw"), recommended_ctx=rec_ctx, native_ctx=native_ctx),
+        estimated_ctx=estimated_ctx,
+        ctx_cap_reason=ctx_cap_reason,
         recommended_total_ctx=rec_ctx * n_sessions if rec_ctx > 0 else 0,
         n_sessions=n_sessions,
         values=values,

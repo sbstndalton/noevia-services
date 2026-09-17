@@ -602,6 +602,56 @@ def api_months(request: Request) -> JSONResponse:
     return JSONResponse({"months": months})
 
 
+APPEND_MAX_CHARS = 8000
+
+
+@app.post("/api/entries/append")
+def api_entries_append(body: dict, request: Request) -> JSONResponse:
+    """Append one new, approved note to TODAY's entry (D10). Append-only by construction.
+
+    Reuses log_exchange — the write-ahead journal plus the ETag-guarded append — so there is no
+    second write path. It cannot target a past day, edit or delete anything, and a repeated
+    ``requestId`` returns the same xid without writing again. The web tool that calls this is
+    behind features.diaryMcpWrite and the normal approval card.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    text = body.get("text")
+    title = body.get("title") or "Added from chat (approved)"
+    request_id = body.get("requestId")
+    if not isinstance(text, str) or not text.strip() or len(text) > APPEND_MAX_CHARS:
+        return JSONResponse({"error": f"text is required (at most {APPEND_MAX_CHARS} characters)"}, status_code=400)
+    if not isinstance(title, str) or len(title) > 80 or re.search(r"[\r\n#]", title):
+        return JSONResponse({"error": "title must be one line of at most 80 characters"}, status_code=400)
+    if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", request_id):
+        return JSONResponse({"error": "requestId must be a UUIDv4"}, status_code=400)
+    if "entryDay" in body:
+        return JSONResponse({"error": "appends always go to today's entry"}, status_code=400)
+    if fmt.MARKER_RE.search(text) or re.search(r"^\s*#", text, re.M):
+        # Day and section structure is written by code, never by model text.
+        return JSONResponse({"error": "text must not contain diary markers or Markdown headings"}, status_code=400)
+    now, day = entry_target({"entryTime": body.get("entryTime")})
+    if abs((now - datetime.now(now.tzinfo)).total_seconds()) > 900:
+        # The offset picks the user's local day; the instant itself must be now, so a note can't
+        # be placed on a past or future day by a crafted timestamp.
+        return JSONResponse({"error": "entryTime must be the current time"}, status_code=400)
+    st = _tenant_state(request)
+    try:
+        xid = st.store.log_exchange(day=day, sub_header=title.strip(), me_text=text, claude_text="", now=now, xid=request_id)
+    except CorpusError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    document = st.store.document_path(day)
+    try:
+        current, _ = st.store.backend.get_text(document)
+    except Exception:  # noqa: BLE001 — unreadable storage: the write is not confirmed
+        current = None
+    if current is None or not fmt.has_marker(current, xid):
+        # The journal holds the note and will apply it when storage accepts writes; say so.
+        return JSONResponse({"ok": True, "queued": True, "xid": xid, "day": day.isoformat(), "document": document}, status_code=202)
+    threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
+    return JSONResponse({"ok": True, "queued": False, "xid": xid, "day": day.isoformat(), "document": document})
+
+
 @app.post("/api/entries/edit")
 def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
     """Edit one logged exchange, matched by its hidden xid marker.
@@ -792,6 +842,31 @@ def api_workspace_trash_change(body: dict, request: Request):
             log.warning('Workspace trash index transfer pending')
         st.recovered = False
         return JSONResponse({**result, 'indexPending': True}, headers={'Cache-Control': 'no-store'})
+
+
+@app.post("/api/workspace-ops")
+def api_workspace_ops(body: dict, request: Request):
+    """DAV DELETE/MOVE/COPY (docs/dav.md § Storage contract): bounded, protected, one transaction."""
+    if not check_auth(request):
+        raise HTTPException(401, 'unauthorized')
+    from .workspace_ops import OpError, operate
+    from .workspace_import import drain_index_outbox
+    st = _tenant_state(request, recover=False)
+    try:
+        if body.get('op') == 'stat':
+            return JSONResponse(operate(st.store, body), headers={'Cache-Control': 'no-store'})
+        with st.store._write_lock, st.managed.migration_lock():
+            if st.journal.pending_count():
+                raise HTTPException(409, 'Finish pending Diary writes before changing files.')
+            result = operate(st.store, body)
+            try:
+                drain_index_outbox(st.backend, st.journal)
+            except Exception:
+                log.warning('Workspace operation index transfer pending')
+            st.recovered = False
+            return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+    except OpError as exc:
+        raise HTTPException(exc.status, str(exc))
 
 
 @app.post("/api/workspace-import")
