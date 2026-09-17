@@ -41,7 +41,8 @@ def test_a_repo_is_suitable_only_when_a_q4_file_fits():
 def test_shards_are_one_option_and_companions_are_not_offered():
     judged = discover.judge(cand("unsloth/M-30B-GGUF", "unsloth", [
         ("Q4/M-30B-Q4_K_M-00001-of-00002.gguf", 6.0), ("Q4/M-30B-Q4_K_M-00002-of-00002.gguf", 6.0),
-        ("mmproj-BF16.gguf", 0.9), ("MTP/mtp-M-30B-Q4_0.gguf", 1.3)]), budget_gb=13.5, trusted=discover.TRUSTED_QUANTISERS)
+        ("mmproj-BF16.gguf", 0.9), ("MTP/mtp-M-30B-Q4_0.gguf", 1.3),
+        ("eagle3-M-30B-BF16.gguf", 1.6)]), budget_gb=13.5, trusted=discover.TRUSTED_QUANTISERS)
     assert [o["path"] for o in judged["options"]] == ["Q4/M-30B-Q4_K_M.gguf"]
     assert judged["options"][0]["gb"] == 12.0 and judged["options"][0]["shards"] == 2
     assert judged["vision"] is True

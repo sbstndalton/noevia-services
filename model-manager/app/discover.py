@@ -32,7 +32,7 @@ SUB_Q4 = re.compile(r"(?:^|[-_.])(?:UD-)?(IQ[123]\w*|Q[123](?:_[\w]+)*)(?:[-_.]|
 QUANT = re.compile(r"(?:^|[-_.])((?:UD-)?(?:IQ\d\w*|Q\d(?:_[\w]+)*|MXFP4|F16|BF16|F32))(?:[-_.]|$)", re.I)
 # "35B-A3B" = 35B total, 3B active (mixture of experts); "27B" = dense.
 PARAMS = re.compile(r"(?:^|[-_.])(\d+(?:\.\d+)?)\s*B(?:-A(\d+(?:\.\d+)?)B)?(?:[-_.]|$)", re.I)
-COMPANION = re.compile(r"mmproj|projector|\bmtp\b|draft", re.I)
+COMPANION = re.compile(r"mmproj|projector|\bmtp\b|draft|eagle\d?|medusa", re.I)
 SUB_Q4_PARAM_LIMIT = 100.0  # billions
 MIN_MODEL_GB = 0.3          # below this it is not a servable model file
 
