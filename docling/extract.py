@@ -14,8 +14,20 @@ formats that were previously accepted and then silently dropped.
 
 Output contract is the page list apps/web/server/documents.cjs already builds:
     {"number": int, "text": str, "status": str, "method": str, "truncated": bool}
-`status` is one of native | ocr | blank | unreadable | truncated | failed.
+`status` is one of native | blank | truncated. The caller's vocabulary also
+has ocr/unreadable/failed, which this extractor never emits: Docling runs OCR
+inline rather than as a separate pass, and it cannot distinguish an
+unreadable page from an empty one.
 """
+
+from collections import namedtuple
+
+# What `_convert` hands back. A plain tuple rather than an attribute stashed on
+# the document: DoclingDocument is a pydantic model with strict fields, so
+# `setattr(document, "source_page_count", n)` raises ValueError("DoclingDocument
+# object has no field ...") — and it raises only AFTER the conversion has been
+# paid for, which on a 334-page PDF is 454 seconds of wasted work.
+Converted = namedtuple("Converted", "document page_count")
 
 PAGE_TEXT_CAP = 200_000
 TOTAL_TEXT_CAP = 2_000_000
@@ -55,10 +67,27 @@ def _build_converter():
 
 
 def _convert(path):
+    """Convert, bounded to PAGE_CAP pages of actual work.
+
+    `page_range` matters more than it looks. Without it Docling converts every
+    page and `extract` then throws the overflow away, so a 334-page book costs
+    full time and memory to produce 300 pages of output. Measured on DaServer,
+    that is not merely wasteful: a 334-page PDF was OOM-killed (SIGKILL, exit
+    137) against a 4 GB limit after 520 s. Bounding the conversion bounds peak
+    RSS and wall time together.
+
+    The true length is still reported, so `truncatedPages` stays honest: it is
+    read from the input document rather than from the pages we chose to
+    convert.
+    """
     global _converter
     if _converter is None:
         _converter = _build_converter()
-    return _converter.convert(path).document
+    result = _converter.convert(path, page_range=(1, PAGE_CAP))
+    source_pages = getattr(getattr(result, "input", None), "page_count", None)
+    if not isinstance(source_pages, bool) and isinstance(source_pages, int) and source_pages > 0:
+        return Converted(result.document, source_pages)
+    return Converted(result.document, None)
 
 
 def _pages_from(document):
@@ -96,11 +125,19 @@ def extract(path, name, convert=_convert, pages_from=_pages_from):
     if suffix not in SUPPORTED:
         raise ValueError("unsupported format")
 
-    document = convert(path)
+    converted = convert(path)
+    # Tolerant of both shapes: the real `_convert` returns a Converted, while a
+    # test may inject a bare document.
+    document = getattr(converted, "document", converted)
+    source_pages = getattr(converted, "page_count", None)
     grouped = pages_from(document)
     # A page count from the document when it has one; otherwise infer from the
     # highest page we actually saw, so a single-page DOCX does not report 0.
-    declared = len(getattr(document, "pages", {}) or {})
+    # Prefer the input's own page count: `document.pages` only holds the pages
+    # that were actually converted, which _convert caps at PAGE_CAP.
+    declared = source_pages
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
+        declared = len(getattr(document, "pages", {}) or {})
     total = declared or (max(grouped) if grouped else 1)
 
     results = []
@@ -116,10 +153,15 @@ def extract(path, name, convert=_convert, pages_from=_pages_from):
         elif text.strip():
             status = "native"
         else:
-            # Docling ran OCR where it judged it necessary, so an empty page
-            # here is empty, not un-attempted. Saying "blank" rather than
-            # "ocr-needed" keeps the caller from queuing a second pass that
-            # would find nothing.
+            # "blank" means Docling returned nothing for this page, which is
+            # NOT the same as the page being empty. Measured on a scanned page
+            # of handwriting: Tesseract cannot read handwriting, Docling's
+            # layout model returned zero clusters, and the page arrived here
+            # indistinguishable from a genuinely blank one. There is no signal
+            # in the conversion result that separates the two cases, so this
+            # deliberately does not guess. Callers must treat "blank" as "no
+            # text recovered", not as "no content present" — see the known gap
+            # in services/docling/README.md.
             status = "blank"
         results.append({"number": number, "text": text, "status": status,
                         "method": "docling", "truncated": truncated})
