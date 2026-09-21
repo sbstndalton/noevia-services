@@ -162,3 +162,22 @@ def test_http_auth_tenant_pending_and_status_codes(volume, monkeypatch):
     assert 'notes.md' in state.journal.dirty_documents()
     monkeypatch.setattr(appmod, 'check_auth', lambda r: False)
     assert client.post('/api/workspace-ops', json=body, headers=headers).status_code == 401
+
+
+def test_preserve_keeps_the_previous_version_restorable_beside_the_file(store):
+    result = operate(store, {'op': 'preserve', 'path': 'notes/a.md', 'version': sha(b'# A\n')})
+    assert files(store)['notes/a.md'] == b'# A\n', 'preserve never changes the file itself'
+    record = [r for r in list_trash(store)['records'] if r['id'] == result['trash']][0]
+    assert record['path'].startswith('notes/a (replaced ') and record['path'].endswith(').md')
+    # Restoring never overwrites: it lands beside the current file.
+    change(store, {'action': 'restore', 'id': result['trash']})
+    assert files(store)[record['path']] == b'# A\n'
+    assert files(store)['notes/a.md'] == b'# A\n'
+
+
+def test_preserve_refuses_protected_stale_and_missing(store):
+    for path in ['INDEX.md', 'AI Memory/profile.md', 'Entries/2026/September/September 14, 2026.md']:
+        expect(428, lambda: operate(store, {'op': 'preserve', 'path': path, 'version': stat(store, path)['version']}))
+    expect(412, lambda: operate(store, {'op': 'preserve', 'path': 'notes/a.md', 'version': sha(b'stale')}))
+    expect(404, lambda: operate(store, {'op': 'preserve', 'path': 'notes/missing.md', 'version': sha(b'x')}))
+    expect(404, lambda: operate(store, {'op': 'preserve', 'path': 'notes', 'version': 'x'}))

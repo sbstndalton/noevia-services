@@ -123,13 +123,13 @@ def _parent_exists(db, full):
                            (parent, len(parent) + 1, parent + '/', len(parent) + 1, parent + '/')).fetchone())
 
 
-def _capsule(db, store, full, row, now):
+def _capsule(db, store, full, row, now, restore_as=None):
     raw = bytes(row['data'])
     if len(raw) > MAX_FILE or MARKER_RE.search(raw.decode('utf-8', errors='replace')):
         raise OpError(403, 'Capture records or files over 512 KiB cannot be moved to Trash')
     operation = str(uuid.uuid4())
     root = store._join('').rstrip('/')
-    relative = full[len(root) + 1:] if root else full
+    relative = restore_as or (full[len(root) + 1:] if root else full)
     record = {'format': 'noevia-trash-v1', 'id': operation, 'path': relative, 'version': row['version'],
               'data': base64.b64encode(raw).decode(), 'state': 'trashed', 'trashedAt': now}
     encoded = json.dumps(record, sort_keys=True, ensure_ascii=False).encode()
@@ -178,6 +178,37 @@ def delete(store, body):
         _keep_parent(db, full)
         _commit(backend, db, list(files), now)
     return {'deleted': body['path'].strip('/'), 'trash': trashed}
+
+
+def _replaced_name(relative, now):
+    """Where a preserved version restores to: beside the file, never over it."""
+    stem = relative[:-3] if relative.lower().endswith('.md') else relative
+    return f"{stem} (replaced {time.strftime('%Y-%m-%d %H.%M.%S', time.gmtime(now))}).md"
+
+
+def preserve(store, body):
+    """Keep the current bytes of a file in Trash before a client replaces it without a precondition.
+
+    Clients such as rclone, Finder and Obsidian sync never send If-Match, so their writes cannot be
+    checked against what they last read. The previous version is kept instead: it appears in Trash
+    and restores beside the current file. Protected files still require If-Match.
+    """
+    require_managed(store)
+    relative = rel_path(body.get('path'))
+    full = store._join(relative)
+    backend = store.backend
+    with backend.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        files, dirs = _tree(db, full)
+        if _kind(files, dirs, full) != 'file':
+            raise OpError(404, 'File not found')
+        if protected(store, full):
+            raise OpError(428, 'Diary capture files, month files, the index and AI Memory need If-Match to be replaced')
+        _check_version('file', files, dirs, full, body.get('version'))
+        now = time.time()
+        operation = _capsule(db, store, full, files[full], now, restore_as=_replaced_name(relative, now))
+        _commit(backend, db, [], now)
+    return {'path': relative, 'trash': operation}
 
 
 def _transfer(store, body, keep_source):
@@ -255,7 +286,8 @@ def copy(store, body):
 def operate(store, body):
     op = body.get('op') if isinstance(body, dict) else None
     handlers = {'stat': lambda: stat(store, body.get('path')), 'delete': lambda: delete(store, body),
-                'move': lambda: move(store, body), 'copy': lambda: copy(store, body)}
+                'move': lambda: move(store, body), 'copy': lambda: copy(store, body),
+                'preserve': lambda: preserve(store, body)}
     if op not in handlers:
-        raise OpError(400, 'Choose stat, delete, move or copy')
+        raise OpError(400, 'Choose stat, delete, move, copy or preserve')
     return handlers[op]()
