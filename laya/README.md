@@ -46,5 +46,7 @@ Verification: Python validation tests use no model imports; Node tests use mocke
 HTTP responses and answering providers. The one authorized real synthetic smoke test
 on DaServer returned `continue` with scores 0.465 / 0.2975 / 0.2374. No benchmark,
 training, paid endpoint call, or real Diary/personal source test was performed.
-The original System-One routing experiment remains the option-logit baseline;
-this Laya integration serves the separate Step supervision experiment.
+As of 2026-09-22, Settings → Server → Experimental provides shared endpoint setup.
+Both System-One routing and Step supervision can use Laya. Saving configuration there
+overrides the initial COWORK_DECISION_URL default without a restart. The legacy
+option-logit endpoint remains a compatibility fallback when no shared endpoint is set.
