@@ -155,3 +155,18 @@ def test_directory_endpoint_checks_auth_and_uses_tenant_store(monkeypatch, tmp_p
     monkeypatch.setattr(appmod, 'check_auth', lambda request: True)
     assert client.post('/api/directory', json={'path':'folder'}).status_code == 200
     assert client.post('/api/directory', json={'path':'folder'}).status_code == 405
+
+def test_file_list_passes_on_a_normalised_modified_time():
+    from agent.workspace_files import _modified
+    class Listing:
+        def list_dir(self, _):
+            return [{'name': 'a.md', 'is_dir': False, 'lastmod': 1790000000.5},
+                    {'name': 'b.md', 'is_dir': False, 'lastmod': 'Tue, 22 Sep 2026 08:00:00 GMT'},
+                    {'name': 'c.md', 'is_dir': False, 'lastmod': None},
+                    {'name': 'd', 'is_dir': True, 'lastmod': '2026-09-22T08:00:00Z'}]
+    rows = {r['name']: r for r in file_list(SimpleNamespace(backend=Listing(), _join=lambda p: p))}
+    assert rows['a.md']['modified'] == 1790000000.5
+    assert rows['b.md']['modified'] == 1790064000.0
+    assert 'modified' not in rows['c.md']
+    assert rows['d']['modified'] == 1790064000.0
+    assert _modified(True) is None and _modified('garbage') is None and _modified(0) is None and _modified('1790000000') == 1790000000.0

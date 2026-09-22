@@ -24,6 +24,28 @@ def version(text):
     return None if text is None else hashlib.sha256(text.encode()).hexdigest()
 
 
+def _modified(value):
+    """Backends report lastmod as epoch seconds (local, managed) or an HTTP date (WebDAV, S3).
+    WebDAV clients such as Obsidian sync decide what changed from it, so pass one epoch float
+    on, or nothing when it is unknown — never a guess."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    try:
+        return float(value) if float(value) > 0 else None
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        from datetime import datetime
+        text = str(value)
+        stamp = parsedate_to_datetime(text) if not text[:4].isdigit() else datetime.fromisoformat(text.replace('Z', '+00:00'))
+        return stamp.timestamp()
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def file_list(store, path=''):
     safe_path(path, True)
     entries = store.backend.list_dir(store._join(path))
@@ -35,7 +57,11 @@ def file_list(store, path=''):
         rel = '/'.join(p for p in (path, name) if p)
         is_dir = bool(item.get('is_dir'))
         if is_dir or name.lower().endswith('.md'):
-            out.append({'path': rel, 'name': name, 'isDir': is_dir})
+            entry = {'path': rel, 'name': name, 'isDir': is_dir}
+            modified = _modified(item.get('lastmod'))
+            if modified is not None:
+                entry['modified'] = modified
+            out.append(entry)
         if len(out) > MAX_FILES:
             raise HTTPException(413, 'This folder has too many files; choose a subfolder')
     return out
