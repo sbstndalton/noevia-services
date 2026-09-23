@@ -1,4 +1,5 @@
 from pathlib import Path
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,6 +25,16 @@ class Settings(BaseSettings):
     # whether a model fits in system memory, because total RAM is never all yours: sizing
     # against it produces plans that swap or get OOM-killed. Raise it on a busy host.
     host_ram_reserve_gb: float = 32.0
+
+    @field_validator("model_loader_token")
+    @classmethod
+    def validate_model_loader_token(cls, value: str) -> str:
+        if not value:
+            return ""
+        token = value.strip()
+        if len(token) < 32:
+            raise ValueError("MODEL_LOADER_TOKEN must contain at least 32 non-whitespace characters")
+        return token
 
     @property
     def llama_container_names(self) -> list[str]:

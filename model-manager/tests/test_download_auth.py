@@ -55,6 +55,8 @@ def test_socket_experiment_requires_token():
     manager = compose.split('  model-loader:')[1]
     assert '/var/run/docker.sock:/var/run/docker.sock' in manager
     assert 'MODEL_LOADER_TOKEN: ${MODEL_LOADER_TOKEN:?' in manager
+    assert 'context: ../../services/model-manager' in manager
+    assert 'model-loader-test:e11a6ec' not in manager
 
 @pytest.mark.parametrize('url', [
     'https://huggingface.co.evil.test/model', 'https://evil.test/huggingface.co/model',
