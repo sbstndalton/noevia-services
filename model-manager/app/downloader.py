@@ -255,9 +255,14 @@ class DownloadManager:
     def _auth_headers(self, url: str) -> dict[str, str]:
         headers: dict[str, str] = {}
         tok = hf.get_token()
-        if tok and "huggingface.co" in url:
+        if tok and hf.is_token_origin(url):
             headers["Authorization"] = f"Bearer {tok}"
         return headers
+
+    async def _authorize_request(self, request: httpx.Request) -> None:
+        # Runs for every redirect and for GETs using a HEAD-resolved CDN URL.
+        request.headers.pop("Authorization", None)
+        request.headers.update(self._auth_headers(str(request.url)))
 
     def _note_progress(self, job: DownloadJob, delta: int) -> None:
         job.downloaded_bytes += delta
@@ -277,7 +282,7 @@ class DownloadManager:
         accept_ranges = False
         resolved_url = url
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True, headers=headers) as head_client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True, event_hooks={"request": [self._authorize_request]}, headers=headers) as head_client:
                 h = await head_client.head(url)
                 if h.status_code < 400:
                     total = int(h.headers.get("content-length") or 0)
@@ -319,7 +324,7 @@ class DownloadManager:
             worker_headers = dict(headers)
             worker_headers["Range"] = f"bytes={cs.start}-{cs.end}"
             timeout = httpx.Timeout(30.0, read=120.0)
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=worker_headers) as w:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, event_hooks={"request": [self._authorize_request]}, headers=worker_headers) as w:
                 async with w.stream("GET", url) as resp:
                     if resp.status_code not in (200, 206):
                         body = ""
@@ -368,7 +373,7 @@ class DownloadManager:
         job._speed_samples.append((time.time(), job.downloaded_bytes))
 
         timeout = httpx.Timeout(30.0, read=120.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, event_hooks={"request": [self._authorize_request]}, headers=headers) as client:
             async with client.stream("GET", url) as resp:
                 if resp.status_code == 416 and start > 0:
                     job.downloaded_bytes = job.total_bytes or start

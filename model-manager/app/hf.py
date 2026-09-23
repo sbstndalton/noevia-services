@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -13,8 +14,19 @@ from .utils import shard_key
 
 AVATAR_TTL_S = 7 * 86_400
 
-HF_API = "https://huggingface.co/api"
 HF_RESOLVE = "https://huggingface.co"
+HF_API = HF_RESOLVE + "/api"
+
+
+def is_token_origin(url: str) -> bool:
+    """Only the exact HTTPS Hub origin may receive the account token."""
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname == urlsplit(HF_RESOLVE).hostname
+                and parsed.port in (None, 443) and parsed.username is None
+                and parsed.password is None and not any(c.isspace() for c in url))
+    except ValueError:
+        return False
 
 _QUANT_RE = re.compile(r"\b(I?Q\d+(?:_[A-Z0-9]+)*|F16|F32|BF16|FP8|FP4)\b", re.IGNORECASE)
 
