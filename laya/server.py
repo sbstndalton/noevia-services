@@ -3,6 +3,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -52,37 +53,129 @@ def worker(pipe):
 
 
 class Runtime:
-    def __init__(self):
-        ctx = mp.get_context('spawn')
-        self.pipe, child = ctx.Pipe()
-        self.process = ctx.Process(target=worker, args=(child,), daemon=True)
-        self.process.start()
-        child.close()
-        if not self.pipe.poll(90) or self.pipe.recv() != {'ready': True}:
-            self.stop()
-            raise RuntimeError('Laya startup failed or exceeded deadline')
+    def __init__(self, ctx=None, worker_target=worker, startup_timeout=90,
+                 decision_timeout=1.3, retry_delays=(0, 2, 8), fatal=os._exit):
+        self.ctx = ctx or mp.get_context('spawn')
+        self.worker_target = worker_target
+        self.startup_timeout = startup_timeout
+        self.decision_timeout = decision_timeout
+        self.retry_delays = retry_delays
+        self.fatal = fatal
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.process = None
+        self.pipe = None
+        self.starting = None
+        self.recovery = None
+        process, pipe = self._start_worker()
+        self.process, self.pipe = process, pipe
+
+    def _start_worker(self):
+        parent, child = self.ctx.Pipe()
+        process = self.ctx.Process(target=self.worker_target, args=(child,), daemon=True)
+        try:
+            process.start()
+            child.close()
+            with self.lock:
+                self.starting = process
+            if self.stopping.is_set() or not parent.poll(self.startup_timeout) or parent.recv() != {'ready': True}:
+                raise RuntimeError('Laya startup failed or exceeded deadline')
+            with self.lock:
+                self.starting = None
+            return process, parent
+        except (EOFError, OSError, RuntimeError):
+            self._stop_process(process, parent)
+            raise RuntimeError('Laya startup failed or exceeded deadline') from None
+        finally:
+            child.close()
+            with self.lock:
+                if self.starting is process:
+                    self.starting = None
+
+    @staticmethod
+    def _stop_process(process, pipe):
+        if process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+        pipe.close()
+
+    def ready(self):
+        with self.lock:
+            process = self.process
+            ready = not self.stopping.is_set() and process is not None and process.is_alive()
+        if process is not None and not ready and not self.stopping.is_set():
+            self._replace(process)
+        return ready
+
+    def _replace(self, process):
+        with self.lock:
+            if self.stopping.is_set() or self.process is not process:
+                return
+            pipe = self.pipe
+            self.process = self.pipe = None
+            self.recovery = threading.Thread(target=self._recover, args=(process, pipe), daemon=True)
+            self.recovery.start()
+
+    def _recover(self, old_process, old_pipe):
+        self._stop_process(old_process, old_pipe)
+        for delay in self.retry_delays:
+            if self.stopping.wait(delay):
+                return
+            try:
+                process, pipe = self._start_worker()
+            except RuntimeError:
+                continue
+            with self.lock:
+                if not self.stopping.is_set():
+                    self.process, self.pipe = process, pipe
+                    return
+            self._stop_process(process, pipe)
+            return
+        if not self.stopping.is_set():
+            # The parent must fail so Docker's bounded on-failure policy applies.
+            self.fatal(1)
 
     def stop(self):
-        self.process.terminate()
-        self.process.join(2)
-        if self.process.is_alive():
-            self.process.kill()
-            self.process.join(2)
+        self.stopping.set()
+        with self.lock:
+            process, pipe, starting, recovery = self.process, self.pipe, self.starting, self.recovery
+            self.process = self.pipe = None
+        if process is not None:
+            self._stop_process(process, pipe)
+        if starting is not None and starting is not process and starting.pid is not None:
+            starting.terminate()
+        if recovery is not None and recovery is not threading.current_thread():
+            recovery.join(5)
 
     def decide(self, body):
-        if not self.process.is_alive():
-            raise RuntimeError('Worker unavailable; restart required')
-        self.pipe.send(body)
-        if not self.pipe.poll(1.3):
-            self.stop()
-            raise RuntimeError('Decision deadline exceeded; restart required')
-        result = self.pipe.recv()
+        with self.lock:
+            process, pipe = self.process, self.pipe
+        if process is None:
+            raise RuntimeError('Worker unavailable')
+        if not process.is_alive():
+            self._replace(process)
+            raise RuntimeError('Worker unavailable')
+        try:
+            pipe.send(body)
+            if not pipe.poll(self.decision_timeout):
+                raise RuntimeError('Decision deadline exceeded')
+            result = pipe.recv()
+        except (BrokenPipeError, EOFError, OSError, RuntimeError):
+            self._replace(process)
+            raise RuntimeError('Decision unavailable') from None
+        if not isinstance(result, dict) or 'error' in result and result['error'] != 'Input exceeds model context budget':
+            self._replace(process)
+            raise RuntimeError('Decision unavailable')
         if 'error' in result:
             raise ValueError(result['error'])
         return result
 
 
-def serve(runtime):
+def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -93,14 +186,20 @@ def serve(runtime):
 
         def reply(self, status, value):
             data = json.dumps(value).encode()
-            self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def do_GET(self):
-            self.reply(200 if self.path == '/health' and runtime.process.is_alive() else 503, {'ready': runtime.process.is_alive()})
+            if self.path != '/health':
+                return self.reply(404, {'error': 'Unknown route'})
+            ready = runtime.ready()
+            self.reply(200 if ready else 503, {'ready': ready})
 
         def do_POST(self):
             if self.path != '/v1/decisions':
@@ -115,7 +214,13 @@ def serve(runtime):
                 self.reply(422, {'error': 'Invalid or over-budget decision request'})
             except Exception:
                 self.reply(503, {'error': 'Decision unavailable'})
-    HTTPServer(('0.0.0.0', 8040), Handler).serve_forever()
+    server = HTTPServer(address, Handler)
+    try:
+        if on_server is not None:
+            on_server(server)
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == '__main__':

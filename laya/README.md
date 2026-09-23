@@ -29,8 +29,12 @@ Provision/start using the existing host preflight with `--profile laya` and serv
 POST `/v1/decisions` accepts `{state, question, options:[{id,label}]}` and returns
 `{selected,scores,model,calibrated:false}`. GET `/health` checks worker availability
 without inference. The single worker has a 90-second startup deadline and a
-1.3-second request deadline; a timed-out worker is terminated and needs service
-restart. There is no automatic inference retry. No request body is logged.
+1.3-second request deadline. A timed-out, crashed, or failed worker is terminated,
+and one replacement loads in the background. Health reports unready during loading;
+the failed decision is never replayed. Replacement startup uses the same 90-second
+deadline with at most three attempts and short backoff. If all attempts fail, the
+parent exits nonzero so the Compose `on-failure:3` policy can surface a persistent
+failure. No request body is logged.
 Over-budget inputs are rejected before inference. No tools or approval authority
 are exposed to the service.
 
