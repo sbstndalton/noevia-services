@@ -7,7 +7,6 @@ They are never Markdown, never indexed, and retained after restore as receipts.
 import base64
 import json
 import logging
-import re
 import time
 import uuid
 
@@ -29,12 +28,13 @@ def identity(value):
 def allowed(store, path):
     safe_path(path)
     full = store._join(path)
-    entries = store._join(store.entries_prefix).rstrip('/')
-    pattern = re.escape(store._join(store.monthly_prefix, store.month_file_template))
-    for field in ('year', 'month', 'month02', 'month_name'):
-        pattern = pattern.replace(re.escape('{' + field + '}'), '[^/]+')
-    if full == store.index_path() or full == entries or full.startswith(entries + '/') or re.fullmatch(pattern, full):
-        raise ValueError('Diary capture files and the Diary index cannot be moved to Trash')
+    # Use the same protected-path predicate as workspace_ops (moves/copies/
+    # deletes) so AI Memory/** is refused here too, not only capture/month/
+    # index files. Imported lazily: workspace_ops imports TRASH_PREFIX from
+    # this module at load time, so a module-level import here would cycle.
+    from .workspace_ops import protected as shared_protected
+    if shared_protected(store, full):
+        raise ValueError('Diary capture files, month files, the index and AI Memory cannot be moved to Trash')
     return full
 
 

@@ -55,6 +55,16 @@ def test_capture_paths_protected(fixture, path):
     assert store.backend.get(path)[0] == b'raw'
 
 
+def test_ai_memory_path_protected(fixture):
+    # workspace_ops.protected() covers AI Memory/**, and the trash endpoint
+    # must refuse the same paths, not just capture/month/index files.
+    store, body = fixture
+    store.backend.put('AI Memory/notes.md', b'memory')
+    with pytest.raises(ValueError, match='AI Memory'):
+        change(store, {**body, 'path': 'AI Memory/notes.md', 'version': hashlib.sha256(b'memory').hexdigest()})
+    assert store.backend.get('AI Memory/notes.md')[0] == b'memory'
+
+
 def test_marker_and_changed_version_protected(fixture):
     store, body = fixture
     _, tag = store.backend.get(body['path'])
