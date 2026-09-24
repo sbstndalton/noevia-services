@@ -38,6 +38,18 @@ class CorpusError(RuntimeError):
     pass
 
 
+MONTH_ID_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+class EditConflict(CorpusError):
+    """The exchange changed since the client loaded it (stale base hash)."""
+
+    def __init__(self, current_hash: Optional[str], current_text: Optional[str]):
+        super().__init__("The entry changed since it was opened; reload and retry")
+        self.current_hash = current_hash
+        self.current_text = current_text
+
+
 class CorpusStore:
     def __init__(self, cfg: Config, backend: CorpusBackend, journal: Journal):
         self._write_lock = threading.RLock()
@@ -370,7 +382,7 @@ class CorpusStore:
     # ---------------- editing ----------------
 
     @serialized
-    def edit_exchange(self, xid: str, new_me: str, new_claude: str, month: Optional[str] = None) -> str:
+    def edit_exchange(self, xid: str, new_me: str, new_claude: str, month: Optional[str] = None, base_hash: Optional[str] = None) -> str:
         """Durably record + apply a human-initiated correction to one logged exchange.
 
         The edit intent goes through the same write-ahead journal as appends, then
@@ -387,14 +399,27 @@ class CorpusStore:
         this call's pre-check) — a race between check and apply merely leaves the
         entry pending for the next apply_pending, which is the safe direction.
 
-        Returns (document path, owning day ISO) for the edited exchange.
+        base_hash (optional) is the fmt.exchange_hash the client saw when it
+        opened the editor. When given and the exchange has changed since (a
+        second tab saved first), EditConflict is raised and nothing is
+        enqueued. Omitting it keeps the legacy last-write-wins behaviour for
+        older clients.
+
+        Returns (document path, owning day ISO, post-edit exchange hash).
         """
+        if month is not None and not MONTH_ID_RE.fullmatch(month):
+            raise ValueError("month must be YYYY-MM")
         found = self._find_document_with_xid(xid, month)
         if found is None:
             raise CorpusError(f"no corpus document contains exchange {xid}")
         original, _ = self.backend.get_text(found[0])
-        if original is None or fmt.replace_exchange_text(original, xid, new_me, new_claude) is None:
+        edited = None if original is None else fmt.replace_exchange_text(original, xid, new_me, new_claude)
+        if edited is None:
             raise CorpusError("The entry cannot be edited safely: malformed or missing block")
+        if base_hash is not None:
+            current_hash = fmt.exchange_hash(original, xid)
+            if current_hash != base_hash.strip().lower():
+                raise EditConflict(current_hash, fmt.exchange_text(original, xid))
         payload = {"xid": xid, "new_me": new_me, "new_claude": new_claude}
         if month:
             payload["month"] = month
@@ -403,7 +428,7 @@ class CorpusStore:
         if not self.journal.is_applied(jid):
             raise CorpusError("Correction is queued but could not be saved yet. It will retry when storage is available.")
         path, day = found
-        return path, day.isoformat()
+        return path, day.isoformat(), fmt.exchange_hash(edited, xid)
 
     def _documents_for_month(self, month_id: str) -> List[Tuple[str, date]]:
         """(document path, owning day) pairs for a YYYY-MM month id."""

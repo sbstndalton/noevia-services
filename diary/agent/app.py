@@ -48,7 +48,7 @@ from pydantic import BaseModel
 from . import corpus as fmt
 from .config import load_config
 from .context import ContextAssembler
-from .corpus_store import CorpusError, CorpusStore
+from .corpus_store import MONTH_ID_RE, CorpusError, CorpusStore, EditConflict
 from .external_sources import (
     external_source_paths,
     infer_date,
@@ -281,8 +281,13 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
             state.recovered = True
         state.last_used = time.monotonic()
         _tenant_states[state_key] = state
-        _evict_tenant_states_locked()
-        return state
+        evicted = _evict_tenant_states_locked()
+    # Close outside the lock: closing HTTP clients/SQLite can block, and every
+    # tenant request serializes on _tenant_lock.
+    for old_state in evicted:
+        if old_state is not state:
+            _close_state(old_state)
+    return state
 
 
 def _close_state(state: AppState) -> None:
@@ -300,19 +305,25 @@ def _close_state(state: AppState) -> None:
         log.exception("failed to close evicted tenant state")
 
 
-def _evict_tenant_states_locked() -> None:
+def _evict_tenant_states_locked() -> list:
     """TTL + LRU eviction of cached tenant states. Caller must hold
     _tenant_lock. Without this, every distinct storage-config change mints a
     new heavyweight entry (SQLite connections, HTTP clients) that is never
-    released except via the explicit tenant-delete route."""
+    released except via the explicit tenant-delete route.
+
+    Returns the evicted states; the caller must _close_state() them AFTER
+    releasing _tenant_lock (closing can block on I/O)."""
+    evicted = []
     now = time.monotonic()
     stale = [k for k, s in _tenant_states.items() if now - getattr(s, "last_used", now) > _TENANT_STATE_TTL_S]
     for key in stale:
-        _tenant_states.pop(key)
+        evicted.append(_tenant_states.pop(key))
         log.info("evicted tenant state %s (TTL expired)", key.split(":")[0])
     while len(_tenant_states) > _TENANT_STATE_CAP:
         key, state = _tenant_states.popitem(last=False)  # least recently used
+        evicted.append(state)
         log.info("evicted tenant state %s (LRU cap)", key.split(":")[0])
+    return evicted
 
 
 @asynccontextmanager
@@ -396,7 +407,7 @@ def _session(session_id: str, tenant_id: str = "legacy") -> dict:
     sid = str(session_id or "default")
     if not _SESSION_ID_RE.fullmatch(sid):
         sid = "default"
-    tid = str(tenant_id or "legacy")
+    tid = str(tenant_id or "legacy").lower()  # match _tenant_state's normalization
     if tid != "legacy" and not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", tid):
         raise HTTPException(status_code=400, detail="invalid tenant")
     key = f"{tid}:{sid}"
@@ -434,6 +445,10 @@ class EditEntryRequest(BaseModel):
     me: str
     assistant: str = ""
     month: Optional[str] = None  # YYYY-MM hint; discovery scans all months without it
+    # sha256 of the exchange block the client edited (corpus.exchange_hash).
+    # Optional for backward compatibility: clients that omit it keep the old
+    # last-write-wins behaviour; clients that send it get 409 on a stale base.
+    base_hash: Optional[str] = None
 
 
 # ---------------- pages ----------------
@@ -670,16 +685,22 @@ def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid xid"}, status_code=400)
     if not req.me.strip():
         return JSONResponse({"error": "me is required"}, status_code=400)
+    if req.month is not None and not MONTH_ID_RE.fullmatch(req.month):
+        return JSONResponse({"error": "month must be YYYY-MM"}, status_code=400)
+    if req.base_hash is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", req.base_hash.strip()):
+        return JSONResponse({"error": "invalid base_hash"}, status_code=400)
     st = _tenant_state(request)
     try:
-        path, day_iso = run_in_threadpool_sync(st.store.edit_exchange, xid, req.me, req.assistant, req.month)
+        path, day_iso, new_hash = run_in_threadpool_sync(st.store.edit_exchange, xid, req.me, req.assistant, req.month, req.base_hash)
+    except EditConflict as exc:
+        return JSONResponse({"error": str(exc), "conflict": True, "current_hash": exc.current_hash, "current_text": exc.current_text}, status_code=409)
     except CorpusError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503 if "queued" in str(exc) else 404)
     except Exception as exc:  # noqa: BLE001 — persistent write conflict etc.
         log.exception("entry edit failed")
-        return JSONResponse({"error": f"edit failed: {exc}"}, status_code=502)
+        return JSONResponse({"error": "edit failed"}, status_code=502)
     _reindex_dirty(st)
-    return JSONResponse({"ok": True, "document": path, "day": day_iso})
+    return JSONResponse({"ok": True, "document": path, "day": day_iso, "hash": new_hash})
 
 
 @app.get("/api/external-sources")
@@ -792,7 +813,8 @@ def api_storage_backup(request: Request):
         raise HTTPException(401, "unauthorized")
     # A worker must not replay legacy writes, initialize empty diaries, or load
     # inference clients merely because it is checking for durable backup work.
-    user_id = request.headers.get("X-Cowork-User-ID", "")
+    # Same normalization as _tenant_state: tenant ids are case-insensitive.
+    user_id = request.headers.get("X-Cowork-User-ID", "").lower()
     if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", user_id):
         raise HTTPException(400, "invalid tenant")
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id

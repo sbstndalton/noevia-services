@@ -49,7 +49,14 @@ corrections. Past entries are editable in the app, but only through
   other corpus mutation (there is no separate, unguarded write path), so a crash
   before or after the underlying PUT replays idempotently;
 - refreshes the retrieval index afterward, so a superseded chunk can never be
-  served alongside the corrected text.
+  served alongside the corrected text;
+- accepts an optional `base_hash` (sha256 hex of the exchange block from the
+  `**Me:**` line up to the xid marker, trimmed; see `corpus.exchange_hash`).
+  When it no longer matches, the edit is refused with `409` and
+  `current_hash`/`current_text`, so two tabs cannot silently overwrite each
+  other. Success responses include the new `hash` for chained edits. Omitting
+  `base_hash` keeps the older last-write-wins behaviour for existing clients;
+- rejects a `month` hint that is not `YYYY-MM` with `400`.
 
 Editing is a human-initiated, visible action in the UI. The assistant never
 rewrites the user's words on its own, and no pipeline step edits corpus text.

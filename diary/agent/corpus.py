@@ -15,6 +15,7 @@ applier can dedupe idempotently; they are stripped when the log is shown to the 
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -185,19 +186,8 @@ def _append_buf_to_sub(sub: SubSection, body: str) -> None:
 # ---------------- editing ----------------
 
 
-def replace_exchange_text(text: str, xid: str, new_me: str, new_claude: str) -> Optional[str]:
-    """Rewrite one exchange (matched by its hidden xid marker) in place.
-
-    Returns the new text, or None when no exchange with that xid exists (or
-    the block is malformed). Everything outside the matched block — the day
-    header, the subsection header, the timestamp/topic, sibling exchanges,
-    and the exchange's own position — is preserved. The marker itself is
-    kept, so the exchange stays replay-safe and can be edited again later.
-
-    This is the format-level half of diary editing: the caller is responsible
-    for the human/consent half (an explicit, user-initiated request routed
-    through the guarded write path).
-    """
+def _exchange_bounds(text: str, xid: str):
+    """(lines, me_start, marker_idx) for one exchange, or None if missing/malformed."""
     marker = f"<!-- xid:{xid} -->"
     if marker not in text:
         return None
@@ -230,6 +220,51 @@ def replace_exchange_text(text: str, xid: str, new_me: str, new_claude: str) -> 
             return None  # malformed: no Me: opener between the header and the marker
     if me_start is None:
         return None
+    return lines, me_start, marker_idx
+
+
+def exchange_hash(text: Optional[str], xid: str) -> Optional[str]:
+    """sha256 hex of one exchange's visible block, used as the edit base hash.
+
+    Hashed input: the block's lines from the '**Me:**' opener up to (not
+    including) the xid marker, joined with '\\n', with surrounding whitespace
+    stripped. Returns None when the exchange is missing or malformed.
+    """
+    block = exchange_text(text, xid)
+    if block is None:
+        return None
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()
+
+
+def exchange_text(text: Optional[str], xid: str) -> Optional[str]:
+    """The exact block text hashed by exchange_hash (None if missing)."""
+    if text is None:
+        return None
+    bounds = _exchange_bounds(text, xid)
+    if bounds is None:
+        return None
+    lines, me_start, marker_idx = bounds
+    return "\n".join(lines[me_start:marker_idx]).strip()
+
+
+def replace_exchange_text(text: str, xid: str, new_me: str, new_claude: str) -> Optional[str]:
+    """Rewrite one exchange (matched by its hidden xid marker) in place.
+
+    Returns the new text, or None when no exchange with that xid exists (or
+    the block is malformed). Everything outside the matched block — the day
+    header, the subsection header, the timestamp/topic, sibling exchanges,
+    and the exchange's own position — is preserved. The marker itself is
+    kept, so the exchange stays replay-safe and can be edited again later.
+
+    This is the format-level half of diary editing: the caller is responsible
+    for the human/consent half (an explicit, user-initiated request routed
+    through the guarded write path).
+    """
+    bounds = _exchange_bounds(text, xid)
+    if bounds is None:
+        return None
+    lines, me_start, marker_idx = bounds
+    marker = f"<!-- xid:{xid} -->"
     block_end = marker_idx
 
     me_clean = new_me.strip()

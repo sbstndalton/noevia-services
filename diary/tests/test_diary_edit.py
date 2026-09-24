@@ -114,7 +114,7 @@ def _store(tmp_path, dav=None, layout="monthly"):
 def test_edit_exchange_updates_corpus_and_returns_location(tmp_path):
     st = _store(tmp_path)
     xid = st.log_exchange(DAY, "Morning plan", "I want to fix my sleep.", "The user set a goal.", now=datetime(2026, 9, 1, 9, 15))
-    path, day_iso = st.edit_exchange(xid, "Edited words.", "Edited assistant.", month="2026-09")
+    path, day_iso, _ = st.edit_exchange(xid, "Edited words.", "Edited assistant.", month="2026-09")
     assert day_iso == DAY.isoformat()
     text, _ = st.read_month(DAY)
     assert "**Me:** Edited words." in text
@@ -169,7 +169,7 @@ def test_edit_unknown_xid_fails_fast_without_journal_entry(tmp_path):
 def test_edit_daily_layout_finds_the_day_file(tmp_path):
     st = _store(tmp_path, layout="daily")
     xid = st.log_exchange(DAY, "t", "original", "reply", now=datetime(2026, 9, 1, 9, 0))
-    path, _ = st.edit_exchange(xid, "daily edit", "r", month="2026-09")
+    path, _, _ = st.edit_exchange(xid, "daily edit", "r", month="2026-09")
     assert path == st.daily_path(DAY)
     text, _ = st.backend.get_text(path)
     assert "**Me:** daily edit" in text
