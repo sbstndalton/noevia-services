@@ -186,6 +186,71 @@ def test_applier_shape_error_is_permanent_but_store_closed_is_not(tmp_path):
     assert not st._is_permanent_failure(entry, OSError("transient"))
 
 
+# ---- tenant delete vs in-flight ManagedCorpusBackend construction race ----
+
+def test_construct_racing_delete_leaves_no_directory(client, tmp_path, monkeypatch):  # noqa: F811
+    """A request whose ManagedCorpusBackend construction is in flight when
+    DELETE /api/internal/tenant runs (and finishes) must not leave behind a
+    recreated, empty tenant directory: it should observe the tombstone and
+    fail closed instead."""
+    from agent.managed_storage import ManagedCorpusBackend
+
+    U3 = "77777777-7777-4777-8777-777777777779"
+    root = Path(appmod._base_cfg.get("retrieval.db_path")).parent / "users" / U3
+    # Seed a pre-existing tenant so the delete has something real to remove.
+    seed = ManagedCorpusBackend(root, U3)
+    seed.close()
+    assert root.exists()
+
+    real_init = ManagedCorpusBackend.__init__
+    constructing, deleted = threading.Event(), threading.Event()
+
+    def delayed_init(self, *a, **k):
+        real_init(self, *a, **k)
+        if getattr(self, "tenant", None) == U3 or a and a[-1] == U3:
+            constructing.set()
+            assert deleted.wait(5)  # block until the delete has completed
+
+    monkeypatch.setattr(ManagedCorpusBackend, "__init__", delayed_init)
+
+    result = {}
+
+    def racer():
+        req = SimpleNamespace(headers={"X-Cowork-User-ID": U3})
+        try:
+            result["state"] = appmod._tenant_state(req)
+        except Exception as exc:  # noqa: BLE001
+            result["exc"] = exc
+
+    racer_thread = threading.Thread(target=racer)
+    racer_thread.start()
+    assert constructing.wait(5)
+
+    resp = client.delete("/api/internal/tenant", headers={"X-Cowork-User-ID": U3})
+    assert resp.status_code == 200
+    deleted.set()
+    racer_thread.join(5)
+
+    assert "exc" in result and getattr(result["exc"], "status_code", None) == 404
+    assert not root.exists()
+
+
+def test_tenant_state_rejects_request_racing_delete(client, tmp_path):  # noqa: F811
+    """_tenant_state itself must fail closed (404) and leave no directory
+    when a tombstone is set concurrently with its construction."""
+    U4 = "88888888-8888-4888-8888-888888888884"
+    root = Path(appmod._base_cfg.get("retrieval.db_path")).parent / "users" / U4
+    with appmod._tenant_lock:
+        appmod._mark_tenant_deleted_locked(U4)
+
+    req = SimpleNamespace(headers={"X-Cowork-User-ID": U4})
+    with pytest.raises(Exception) as excinfo:
+        appmod._tenant_state(req)
+    # FastAPI's HTTPException carries status_code 404.
+    assert getattr(excinfo.value, "status_code", None) == 404
+    assert not root.exists()
+
+
 def test_update_standing_sections_drops_malformed_ops(tmp_path):
     st = _store(tmp_path)
     assert st.update_standing_sections(["x", {"text": 1}], {"a": 1}, "2026-09-01") is None

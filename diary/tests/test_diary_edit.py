@@ -242,6 +242,7 @@ def client(tmp_path, monkeypatch):
     appmod.SESSIONS.clear()
     appmod._state = None
     appmod._tenant_states.clear()
+    appmod._deleted_tenants.clear()
     _FakeRetriever.calls = []
 
     def patched_init(self, cfg_inner, backend=None):

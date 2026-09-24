@@ -308,6 +308,23 @@ def test_v1_chat_rejects_missing_user_message(client):
     assert r.json()["error"]["type"] == "invalid_request_error"
 
 
+def test_v1_chat_completions_hides_exception_detail(client, monkeypatch):
+    """A backend failure must not leak exception text (e.g. internal URLs)
+    into the API response; the real cause is logged, not returned."""
+    def boom(*a, **k):
+        raise RuntimeError("synthetic failure talking to http://internal-backend:9999/secret-path")
+
+    monkeypatch.setattr(appmod, "_run_exchange", boom)
+    r = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "trigger a backend failure"}],
+    })
+    assert r.status_code == 502
+    body = r.json()
+    assert body["error"]["message"] == "model error"
+    assert "internal-backend" not in body["error"]["message"]
+    assert "synthetic failure" not in body["error"]["message"]
+
+
 def test_v1_appends_to_selected_past_day(client):
     r = client.post('/v1/chat/completions', json={
         'messages': [{'role':'user','content':'Adding a detail to July eighth.'}],

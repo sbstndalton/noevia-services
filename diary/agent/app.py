@@ -122,6 +122,32 @@ _TENANT_STATE_CAP = 32
 _TENANT_STATE_TTL_S = 24 * 60 * 60
 _base_cfg = load_config()
 
+# Brief tombstone of just-deleted tenant ids, protected by _tenant_lock.
+# DELETE /api/internal/tenant rmtree's the tenant root; without this, a
+# request that raced the delete can construct a ManagedCorpusBackend (which
+# mkdirs + creates the sqlite db as a side effect of __init__) right after
+# rmtree and silently leave behind a fresh, empty tenant directory. The
+# tombstone is kept only long enough to catch that race, not to permanently
+# block reuse of a tenant id.
+_deleted_tenants: dict = {}
+_DELETED_TENANT_TTL_S = 30.0
+
+
+def _mark_tenant_deleted_locked(user_id: str) -> None:
+    """Record a deletion tombstone. Caller holds _tenant_lock."""
+    now = time.monotonic()
+    _deleted_tenants[user_id] = now
+    stale = [uid for uid, ts in _deleted_tenants.items() if now - ts > _DELETED_TENANT_TTL_S]
+    for uid in stale:
+        _deleted_tenants.pop(uid, None)
+
+
+def _tenant_recently_deleted_locked(user_id: str) -> bool:
+    """True if user_id was deleted within the tombstone window. Caller holds
+    _tenant_lock."""
+    ts = _deleted_tenants.get(user_id)
+    return ts is not None and (time.monotonic() - ts) <= _DELETED_TENANT_TTL_S
+
 
 def _set_cfg(cfg, dotted: str, value) -> None:
     node = cfg.as_dict()
@@ -190,8 +216,22 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
     user_id = user_id.lower()
     storage_header = request.headers.get("X-Cowork-Storage", "")
     managed_root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
-    managed = ManagedCorpusBackend(managed_root, user_id)
-    is_managed = managed.active()
+    with _tenant_lock:
+        if _tenant_recently_deleted_locked(user_id):
+            raise HTTPException(status_code=404, detail="tenant not found")
+    try:
+        managed = ManagedCorpusBackend(managed_root, user_id)
+        is_managed = managed.active()
+    except Exception:  # noqa: BLE001
+        # A concurrent DELETE /api/internal/tenant can rmtree the tenant root
+        # while we're mid-construction (e.g. sqlite file vanishes under us).
+        # If that's what happened, fail closed with 404 instead of a 500;
+        # any real construction error unrelated to a delete race still
+        # propagates.
+        with _tenant_lock:
+            if _tenant_recently_deleted_locked(user_id):
+                raise HTTPException(status_code=404, detail="tenant not found")
+        raise
     if request.headers.get("X-Cowork-Storage-Blocked") == "1" and not is_managed:
         raise HTTPException(403, "The original storage endpoint is not approved. Ask an administrator to review the connection.")
     volume = None if is_managed else tenant_volume(user_id)
@@ -199,6 +239,17 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
     storage_key = "managed" if is_managed else json.dumps(volume, sort_keys=True) if volume else storage_header
     state_key = f"{user_id}:{hashlib.sha256(storage_key.encode()).hexdigest()[:16]}"
     with _tenant_lock:
+        if _tenant_recently_deleted_locked(user_id):
+            # Lost the race: constructing ManagedCorpusBackend above (mkdir +
+            # sqlite init) recreated the tenant root right after DELETE ran.
+            # Undo that side effect and fail closed rather than silently
+            # reviving a deleted tenant.
+            try:
+                managed.close()
+            except Exception:  # noqa: BLE001
+                pass
+            shutil.rmtree(managed_root, ignore_errors=True)
+            raise HTTPException(status_code=404, detail="tenant not found")
         cached = _tenant_states.get(state_key)
         if cached is not None:
             # LRU touch: move to the most-recently-used end.
@@ -418,6 +469,7 @@ def delete_tenant(request: Request) -> JSONResponse:
                 _close_state(state)
                 _tenant_states.pop(key, None)
         shutil.rmtree(root, ignore_errors=True)
+        _mark_tenant_deleted_locked(user_id)
     return JSONResponse({"ok": True})# ---------------- in-memory session (per tenant, bounded) ----------------
 
 SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
@@ -1114,10 +1166,10 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day, True, optional_reference(body))
     except HTTPException:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
-            {"error": {"message": f"model error: {exc}", "type": "api_error"}}, status_code=502
+            {"error": {"message": "model error", "type": "api_error"}}, status_code=502
         )
 
     now = int(time.time())
