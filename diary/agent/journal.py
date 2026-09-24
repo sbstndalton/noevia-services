@@ -91,6 +91,14 @@ class Journal:
             )
 
     @synchronized
+    def quarantine(self, jid: str, error: str) -> None:
+        """Retire an entry that can never succeed; the row and error stay inspectable."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE journal SET applied = 1, applied_at = ?, attempts = attempts + 1, last_error = ? WHERE id = ?",
+                (datetime.now().isoformat(timespec="seconds"), error[:2000], jid),
+            )
+
     def mark_failed(self, jid: str, error: str) -> None:
         with self._conn:
             self._conn.execute(

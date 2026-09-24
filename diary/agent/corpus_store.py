@@ -18,8 +18,11 @@ def serialized(fn):
     @wraps(fn)
     def call(self, *args, **kwargs):
         guard = getattr(self.backend, "write_transaction", nullcontext)
-        with self._write_lock, guard():
-            return fn(self, *args, **kwargs)
+        with self._write_lock:
+            if getattr(self, "closed", False):
+                raise StoreClosed("store is closed")
+            with guard():
+                return fn(self, *args, **kwargs)
     return call
 
 from datetime import date, datetime
@@ -50,9 +53,21 @@ class EditConflict(CorpusError):
         self.current_text = current_text
 
 
+class PermanentApplyError(CorpusError):
+    """A journal entry that can never succeed on retry (target gone or malformed)."""
+
+
+class StoreClosed(CorpusError):
+    """The tenant store was closed (e.g. tenant deleted); no further writes."""
+
+
+MAX_APPLY_ATTEMPTS = 20
+
+
 class CorpusStore:
     def __init__(self, cfg: Config, backend: CorpusBackend, journal: Journal):
         self._write_lock = threading.RLock()
+        self.closed = False
         self.cfg = cfg
         self.backend = backend
         self.dav = backend  # one-release compatibility for integrations/tests
@@ -441,6 +456,8 @@ class CorpusStore:
             entries = self.backend.list_dir(month_dir)
         except Exception as exc:  # noqa: BLE001
             log.warning("edit discovery: month dir listing failed for %s: %s", month_dir, exc)
+            if errors is not None:
+                errors.append(exc)
             return []
         expected = re.compile(rf"^{re.escape(first.strftime('%B'))} (\d{{1,2}}), {year}\.md$")
         docs = []
@@ -455,7 +472,9 @@ class CorpusStore:
                 docs.append((self.daily_path(d), d))
         return sorted(docs, key=lambda pair: pair[1])
 
-    def _find_document_with_xid(self, xid: str, month: Optional[str] = None) -> Optional[Tuple[str, date]]:
+    def _find_document_with_xid(
+        self, xid: str, month: Optional[str] = None, errors: Optional[list] = None
+    ) -> Optional[Tuple[str, date]]:
         """Newest-first scan for the document containing an exchange marker.
 
         Edits overwhelmingly target recent entries, so months are walked in
@@ -474,6 +493,8 @@ class CorpusStore:
                 text, _ = self.backend.get_text(path)
             except Exception as exc:  # noqa: BLE001 — unreachable doc: keep scanning
                 log.warning("edit discovery: read failed for %s: %s", path, exc)
+                if errors is not None:
+                    errors.append(exc)
                 continue
             if text and fmt.has_marker(text, xid):
                 return path, day
@@ -482,18 +503,21 @@ class CorpusStore:
     def _apply_exchange_edit(self, entry: JournalEntry) -> None:
         p = entry.payload
         xid = p["xid"]
-        found = self._find_document_with_xid(xid, p.get("month"))
+        scan_errors: list = []
+        found = self._find_document_with_xid(xid, p.get("month"), scan_errors)
         if found is None:
-            raise CorpusError(f"no corpus document contains exchange {xid}")
+            if scan_errors:  # storage trouble during the scan: may succeed later
+                raise CorpusError(f"no corpus document contains exchange {xid} (scan incomplete)")
+            raise PermanentApplyError(f"no corpus document contains exchange {xid}")
         target, day = found
         self.journal.mark_dirty(target)
 
         def mutate(current: Optional[str]) -> Tuple[Optional[str], bool]:
             if current is None:
-                raise CorpusError("The entry no longer exists")
+                raise PermanentApplyError("The entry no longer exists")
             new_text = fmt.replace_exchange_text(current, xid, p["new_me"], p["new_claude"])
             if new_text is None:
-                raise CorpusError("The entry cannot be edited safely: malformed or missing block")
+                raise PermanentApplyError("The entry cannot be edited safely: malformed or missing block")
             if new_text == current:
                 return current, False  # nothing to do (already applied — replay safe)
             return new_text, True
@@ -505,8 +529,19 @@ class CorpusStore:
 
     _KNOWN_KINDS = ("exchange", "exchange_edit", "index_month", "index_update")
 
-    def _is_permanent_failure(self, entry: JournalEntry) -> bool:
-        """Return True if the entry will never succeed on retry (bad kind or payload)."""
+    def _is_permanent_failure(self, entry: JournalEntry, exc: Optional[BaseException] = None) -> bool:
+        """Return True if the entry will never succeed on retry.
+
+        Covers bad kinds/payloads, appliers that signal PermanentApplyError, and
+        entries that already failed MAX_APPLY_ATTEMPTS times, so one entry can
+        never block the journal forever.
+        """
+        if isinstance(exc, StoreClosed):
+            return False
+        if isinstance(exc, PermanentApplyError):
+            return True
+        if entry.attempts + 1 >= MAX_APPLY_ATTEMPTS:
+            return True
         if entry.kind not in self._KNOWN_KINDS:
             return True
         p = entry.payload
@@ -537,12 +572,13 @@ class CorpusStore:
                 self.journal.mark_applied(entry.id)
                 applied += 1
             except Exception as exc:  # noqa: BLE001 — keep trying remaining entries
-                if self._is_permanent_failure(entry):
+                if self._is_permanent_failure(entry, exc):
                     log.error(
                         "journal entry %s (kind=%s) quarantined — permanent failure: %s",
                         entry.id, entry.kind, exc,
                     )
-                    self.journal.mark_applied(entry.id)
+                    # Row stays in the journal (applied=1, last_error kept) for inspection.
+                    self.journal.quarantine(entry.id, f"quarantined: {exc}")
                 else:
                     log.error("journal entry %s failed: %s", entry.id, exc)
                     self.journal.mark_failed(entry.id, str(exc))

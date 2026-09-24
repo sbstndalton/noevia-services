@@ -70,6 +70,9 @@ class LocalCorpusBackend:
         max_retries: int = 5,
     ) -> Tuple[bool, Optional[str], int]:
         del max_retries  # retries happen in CorpusStore after it re-reads fresh content
+        if getattr(self, "closed", False):
+            from .corpus_store import StoreClosed
+            raise StoreClosed("storage is closed")
         target = self._path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         with self._lock(target):
@@ -129,15 +132,20 @@ class LocalCorpusBackend:
             if resolved != self.root and self.root not in resolved.parents:
                 continue
             is_dir = child.is_dir()
-            data = None if is_dir else child.read_bytes()
+            st = child.stat()
+            # Listing etags are change indicators only (no caller uses them as
+            # If-Match; writes re-GET for the content-hash version), so stat is
+            # enough and avoids reading every file on each listing.
             entries.append({
                 "name": child.name,
                 "path": "/".join(part for part in [path.strip("/"), child.name] if part),
-                "etag": None if data is None else self._version(data),
-                "lastmod": child.stat().st_mtime,
+                "etag": None if is_dir else f'"stat:{st.st_mtime_ns}-{st.st_size}"',
+                "lastmod": st.st_mtime,
                 "is_dir": is_dir,
             })
         return entries
 
     def close(self) -> None:
-        return None
+        # Refuse later writes: put() would otherwise mkdir(parents=True) and
+        # recreate a deleted tenant's directory tree.
+        self.closed = True
