@@ -111,8 +111,12 @@ class Journal:
 
     @synchronized
     def unapplied(self, limit: int = 100) -> List[JournalEntry]:
+        # rowid is insertion order and is monotonic even across a local clock step-back;
+        # created_at is naive local time at 1s resolution and is kept for display only —
+        # ordering replay by it can replay an older exchange_edit after a newer one and
+        # overwrite the newer text.
         rows = self._conn.execute(
-            "SELECT * FROM journal WHERE applied = 0 ORDER BY created_at, rowid LIMIT ?", (limit,)
+            "SELECT * FROM journal WHERE applied = 0 ORDER BY rowid LIMIT ?", (limit,)
         ).fetchall()
         return [
             JournalEntry(
