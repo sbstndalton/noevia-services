@@ -136,6 +136,23 @@ def test_store_returns_hash_of_applied_document(tmp_path):
     assert new_hash == exchange_hash(st.read_month(DAY)[0], xid)
 
 
+# ---- oversized X-Cowork-Storage header is rejected before decoding ----
+
+def test_oversized_storage_header_rejected_with_413(client):
+    huge = "a" * (appmod.MAX_STORAGE_HEADER_LEN + 1)
+    r = client.get("/api/storage-status", headers={"X-Cowork-User-ID": U1, "X-Cowork-Storage": huge})
+    assert r.status_code == 413
+
+
+def test_oversized_storage_header_ignored_by_request_storage(client):
+    huge = "a" * (appmod.MAX_STORAGE_HEADER_LEN + 1)
+
+    class Req:
+        headers = {"X-Cowork-Storage": huge}
+
+    assert appmod._request_storage(Req()) == {}
+
+
 def test_edit_endpoint_hides_exception_text(client, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("secret internal detail")

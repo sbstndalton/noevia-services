@@ -256,7 +256,20 @@ class S3CorpusBackend:
                     headers["If-None-Match"] = if_none_match
                 resp = self._request("PUT", self._key(remote_path), data=data, headers=headers)
                 if resp.status_code in (200, 201, 204):
-                    etag = clean_etag(resp.headers.get("ETag")) or f'"{self._sha256_hex(data)}"'
+                    etag = clean_etag(resp.headers.get("ETag"))
+                    if etag is None:
+                        # Some S3-compatible servers omit the ETag on PUT. A
+                        # synthetic (sha256) ETag looks real but never matches
+                        # what the server later reports, so every subsequent
+                        # If-Match update would 412-loop forever. Ask the
+                        # server directly instead of guessing.
+                        head = self._request("HEAD", self._key(remote_path))
+                        etag = clean_etag(head.headers.get("ETag")) if head.status_code == 200 else None
+                    if etag is None:
+                        raise RuntimeError(
+                            "S3 storage did not report an ETag for the written object; "
+                            "conditional updates cannot be verified against this server."
+                        )
                     self._etag_cache[remote_path] = etag
                     return True, etag, resp.status_code
                 status = resp.status_code

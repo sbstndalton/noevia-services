@@ -70,21 +70,18 @@ class WebDAVCorpusBackend:
 
     # ---------------- primitives ----------------
 
+    # Default cap for reads that don't specify their own budget (get/get_text/
+    # list_dir). Generous enough for any real corpus file, but keeps a
+    # misbehaving or hostile WebDAV server from streaming an unbounded
+    # response into memory.
+    DEFAULT_READ_LIMIT = 64 * 1024 * 1024
+
     def get(self, remote_path: str) -> Tuple[Optional[bytes], Optional[str]]:
         """Fetch file bytes + ETag. Returns (None, None) if the file does not exist."""
-        url = self._url(remote_path)
-        resp = self._client.get(url, headers={"Accept": "*/*"})
-        if resp.status_code == 404:
-            return None, None
-        self._ensure_not_redirect(resp)
-        resp.raise_for_status()
-        etag = clean_etag(resp.headers.get("ETag"))
-        self._etag_cache[remote_path] = etag
-        self._lm_cache[remote_path] = resp.headers.get("Last-Modified")
-        return resp.content, etag
+        return self.get_bounded(remote_path, self.DEFAULT_READ_LIMIT)
 
     def get_bounded(self, remote_path: str, limit: int):
-        """Stream import bytes with a strict decoded-size budget."""
+        """Stream bytes with a strict decoded-size budget."""
         with self._client.stream('GET', self._url(remote_path), headers={'Accept': '*/*'}) as resp:
             if resp.status_code == 404:
                 return None, None
@@ -93,9 +90,12 @@ class WebDAVCorpusBackend:
             data = bytearray()
             for chunk in resp.iter_bytes(65536):
                 if len(data) + len(chunk) > limit:
-                    raise ValueError('Import file exceeds its safety limit')
+                    raise ValueError('File exceeds its safety limit')
                 data.extend(chunk)
-            return bytes(data), clean_etag(resp.headers.get('ETag'))
+            etag = clean_etag(resp.headers.get('ETag'))
+            self._etag_cache[remote_path] = etag
+            self._lm_cache[remote_path] = resp.headers.get('Last-Modified')
+            return bytes(data), etag
 
     def get_text(self, remote_path: str) -> Tuple[Optional[str], Optional[str]]:
         data, etag = self.get(remote_path)

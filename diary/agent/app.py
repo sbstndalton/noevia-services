@@ -118,6 +118,11 @@ class AppState:
 _state: Optional[AppState] = None
 _tenant_states: "OrderedDict[str, AppState]" = OrderedDict()
 _tenant_lock = threading.Lock()
+# Bound how large the (client-influenced) X-Cowork-Storage header can be
+# before we bother decoding/parsing it. The cache key derived from it is
+# already a sha256 digest, but decoding an unbounded header is needless
+# per-request CPU/memory work.
+MAX_STORAGE_HEADER_LEN = 4096
 _TENANT_STATE_CAP = 32
 _TENANT_STATE_TTL_S = 24 * 60 * 60
 _base_cfg = load_config()
@@ -215,6 +220,8 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
         raise HTTPException(status_code=400, detail="missing or invalid X-Cowork-User-ID")
     user_id = user_id.lower()
     storage_header = request.headers.get("X-Cowork-Storage", "")
+    if len(storage_header) > MAX_STORAGE_HEADER_LEN:
+        raise HTTPException(status_code=413, detail="X-Cowork-Storage header too large")
     managed_root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     with _tenant_lock:
         if _tenant_recently_deleted_locked(user_id):
@@ -880,6 +887,8 @@ def api_external_sources_import(body: ImportRequest, request: Request) -> JSONRe
 def _request_storage(request):
     try:
         raw = request.headers.get("X-Cowork-Storage", "")
+        if len(raw) > MAX_STORAGE_HEADER_LEN:
+            return {}
         value = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))) if raw else {}
         return value if isinstance(value, dict) else {}
     except Exception:

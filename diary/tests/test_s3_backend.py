@@ -283,3 +283,44 @@ def test_rejects_store_ignoring_conditional_headers(monkeypatch):
     assert all('.cowork-probes/' in key for _, key in calls)
     assert calls[-1][0] == 'DELETE'
     backend.close()
+
+
+def test_put_falls_back_to_head_when_put_omits_etag(monkeypatch):
+    """A server that omits the ETag on PUT gets HEAD-ed for the real one, not a synthetic guess."""
+    import httpx
+    backend = S3CorpusBackend('https://example.invalid', 'bucket')
+    monkeypatch.setattr(backend, '_verify_conditions', lambda: None)
+
+    def request(method, key, **kwargs):
+        if method == 'PUT':
+            return httpx.Response(200, request=httpx.Request(method, 'https://example.invalid'))
+        if method == 'HEAD':
+            return httpx.Response(200, headers={'ETag': '"real-etag"'}, request=httpx.Request(method, 'https://example.invalid'))
+        if method == 'GET':
+            return httpx.Response(404, request=httpx.Request(method, 'https://example.invalid'))
+        raise AssertionError(method)
+    monkeypatch.setattr(backend, '_request', request)
+    ok, etag, status = backend.put('notes/a.md', b'hello')
+    assert ok and etag == '"real-etag"' and status == 200
+    backend.close()
+
+
+def test_put_raises_clearly_when_no_etag_is_ever_available(monkeypatch):
+    """If HEAD also has no ETag, fail loudly instead of caching a synthetic one that
+    would later mismatch the server and 412-loop forever."""
+    import httpx
+    backend = S3CorpusBackend('https://example.invalid', 'bucket')
+    monkeypatch.setattr(backend, '_verify_conditions', lambda: None)
+
+    def request(method, key, **kwargs):
+        if method == 'PUT':
+            return httpx.Response(200, request=httpx.Request(method, 'https://example.invalid'))
+        if method == 'HEAD':
+            return httpx.Response(200, request=httpx.Request(method, 'https://example.invalid'))
+        if method == 'GET':
+            return httpx.Response(404, request=httpx.Request(method, 'https://example.invalid'))
+        raise AssertionError(method)
+    monkeypatch.setattr(backend, '_request', request)
+    with pytest.raises(RuntimeError, match='did not report an ETag'):
+        backend.put('notes/a.md', b'hello')
+    backend.close()
