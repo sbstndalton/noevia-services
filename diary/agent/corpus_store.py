@@ -11,6 +11,7 @@ import logging
 import re
 import uuid
 import threading
+import time
 from functools import wraps
 from contextlib import nullcontext
 
@@ -82,6 +83,36 @@ class StoreClosed(CorpusError):
 
 
 MAX_APPLY_ATTEMPTS = 20
+# After a transient (storage/network) failure, apply_pending is a no-op for
+# this long so appends during an outage do not hammer the backend.
+TRANSIENT_RETRY_COOLDOWN_S = 30.0
+
+
+def is_transient_failure(exc: Optional[BaseException]) -> bool:
+    """True for storage/network outages that may succeed later.
+
+    Such errors never count towards quarantine: an outage of any length must
+    not retire a user's exchange. Covers StorageUnavailable (an OSError),
+    OSError/ConnectionError/TimeoutError, httpx transport errors and HTTP
+    5xx/429 responses surfaced via raise_for_status().
+    """
+    seen = 0
+    while exc is not None and seen < 8:
+        if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
+            return True
+        try:
+            import httpx  # optional at import time for local-only installs
+        except ImportError:  # pragma: no cover
+            httpx = None
+        if httpx is not None:
+            if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+                return True
+            if isinstance(exc, httpx.HTTPStatusError):
+                code = exc.response.status_code if exc.response is not None else 0
+                return code == 429 or code >= 500
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
 
 
 class CorpusStore:
@@ -92,6 +123,8 @@ class CorpusStore:
         self.backend = backend
         self.dav = backend  # one-release compatibility for integrations/tests
         self.journal = journal
+        self._clock = time.monotonic
+        self._transient_until = 0.0
         self.remote_root = (cfg.get("corpus.root") or cfg.get("corpus.webdav.remote_root") or "").strip("/")
         self.monthly_prefix = cfg.get("corpus.monthly_prefix") or ""
         self.entry_layout = str(cfg.get("corpus.entry_layout", "monthly")).strip().lower()
@@ -562,6 +595,8 @@ class CorpusStore:
             return False
         if isinstance(exc, PermanentApplyError):
             return True
+        if is_transient_failure(exc):
+            return False  # outages never quarantine, however long they last
         # Shape errors from an applier are deterministic: retrying cannot help.
         if isinstance(exc, (TypeError, AttributeError, KeyError)):
             return True
@@ -593,9 +628,15 @@ class CorpusStore:
         return False
 
     @serialized
-    def apply_pending(self, limit: int = 100) -> int:
-        """Apply all unapplied journal entries in order. Returns count applied now."""
+    def apply_pending(self, limit: int = 100, force: bool = False) -> int:
+        """Apply all unapplied journal entries in order. Returns count applied now.
+
+        After a transient failure, calls within TRANSIENT_RETRY_COOLDOWN_S are
+        skipped (entries stay pending) unless force=True.
+        """
         applied = 0
+        if not force and self._clock() < self._transient_until:
+            return 0
         for entry in self.journal.unapplied(limit=limit):
             try:
                 self._apply_entry(entry)
@@ -612,6 +653,8 @@ class CorpusStore:
                 else:
                     log.error("journal entry %s failed: %s", entry.id, exc)
                     self.journal.mark_failed(entry.id, str(exc))
+                    if is_transient_failure(exc):
+                        self._transient_until = self._clock() + TRANSIENT_RETRY_COOLDOWN_S
                     break  # preserve ordering: an older failed correction must not overwrite a newer one later
         return applied
 

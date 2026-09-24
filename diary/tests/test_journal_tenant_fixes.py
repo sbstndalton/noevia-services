@@ -55,16 +55,76 @@ def test_edit_with_malformed_block_is_quarantined(tmp_path):
     assert _row(st.journal, jid)[2].startswith("quarantined:")
 
 
-def test_transient_failures_are_capped(tmp_path):
+def test_transient_failures_never_quarantine(tmp_path):
+    from agent.dedicated_storage import StorageUnavailable
     st = _store(tmp_path)
     jid = st.journal.enqueue("exchange", {"day": "2026-09-01", "xid": "x1", "sub_header": "s", "body": "b"})
-    st.backend.put = MagicMock(side_effect=OSError("synthetic outage"))
-    for _ in range(MAX_APPLY_ATTEMPTS - 1):
-        st.apply_pending()
-        assert not st.journal.is_applied(jid)
-    st.apply_pending()
+    st.backend.put = MagicMock(side_effect=StorageUnavailable("synthetic outage"))
+    for _ in range(MAX_APPLY_ATTEMPTS + 5):
+        st.apply_pending(force=True)
     applied, attempts, err = _row(st.journal, jid)
-    assert applied == 1 and attempts == MAX_APPLY_ATTEMPTS and "synthetic outage" in err
+    assert applied == 0 and attempts == MAX_APPLY_ATTEMPTS + 5
+    assert "synthetic outage" in err and not err.startswith("quarantined:")
+    st.backend.put = MagicMock(return_value=(True, "e1", 201))
+    st.apply_pending(force=True)
+    assert st.journal.is_applied(jid)
+
+
+@pytest.mark.parametrize("make_exc", [
+    lambda: OSError("synthetic io"),
+    lambda: TimeoutError("synthetic timeout"),
+    lambda: __import__("httpx").ConnectError("synthetic connect"),
+    lambda: __import__("httpx").HTTPStatusError(
+        "synthetic 503", request=__import__("httpx").Request("PUT", "http://x"),
+        response=__import__("httpx").Response(503)),
+    lambda: __import__("httpx").HTTPStatusError(
+        "synthetic 429", request=__import__("httpx").Request("PUT", "http://x"),
+        response=__import__("httpx").Response(429)),
+])
+def test_transient_kinds_classified(make_exc):
+    from agent.corpus_store import is_transient_failure
+    assert is_transient_failure(make_exc())
+
+
+def test_non_transient_http_error_still_capped(tmp_path):
+    import httpx
+    st = _store(tmp_path)
+    jid = st.journal.enqueue("exchange", {"day": "2026-09-01", "xid": "x1", "sub_header": "s", "body": "b"})
+    st.backend.put = MagicMock(side_effect=httpx.HTTPStatusError(
+        "synthetic 403", request=httpx.Request("PUT", "http://x"), response=httpx.Response(403)))
+    for _ in range(MAX_APPLY_ATTEMPTS):
+        st.apply_pending(force=True)
+    applied, attempts, err = _row(st.journal, jid)
+    assert applied == 1 and attempts == MAX_APPLY_ATTEMPTS and err.startswith("quarantined:")
+
+
+def test_permanent_apply_error_still_quarantines(tmp_path):
+    from agent.corpus_store import PermanentApplyError
+    st = _store(tmp_path)
+    jid = st.journal.enqueue("exchange", {"day": "2026-09-01", "xid": "x1", "sub_header": "s", "body": "b"})
+    st._apply_exchange = MagicMock(side_effect=PermanentApplyError("synthetic permanent"))
+    st.apply_pending(force=True)
+    applied, _, err = _row(st.journal, jid)
+    assert applied == 1 and err.startswith("quarantined:")
+
+
+def test_transient_failure_cooldown(tmp_path):
+    from agent.corpus_store import TRANSIENT_RETRY_COOLDOWN_S
+    st = _store(tmp_path)
+    now = [1000.0]
+    st._clock = lambda: now[0]
+    jid = st.journal.enqueue("exchange", {"day": "2026-09-01", "xid": "x1", "sub_header": "s", "body": "b"})
+    st.backend.put = MagicMock(side_effect=OSError("synthetic outage"))
+    st.apply_pending()
+    assert st.backend.put.call_count == 1
+    for _ in range(10):
+        now[0] += 1
+        st.apply_pending()
+    assert st.backend.put.call_count == 1  # skipped during cooldown
+    now[0] = 1000.0 + TRANSIENT_RETRY_COOLDOWN_S + 0.1
+    st.backend.put = MagicMock(return_value=(True, "e1", 201))
+    st.apply_pending()
+    assert st.journal.is_applied(jid)
 
 
 # ---- 2: tenant delete must not race an in-flight write ----
