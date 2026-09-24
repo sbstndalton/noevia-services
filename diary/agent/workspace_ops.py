@@ -181,9 +181,34 @@ def delete(store, body):
 
 
 def _replaced_name(relative, now):
-    """Where a preserved version restores to: beside the file, never over it."""
+    """Where a preserved version restores to: beside the file, never over it.
+
+    The result must stay within the 500-character path limit enforced by
+    ``safe_path``/``rel_path`` elsewhere, even though ``relative`` itself was only
+    checked against that same limit *before* the " (replaced ...)" suffix was
+    added. Shorten the stem rather than the suffix, so restores stay grouped by
+    timestamp and still land beside the original file.
+    """
     stem = relative[:-3] if relative.lower().endswith('.md') else relative
-    return f"{stem} (replaced {time.strftime('%Y-%m-%d %H.%M.%S', time.gmtime(now))}).md"
+    suffix = f" (replaced {time.strftime('%Y-%m-%d %H.%M.%S', time.gmtime(now))}).md"
+    budget = 500 - len(suffix)
+    if len(stem) > budget:
+        # Keep the folder prefix intact (it is what a person recognizes and what
+        # other checks such as `allowed()` reason about) and shorten only the
+        # trailing filename segment. Never drop the folder entirely: a name left
+        # with no '/' could accidentally collide with a top-level reserved
+        # filename pattern (e.g. a month file).
+        folder, _, name = stem.rpartition('/')
+        prefix = folder + '/' if folder else ''
+        room = budget - len(prefix)
+        if room < 1:
+            # Even the folder alone doesn't fit; fall back to trimming the whole
+            # stem from the front so at least a valid, in-budget name results.
+            stem = stem[-budget:].lstrip('.').lstrip('/') or 'file'
+        else:
+            name = name.lstrip('.') or 'file'
+            stem = prefix + name[:room]
+    return f"{stem}{suffix}"
 
 
 def preserve(store, body):

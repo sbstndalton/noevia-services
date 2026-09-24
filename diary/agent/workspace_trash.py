@@ -6,9 +6,12 @@ They are never Markdown, never indexed, and retained after restore as receipts.
 """
 import base64
 import json
+import logging
 import re
 import time
 import uuid
+
+_LOG = logging.getLogger(__name__)
 from .managed_storage import ManagedCorpusBackend, digest
 from .workspace_files import safe_path, MAX_FILE
 from .corpus import MARKER_RE
@@ -68,7 +71,16 @@ def list_trash(store, after=''):
     records = []
     for row in rows[:100]:
         operation = identity(row['path'][len(PREFIX):-5])
-        record, _ = decode(row['data'], operation)
+        try:
+            record, _ = decode(row['data'], operation)
+        except ValueError:
+            # One corrupt or oversized capsule must not hide every other record on
+            # the page (or every page after it, since 'after' walks by path). Flag
+            # it and move on; it can still be inspected with recover_capsule.
+            _LOG.warning('Trash record %s is invalid and was skipped in listing', operation)
+            records.append({'id': operation, 'path': None, 'version': None,
+                             'state': 'invalid', 'trashedAt': None, 'invalid': True})
+            continue
         records.append(summary(record))
     return {'records': records, 'next': records[-1]['id'] if len(rows) > 100 else None}
 

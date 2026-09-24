@@ -181,3 +181,59 @@ def test_preserve_refuses_protected_stale_and_missing(store):
     expect(412, lambda: operate(store, {'op': 'preserve', 'path': 'notes/a.md', 'version': sha(b'stale')}))
     expect(404, lambda: operate(store, {'op': 'preserve', 'path': 'notes/missing.md', 'version': sha(b'x')}))
     expect(404, lambda: operate(store, {'op': 'preserve', 'path': 'notes', 'version': 'x'}))
+
+
+def test_preserve_of_a_near_max_length_path_stays_listable_and_restorable(store):
+    # rel_path allows up to 500 characters; the " (replaced ...)" suffix used to be
+    # appended on top of that without limit, so the stored capsule's own path field
+    # could exceed 500 and later fail safe_path() when decoded (both on restore and
+    # while listing Trash). The stem must now be shortened to keep the full replaced
+    # name at or under 500 characters, with the extension and suffix intact.
+    long_stem = 'notes/' + 'x' * (490 - len('notes/.md'))
+    long_path = long_stem + '.md'
+    assert len(long_path) == 490
+    with store.backend.db() as db:
+        db.execute('INSERT INTO files VALUES (?,?,?,?)', (long_path, b'# long\n', sha(b'# long\n'), 0))
+        db.execute('INSERT OR IGNORE INTO directories VALUES (?)', ('notes',))
+
+    result = operate(store, {'op': 'preserve', 'path': long_path, 'version': sha(b'# long\n')})
+
+    listing = list_trash(store)
+    matches = [r for r in listing['records'] if r['id'] == result['trash']]
+    assert len(matches) == 1, 'the preserved capsule must still be listed, not hidden by a 409'
+    record = matches[0]
+    assert record.get('invalid') is not True
+    assert len(record['path']) <= 500
+    assert record['path'].endswith(').md') and ' (replaced ' in record['path']
+
+    change(store, {'action': 'restore', 'id': result['trash']})
+    assert files(store)[record['path']] == b'# long\n'
+    assert files(store)[long_path] == b'# long\n', 'preserve never changes the original file'
+
+
+def test_list_trash_skips_a_corrupt_capsule_instead_of_failing_the_page(store):
+    # Hand-plant a capsule whose recorded path is invalid (over 500 chars), simulating
+    # data written before this fix, or any other form of corruption. It must not make
+    # every other record on the page (or the whole listing) return a 409/error.
+    result = operate(store, {'op': 'delete', 'path': 'solo/only.md', 'version': sha(b'# only\n')})
+    good_id = result['trash'][0]
+
+    import base64
+    import json
+    import time as time_mod
+    from agent.workspace_trash import PREFIX as TRASH_PREFIX
+    bad_id = '00000000-0000-0000-0000-000000000000'
+    bad_record = {
+        'format': 'noevia-trash-v1', 'id': bad_id, 'path': 'x' * 600 + '.md',
+        'version': sha(b'junk'), 'data': base64.b64encode(b'junk').decode(),
+        'state': 'trashed', 'trashedAt': time_mod.time(),
+    }
+    encoded = json.dumps(bad_record, sort_keys=True, ensure_ascii=False).encode()
+    with store.backend.db() as db:
+        db.execute('INSERT INTO files VALUES (?,?,?,?)', (TRASH_PREFIX + bad_id + '.json', encoded, sha(encoded), 0))
+
+    listing = list_trash(store)
+    ids = {r['id'] for r in listing['records']}
+    assert good_id in ids, 'a valid record must still be listed alongside a corrupt one'
+    bad = [r for r in listing['records'] if r['id'] == bad_id][0]
+    assert bad.get('invalid') is True
