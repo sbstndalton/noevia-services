@@ -84,3 +84,14 @@ def test_local_fallback_when_no_storage_header(moto_s3, tenant_cfg):
 
     state = appmod._tenant_state(_tenant_request(str(uuid.uuid4()), None))
     assert isinstance(state.backend, ManagedCorpusBackend)
+
+
+@pytest.mark.parametrize("given,expected", [("eu-west-1", "eu-west-1"), (None, "us-east-1"), ("Bad Region!", "us-east-1")])
+def test_s3_storage_header_region_reaches_backend(moto_s3, tenant_cfg, given, expected):
+    storage = {"kind": "s3", "baseUrl": moto_s3, "bucket": "region-bucket",
+               "username": "AKIAIOSFODNN7EXAMPLE", "secret": "secret-here", "corpusRoot": "r"}
+    if given is not None:
+        storage["region"] = given
+    state = appmod._tenant_state(_tenant_request(str(uuid.uuid4()), storage))
+    assert state.cfg.get("corpus.s3.region") == expected
+    assert state.backend.backend.region == expected

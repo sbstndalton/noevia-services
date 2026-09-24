@@ -321,6 +321,9 @@ def _build_tenant_state_locked(request, user_id, state_key, storage_header, mana
         _set_cfg(cfg, "corpus.s3.bucket", storage.get("bucket", ""))
         _set_cfg(cfg, "corpus.s3.access_key", storage.get("username", ""))
         _set_cfg(cfg, "corpus.s3.secret_key", storage.get("secret", ""))
+        # SigV4 scope region; AWS buckets outside us-east-1 reject any other.
+        region = str(storage.get("region") or "").strip().lower()
+        _set_cfg(cfg, "corpus.s3.region", region if re.fullmatch(r"[a-z0-9-]{1,32}", region) else "us-east-1")
         # The user's chosen folder inside the bucket maps to a key prefix;
         # corpus paths stay bare keys under that prefix.
         _set_cfg(cfg, "corpus.s3.prefix", storage.get("corpusRoot", ""))
