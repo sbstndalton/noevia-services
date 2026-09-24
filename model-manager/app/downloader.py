@@ -159,6 +159,19 @@ class DownloadJob:
         )
 
 
+def safe_dest(filename: str) -> Path:
+    """The download destination for `filename`, refused unless it stays inside the models dir.
+
+    Every caller builds `filename` from request data (a target folder, a shard base, a repo
+    file name), so this is the one place that guarantees bytes never land outside it.
+    """
+    root = settings.models_dir.resolve()
+    dest = (settings.models_dir / filename).resolve()
+    if dest == root or not dest.is_relative_to(root):
+        raise ValueError("download destination is outside the models folder")
+    return settings.models_dir / filename
+
+
 class DownloadManager:
     def __init__(self) -> None:
         self.jobs: dict[str, DownloadJob] = {}
@@ -177,7 +190,7 @@ class DownloadManager:
         return sorted(self.jobs.values(), key=sort_key)
 
     def _make_job(self, *, repo_id: str, filename: str, url: str, total_bytes: int) -> DownloadJob:
-        dest = settings.models_dir / filename
+        dest = safe_dest(filename)
         for j in self.jobs.values():
             if j.dest_path == dest and j.status in ("queued", "downloading"):
                 return j

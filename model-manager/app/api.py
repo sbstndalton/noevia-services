@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,10 @@ from fastapi import APIRouter, Body, HTTPException, Query
 
 from . import autoconfig, db, gguf_meta, hf, hw, ini, services, telemetry
 from .config import settings
-from .downloader import manager
+from .downloader import manager, safe_dest
 from .utils import human_bytes
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
 
 
@@ -295,7 +297,8 @@ async def section_draft_heads(name: str) -> dict:
             except Exception:  # noqa: BLE001 - no MTP build published
                 pass
     except Exception as e:  # noqa: BLE001 - offline or rate limited: local answer still stands
-        out["remoteError"] = str(e)[:160]
+        log.warning("draft lookup for %s failed: %s", repo, e)
+        out["remoteError"] = "Could not reach Hugging Face to list draft models."
     return out
 
 
@@ -515,6 +518,7 @@ async def search(q: str = "", sort: str = "fit", limit: int = 30, trustedOnly: b
         # search_models raises this and only this: it already turns the hub's HTTP statuses
         # and transport failures into a sentence that names the fix (a token, a rate limit).
         # Catching httpx here instead would match nothing and 500 on every hub outage.
+        # The message is built by hf.py from fixed sentences, never from raw transport text.
         return {"error": str(e), "results": []}
 
     budget = max((float(b.get("vram_gb") or 0) for b in _backend_list()), default=0.0)
@@ -712,12 +716,18 @@ async def start_download(body: dict = Body(...)) -> dict:
     if not repo or "/" not in repo:
         raise HTTPException(400, "Choose a Hugging Face repository")
     detail = await hf.repo_detail(repo)
+    plan: list[dict] = []
     shard_base = str(body.get("shardBase") or "")
     if shard_base:
         subdir = Path(shard_base).stem
+        # Only a shard base the repository actually lists, and one that names a plain folder:
+        # ".." here would otherwise become the parent of every file queued below.
+        if (not any(f.shard_base == shard_base for f in detail.files)
+                or subdir in ("", ".", "..") or "/" in subdir or "\\" in subdir):
+            raise HTTPException(400, "That shard set is not in the repository")
         for f in detail.files:
             if f.shard_base == shard_base:
-                manager.enqueue(repo_id=repo, hf_path=f.path, filename=prefix + f"{subdir}/{Path(f.path).name}", total_bytes=f.size)
+                plan.append(dict(hf_path=f.path, filename=prefix + f"{subdir}/{Path(f.path).name}", total_bytes=f.size))
                 queued.append(f.path)
         main_stem = subdir
     else:
@@ -726,22 +736,35 @@ async def start_download(body: dict = Body(...)) -> dict:
             raise HTTPException(404, "That file is not in the repository")
         base = Path(path).name
         if "mmproj" in base.lower():
-            manager.enqueue(repo_id=repo, hf_path=path, filename=prefix + f"{_model_stem(base)}/{base}", total_bytes=match.size)
+            plan.append(dict(hf_path=path, filename=prefix + f"{_model_stem(base)}/{base}", total_bytes=match.size))
+            _enqueue_all(repo, plan)
             return {"queued": [path]}
         main_stem, filename = _dest_for_main(base)
-        manager.enqueue(repo_id=repo, hf_path=path, filename=prefix + filename, total_bytes=match.size)
+        plan.append(dict(hf_path=path, filename=prefix + filename, total_bytes=match.size))
         queued.append(path)
     # Companions from the same repo: its vision projector(s) and the smallest draft head.
     for f in [f for f in detail.files if "mmproj" in Path(f.path).name.lower()][:4]:
-        manager.enqueue(repo_id=repo, hf_path=f.path, filename=prefix + _dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size)
+        plan.append(dict(hf_path=f.path, filename=prefix + _dest_for_companion(main_stem, Path(f.path).name), total_bytes=f.size))
         queued.append(f.path)
     heads = [f for f in detail.files if f.path.lower().endswith(".gguf") and "mmproj" not in Path(f.path).name.lower()
              and autoconfig._looks_like_draft(Path(f.path).name)]
     if heads and not shard_base:
         head = min(heads, key=lambda f: f.size or 0)
-        manager.enqueue(repo_id=repo, hf_path=head.path, filename=prefix + _dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size)
+        plan.append(dict(hf_path=head.path, filename=prefix + _dest_for_companion(main_stem, Path(head.path).name), total_bytes=head.size))
         queued.append(head.path)
+    _enqueue_all(repo, plan)
     return {"queued": queued}
+
+
+def _enqueue_all(repo: str, plan: list[dict]) -> None:
+    """Queue every planned file, or none: each destination is checked before the first starts."""
+    try:
+        for p in plan:
+            safe_dest(p["filename"])
+    except ValueError:
+        raise HTTPException(400, "That download would land outside the models folder") from None
+    for p in plan:
+        manager.enqueue(repo_id=repo, **p)
 
 
 @router.post("/downloads/{job_id}/cancel")

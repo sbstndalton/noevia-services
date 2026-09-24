@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ import httpx
 
 from . import db
 from .utils import shard_key
+
+log = logging.getLogger(__name__)
 
 AVATAR_TTL_S = 7 * 86_400
 
@@ -143,7 +146,8 @@ async def search_models(query: str, limit: int = 30, sort: str = "downloads") ->
                     return kept or loose
                 return []
         except httpx.HTTPError as e:
-            raise HfSearchError(f"Could not reach Hugging Face: {e}") from e
+            log.warning("hub search transport error: %s", e)
+            raise HfSearchError("Could not reach Hugging Face. Check this server's connection and try again.") from e
 
     return [_model_from_item(i) for i in items]
 

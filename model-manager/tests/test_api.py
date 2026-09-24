@@ -284,3 +284,58 @@ def test_search_survives_an_avatar_failure(client, monkeypatch):
     monkeypatch.setattr(hf, "owner_avatars", bad_avatars)
     r = client.get("/api/v1/search", params={"q": "qwen"})
     assert r.status_code == 200 and r.json()["results"] == []
+
+
+def _fake_repo(monkeypatch, files):
+    from app import api, hf
+    detail = hf.HfRepoDetail(id="synthetic/repo-GGUF", files=[
+        hf.HfFile(path=p, size=10, quant=None, shard_base=b, shard_index=None, shard_total=None) for p, b in files],
+        readme_snippet=None)
+
+    async def repo_detail(repo):
+        return detail
+    monkeypatch.setattr(hf, "repo_detail", repo_detail)
+    queued = []
+    monkeypatch.setattr(api.manager, "enqueue", lambda **kw: queued.append(kw["filename"]))
+    return queued
+
+
+def test_a_shard_base_the_repo_does_not_list_is_refused_and_queues_nothing(client, monkeypatch):
+    queued = _fake_repo(monkeypatch, [("m-Q4.gguf", "m-Q4.gguf"), ("mmproj-f16.gguf", "mmproj-f16.gguf")])
+    for bad in ("..", "../..", "/etc/passwd", "nope.gguf", "."):
+        r = client.post("/api/v1/downloads", json={"repo": "synthetic/repo-GGUF", "shardBase": bad})
+        assert r.status_code == 400, bad
+    assert queued == []
+    ok = client.post("/api/v1/downloads", json={"repo": "synthetic/repo-GGUF", "shardBase": "m-Q4.gguf"})
+    assert ok.status_code == 200 and queued == ["m-Q4/m-Q4.gguf", "m-Q4/mmproj-f16.gguf"]
+
+
+def test_a_listed_shard_base_that_escapes_is_still_refused(client, monkeypatch):
+    queued = _fake_repo(monkeypatch, [("x/...gguf", "..")])
+    r = client.post("/api/v1/downloads", json={"repo": "synthetic/repo-GGUF", "shardBase": ".."})
+    assert r.status_code == 400 and queued == []
+
+
+def test_the_downloader_refuses_any_destination_outside_the_models_dir():
+    from app.downloader import manager, safe_dest
+    for bad in ("../x.gguf", "a/../../x.gguf", "/etc/x.gguf", "", "."):
+        with pytest.raises(ValueError):
+            safe_dest(bad)
+        with pytest.raises(ValueError):
+            manager._make_job(repo_id="r", filename=bad, url="https://example.invalid/x", total_bytes=0)
+    assert safe_dest("archive/m/m.gguf").name == "m.gguf"
+
+
+def test_hub_errors_are_not_echoed(client, monkeypatch):
+    from app import hf
+
+    import httpx
+
+    class Boom:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **kw): raise httpx.ConnectError("secret-internal-detail 10.0.0.9:443")
+    monkeypatch.setattr(hf.httpx, "AsyncClient", Boom)
+    r = client.get("/api/v1/search?q=x-unique-query").json()
+    assert "secret-internal-detail" not in r["error"] and "Could not reach" in r["error"] and r["results"] == []
