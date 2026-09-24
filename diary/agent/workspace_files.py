@@ -89,8 +89,16 @@ def file_write(store, body):
             return {'path': path, 'content': content, 'version': version(content)}
         if current is not None and not etag:
             raise HTTPException(409, 'Storage did not return a version; refusing an unguarded overwrite')
+        dirty_list = getattr(store.journal, 'dirty_documents', None)
+        was_dirty = full in (dirty_list() if dirty_list else [])
         store.journal.mark_dirty(full)
-        ok, _, status = store.backend.put(full, content.encode(), if_match=etag)
+        try:
+            ok, _, status = store.backend.put(full, content.encode(), if_match=etag)
+        except (IsADirectoryError, NotADirectoryError):
+            clear = getattr(store.journal, 'clear_dirty', None)
+            if clear and not was_dirty:
+                clear(full)
+            raise HTTPException(409, 'A directory or file already occupies this path; your draft has been kept')
         if not ok:
             raise HTTPException(409 if status == 412 else 502, 'Storage write failed or conflicted; your draft has been kept')
     return {'path': path, 'content': content, 'version': version(content)}

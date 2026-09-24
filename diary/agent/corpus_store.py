@@ -57,6 +57,26 @@ class PermanentApplyError(CorpusError):
     """A journal entry that can never succeed on retry (target gone or malformed)."""
 
 
+def sanitize_index_ops(ops, section: str = "", quiet: bool = False) -> list:
+    """Keep only well-formed index edit ops: dicts with a string `text` (and a
+    string `replacement` when present). Anything else is dropped and logged so
+    a malformed model reply can never be journaled as a poison entry."""
+    if not ops:
+        return []
+    if not isinstance(ops, list):
+        if not quiet:
+            log.warning("index_update %s: dropped non-list ops (%s)", section, type(ops).__name__)
+        return []
+    kept = [
+        op for op in ops
+        if isinstance(op, dict) and isinstance(op.get("text"), str)
+        and ("replacement" not in op or isinstance(op["replacement"], str))
+    ]
+    if len(kept) != len(ops) and not quiet:
+        log.warning("index_update %s: dropped %d malformed op(s)", section, len(ops) - len(kept))
+    return kept
+
+
 class StoreClosed(CorpusError):
     """The tenant store was closed (e.g. tenant deleted); no further writes."""
 
@@ -385,6 +405,8 @@ class CorpusStore:
         """Enqueue + apply INDEX.md standing-section edits. Returns journal id."""
         if not self.index_enabled:
             return None
+        open_question_ops = sanitize_index_ops(open_question_ops, "open_questions")
+        timeline_ops = sanitize_index_ops(timeline_ops, "timeline")
         if not open_question_ops and not timeline_ops:
             return None
         jid = self.journal.enqueue(
@@ -540,6 +562,9 @@ class CorpusStore:
             return False
         if isinstance(exc, PermanentApplyError):
             return True
+        # Shape errors from an applier are deterministic: retrying cannot help.
+        if isinstance(exc, (TypeError, AttributeError, KeyError)):
+            return True
         if entry.attempts + 1 >= MAX_APPLY_ATTEMPTS:
             return True
         if entry.kind not in self._KNOWN_KINDS:
@@ -558,7 +583,12 @@ class CorpusStore:
             elif entry.kind == "index_month":
                 p["label"]
                 p["month"]
-        except (KeyError, ValueError, TypeError):
+            elif entry.kind == "index_update":
+                for key in ("open_questions", "timeline"):
+                    ops = p.get(key) or []
+                    if not isinstance(ops, list) or sanitize_index_ops(ops, key, quiet=True) != ops:
+                        return True
+        except (KeyError, ValueError, TypeError, AttributeError):
             return True
         return False
 

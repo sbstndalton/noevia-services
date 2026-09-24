@@ -159,3 +159,40 @@ def test_local_listing_does_not_read_files(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(AssertionError("read")))
     (entry,) = backend.list_dir("")
     assert entry["etag"] and entry["name"] == "a.md"
+
+
+# ---- malformed index_update ops must never poison the journal ----
+
+@pytest.mark.parametrize("payload", [
+    {"open_questions": ["x"], "timeline": [], "today": "2026-09-01"},
+    {"open_questions": [], "timeline": {"a": 1}, "today": "2026-09-01"},
+    {"open_questions": [{"action": "add", "text": 5}], "timeline": [], "today": "2026-09-01"},
+])
+def test_malformed_index_update_is_quarantined_and_exchange_applies(tmp_path, payload):
+    st = _store(tmp_path)
+    jid = st.journal.enqueue("index_update", payload)
+    xid = st.log_exchange(DAY, "topic", "synthetic words", "reply", now=datetime(2026, 9, 1, 9))
+    assert xid in st.read_month(DAY)[0]
+    assert _row(st.journal, jid)[2].startswith("quarantined:")
+    assert st.journal.pending_count() == 0
+
+
+def test_applier_shape_error_is_permanent_but_store_closed_is_not(tmp_path):
+    st = _store(tmp_path)
+    entry = SimpleNamespace(kind="index_update", attempts=0, payload={"open_questions": [], "timeline": []})
+    assert st._is_permanent_failure(entry, AttributeError("x"))
+    assert st._is_permanent_failure(entry, TypeError("x"))
+    assert not st._is_permanent_failure(entry, StoreClosed("closed"))
+    assert not st._is_permanent_failure(entry, OSError("transient"))
+
+
+def test_update_standing_sections_drops_malformed_ops(tmp_path):
+    st = _store(tmp_path)
+    assert st.update_standing_sections(["x", {"text": 1}], {"a": 1}, "2026-09-01") is None
+    assert st.journal.pending_count() == 0
+    jid = st.update_standing_sections(
+        [{"action": "add", "text": "synthetic question?"}, {"action": "edit", "text": "a", "replacement": 3}],
+        [], "2026-09-01")
+    assert jid is not None and st.journal.is_applied(jid)
+    row = st.journal._conn.execute("SELECT payload FROM journal WHERE id=?", (jid,)).fetchone()
+    assert "replacement" not in row[0]

@@ -170,3 +170,16 @@ def test_file_list_passes_on_a_normalised_modified_time():
     assert 'modified' not in rows['c.md']
     assert rows['d']['modified'] == 1790064000.0
     assert _modified(True) is None and _modified('garbage') is None and _modified(0) is None and _modified('1790000000') == 1790000000.0
+
+
+@pytest.mark.parametrize('err', [IsADirectoryError, NotADirectoryError])
+def test_write_onto_directory_path_is_409_and_not_left_dirty(err):
+    st = store({})
+    st.journal.dirty_documents = lambda: list(st.journal.dirty)
+    st.journal.clear_dirty = lambda p: st.journal.dirty.remove(p)
+    def boom(*a, **k): raise err('tenant/memory/a.md')
+    st.backend.put = boom
+    with pytest.raises(HTTPException) as exc:
+        file_write(st, {'path': 'memory/a.md', 'content': 'x', 'version': None})
+    assert exc.value.status_code == 409
+    assert st.journal.dirty == []
