@@ -151,6 +151,32 @@ class Journal:
         return self._conn.execute("SELECT 1 FROM journal WHERE kind='exchange' LIMIT 1").fetchone() is not None
 
     @synchronized
+    def unapplied_exchange_edit(self, xid: str) -> Optional[JournalEntry]:
+        """Newest unapplied exchange_edit journal entry for xid, if any.
+
+        Used by edit_exchange to detect that a previous edit for the same
+        exchange is still queued (e.g. during a transient-failure cooldown)
+        before enqueueing another, so a caller working from a stale base_hash
+        does not silently clobber the queued edit.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM journal WHERE applied = 0 AND kind = 'exchange_edit' ORDER BY rowid DESC"
+        ).fetchall()
+        for r in rows:
+            payload = json.loads(r["payload"])
+            if payload.get("xid") == xid:
+                return JournalEntry(
+                    id=r["id"],
+                    created_at=r["created_at"],
+                    kind=r["kind"],
+                    payload=payload,
+                    applied=bool(r["applied"]),
+                    attempts=r["attempts"],
+                    last_error=r["last_error"],
+                )
+        return None
+
+    @synchronized
     def is_applied(self, jid: str) -> bool:
         row = self._conn.execute("SELECT applied FROM journal WHERE id=?", (jid,)).fetchone()
         return bool(row and row[0])

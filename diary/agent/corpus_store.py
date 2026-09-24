@@ -48,8 +48,13 @@ MONTH_ID_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 class EditConflict(CorpusError):
     """The exchange changed since the client loaded it (stale base hash)."""
 
-    def __init__(self, current_hash: Optional[str], current_text: Optional[str]):
-        super().__init__("The entry changed since it was opened; reload and retry")
+    def __init__(
+        self,
+        current_hash: Optional[str],
+        current_text: Optional[str],
+        message: str = "The entry changed since it was opened; reload and retry",
+    ):
+        super().__init__(message)
         self.current_hash = current_hash
         self.current_text = current_text
 
@@ -490,6 +495,24 @@ class CorpusStore:
             current_hash = fmt.exchange_hash(original, xid)
             if current_hash != base_hash.strip().lower():
                 raise EditConflict(current_hash, fmt.exchange_text(original, xid))
+            queued = self.journal.unapplied_exchange_edit(xid)
+            if queued is not None:
+                # The caller's base matches current storage, but an earlier edit
+                # for this same exchange is still queued (e.g. mid transient-
+                # failure cooldown): applying it after this one lands would
+                # silently discard whichever write applies second. We cannot
+                # cheaply know the hash the queued edit will produce without
+                # re-deriving it here, so treat it as a conflict outright.
+                queued_new_me = queued.payload.get("new_me")
+                queued_new_claude = queued.payload.get("new_claude")
+                queued_result = fmt.replace_exchange_text(original, xid, queued_new_me, queued_new_claude)
+                queued_hash = fmt.exchange_hash(queued_result, xid) if queued_result else None
+                if queued_hash is None or queued_hash != base_hash.strip().lower():
+                    raise EditConflict(
+                        current_hash,
+                        fmt.exchange_text(original, xid),
+                        message="An edit for this exchange is still queued; reload and retry",
+                    )
         payload = {"xid": xid, "new_me": new_me, "new_claude": new_claude}
         if month:
             payload["month"] = month
@@ -500,7 +523,9 @@ class CorpusStore:
         path, day = found
         return path, day.isoformat(), fmt.exchange_hash(edited, xid)
 
-    def _documents_for_month(self, month_id: str) -> List[Tuple[str, date]]:
+    def _documents_for_month(
+        self, month_id: str, errors: Optional[list] = None
+    ) -> List[Tuple[str, date]]:
         """(document path, owning day) pairs for a YYYY-MM month id."""
         year, mon = int(month_id[:4]), int(month_id[5:7])
         first = date(year, mon, 1)
@@ -537,11 +562,11 @@ class CorpusStore:
         for an explicit, human-initiated action. Returns (path, owning day).
         """
         if month:
-            candidates = self._documents_for_month(month)
+            candidates = self._documents_for_month(month, errors)
         else:
             candidates = []
             for m in reversed(self.list_months()):
-                docs = self._documents_for_month(m["id"])
+                docs = self._documents_for_month(m["id"], errors)
                 candidates.extend(reversed(docs))
         for path, day in candidates:
             try:
@@ -562,7 +587,9 @@ class CorpusStore:
         found = self._find_document_with_xid(xid, p.get("month"), scan_errors)
         if found is None:
             if scan_errors:  # storage trouble during the scan: may succeed later
-                raise CorpusError(f"no corpus document contains exchange {xid} (scan incomplete)")
+                raise CorpusError(
+                    f"no corpus document contains exchange {xid} (scan incomplete)"
+                ) from scan_errors[0]
             raise PermanentApplyError(f"no corpus document contains exchange {xid}")
         target, day = found
         self.journal.mark_dirty(target)

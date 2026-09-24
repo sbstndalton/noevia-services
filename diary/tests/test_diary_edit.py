@@ -15,7 +15,8 @@ import pytest
 import agent.app as appmod
 from agent.config import Config
 from agent.corpus import parse_diary, render_exchange, replace_exchange_text
-from agent.corpus_store import CorpusError, CorpusStore
+from agent.corpus_store import CorpusError, CorpusStore, EditConflict
+from agent.dedicated_storage import StorageUnavailable
 from agent.journal import Journal
 from agent.retrieval import Retriever
 from tests.test_journal_store import FakeWebDAV
@@ -164,6 +165,77 @@ def test_edit_unknown_xid_fails_fast_without_journal_entry(tmp_path):
     with pytest.raises(CorpusError):
         st.edit_exchange("99999999-9999-4999-8999-999999999999", "x", "y", month="2026-09")
     assert st.journal.pending_count() == 0
+
+
+def test_apply_exchange_edit_survives_transient_list_dir_failure(tmp_path):
+    """Issue: list_dir raising during a daily-layout apply must not crash with a
+    NameError, must not quarantine, and must leave the edit pending for retry."""
+    st = _store(tmp_path, layout="daily")
+    xid = st.log_exchange(DAY, "t", "original", "reply", now=datetime(2026, 9, 1, 9, 0))
+    real_list_dir = st.backend.list_dir
+    calls = {"n": 0}
+
+    def flaky_list_dir(path):
+        calls["n"] += 1
+        raise StorageUnavailable("WebDAV blip")
+
+    st.backend.list_dir = flaky_list_dir
+    jid = st.journal.enqueue("exchange_edit", {"xid": xid, "new_me": "queued", "new_claude": "r", "month": "2026-09"})
+    applied = st.apply_pending(force=True)
+    assert applied == 0
+    assert calls["n"] >= 1
+    row = st.journal._conn.execute("SELECT applied, attempts FROM journal WHERE id=?", (jid,)).fetchone()
+    assert row["applied"] == 0  # pending, not quarantined
+    assert st._transient_until > 0  # cooldown engaged like any other transient failure
+
+    # Restore storage and confirm the entry still applies cleanly afterwards.
+    st.backend.list_dir = real_list_dir
+    st.apply_pending(force=True)
+    text, _ = st.read_month(DAY)
+    assert "**Me:** queued" in text
+
+
+def test_edit_exchange_surfaces_clean_storage_error_not_a_crash(tmp_path):
+    """edit_exchange's synchronous apply_pending call must not blow up with the
+    _documents_for_month NameError; it should raise a plain CorpusError so the
+    API layer can turn it into a clean 503/404 instead of a 500."""
+    st = _store(tmp_path, layout="daily")
+    xid = st.log_exchange(DAY, "t", "original", "reply", now=datetime(2026, 9, 1, 9, 0))
+
+    def flaky_list_dir(path):
+        raise StorageUnavailable("WebDAV blip")
+
+    st.backend.list_dir = flaky_list_dir
+    with pytest.raises(CorpusError):
+        st.edit_exchange(xid, "edited", "r", month="2026-09")
+    # The pre-check fails fast (by design, before anything is enqueued) — the
+    # key regression is that this raises a clean CorpusError instead of an
+    # unhandled NameError from the old buggy `errors` reference.
+    assert st.journal.pending_count() == 0
+
+
+def test_edit_exchange_conflicts_when_an_edit_for_the_xid_is_already_queued(tmp_path):
+    """A second edit_exchange call using a base_hash that matches current
+    storage must still be rejected as a conflict while an earlier edit for the
+    same exchange is unapplied (e.g. during a transient cooldown): applying
+    both later in journal order would silently discard one of them."""
+    st = _store(tmp_path)
+    xid = st.log_exchange(DAY, "t", "original", "reply", now=datetime(2026, 9, 1, 9, 0))
+    text, _ = st.read_month(DAY)
+    from agent import corpus as fmt
+
+    base_hash = fmt.exchange_hash(text, xid)
+
+    # Simulate an edit that got enqueued but not yet applied (e.g. storage was
+    # down when it was queued and apply_pending's cooldown hasn't elapsed).
+    st.journal.enqueue("exchange_edit", {"xid": xid, "new_me": "first edit", "new_claude": "r1", "month": "2026-09"})
+
+    with pytest.raises(EditConflict) as exc_info:
+        st.edit_exchange(xid, "second edit", "r2", base_hash=base_hash, month="2026-09")
+    assert "queued" in str(exc_info.value).lower()
+    # No second exchange_edit should have been enqueued for a conflicting call.
+    pending_edits = [e for e in st.journal.unapplied(limit=100) if e.kind == "exchange_edit"]
+    assert len(pending_edits) == 1
 
 
 def test_edit_daily_layout_finds_the_day_file(tmp_path):
