@@ -186,5 +186,49 @@ class Journal:
         return int(self._conn.execute("SELECT COUNT(*) FROM journal WHERE applied = 0").fetchone()[0])
 
     @synchronized
+    def quarantined_count(self) -> int:
+        """Number of entries retired as permanent failures (#200), including
+        dependents quarantined solely because an earlier entry for the same
+        xid was quarantined. Exposed via /api/health for operator visibility."""
+        return int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM journal WHERE applied = 1 AND last_error LIKE 'quarantined:%'"
+            ).fetchone()[0]
+        )
+
+    @synchronized
+    def unapplied_after_with_xid(self, after_rowid: int, xid: str) -> List[JournalEntry]:
+        """Later, still-unapplied entries that target the same xid as a just-
+        quarantined entry (#200): once an exchange's underlying document
+        cannot be applied, every queued edit that depends on it (same xid)
+        can never apply either — replaying them against the pre-edit state
+        would silently drop or misapply the correction. Ordered by rowid so
+        the caller quarantines them oldest-first, matching apply order."""
+        rows = self._conn.execute(
+            "SELECT * FROM journal WHERE applied = 0 AND rowid > ? ORDER BY rowid", (after_rowid,)
+        ).fetchall()
+        out = []
+        for r in rows:
+            payload = json.loads(r["payload"])
+            if payload.get("xid") == xid:
+                out.append(
+                    JournalEntry(
+                        id=r["id"],
+                        created_at=r["created_at"],
+                        kind=r["kind"],
+                        payload=payload,
+                        applied=bool(r["applied"]),
+                        attempts=r["attempts"],
+                        last_error=r["last_error"],
+                    )
+                )
+        return out
+
+    @synchronized
+    def rowid_of(self, jid: str) -> int:
+        row = self._conn.execute("SELECT rowid FROM journal WHERE id=?", (jid,)).fetchone()
+        return int(row[0]) if row else -1
+
+    @synchronized
     def close(self) -> None:
         self._conn.close()

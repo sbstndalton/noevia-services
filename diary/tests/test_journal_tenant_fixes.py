@@ -44,6 +44,36 @@ def test_edit_of_deleted_document_is_quarantined_and_later_exchange_applies(tmp_
     assert applied == 1 and err.startswith("quarantined:")  # retired but inspectable
 
 
+def test_quarantine_cascades_to_later_edits_of_same_xid(tmp_path):
+    """#200: once an entry for xid X is quarantined, every later still-
+    unapplied entry that targets the same xid must be quarantined too, in
+    the same pass, with a reason naming the entry it depends on. An
+    unrelated later entry (different xid) must still apply normally."""
+    st = _store(tmp_path)
+    xid = st.log_exchange(DAY, "topic", "synthetic words", "reply", now=datetime(2026, 9, 1, 9))
+    st.backend.files.clear()  # the underlying document is now gone
+    # The first edit will fail permanently (no document contains the xid).
+    jid1 = st.journal.enqueue("exchange_edit", {"xid": xid, "new_me": "a", "new_claude": "b", "month": "2026-09"})
+    # A second, later queued edit for the SAME xid depends on the first.
+    jid2 = st.journal.enqueue("exchange_edit", {"xid": xid, "new_me": "c", "new_claude": "d", "month": "2026-09"})
+    # An unrelated exchange (different xid) must be unaffected.
+    other = st.journal.enqueue("exchange", {
+        "day": "2026-09-02", "xid": "77777777-7777-4777-8777-777777777777",
+        "sub_header": "later", "body": "unrelated synthetic body",
+    })
+
+    st.apply_pending()
+
+    applied1, _, err1 = _row(st.journal, jid1)
+    applied2, _, err2 = _row(st.journal, jid2)
+    assert applied1 == 1 and err1.startswith("quarantined:")
+    assert applied2 == 1 and err2.startswith("quarantined:")
+    assert f"depends on quarantined {jid1}" in err2
+    assert st.journal.is_applied(other)
+    assert "unrelated synthetic body" in st.read_month(date(2026, 9, 2))[0]
+    assert st.journal.quarantined_count() == 2
+
+
 def test_edit_with_malformed_block_is_quarantined(tmp_path):
     st = _store(tmp_path)
     xid = st.log_exchange(DAY, "topic", "synthetic words", "reply", now=datetime(2026, 9, 1, 9))
@@ -291,12 +321,12 @@ def test_construct_racing_delete_leaves_no_directory(client, tmp_path, monkeypat
     deleted.set()
     racer_thread.join(5)
 
-    assert "exc" in result and getattr(result["exc"], "status_code", None) == 404
+    assert "exc" in result and getattr(result["exc"], "status_code", None) == 410
     assert not root.exists()
 
 
 def test_tenant_state_rejects_request_racing_delete(client, tmp_path):  # noqa: F811
-    """_tenant_state itself must fail closed (404) and leave no directory
+    """_tenant_state itself must fail closed (410) and leave no directory
     when a tombstone is set concurrently with its construction."""
     U4 = "88888888-8888-4888-8888-888888888884"
     root = Path(appmod._base_cfg.get("retrieval.db_path")).parent / "users" / U4
@@ -306,9 +336,28 @@ def test_tenant_state_rejects_request_racing_delete(client, tmp_path):  # noqa: 
     req = SimpleNamespace(headers={"X-Cowork-User-ID": U4})
     with pytest.raises(Exception) as excinfo:
         appmod._tenant_state(req)
-    # FastAPI's HTTPException carries status_code 404.
-    assert getattr(excinfo.value, "status_code", None) == 404
+    # FastAPI's HTTPException carries status_code 410 (Gone): distinct from
+    # "never existed" so callers know the id was recently deleted.
+    assert getattr(excinfo.value, "status_code", None) == 410
     assert not root.exists()
+
+
+def test_tombstone_outlives_old_30s_window(client, tmp_path):  # noqa: F811
+    """Regression for #161: a request arriving well after the old 30s window
+    (but within the new 24h tombstone) must still be rejected with 410, not
+    silently recreate an empty tenant directory."""
+    U5 = "99999999-9999-4999-8999-999999999995"
+    root = Path(appmod._base_cfg.get("retrieval.db_path")).parent / "users" / U5
+    with appmod._tenant_lock:
+        # Simulate the tombstone having been set 60s ago (past the old TTL).
+        appmod._deleted_tenants[U5] = time.monotonic() - 60.0
+
+    req = SimpleNamespace(headers={"X-Cowork-User-ID": U5})
+    with pytest.raises(Exception) as excinfo:
+        appmod._tenant_state(req)
+    assert getattr(excinfo.value, "status_code", None) == 410
+    assert not root.exists()
+    appmod._deleted_tenants.pop(U5, None)
 
 
 def test_update_standing_sections_drops_malformed_ops(tmp_path):

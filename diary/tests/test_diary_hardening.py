@@ -34,6 +34,27 @@ def test_lru_evicted_tenant_state_is_closed_outside_lock(client, monkeypatch):
     assert first[0] not in appmod._tenant_states.values()
 
 
+def test_storage_status_polling_across_many_tenants_does_not_evict_active(client, monkeypatch):
+    """#211: storage-status polling from many tenants must not evict a
+    genuinely active tenant's cached state. Establish U1 as "active" first,
+    then poll /api/storage-status for 40 distinct tenants; U1 must still be
+    cached (the raised cap gives headroom, and status is a lightweight,
+    no-replay path)."""
+    closed = []
+    monkeypatch.setattr(appmod, "_close_state", closed.append)
+    active_headers = {"X-Cowork-User-ID": U1}
+    assert client.get("/api/storage-status", headers=active_headers).status_code == 200
+    active_key = next(iter(appmod._tenant_states))
+
+    for i in range(40):
+        polling_id = f"a0000000-0000-4000-8{str(i).zfill(3)}-000000000000"
+        r = client.get("/api/storage-status", headers={"X-Cowork-User-ID": polling_id})
+        assert r.status_code == 200
+
+    assert active_key in appmod._tenant_states
+    assert not any(s is appmod._tenant_states[active_key] for s in closed)
+
+
 def test_ttl_expired_tenant_state_is_closed(client, monkeypatch):
     closed = []
     monkeypatch.setattr(appmod, "_close_state", closed.append)

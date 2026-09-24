@@ -242,3 +242,64 @@ def test_backup_rejects_escaping_destination_before_remote_io(managed, tmp_path,
     managed.put('a.md', b'private')
     assert managed.backup(remote, dict(storage, corpusRoot='../escape'), now=time.time()+10)['backup'] == 'failed'
     assert remote.list_dir('') == []
+
+
+def test_backup_streams_file_data_one_row_at_a_time(managed, tmp_path, storage, monkeypatch):
+    """#219 regression: backup() must not SELECT every file's blob into
+    memory up front. Only a bounded (path, version) row set is fetched
+    before remote I/O; each file's bytes are queried individually as it is
+    about to be uploaded/verified."""
+    remote = LocalCorpusBackend(str(tmp_path / 'remote'))
+    for i in range(5):
+        managed.put(f'day-{i}.md', f'entry {i}'.encode() * 50)
+
+    from contextlib import contextmanager
+
+    seen_selects = []
+    real_db = type(managed).db
+
+    class _SpyConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **k):
+            if 'FROM files' in sql:
+                seen_selects.append(sql)
+            return self._conn.execute(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __getitem__(self, key):
+            return self._conn[key]
+
+    @contextmanager
+    def spying_db(self):
+        with real_db(self) as db:
+            yield _SpyConn(db)
+
+    monkeypatch.setattr(type(managed), 'db', spying_db)
+    result = managed.backup(remote, storage, now=time.time() + 10)
+    assert result['backup'] == 'complete'
+    # Exactly one query pulls the file list (metadata only, no `data` column
+    # requested via SELECT *); the remaining per-file queries each fetch a
+    # single row's data by path.
+    bulk_selects = [s for s in seen_selects if s.strip().upper().startswith('SELECT PATH, VERSION')]
+    assert len(bulk_selects) == 1
+    per_file_selects = [s for s in seen_selects if 'WHERE path=?' in s]
+    assert len(per_file_selects) == 5
+
+
+def test_backup_backend_reused_across_calls(tmp_path, storage):
+    """#219 regression: app.py's backup endpoint must reuse one
+    ManagedCorpusBackend per tenant instead of constructing (and
+    re-initializing schema/meta for) a new one on every call."""
+    import agent.app as appmod
+
+    appmod._backup_backends.clear()
+    user_id = str(uuid.uuid4())
+    root = tmp_path / 'users' / user_id
+    first = appmod._get_backup_backend(user_id, root)
+    second = appmod._get_backup_backend(user_id, root)
+    assert first is second
+    assert len(appmod._backup_backends) == 1

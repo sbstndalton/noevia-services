@@ -123,19 +123,38 @@ _tenant_lock = threading.Lock()
 # already a sha256 digest, but decoding an unbounded header is needless
 # per-request CPU/memory work.
 MAX_STORAGE_HEADER_LEN = 4096
-_TENANT_STATE_CAP = 32
+# Raised from 32 (#211): read-only status polling (GET /api/storage-status)
+# from many browser tabs each touches the LRU like any other tenant request.
+# With dozens of tenants polling status concurrently, a low cap meant status
+# polls for tenant A could evict tenant B's live, in-use state (and vice
+# versa) even though neither tenant is actually idle. A higher cap gives
+# headroom for routine polling across many tenants without changing the
+# eviction policy itself; storage-status also skips journal replay (see
+# api_storage_status) so the extra cached entries stay cheap.
+_TENANT_STATE_CAP = 128
 _TENANT_STATE_TTL_S = 24 * 60 * 60
 _base_cfg = load_config()
 
-# Brief tombstone of just-deleted tenant ids, protected by _tenant_lock.
+# Tombstone of deleted tenant ids, protected by _tenant_lock.
 # DELETE /api/internal/tenant rmtree's the tenant root; without this, a
 # request that raced the delete can construct a ManagedCorpusBackend (which
 # mkdirs + creates the sqlite db as a side effect of __init__) right after
-# rmtree and silently leave behind a fresh, empty tenant directory. The
-# tombstone is kept only long enough to catch that race, not to permanently
-# block reuse of a tenant id.
+# rmtree and silently leave behind a fresh, empty tenant directory.
+#
+# There is no explicit "re-create tenant" endpoint in this service: tenant
+# ids are server-issued UUIDs, and the apps/web proxy always mints a new one
+# for a new account rather than reusing a deleted id. So a short tombstone
+# (formerly 30s) only narrowed the race window without closing it: a request
+# arriving after the tombstone expired but before any cleanup could still
+# recreate an empty tenant directory (issue #161). Since legitimate reuse of
+# a just-deleted id is not part of the normal flow, the tombstone is kept for
+# a long, fixed window instead, and requests for a tombstoned tenant get a
+# distinct 410 Gone (not 404) so callers can tell "deleted, retry later" from
+# "never existed". The window is intentionally long (not permanent): an
+# operator or automation that must reuse the id can simply wait it out, and
+# nothing here blocks a *different* (freshly issued) tenant id.
 _deleted_tenants: dict = {}
-_DELETED_TENANT_TTL_S = 30.0
+_DELETED_TENANT_TTL_S = 24 * 60 * 60.0
 
 
 def _mark_tenant_deleted_locked(user_id: str) -> None:
@@ -225,19 +244,19 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
     managed_root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     with _tenant_lock:
         if _tenant_recently_deleted_locked(user_id):
-            raise HTTPException(status_code=404, detail="tenant not found")
+            raise HTTPException(status_code=410, detail="tenant deleted")
     try:
         managed = ManagedCorpusBackend(managed_root, user_id)
         is_managed = managed.active()
     except Exception:  # noqa: BLE001
         # A concurrent DELETE /api/internal/tenant can rmtree the tenant root
         # while we're mid-construction (e.g. sqlite file vanishes under us).
-        # If that's what happened, fail closed with 404 instead of a 500;
+        # If that's what happened, fail closed with 410 instead of a 500;
         # any real construction error unrelated to a delete race still
         # propagates.
         with _tenant_lock:
             if _tenant_recently_deleted_locked(user_id):
-                raise HTTPException(status_code=404, detail="tenant not found")
+                raise HTTPException(status_code=410, detail="tenant deleted")
         raise
     if request.headers.get("X-Cowork-Storage-Blocked") == "1" and not is_managed:
         raise HTTPException(403, "The original storage endpoint is not approved. Ask an administrator to review the connection.")
@@ -256,7 +275,7 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
             except Exception:  # noqa: BLE001
                 pass
             shutil.rmtree(managed_root, ignore_errors=True)
-            raise HTTPException(status_code=404, detail="tenant not found")
+            raise HTTPException(status_code=410, detail="tenant deleted")
         cached = _tenant_states.get(state_key)
         if cached is not None:
             # LRU touch: move to the most-recently-used end.
@@ -473,6 +492,13 @@ def delete_tenant(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid user"}, status_code=400)
     user_id = user_id.lower()
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    with _backup_backends_lock:
+        backup_backend = _backup_backends.pop(user_id, None)
+    if backup_backend is not None:
+        try:
+            backup_backend.close()
+        except Exception:  # noqa: BLE001
+            pass
     with _tenant_lock:
         for key, state in list(_tenant_states.items()):
             if key.startswith(f"{user_id}:"):
@@ -899,8 +925,42 @@ def _request_storage(request):
 def api_storage_status(request: Request):
     if not check_auth(request):
         raise HTTPException(401, "unauthorized")
-    st = _tenant_state(request)
+    # Lightweight path (#211): status is polled far more often than the
+    # store is actually written to, so it must not pay for (or trigger) a
+    # full journal replay/reindex the way a write-path request does.
+    # recover=False still resolves/caches the tenant AppState (status needs
+    # a live backend to inspect), but leaves recovery to the next request
+    # that actually needs the store's content to be caught up.
+    st = _tenant_state(request, recover=False)
     return st.managed.status(_request_storage(request))
+
+
+# Backup-only ManagedCorpusBackend cache (#219): api_storage_backup used to
+# construct a brand-new ManagedCorpusBackend on every call, which re-runs
+# schema init + a set_meta write in its __init__ each time. Backups are
+# polled/triggered on a schedule, so that overhead repeats constantly per
+# tenant. Kept separate from _tenant_states (which is heavier and tied to
+# the full AppState/LLM/retrieval stack backup requests must not build).
+_backup_backends: "OrderedDict[str, ManagedCorpusBackend]" = OrderedDict()
+_backup_backends_lock = threading.Lock()
+_BACKUP_BACKEND_CAP = 128
+
+
+def _get_backup_backend(user_id: str, root: Path) -> ManagedCorpusBackend:
+    with _backup_backends_lock:
+        cached = _backup_backends.get(user_id)
+        if cached is not None:
+            _backup_backends.move_to_end(user_id)
+            return cached
+        backend = ManagedCorpusBackend(root, user_id)
+        _backup_backends[user_id] = backend
+        while len(_backup_backends) > _BACKUP_BACKEND_CAP:
+            _, evicted = _backup_backends.popitem(last=False)
+            try:
+                evicted.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return backend
 
 
 @app.post("/api/storage-backup")
@@ -916,7 +976,7 @@ def api_storage_backup(request: Request):
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     if not (root / 'managed-diary.db').exists():
         return {"mode": "legacy"}
-    managed = ManagedCorpusBackend(root, user_id)
+    managed = _get_backup_backend(user_id, root)
     storage = _request_storage(request)
     if not managed.destination(storage) or not managed.active():
         return managed.status(storage)
@@ -1104,6 +1164,7 @@ def api_health(request: Request) -> JSONResponse:
             st = _tenant_state(request)
             payload.update({
                 "journal_pending": st.journal.pending_count(),
+                "journal_quarantined": st.journal.quarantined_count(),
                 "retrieval": st.retrieval.stats(),
             })
         except HTTPException:

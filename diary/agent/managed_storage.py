@@ -261,7 +261,12 @@ class ManagedCorpusBackend:
                 row = db.execute('SELECT * FROM backups WHERE destination=?', (destination,)).fetchone()
                 if float(self.meta(db, 'due', '0')) > now or (row and (row['generation'] == generation or row['retry_at'] > now)):
                     return self.status(storage)
-                files = db.execute('SELECT * FROM files ORDER BY path').fetchall()
+                # Metadata only: content blobs are fetched one row at a time
+                # below (see the loop), so a tenant with a large corpus never
+                # holds every file's bytes in memory at once (#219). Loading
+                # a bare (path, version) pair per file is cheap even for
+                # thousands of documents.
+                file_meta = db.execute('SELECT path, version FROM files ORDER BY path').fetchall()
                 directories = [r[0] for r in db.execute('SELECT path FROM directories ORDER BY path')]
                 settings = self.meta(db, 'settings', '{}')
                 snapshot_time = float(self.meta(db, 'snapshot_time', '0'))
@@ -270,11 +275,20 @@ class ManagedCorpusBackend:
                 safe_key(base)
                 manifest = {'format': 'noevia-diary-backup-v1', 'tenant': self.tenant, 'generation': generation,
                             'savedAt': snapshot_time, 'settings': json.loads(settings), 'directories': directories, 'files': []}
-                for file in files:
-                    data = bytes(file['data'])
-                    object_path = base + '/objects/' + file['version'] + '/' + file['path'].rsplit('/', 1)[-1]
+                for path, version in ((r['path'], r['version']) for r in file_meta):
+                    object_path = base + '/objects/' + version + '/' + path.rsplit('/', 1)[-1]
+                    # Fetch this file's bytes only when it is actually about to
+                    # be verified/uploaded, not all up front (#219). Every
+                    # object is still verified against the remote every
+                    # generation: objects are supposed to be immutable once
+                    # written, but a corrupted/edited remote object must still
+                    # be detected rather than silently trusted (see
+                    # test_remote_conflict_preserves_remote_and_local).
+                    with self.db() as fdb:
+                        row = fdb.execute('SELECT data FROM files WHERE path=?', (path,)).fetchone()
+                    data = bytes(row[0]) if row else b''
                     self._create_verified(remote, object_path, data)
-                    manifest['files'].append({'path': file['path'], 'sha256': file['version'], 'object': object_path})
+                    manifest['files'].append({'path': path, 'sha256': version, 'object': object_path})
                 body = json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode()
                 self._create_verified(remote, base + '/manifests/' + digest(body) + '.json', body)
                 with self.db() as db:

@@ -664,7 +664,12 @@ class CorpusStore:
         applied = 0
         if not force and self._clock() < self._transient_until:
             return 0
+        quarantined_this_pass: set = set()
         for entry in self.journal.unapplied(limit=limit):
+            if entry.id in quarantined_this_pass:
+                # Already retired below as a dependent of an earlier
+                # quarantined entry with the same xid (#200); skip re-applying.
+                continue
             try:
                 self._apply_entry(entry)
                 self.journal.mark_applied(entry.id)
@@ -677,6 +682,7 @@ class CorpusStore:
                     )
                     # Row stays in the journal (applied=1, last_error kept) for inspection.
                     self.journal.quarantine(entry.id, f"quarantined: {exc}")
+                    self._quarantine_dependents(entry, quarantined_this_pass)
                 else:
                     log.error("journal entry %s failed: %s", entry.id, exc)
                     self.journal.mark_failed(entry.id, str(exc))
@@ -684,6 +690,32 @@ class CorpusStore:
                         self._transient_until = self._clock() + TRANSIENT_RETRY_COOLDOWN_S
                     break  # preserve ordering: an older failed correction must not overwrite a newer one later
         return applied
+
+    def _quarantine_dependents(self, entry: JournalEntry, quarantined_this_pass: set) -> None:
+        """When ``entry`` is quarantined (#200), also quarantine every later,
+        still-unapplied journal entry that shares its xid.
+
+        A later entry with the same xid (e.g. a queued exchange_edit) is a
+        correction to the exchange ``entry`` was trying to write; if the
+        original can never apply, replaying the dependent edit later would
+        either fail identically or, worse, silently apply against stale
+        content. Quarantining them together, in the same pass, keeps the
+        journal from getting stuck retrying entries that can never succeed
+        and makes the dependency explicit in last_error.
+        """
+        xid = entry.payload.get("xid") if isinstance(entry.payload, dict) else None
+        if not xid:
+            return
+        after_rowid = self.journal.rowid_of(entry.id)
+        for dependent in self.journal.unapplied_after_with_xid(after_rowid, xid):
+            if dependent.id in quarantined_this_pass:
+                continue
+            log.error(
+                "journal entry %s (kind=%s) quarantined — depends on quarantined %s",
+                dependent.id, dependent.kind, entry.id,
+            )
+            self.journal.quarantine(dependent.id, f"quarantined: depends on quarantined {entry.id}")
+            quarantined_this_pass.add(dependent.id)
 
     def _apply_entry(self, entry: JournalEntry) -> None:
         if entry.kind == "exchange":
