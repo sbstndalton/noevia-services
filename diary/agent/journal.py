@@ -99,6 +99,7 @@ class Journal:
                 (datetime.now().isoformat(timespec="seconds"), error[:2000], jid),
             )
 
+    @synchronized
     def mark_failed(self, jid: str, error: str) -> None:
         with self._conn:
             self._conn.execute(
