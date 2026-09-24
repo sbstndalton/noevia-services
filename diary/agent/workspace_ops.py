@@ -61,8 +61,24 @@ def require_managed(store):
 
 
 def _tree(db, full):
-    """Files and explicit directories at or under ``full``."""
+    """Files (with bytes) and explicit directories at or under ``full``.
+
+    Loads every file body of the subtree; callers that only need path/version
+    (identity and folder_version, e.g. ``stat``) should use ``_tree_meta`` instead.
+    """
     files = {r['path']: r for r in db.execute('SELECT path,data,version,updated FROM files WHERE path=? OR substr(path,1,?)=?',
+                                               (full, len(full) + 1, full + '/'))}
+    dirs = [r[0] for r in db.execute('SELECT path FROM directories WHERE path=? OR substr(path,1,?)=?', (full, len(full) + 1, full + '/'))]
+    return files, dirs
+
+
+def _tree_meta(db, full):
+    """Files and explicit directories at or under ``full``, without loading file bodies.
+
+    Used by ``stat``/``folder_version`` (e.g. folderTag on every PROPFIND Depth 1
+    child), which only ever need path and version, never the bytes.
+    """
+    files = {r['path']: r for r in db.execute('SELECT path,version,updated FROM files WHERE path=? OR substr(path,1,?)=?',
                                                (full, len(full) + 1, full + '/'))}
     dirs = [r[0] for r in db.execute('SELECT path FROM directories WHERE path=? OR substr(path,1,?)=?', (full, len(full) + 1, full + '/'))]
     return files, dirs
@@ -85,7 +101,7 @@ def stat(store, path):
     require_managed(store)
     full = store._join(rel_path(path))
     with store.backend.db() as db:
-        files, dirs = _tree(db, full)
+        files, dirs = _tree_meta(db, full)
     kind = _kind(files, dirs, full)
     if kind is None:
         raise OpError(404, 'File or folder not found')

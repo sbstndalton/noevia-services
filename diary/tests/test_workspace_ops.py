@@ -1,4 +1,5 @@
 import hashlib
+from contextlib import contextmanager
 from types import SimpleNamespace
 import pytest
 from agent.managed_storage import ManagedCorpusBackend
@@ -86,6 +87,39 @@ def test_folder_version_changes_with_children(store):
     _, tag = store.backend.get('notes/a.md')
     store.backend.put('notes/a.md', b'# changed\n', if_match=tag)
     expect(412, lambda: operate(store, {'op': 'delete', 'path': 'notes', 'version': before}))
+
+
+def test_stat_never_loads_file_bodies(store, monkeypatch):
+    """folderTag calls stat() for every PROPFIND Depth 1 child; it must not pull `data`
+    out of the files table, even for a subtree holding large synthetic bodies."""
+    large = b'x' * (2 * 1024 * 1024)
+    with store.backend.db() as db:
+        db.execute('INSERT INTO files VALUES (?,?,?,?)', ('notes/big1.md', large, sha(large), 0))
+        db.execute('INSERT INTO files VALUES (?,?,?,?)', ('notes/big2.md', large, sha(large), 0))
+
+    queries = []
+    real_db = type(store.backend).db  # the original @contextmanager-decorated method
+
+    @contextmanager
+    def spying_db(self):
+        with real_db.__get__(self)() as conn:
+            conn.set_trace_callback(queries.append)
+            try:
+                yield conn
+            finally:
+                conn.set_trace_callback(None)
+
+    monkeypatch.setattr(type(store.backend), 'db', spying_db)
+
+    result_file = stat(store, 'notes/big1.md')
+    result_dir = stat(store, 'notes')
+
+    assert result_file['isDir'] is False
+    assert result_dir['isDir'] is True and result_dir['entries'] >= 2
+    files_queries = [q for q in queries if 'FROM files' in q]
+    assert files_queries, 'expected stat() to query the files table'
+    assert all('data' not in q.split('FROM')[0] for q in files_queries), (
+        f'stat() must select only path/version/updated, never data: {files_queries}')
 
 
 def test_capture_records_are_not_trashed(store):
