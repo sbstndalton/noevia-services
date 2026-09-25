@@ -92,3 +92,11 @@ and decides which tenant ID to forward. Because this service has no per-tenant
 authentication of its own, direct exposure would let anyone with the token
 act as anyone. This is a deliberate trade-off documented here as a hard
 requirement; keep the service internal.
+
+`DIARY_TENANT_KEY` narrows this (M2, `docs/spec-managed-diary.md`): with it set,
+every request naming a tenant must carry an `X-Cowork-Tenant-Assertion` HMAC from
+the web server, bound to the tenant, method, path and storage headers, within a
+60 s window and single-use. The token alone then no longer lets a caller act as
+another tenant or delete one. With neither `DIARY_AUTH_TOKEN` nor
+`DIARY_TENANT_KEY` set the service refuses to start unless `DIARY_ALLOW_OPEN=1`.
+Keep the service internal regardless.

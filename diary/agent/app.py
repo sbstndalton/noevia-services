@@ -4,7 +4,11 @@ Single-user web UI (port 8010) for chatting with the companion and observing the
 automatic diary-logging pipeline (logged / skipped, with manual re-log).
 
 Auth model:
-  - `ui.auth_token` (env DIARY_AUTH_TOKEN) empty  -> open (LAN-only mode).
+  - `ui.auth_token` (env DIARY_AUTH_TOKEN) empty  -> open (LAN-only mode). The
+    service refuses to start with neither DIARY_AUTH_TOKEN nor DIARY_TENANT_KEY
+    set unless DIARY_ALLOW_OPEN=1 declares that mode explicitly.
+  - DIARY_TENANT_KEY set -> every request naming a tenant (X-Cowork-User-ID)
+    must carry a valid X-Cowork-Tenant-Assertion (agent/tenant_assertion.py).
   - token set -> all /api/* and /v1/* endpoints require `Authorization: Bearer <token>`
     (or `X-Diary-Token`). The `/` page shell and /static are open; the browser stores
     the token in localStorage and sends it on every call.
@@ -42,6 +46,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
 from .streaming import exchange_stream
 from pydantic import BaseModel
 
@@ -63,6 +68,7 @@ from .storage import create_backend
 from .dedicated_storage import StorageUnavailable, tenant_volume
 from .managed_storage import ManagedCorpusBackend
 from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
+from . import tenant_assertion
 
 log = logging.getLogger("diary")
 
@@ -215,6 +221,141 @@ def _snapshot_sqlite(source: Path, target: Path) -> None:
         src.close()
 
 
+STORAGE_CREDENTIAL_REQUIRED = "storage_credential_required"
+_REMOTE_KINDS = ("nextcloud", "webdav", "s3")
+_open_tenant_logged = False
+
+
+def _storage_descriptor(storage_header: str) -> Optional[dict]:
+    if not storage_header or len(storage_header) > MAX_STORAGE_HEADER_LEN:
+        return None
+    try:
+        value = json.loads(base64.urlsafe_b64decode(storage_header + "=" * (-len(storage_header) % 4)))
+    except Exception:  # noqa: BLE001
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _storage_credential(descriptor: Optional[dict], user_id: str):
+    """(cache key, secret missing) for a secretRef descriptor; (None, False) otherwise.
+
+    Web sends a remote descriptor with secretRef and without the secret once
+    DIARY_TENANT_KEY is set on its side (#292). With a key here too, a secret
+    that arrives with its ref must match it, so a state is never cached under
+    another credential's name."""
+    if not descriptor or descriptor.get("kind") not in _REMOTE_KINDS or "secretRef" not in descriptor:
+        return None, False
+    ref = descriptor.get("secretRef")
+    if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{32}|", ref):
+        raise HTTPException(status_code=400, detail="invalid storage descriptor")
+    secret = descriptor.get("secret") or ""
+    key = tenant_assertion.tenant_key()
+    if secret and key and not secrets.compare_digest(ref, tenant_assertion.storage_secret_ref(key, user_id, secret)):
+        raise HTTPException(status_code=400, detail="invalid storage descriptor")
+    keyed = {k: v for k, v in descriptor.items() if k != "secret"}
+    return json.dumps(keyed, sort_keys=True), bool(ref) and not secret
+
+
+def _require_tenant_assertion(request: Request) -> None:
+    """With DIARY_TENANT_KEY set, acting as a tenant needs a verified assertion.
+
+    TenantAssertionMiddleware verifies any request that names a tenant; this is
+    the in-handler backstop. It refuses every unasserted tenant resolution,
+    including the header-less DIARY_LEGACY_USER_ID fallback even when a bearer
+    token is set: the bearer proves "web server", not which tenant, and web
+    always names the tenant (and signs it), so a header-less tenant call can
+    only come from an unsigned legacy client."""
+    if not tenant_assertion.tenant_key():
+        return
+    if getattr(request.state, "tenant_asserted", False):
+        return
+    raise HTTPException(status_code=401, detail="tenant assertion required")
+
+
+def enforce_open_mode_policy(auth_token: str) -> None:
+    """Refuse to serve with no service token and no tenant key unless declared."""
+    if auth_token or tenant_assertion.tenant_key():
+        return
+    if (os.environ.get("DIARY_ALLOW_OPEN") or "").strip() == "1":
+        log.warning("DIARY_ALLOW_OPEN=1: serving without DIARY_AUTH_TOKEN or DIARY_TENANT_KEY (LAN-only mode)")
+        return
+    raise RuntimeError(
+        "Refusing to start: DIARY_AUTH_TOKEN and DIARY_TENANT_KEY are both empty. "
+        "Set them, or set DIARY_ALLOW_OPEN=1 to run the LAN-only open mode deliberately.")
+
+
+MAX_SIGNED_BODY = 64 * 1024 * 1024
+_nonce_full_logged = False
+
+
+class TenantAssertionMiddleware:
+    """Pure ASGI: verify X-Cowork-Tenant-Assertion on every request that names a
+    tenant, when DIARY_TENANT_KEY is set.
+
+    JSON bodies are covered by the signature, so they are buffered here, hashed
+    and replayed to the app; other media types (ZIP import) sign "stream" and
+    pass through unbuffered (tenant_assertion.body_is_hashed). Responses are
+    never touched, so streamed replies still stream."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        global _open_tenant_logged, _nonce_full_logged
+        if scope.get("type") == "http":
+            headers = Headers(scope=scope)
+            if headers.get("x-cowork-user-id", ""):
+                key = tenant_assertion.tenant_key()
+                if key:
+                    if tenant_assertion.body_is_hashed(headers.get("content-type", "")):
+                        chunks, size, more = [], 0, True
+                        while more:
+                            message = await receive()
+                            if message.get("type") != "http.request":
+                                break
+                            chunk = message.get("body", b"")
+                            size += len(chunk)
+                            if size > MAX_SIGNED_BODY:
+                                await JSONResponse({"detail": "request body too large"}, status_code=413)(scope, receive, send)
+                                return
+                            chunks.append(chunk)
+                            more = message.get("more_body", False)
+                        body = b"".join(chunks)
+                        body_hash = tenant_assertion.sha256_hex(body)
+                        replayed = False
+
+                        async def receive_buffered():
+                            nonlocal replayed
+                            if not replayed:
+                                replayed = True
+                                return {"type": "http.request", "body": body, "more_body": False}
+                            return await receive()
+
+                        downstream_receive = receive_buffered
+                    else:
+                        body_hash, downstream_receive = tenant_assertion.STREAM, receive
+                    try:
+                        reason = tenant_assertion.verify(key, headers, scope.get("method", "GET"), tenant_assertion.wire_path(scope),
+                                                         query=scope.get("query_string", b""), body_hash=body_hash)
+                    except tenant_assertion.NonceCacheFull:
+                        if not _nonce_full_logged:
+                            _nonce_full_logged = True
+                            log.error("tenant assertion nonce cache full of unexpired nonces: refusing requests (503)")
+                        await JSONResponse({"detail": "tenant assertion capacity exhausted"}, status_code=503)(scope, receive, send)
+                        return
+                    if reason:
+                        log.warning("tenant assertion rejected: %s", reason)
+                        await JSONResponse({"detail": "invalid tenant assertion"}, status_code=401)(scope, receive, send)
+                        return
+                    scope.setdefault("state", {})["tenant_asserted"] = True
+                    await self.app(scope, downstream_receive, send)
+                    return
+                elif not _open_tenant_logged:
+                    _open_tenant_logged = True
+                    log.warning("DIARY_TENANT_KEY is unset: accepting tenant requests without X-Cowork-Tenant-Assertion")
+        await self.app(scope, receive, send)
+
+
 def _tenant_state(request: Request, *, recover=True) -> AppState:
     """Resolve the tenant AppState for this request.
 
@@ -237,10 +378,13 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
     user_id = request.headers.get("X-Cowork-User-ID", "") or os.environ.get("DIARY_LEGACY_USER_ID", "")
     if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         raise HTTPException(status_code=400, detail="missing or invalid X-Cowork-User-ID")
+    _require_tenant_assertion(request)
     user_id = user_id.lower()
     storage_header = request.headers.get("X-Cowork-Storage", "")
     if len(storage_header) > MAX_STORAGE_HEADER_LEN:
         raise HTTPException(status_code=413, detail="X-Cowork-Storage header too large")
+    descriptor = _storage_descriptor(storage_header)
+    credential_key, credential_missing = _storage_credential(descriptor, user_id)
     managed_root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     with _tenant_lock:
         if _tenant_recently_deleted_locked(user_id):
@@ -262,7 +406,9 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
         raise HTTPException(403, "The original storage endpoint is not approved. Ask an administrator to review the connection.")
     volume = None if is_managed else tenant_volume(user_id)
     # A dedicated volume owns one state/lock domain even if general storage changes.
-    storage_key = "managed" if is_managed else json.dumps(volume, sort_keys=True) if volume else storage_header
+    # A secretRef descriptor (#292) keys the state by the ref, so the secret
+    # itself is needed only to build a state, never to find a cached one.
+    storage_key = "managed" if is_managed else json.dumps(volume, sort_keys=True) if volume else credential_key or storage_header
     state_key = f"{user_id}:{hashlib.sha256(storage_key.encode()).hexdigest()[:16]}"
     with _tenant_lock:
         if _tenant_recently_deleted_locked(user_id):
@@ -283,6 +429,9 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
             cached.last_used = time.monotonic()
             state, evicted = cached, []
         else:
+            if credential_missing and not is_managed and not volume:
+                # No cached state for this credential: ask web to resend with the secret.
+                raise HTTPException(status_code=428, detail={"code": STORAGE_CREDENTIAL_REQUIRED})
             state, evicted = _build_tenant_state_locked(request, user_id, state_key, storage_header, managed, is_managed, volume)
     # Close outside the lock: closing HTTP clients/SQLite can block, and every
     # tenant request serializes on _tenant_lock.
@@ -439,6 +588,7 @@ def _evict_tenant_states_locked() -> list:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     st = get_state()
+    enforce_open_mode_policy(st.auth_token)
     # Replay is tenant-scoped in _tenant_state. Never replay the retired global
     # corpus after a tenant has explicitly moved into app storage.
     yield
@@ -450,6 +600,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
+app.add_middleware(TenantAssertionMiddleware)
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 
@@ -490,6 +641,9 @@ def delete_tenant(request: Request) -> JSONResponse:
     user_id = request.headers.get("X-Cowork-User-ID", "")
     if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", user_id):
         return JSONResponse({"error": "invalid user"}, status_code=400)
+    # Irreversible: with DIARY_TENANT_KEY set, only a signed web request may delete.
+    if tenant_assertion.tenant_key() and not getattr(request.state, "tenant_asserted", False):
+        return JSONResponse({"error": "tenant assertion required"}, status_code=401)
     user_id = user_id.lower()
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     with _backup_backends_lock:
@@ -973,6 +1127,7 @@ def api_storage_backup(request: Request):
     user_id = request.headers.get("X-Cowork-User-ID", "").lower()
     if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", user_id):
         raise HTTPException(400, "invalid tenant")
+    _require_tenant_assertion(request)
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     if not (root / 'managed-diary.db').exists():
         return {"mode": "legacy"}
@@ -980,6 +1135,8 @@ def api_storage_backup(request: Request):
     storage = _request_storage(request)
     if not managed.destination(storage) or not managed.active():
         return managed.status(storage)
+    if storage.get("secretRef") and not storage.get("secret"):
+        raise HTTPException(status_code=428, detail={"code": STORAGE_CREDENTIAL_REQUIRED})
     from .webdav import WebDAVCorpusBackend
     remote = WebDAVCorpusBackend(storage.get('baseUrl', ''), storage.get('username', ''), storage.get('secret', ''), timeout_s=15)
     try:
