@@ -16,6 +16,7 @@ import time
 import uuid
 
 from .corpus import MARKER_RE
+from .corpus_store import month_name_pattern
 from .managed_storage import ManagedCorpusBackend, digest
 from .workspace_files import MAX_FILE
 from .workspace_trash import PREFIX as TRASH_PREFIX
@@ -48,11 +49,20 @@ def protected(store, full):
     """True when ``full`` (a backend key) is a path clients may never delete, move or replace."""
     entries = store._join(store.entries_prefix).rstrip('/')
     memory = store._join(MEMORY_FOLDER).rstrip('/')
+    # Field-specific substitutions (digits for year/month, {month_name} built from the actual
+    # locale-dependent %B values month_filename() produces for months 1-12), matching
+    # corpus_store.py's list_months() regex exactly (same helper, same [0-9]/ASCII digit
+    # matching). A blanket "[^/]+" here previously made any "word-word.md" filename at the
+    # corpus root match the default "{year}-{month02}.md" template, wrongly protecting
+    # ordinary files from DELETE/MOVE/overwrite; a blanket "[A-Za-z]+" for {month_name} in turn
+    # lost protection for locale month names such as "März" or "août".
     pattern = re.escape(store._join(store.monthly_prefix, store.month_file_template))
-    for field in ('year', 'month', 'month02', 'month_name'):
-        pattern = pattern.replace(re.escape('{' + field + '}'), '[^/]+')
+    pattern = pattern.replace(re.escape('{year}'), r'[0-9]{4}')
+    pattern = pattern.replace(re.escape('{month02}'), r'[0-9]{2}')
+    pattern = pattern.replace(re.escape('{month}'), r'[0-9]{1,2}')
+    pattern = pattern.replace(re.escape('{month_name}'), f'(?:{month_name_pattern()})')
     return (full == store.index_path() or full in (entries, memory) or full.startswith(entries + '/')
-            or full.startswith(memory + '/') or re.fullmatch(pattern, full) is not None)
+            or full.startswith(memory + '/') or re.fullmatch(pattern, full, re.ASCII) is not None)
 
 
 def require_managed(store):

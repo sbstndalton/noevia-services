@@ -15,6 +15,19 @@ import time
 from functools import wraps
 from contextlib import nullcontext
 
+def month_name_pattern() -> str:
+    """Regex alternation for the {month_name} template field.
+
+    Built from calendar.month_name[1..12] (i.e. exactly what month_filename()'s
+    day.strftime("%B") produces under the current locale — Windows and glibc
+    differ, and %B is not necessarily ASCII: "März", "août", etc.), escaped and
+    joined with "|". A blanket [A-Za-z]+ would silently drop locale-specific
+    protection for such names; both list_months() and workspace_ops.protected()
+    must use this so a real month file is always recognized as protected.
+    """
+    return "|".join(re.escape(calendar.month_name[m]) for m in range(1, 13))
+
+
 def serialized(fn):
     @wraps(fn)
     def call(self, *args, **kwargs):
@@ -273,12 +286,12 @@ class CorpusStore:
         template = self.month_file_template
         # Build a regex from the template: literal text around named fields.
         pattern = re.escape(template)
-        pattern = pattern.replace(re.escape("{year}"), r"(?P<year>\d{4})")
-        pattern = pattern.replace(re.escape("{month02}"), r"(?P<month02>\d{2})")
-        pattern = pattern.replace(re.escape("{month}"), r"(?P<month>\d{1,2})")
-        pattern = pattern.replace(re.escape("{month_name}"), r"(?P<month_name>[A-Za-z]+)")
+        pattern = pattern.replace(re.escape("{year}"), r"(?P<year>[0-9]{4})")
+        pattern = pattern.replace(re.escape("{month02}"), r"(?P<month02>[0-9]{2})")
+        pattern = pattern.replace(re.escape("{month}"), r"(?P<month>[0-9]{1,2})")
+        pattern = pattern.replace(re.escape("{month_name}"), rf"(?P<month_name>{month_name_pattern()})")
         pattern = f"^{pattern}$"
-        rx = re.compile(pattern)
+        rx = re.compile(pattern, re.ASCII)
 
         months: List[dict] = []
         seen = set()
