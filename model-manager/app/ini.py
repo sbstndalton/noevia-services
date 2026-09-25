@@ -6,12 +6,18 @@ import os
 import re
 import shlex
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 
 from .config import settings
 
 BACKUPS_TO_KEEP = 10
+
+# One process-wide lock for every models.ini read-modify-write. FastAPI runs sync handlers in a
+# threadpool, so callers hold it around their revision check and write; the write helpers take it
+# too (re-entrant) so legacy UI routes serialise with the API.
+WRITE_LOCK = threading.RLock()
 
 # ---- field schema: drives form + serialization ----
 
@@ -573,6 +579,11 @@ def suggest_defaults(summary: dict) -> tuple[dict[str, str], list[str]]:
 
 
 def upsert_section(name: str, values: dict[str, str], extras_text: str) -> None:
+    with WRITE_LOCK:
+        return _upsert_section(name, values, extras_text)
+
+
+def _upsert_section(name: str, values: dict[str, str], extras_text: str) -> None:
     """Create or replace a section. `values` = known form fields (empty strings skipped).
     `extras_text` = raw 'key = value' lines, one per line, appended (last-wins per key)."""
     cp = read_ini()
@@ -604,6 +615,11 @@ def upsert_section(name: str, values: dict[str, str], extras_text: str) -> None:
 
 
 def delete_section(name: str) -> bool:
+    with WRITE_LOCK:
+        return _delete_section(name)
+
+
+def _delete_section(name: str) -> bool:
     cp = read_ini()
     if not cp.has_section(name):
         return False
@@ -613,6 +629,11 @@ def delete_section(name: str) -> bool:
 
 
 def rename_section(old: str, new: str) -> bool:
+    with WRITE_LOCK:
+        return _rename_section(old, new)
+
+
+def _rename_section(old: str, new: str) -> bool:
     if not valid_section_name(new):
         return False
     cp = read_ini()
@@ -627,33 +648,85 @@ def rename_section(old: str, new: str) -> bool:
     return True
 
 
-def _atomic_write(cp: configparser.ConfigParser) -> None:
-    path = settings.models_ini_path
+def _backup_current(path) -> None:
+    """Rotating `.bak-<ts>` copy of the current file. A failed copy aborts the write."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_suffix(path.suffix + f".bak-{ts}")
+    n = 1
+    while backup.exists():
+        backup = path.with_suffix(path.suffix + f".bak-{ts}-{n}")
+        n += 1
+    shutil.copy(path, backup)  # not copy2: preserve creation-time mtime, not original
+    _prune_backups()
+
+
+def _immutable_backup(path, base_revision: str) -> None:
+    """`models.ini.noevia-backup-<baseRevision>` (0600, never pruned or overwritten): the
+    pre-write copy web used to make, named by the revision the caller replaced."""
+    if not re.fullmatch(r"[0-9a-f]{64}", base_revision or ""):
+        raise ValueError("baseRevision must be a sha256 hex digest")
+    backup = path.with_name(f"{path.name}.noevia-backup-{base_revision}")
+    try:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(path.read_bytes())
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _fsync_dir(directory) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _replace_file(path, text: str, *, base_revision: str | None = None) -> None:
+    """Back up, write a fsynced temp file with the current mode, rename it over models.ini and
+    fsync the directory, so the llama router always sees a whole file and the rename survives a
+    crash. Any backup failure raises before the file is touched."""
     path.parent.mkdir(parents=True, exist_ok=True)
-
+    mode = 0o644
     if path.exists():
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        backup = path.with_suffix(path.suffix + f".bak-{ts}")
-        n = 1
-        while backup.exists():
-            backup = path.with_suffix(path.suffix + f".bak-{ts}-{n}")
-            n += 1
+        mode = path.stat().st_mode & 0o777
+        if base_revision is not None:
+            _immutable_backup(path, base_revision)
+        _backup_current(path)
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{time.monotonic_ns()}")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
         try:
-            shutil.copy(path, backup)  # not copy2: preserve creation-time mtime, not original
-        except OSError:
+            tmp.unlink()
+        except FileNotFoundError:
             pass
-        _prune_backups()
 
+
+def _atomic_write(cp: configparser.ConfigParser) -> None:
     buf = io.StringIO()
     cp.write(buf, space_around_delimiters=True)
     preamble = getattr(cp, "_noevia_preamble", "")
     if preamble and not preamble.endswith("\n"):
         preamble += "\n"
-    text = preamble + buf.getvalue()
+    with WRITE_LOCK:
+        _replace_file(settings.models_ini_path, preamble + buf.getvalue())
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+
+def write_raw_text(text: str, base_revision: str | None = None) -> None:
+    """Replace models.ini with caller-supplied text verbatim (comments and layout kept).
+    With `base_revision`, an immutable `models.ini.noevia-backup-<base_revision>` is kept as well
+    as the rotating `.bak-<ts>` copy."""
+    with WRITE_LOCK:
+        _replace_file(settings.models_ini_path, text, base_revision=base_revision)
 
 
 def _prune_backups() -> None:

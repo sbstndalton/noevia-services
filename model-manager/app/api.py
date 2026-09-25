@@ -188,7 +188,8 @@ def section(name: str, defaults: bool = False) -> dict:
 def save_section(name: str, body: dict = Body(...)) -> dict:
     if not ini.valid_section_name(name):
         raise HTTPException(400, "invalid section name")
-    _require_revision(body.get("baseRevision"))
+    if not body.get("baseRevision"):
+        raise HTTPException(400, "baseRevision is required")
     raw = body.get("values") or {}
     values: dict[str, str] = {}
     for f in ini.ALL_FIELDS:
@@ -203,8 +204,37 @@ def save_section(name: str, body: dict = Body(...)) -> dict:
         raise HTTPException(400, "values must be single lines")
     if any(line.strip().startswith("[") for line in extras.splitlines()):
         raise HTTPException(400, "extra lines cannot start a new section")
-    ini.upsert_section(name, values, extras)
-    return {"ok": True, "revision": revision(), "section": ini.get_section(name)}
+    with ini.WRITE_LOCK:
+        _require_revision(body.get("baseRevision"))
+        ini.upsert_section(name, values, extras)
+        return {"ok": True, "revision": revision(), "section": ini.get_section(name)}
+
+
+MODELS_INI_MAX_BYTES = 1024 * 1024
+
+
+@router.put("/models-ini")
+def replace_models_ini(body: dict = Body(...)) -> dict:
+    """Whole-file compare-and-swap used by noevia web (MODELS_INI_WRITER=model-loader), so this
+    sidecar stays the only process that writes models.ini. The text is stored verbatim."""
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, "text is required")
+    if len(text.encode("utf-8")) > MODELS_INI_MAX_BYTES:
+        raise HTTPException(413, "models.ini exceeds the editor limit")
+    try:
+        ini.parse_ini_text(text)
+    except Exception:
+        raise HTTPException(400, "models.ini text does not parse")
+    base = body.get("baseRevision")
+    with ini.WRITE_LOCK:
+        _require_revision(base)
+        try:
+            ini.write_raw_text(text, base_revision=base)
+        except OSError:
+            log.exception("models.ini write failed")
+            raise HTTPException(500, "models.ini could not be written safely; nothing was changed")
+        return {"ok": True, "revision": revision()}
 
 
 SAFE_DEFAULT_CTX = 8192
@@ -223,6 +253,11 @@ def register_safe_defaults(name: str) -> dict:
         raise HTTPException(400, "invalid section name")
     if "mmproj" in name.lower():
         raise HTTPException(400, "draft heads and projectors are not registered on their own")
+    with ini.WRITE_LOCK:
+        return _register_safe_defaults(name)
+
+
+def _register_safe_defaults(name: str) -> dict:
     if ini.get_section(name) is not None:
         raise HTTPException(409, "settings already exist for this model")
     gguf_path, _model_rel, rel = _resolve_section_gguf(name)
@@ -307,20 +342,22 @@ def rename_section(name: str, body: dict = Body(...)) -> dict:
     new = str(body.get("newName") or "").strip()
     if not ini.valid_section_name(new):
         raise HTTPException(400, "invalid new name")
-    _require_revision(body.get("baseRevision"))
-    if new in ini.section_names():
-        raise HTTPException(409, "a section with that name already exists")
-    if not ini.rename_section(name, new):
-        raise HTTPException(404, "section not found")
-    return {"ok": True, "revision": revision()}
+    with ini.WRITE_LOCK:
+        _require_revision(body.get("baseRevision"))
+        if new in ini.section_names():
+            raise HTTPException(409, "a section with that name already exists")
+        if not ini.rename_section(name, new):
+            raise HTTPException(404, "section not found")
+        return {"ok": True, "revision": revision()}
 
 
 @router.delete("/sections/{name}")
 def delete_section(name: str, baseRevision: str = Query("")) -> dict:
-    _require_revision(baseRevision)
-    if not ini.delete_section(name):
-        raise HTTPException(404, "section not found")
-    return {"ok": True, "revision": revision()}
+    with ini.WRITE_LOCK:
+        _require_revision(baseRevision)
+        if not ini.delete_section(name):
+            raise HTTPException(404, "section not found")
+        return {"ok": True, "revision": revision()}
 
 
 @router.get("/sections/{name}/autoconfig")

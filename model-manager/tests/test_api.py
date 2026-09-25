@@ -339,3 +339,88 @@ def test_hub_errors_are_not_echoed(client, monkeypatch):
     monkeypatch.setattr(hf.httpx, "AsyncClient", Boom)
     r = client.get("/api/v1/search?q=x-unique-query").json()
     assert "secret-internal-detail" not in r["error"] and "Could not reach" in r["error"] and r["results"] == []
+
+
+def test_models_ini_replace_is_verbatim_and_revision_pinned(client):
+    path = ROOT / "models" / "models.ini"
+    base = client.get("/api/v1/sections").json()["revision"]
+    text = INI + "; operator comment kept\nparallel = 2\n"
+    ok = client.put("/api/v1/models-ini", json={"baseRevision": base, "text": text})
+    assert ok.status_code == 200 and path.read_text() == text
+    import hashlib
+    assert ok.json()["revision"] == hashlib.sha256(text.encode()).hexdigest()
+    # Stale revision, missing revision, unparsable text and oversize text never write.
+    assert client.put("/api/v1/models-ini", json={"baseRevision": base, "text": INI}).status_code == 409
+    assert client.put("/api/v1/models-ini", json={"text": INI}).status_code == 400
+    current = ok.json()["revision"]
+    assert client.put("/api/v1/models-ini", json={"baseRevision": current, "text": "[broken\nx"}).status_code == 400
+    assert client.put("/api/v1/models-ini", json={"baseRevision": current, "text": "x" * (1024 * 1024 + 1)}).status_code == 413
+    assert client.put("/api/v1/models-ini", json={"baseRevision": current, "text": ""}).status_code == 400
+    assert path.read_text() == text
+    assert not list(path.parent.glob("models.ini.tmp-*"))
+    assert any(b[0].startswith("models.ini.bak-") for b in client.get("/api/v1/sections").json()["backups"])
+
+
+def test_models_ini_replace_keeps_immutable_backup_and_fsyncs_dir(client, monkeypatch):
+    import os
+    from app import ini
+    path = ROOT / "models" / "models.ini"
+    base = client.get("/api/v1/sections").json()["revision"]
+    before = path.read_bytes()
+    synced = []
+    real_fsync_dir = ini._fsync_dir
+    monkeypatch.setattr(ini, "_fsync_dir", lambda d: (synced.append(str(d)), real_fsync_dir(d)))
+    text = INI + "; immutable backup check\n"
+    assert client.put("/api/v1/models-ini", json={"baseRevision": base, "text": text}).status_code == 200
+    backup = path.parent / f"models.ini.noevia-backup-{base}"
+    assert backup.read_bytes() == before and (os.stat(backup).st_mode & 0o777) == 0o600
+    assert synced == [str(path.parent)]
+
+
+def test_models_ini_write_aborts_when_backup_fails(client, monkeypatch):
+    from app import ini
+    path = ROOT / "models" / "models.ini"
+    base = client.get("/api/v1/sections").json()["revision"]
+    before = path.read_text()
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+    monkeypatch.setattr(ini.shutil, "copy", boom)
+    r = client.put("/api/v1/models-ini", json={"baseRevision": base, "text": INI + "; lost\n"})
+    assert r.status_code == 500 and path.read_text() == before
+    assert not list(path.parent.glob("models.ini.tmp-*"))
+
+
+def test_concurrent_models_ini_writers_serialise(client, monkeypatch):
+    """A whole-file replace and a section delete from the same base revision: without the lock
+    both pass the revision check and the second silently overwrites the first."""
+    import threading
+    import time as _time
+    from fastapi import HTTPException
+    from app import api, ini
+    base = client.get("/api/v1/sections").json()["revision"]
+    name = client.get("/api/v1/sections").json()["sections"][0]["name"]
+    real = ini._replace_file
+    entered = threading.Event()
+
+    def slow(*a, **kw):
+        entered.set()
+        _time.sleep(0.3)
+        return real(*a, **kw)
+    monkeypatch.setattr(ini, "_replace_file", slow)
+    results: dict[str, object] = {}
+
+    def run(key, fn):
+        try:
+            results[key] = fn()
+        except HTTPException as e:
+            results[key] = e.status_code
+
+    a = threading.Thread(target=run, args=("replace", lambda: api.replace_models_ini({"baseRevision": base, "text": INI + "; first\n"})))
+    a.start()
+    assert entered.wait(2)
+    b = threading.Thread(target=run, args=("delete", lambda: api.delete_section(name, baseRevision=base)))
+    b.start()
+    a.join(5); b.join(5)
+    assert isinstance(results["replace"], dict) and results["delete"] == 409
+    assert (ROOT / "models" / "models.ini").read_text().endswith("; first\n")
