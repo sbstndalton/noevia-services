@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 
 from . import autoconfig
 from . import telemetry
-from . import bench, db, gguf_meta, hf, hw, ini, services
+from . import bench, db, discover, gguf_meta, hf, hw, ini, services
 from .config import settings
 from .downloader import manager
 from .utils import human_bytes, shard_key
@@ -587,6 +587,12 @@ async def search_repo(request: Request, repo_id: str) -> HTMLResponse:
             files.sort(key=lambda x: (x.shard_index or 0, x.path))
             shard_total = files[0].shard_total if files[0].shard_index else None
             total_size = sum(x.size for x in files)
+            first_path = files[0].path.lower()
+            # Imatrix calibration data and other tiny strays are not models: excluded before
+            # grouping, before header-probe selection, and before estimates are attached. A
+            # repo's own mmproj is unaffected — see #342.
+            if first_path.endswith(".gguf") and "mmproj" not in first_path and discover.is_stray_gguf(base, total_size):
+                continue
             groups.append({
                 "shard_base": base,
                 "shard_total": shard_total,

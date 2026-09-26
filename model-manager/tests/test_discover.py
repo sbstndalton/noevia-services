@@ -139,3 +139,41 @@ def test_stray_files_without_a_quantisation_are_not_offered_as_models():
     assert not judged["suitable"], "its only fitting file is below Q4"
     assert judged["best"] is None
     assert "below Q4" in judged["reasons"][0] or "does not fit" in judged["reasons"][0]
+
+
+def test_imatrix_files_are_never_offered_as_models():
+    """Issue #342: an imatrix.gguf is llama.cpp quantisation calibration data, not weights.
+    It must never appear as a downloadable option, even alongside a real, fitting quant."""
+    judged = discover.judge(cand("bartowski/Qwen_Qwen3.5-4B-GGUF", "bartowski", [
+        ("Qwen_Qwen3.5-4B-Q4_K_M.gguf", 2.6), ("Qwen_Qwen3.5-4B-imatrix.gguf", 0.0035)]),
+        budget_gb=13.5, trusted=discover.TRUSTED_QUANTISERS)
+    assert [o["path"] for o in judged["options"]] == ["Qwen_Qwen3.5-4B-Q4_K_M.gguf"]
+
+
+def test_is_model_weight_file_rejects_imatrix_regardless_of_size_or_naming():
+    # The normal case: tiny, no quant token.
+    assert discover.is_model_weight_file("x/Qwen_Qwen3.5-4B-imatrix.gguf", 3_500_000) is False
+    # Case-insensitive, and even a suspiciously large or quant-looking name must not slip through
+    # — "imatrix" in the basename is disqualifying on its own.
+    assert discover.is_model_weight_file("x/model-IMatrix.gguf", 1_000_000) is False
+    assert discover.is_model_weight_file("x/model-Q4_K_M-imatrix.gguf", 5_000_000_000) is False
+    # A real quantised model file of the same rough size is accepted.
+    assert discover.is_model_weight_file("x/Qwen_Qwen3.5-4B-Q4_K_M.gguf", 2_600_000_000) is True
+    # Stray files without a quant token, or too small, are rejected the same way build_options
+    # already rejected them — the helper must not loosen that.
+    assert discover.is_model_weight_file("x/index.gguf", 10_000) is False
+    assert discover.is_model_weight_file("x/no-quant-token.gguf", 5_000_000_000) is False
+
+
+def test_is_stray_gguf_does_not_require_a_quant_token_unlike_is_model_weight_file():
+    """The repo-detail view (search_repo) uses this looser check: a real, big file with no
+    recognised quant token (a plain "model.gguf", or a scheme our regex doesn't know) is a
+    model, not a stray — only imatrix and genuinely tiny files are excluded."""
+    assert discover.is_stray_gguf("x/model.gguf", 2_000_000_000) is False
+    assert discover.is_stray_gguf("x/model-TQ1_0.gguf", 2_000_000_000) is False
+    assert discover.is_stray_gguf("x/model-imatrix.gguf", 3_500_000) is True
+    assert discover.is_stray_gguf("x/model-IMatrix.GGUF", 5_000_000_000) is True, \
+        "imatrix disqualifies a file regardless of size"
+    assert discover.is_stray_gguf("x/extras/stray.gguf", 5_000_000) is True
+    # is_model_weight_file is strictly stronger: it additionally requires a quant token.
+    assert discover.is_model_weight_file("x/model.gguf", 2_000_000_000) is False

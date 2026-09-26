@@ -33,8 +33,45 @@ QUANT = re.compile(r"(?:^|[-_.])((?:UD-)?(?:IQ\d\w*|Q\d(?:_[\w]+)*|MXFP4|F16|BF1
 # "35B-A3B" = 35B total, 3B active (mixture of experts); "27B" = dense.
 PARAMS = re.compile(r"(?:^|[-_.])(\d+(?:\.\d+)?)\s*B(?:-A(\d+(?:\.\d+)?)B)?(?:[-_.]|$)", re.I)
 COMPANION = re.compile(r"mmproj|projector|\bmtp\b|draft|eagle\d?|medusa", re.I)
+# llama.cpp importance-matrix calibration data: a real file the quantiser needs, but not weights
+# — it has no layers, no context, nothing a server can load. A repo can name it almost anything,
+# but "imatrix" is universal (imatrix.gguf, iMatrix.dat-derived .gguf, model-imatrix.gguf, ...).
+IMATRIX = re.compile(r"imatrix", re.I)
 SUB_Q4_PARAM_LIMIT = 100.0  # billions
 MIN_MODEL_GB = 0.3          # below this it is not a servable model file
+
+
+def is_model_weight_file(path: str, size_bytes: int) -> bool:
+    """True if this GGUF is real, standalone model weights — not calibration data, an index
+    shard, or some other stray file a repo happens to carry alongside the actual model.
+
+    Shared by every path that turns a repo's file listing into "download this as a model":
+    Discover's search results (`build_options` below), the repo-detail view opened from a
+    search result, the download endpoint that plans what to fetch, and the companion check that
+    decides what belongs in "Your models". A file this rejects is rejected everywhere.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if IMATRIX.search(name):
+        return False
+    return quant_of(path) is not None and (size_bytes / 1e9) >= MIN_MODEL_GB
+
+
+def is_stray_gguf(path: str, size_bytes: int) -> bool:
+    """True if this GGUF must never be shown as a model, full stop: imatrix calibration data, or
+    too small to be real weights at all.
+
+    Deliberately looser than `is_model_weight_file`: it does NOT require a recognised
+    quantisation token. Discover's search results can afford that stricter bar because there are
+    always other repos to rank; the repo-detail view shows the one repo a user actually opened,
+    and a plain "model.gguf" or a quant scheme our regex doesn't know (TQ1_0, FP8, a future
+    scheme...) is still a real, loadable model that must not disappear from it. Use this where a
+    repo's file list is shown as-is (repo-detail), and `is_model_weight_file` where files compete
+    to be ranked as a search result.
+    """
+    name = path.rsplit("/", 1)[-1]
+    if IMATRIX.search(name):
+        return True
+    return (size_bytes / 1e9) < MIN_MODEL_GB
 
 
 @dataclass
@@ -103,12 +140,13 @@ def build_options(candidate: Candidate, budget_gb: float) -> list[dict]:
         row["bytes"] += int(f.get("size") or 0)
         row["shards"] += 1
     for row in grouped.values():
+        # Repos carry stray GGUFs (index shards, tiny extras, imatrix calibration data). A model
+        # has a quantisation in its name and real size; without both, offering it as a download
+        # only misleads.
+        if not is_model_weight_file(row["path"], row["bytes"]):
+            continue
         gb = row["bytes"] / 1e9
         quant = quant_of(row["path"])
-        # Repos carry stray GGUFs (index shards, tiny extras). A model has a quantisation in its
-        # name and real size; without both, offering it as a download only misleads.
-        if quant is None or gb < MIN_MODEL_GB:
-            continue
         params = total_b or params_from(row["path"])[0]
         sub_q4 = bool(SUB_Q4.search(row["path"].rsplit("/", 1)[-1])) and (params is None or params < SUB_Q4_PARAM_LIMIT)
         reasons = []

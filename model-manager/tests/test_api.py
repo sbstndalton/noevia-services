@@ -316,6 +316,157 @@ def test_a_listed_shard_base_that_escapes_is_still_refused(client, monkeypatch):
     assert r.status_code == 400 and queued == []
 
 
+# --- Issue #342: imatrix files must never be offered, probed, or downloaded as models ---
+
+def _fake_repo_detail(monkeypatch, files):
+    """Like _fake_repo, but with real per-file size/quant so MIN_MODEL_GB / quant checks apply."""
+    from app import api, hf
+    detail = hf.HfRepoDetail(id="bartowski/Qwen_Qwen3.5-4B-GGUF", files=[
+        hf.HfFile(path=p, size=size, quant=quant, shard_base=p, shard_index=None, shard_total=None)
+        for p, size, quant in files], readme_snippet=None)
+
+    async def repo_detail(repo):
+        return detail
+    monkeypatch.setattr(hf, "repo_detail", repo_detail)
+    queued = []
+    monkeypatch.setattr(api.manager, "enqueue", lambda **kw: queued.append(kw["filename"]))
+    return queued
+
+
+def test_search_repo_excludes_imatrix_from_groups_and_never_probes_it(client, monkeypatch):
+    from app import hf, main
+    queued = _fake_repo_detail(monkeypatch, [
+        ("Qwen_Qwen3.5-4B-Q4_K_M.gguf", int(2.6e9), "Q4_K_M"),
+        ("Qwen_Qwen3.5-4B-imatrix.gguf", 3_500_000, None),
+        ("mmproj-F16.gguf", int(0.9e9), "F16"),
+    ])
+    probed = []
+
+    async def fake_header(repo, path):
+        probed.append(path)
+        return {"model": {"context_length": 32768}}
+    monkeypatch.setattr(hf, "gguf_header", fake_header)
+    monkeypatch.setattr(main, "_preset_estimates", lambda summary, size, mmproj_gb=0.0: [{"key": "fast", "label": "Fast", "ctx": 8192}])
+
+    r = client.get("/api/v1/search/repo", params={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF"})
+    assert r.status_code == 200
+    body = r.json()
+    paths = {g["files"][0]["path"] for g in body["groups"]}
+    assert "Qwen_Qwen3.5-4B-imatrix.gguf" not in paths, "imatrix must be excluded from repo-detail groups"
+    assert paths == {"Qwen_Qwen3.5-4B-Q4_K_M.gguf", "mmproj-F16.gguf"}
+    assert probed == ["Qwen_Qwen3.5-4B-Q4_K_M.gguf"], "the imatrix file must never be chosen as the header probe"
+    real = next(g for g in body["groups"] if not g["projector"])
+    assert real["nativeCtx"] == 32768 and real["estimates"]
+    assert queued == []  # unused here, but keeps _fake_repo_detail's enqueue stub inert
+
+
+def test_search_repo_keeps_an_unrecognised_quant_but_drops_imatrix_and_tiny_strays(client, monkeypatch):
+    """Repo-detail must not require a recognised quant token: unlike Discover's search results,
+    the repo a user actually opened should not lose a real, large file just because its name is
+    "model.gguf" or uses a quant scheme our regex doesn't know. Imatrix and tiny strays are still
+    excluded regardless."""
+    _fake_repo_detail(monkeypatch, [
+        ("model.gguf", int(2.0e9), None),
+        ("model-imatrix.gguf", 3_500_000, None),
+        ("extras/stray.gguf", 5_000_000, None),
+    ])
+    r = client.get("/api/v1/search/repo", params={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF"})
+    assert r.status_code == 200
+    paths = {g["files"][0]["path"] for g in r.json()["groups"]}
+    assert paths == {"model.gguf"}
+
+
+def test_legacy_html_repo_view_also_excludes_imatrix_and_tiny_strays(client, monkeypatch):
+    """The older server-rendered route (`_repo_files.html` via app.main.search_repo) duplicates
+    the React repo-detail view's grouping and must not regress independently — see #342."""
+    from app import hf
+    detail = hf.HfRepoDetail(id="bartowski/Qwen_Qwen3.5-4B-GGUF", files=[
+        hf.HfFile(path="model.gguf", size=int(2.0e9), quant=None,
+                  shard_base="model.gguf", shard_index=None, shard_total=None),
+        hf.HfFile(path="model-imatrix.gguf", size=3_500_000, quant=None,
+                  shard_base="model-imatrix.gguf", shard_index=None, shard_total=None),
+        hf.HfFile(path="extras/stray.gguf", size=5_000_000, quant=None,
+                  shard_base="extras/stray.gguf", shard_index=None, shard_total=None),
+        hf.HfFile(path="mmproj-F16.gguf", size=1_000_000, quant="F16",
+                  shard_base="mmproj-F16.gguf", shard_index=None, shard_total=None),
+    ], readme_snippet=None)
+
+    async def repo_detail(repo):
+        return detail
+    monkeypatch.setattr(hf, "repo_detail", repo_detail)
+
+    async def no_header(*a, **kw):
+        return None
+    monkeypatch.setattr(hf, "gguf_header", no_header)
+
+    r = client.get("/search/repo/bartowski/Qwen_Qwen3.5-4B-GGUF")
+    assert r.status_code == 200, r.text
+    body = r.text
+    assert "model.gguf" in body and "mmproj-F16.gguf" in body
+    assert "model-imatrix.gguf" not in body
+    assert "extras/stray.gguf" not in body
+
+
+def test_downloads_reject_an_imatrix_path_with_a_clear_400(client, monkeypatch):
+    queued = _fake_repo_detail(monkeypatch, [
+        ("m-Q4_K_M.gguf", int(2.0e9), "Q4_K_M"),
+        ("m-imatrix.gguf", 3_500_000, None),
+    ])
+    r = client.post("/api/v1/downloads", json={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF", "path": "m-imatrix.gguf"})
+    assert r.status_code == 400
+    assert "imatrix" in r.json()["detail"].lower()
+    assert queued == []
+    ok = client.post("/api/v1/downloads", json={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF", "path": "m-Q4_K_M.gguf"})
+    assert ok.status_code == 200 and queued == ["m-Q4_K_M/m-Q4_K_M.gguf"]
+
+
+def test_downloads_reject_an_imatrix_shard_base_with_a_clear_400(client, monkeypatch):
+    from app import api, hf
+    detail = hf.HfRepoDetail(id="bartowski/Qwen_Qwen3.5-4B-GGUF", files=[
+        hf.HfFile(path="part/m-imatrix-00001-of-00002.gguf", size=2_000_000, quant=None,
+                  shard_base="part/m-imatrix.gguf", shard_index=1, shard_total=2),
+        hf.HfFile(path="part/m-imatrix-00002-of-00002.gguf", size=2_000_000, quant=None,
+                  shard_base="part/m-imatrix.gguf", shard_index=2, shard_total=2),
+    ], readme_snippet=None)
+
+    async def repo_detail(repo):
+        return detail
+    monkeypatch.setattr(hf, "repo_detail", repo_detail)
+    queued = []
+    monkeypatch.setattr(api.manager, "enqueue", lambda **kw: queued.append(kw["filename"]))
+    r = client.post("/api/v1/downloads", json={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF", "shardBase": "part/m-imatrix.gguf"})
+    assert r.status_code == 400 and "imatrix" in r.json()["detail"].lower()
+    assert queued == []
+
+
+def test_downloads_reject_an_imatrix_url_filename_before_any_network_call(client, monkeypatch):
+    import httpx
+
+    async def must_not_be_called(*a, **kw):
+        raise AssertionError("must reject before making any network request")
+    monkeypatch.setattr(httpx.AsyncClient, "head", must_not_be_called)
+    r = client.post("/api/v1/downloads", json={"url": "https://example.invalid/model-imatrix.gguf", "target": ""})
+    assert r.status_code == 400 and "imatrix" in r.json()["detail"].lower()
+
+
+def test_is_companion_treats_imatrix_as_a_companion_not_a_standalone_model():
+    from app import ini
+    assert ini._is_companion("Qwen_Qwen3.5-4B-imatrix.gguf") is True
+    assert ini._is_companion("Qwen_Qwen3.5-4B-IMatrix.GGUF") is True
+    assert ini._is_companion("Qwen_Qwen3.5-4B-Q4_K_M.gguf") is False
+
+
+def test_an_imatrix_file_on_disk_is_never_listed_in_get_models(client):
+    stray = ROOT / "models" / "stray-imatrix.gguf"
+    stray.write_bytes(b"GGUF" + b"\0" * 64)
+    try:
+        body = client.get("/api/v1/models").json()
+        assert "stray-imatrix.gguf" not in {m["name"] for m in body["models"]}
+        assert "stray-imatrix" not in body["unregistered"]
+    finally:
+        stray.unlink()
+
+
 def test_the_downloader_refuses_any_destination_outside_the_models_dir():
     from app.downloader import manager, safe_dest
     for bad in ("../x.gguf", "a/../../x.gguf", "/etc/x.gguf", "", "."):

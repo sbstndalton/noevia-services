@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+from . import discover
 from .config import settings
 
 BACKUPS_TO_KEEP = 10
@@ -401,9 +402,12 @@ def _is_companion(filename: str, path: "Path | None" = None) -> bool:
     Covers:
       - mmproj files (multimodal projectors — vision, audio, etc.)
       - draft heads for speculative decoding (Qwen3 MTP, generic -draft-)
+      - imatrix calibration data (llama.cpp quantisation input, not weights — see #342)
     """
     n = filename.lower()
     if "mmproj" in n:
+        return True
+    if discover.IMATRIX.search(n):
         return True
     # Import lazily to avoid circular: autoconfig imports ini for ALL_KNOWN_KEYS.
     from .autoconfig import _head_sized, _looks_like_draft
