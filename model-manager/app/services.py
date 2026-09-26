@@ -466,9 +466,70 @@ def _extract_ports(attrs: dict) -> tuple[list[str], int | None]:
     return result, internal
 
 
+_PORT_FLAG_RE = re.compile(r"--port[=\s]+(\d+)")
+
+
+def _port_from_command_or_env(attrs: dict) -> int | None:
+    """Read the llama.cpp server's listen port from its own launch config, for containers
+    that publish no port at all (issue #341): checks `--port N` in Cmd/Entrypoint, then the
+    LLAMA_ARG_PORT env var llama.cpp's server also honors."""
+    config = attrs.get("Config") or {}
+    parts: list[str] = []
+    for key in ("Cmd", "Entrypoint"):
+        val = config.get(key)
+        if isinstance(val, list):
+            parts.extend(str(p) for p in val)
+    m = _PORT_FLAG_RE.search(" ".join(parts))
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
+    for env_entry in (config.get("Env") or []):
+        if not isinstance(env_entry, str) or "=" not in env_entry:
+            continue
+        name, _, value = env_entry.partition("=")
+        if name == "LLAMA_ARG_PORT" and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError:
+                continue
+    return None
+
+
+def _resolve_internal_port(attrs: dict) -> tuple[list[str], int | None]:
+    """Like `_extract_ports`, but falls back to the container's own `--port`/env when Docker
+    publishes no port, then to the configured default (llama.cpp server default 8080). An
+    internal-network-only container legitimately has no port mapping, but the probe still
+    needs *a* port to reach it on the docker network -- returning None here previously made
+    the probe silently skip, which issue #341 showed as a false "no model loaded"."""
+    host_ports, internal = _extract_ports(attrs)
+    if internal is not None:
+        return host_ports, internal
+    internal = _port_from_command_or_env(attrs)
+    if internal is not None:
+        return host_ports, internal
+    default = settings.llama_default_port
+    if default:
+        return host_ports, default
+    return host_ports, None
+
+
+# Messages `_probe_loaded_model` returns when the probe itself succeeded (reached the server,
+# got a 200 with parseable JSON) but no model happens to be loaded. Distinct from a skipped or
+# failed probe: only the latter should surface as `probe_error` (issue #341's "Expected" -
+# "no model loaded" only after a successful probe; probe_error only when skipped or failed).
+_SOFT_PROBE_NOTE_RE = re.compile(r"^(no models configured|\d+ configured, none loaded)$")
+
+
+def _is_soft_probe_note(message: str | None) -> bool:
+    return bool(message) and bool(_SOFT_PROBE_NOTE_RE.match(message))
+
+
 async def _probe_loaded_model(container_name: str, internal_port: int | None) -> tuple[str | None, str | None]:
     if internal_port is None:
-        return None, None
+        # Sanitized: never leak internals, but never silently pretend the probe ran either.
+        return None, "port unknown"
     url = f"http://{container_name}:{internal_port}/v1/models"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(2.0, read=3.0)) as client:
@@ -487,8 +548,16 @@ async def _probe_loaded_model(container_name: str, internal_port: int | None) ->
             if loaded_ids:
                 return ", ".join(i for i in loaded_ids if i), None
             return None, f"{len(items)} configured, none loaded"
-    except (httpx.HTTPError, ValueError) as e:
-        return None, f"{type(e).__name__}: {e}"
+    except httpx.TimeoutException:
+        return None, "timeout"
+    except httpx.ConnectError:
+        return None, "connection refused"
+    except httpx.HTTPError:
+        # Sanitized: httpx exception text can embed the full request URL; the container
+        # name/port aren't secret, but there's no reason to echo raw exception internals.
+        return None, "request failed"
+    except ValueError:
+        return None, "invalid response"
 
 
 def discover_llama_containers() -> list[dict]:
@@ -557,7 +626,7 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
             started, up = _parse_started_at(state.get("StartedAt", ""))
             b.started_at = started
             b.uptime = up
-            b.host_ports, b.internal_port = _extract_ports(attrs)
+            b.host_ports, b.internal_port = _resolve_internal_port(attrs)
         except NotFound:
             pass
         except DockerException as e:
@@ -573,7 +642,9 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
         )
         for (i, _n, _p), (loaded, err) in zip(probe_targets, results):
             out[i].loaded_model = loaded
-            out[i].probe_error = err
+            # A successful probe (loaded, or confirmed nothing loaded) is not an error --
+            # only a skipped/failed probe should tell Hardware the state is unavailable.
+            out[i].probe_error = None if (loaded or _is_soft_probe_note(err)) else err
     return out
 
 
@@ -740,7 +811,7 @@ async def test_prompt(container_name: str, prompt: str, max_tokens: int = 256) -
     if client is not None:
         try:
             c = client.containers.get(container_name)
-            _, internal_port = _extract_ports(c.attrs or {})
+            _, internal_port = _resolve_internal_port(c.attrs or {})
         except (NotFound, DockerException):
             pass
     if internal_port is None:

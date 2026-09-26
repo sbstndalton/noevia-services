@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     llama_containers: str = ""  # empty = auto-discover any ghcr.io/ggml-org/llama.cpp:* container
     gpu_vram: str = ""  # optional container_name:vram_gib overrides — auto-probed via nvidia-smi/rocm-smi if empty
     bind_port: int = 8090
+    # Fallback internal port used to probe a llama.cpp container when Docker metadata has none
+    # (issue #341: an internal-network-only container publishes no port, so
+    # NetworkSettings.Ports is {} and Config.ExposedPorts is null). Only used when the
+    # container's own command/env doesn't say otherwise. 8080 is llama.cpp server's default;
+    # set to 0 to disable the fallback entirely (probe reports probe_error="port unknown").
+    llama_default_port: int = 8080
     max_concurrent_downloads: int = 2
     # RAM the OS, page cache and everything else on the box need. Subtracted before deciding
     # whether a model fits in system memory, because total RAM is never all yours: sizing
