@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 import agent.app as appmod
 from agent.config import Config
@@ -158,6 +159,69 @@ def test_transient_failure_cooldown(tmp_path):
 
 
 # ---- 2: tenant delete must not race an in-flight write ----
+
+def test_delete_tenant_clears_only_its_chat_sessions(client):  # noqa: F811
+    user_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    deleted = appmod._session("one", user_id.upper())
+    deleted["turns"].append({"role": "user", "content": "synthetic private prompt"})
+    appmod._session("two", user_id)["log_status"].append({"assistant": "synthetic reply"})
+    survivor = appmod._session("one", U2)
+    survivor["turns"].append({"role": "user", "content": "other tenant"})
+
+    response = client.delete("/api/internal/tenant", headers={"X-Cowork-User-ID": user_id.upper()})
+
+    assert response.status_code == 200
+    assert not any(key.startswith(f"{user_id}:") for key in appmod.SESSIONS)
+    assert appmod.SESSIONS[f"{U2}:one"] is survivor
+    with pytest.raises(HTTPException) as exc:
+        appmod._session("late", user_id)
+    assert exc.value.status_code == 410
+
+
+def test_delete_blocks_session_creation_during_removal(client, monkeypatch):  # noqa: F811
+    entered, release = threading.Event(), threading.Event()
+    session_started, session_done = threading.Event(), threading.Event()
+    real_rmtree = appmod.shutil.rmtree
+
+    def paused_rmtree(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return real_rmtree(*args, **kwargs)
+
+    monkeypatch.setattr(appmod.shutil, "rmtree", paused_rmtree)
+    deleted = {}
+    late = {}
+
+    def remove():
+        deleted["response"] = client.delete("/api/internal/tenant", headers={"X-Cowork-User-ID": U1})
+
+    def create_session():
+        session_started.set()
+        try:
+            late["session"] = appmod._session("late", U1)
+        except HTTPException as exc:
+            late["status"] = exc.status_code
+        finally:
+            session_done.set()
+
+    deleter = threading.Thread(target=remove)
+    creator = threading.Thread(target=create_session)
+    deleter.start()
+    try:
+        assert entered.wait(5)
+        creator.start()
+        assert session_started.wait(5)
+        assert not session_done.wait(0.1)
+    finally:
+        release.set()
+        deleter.join(5)
+        if creator.ident is not None:
+            creator.join(5)
+
+    assert deleted["response"].status_code == 200
+    assert late == {"status": 410}
+    assert not any(key.startswith(f"{U1}:") for key in appmod.SESSIONS)
+
 
 def test_delete_tenant_waits_for_write_and_leaves_no_files(client, tmp_path):  # noqa: F811
     root = Path(appmod._base_cfg.get("retrieval.db_path")).parent / "users" / U1

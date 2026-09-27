@@ -660,7 +660,13 @@ def delete_tenant(request: Request) -> JSONResponse:
                 _tenant_states.pop(key, None)
         shutil.rmtree(root, ignore_errors=True)
         _mark_tenant_deleted_locked(user_id)
-    return JSONResponse({"ok": True})# ---------------- in-memory session (per tenant, bounded) ----------------
+        for key in list(SESSIONS):
+            if key.startswith(f"{user_id}:"):
+                SESSIONS.pop(key, None)
+    return JSONResponse({"ok": True})
+
+
+# ---------------- in-memory session (per tenant, bounded) ----------------
 
 SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
 _SESSION_CAP = 256
@@ -671,10 +677,11 @@ _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 def _session(session_id: str, tenant_id: str = "legacy") -> dict:
     """Conversation scratch state, keyed by tenant + client-supplied session id.
 
-    Both key parts are validated/normalized and the map is TTL+LRU bounded:
+    Both key parts are validated/normalized and the map is capacity bounded:
     SESSIONS used to grow without limit because both parts were unvalidated
     client input and entries were never evicted. Validation also keeps keys
-    to one line (a header cannot smuggle ':' collisions or weird bytes).
+    to one line (a header cannot smuggle ':' collisions or weird bytes). Old
+    entries are swept opportunistically when inserting into a full map.
     """
     sid = str(session_id or "default")
     if not _SESSION_ID_RE.fullmatch(sid):
@@ -683,20 +690,25 @@ def _session(session_id: str, tenant_id: str = "legacy") -> dict:
     if tid != "legacy" and not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", tid):
         raise HTTPException(status_code=400, detail="invalid tenant")
     key = f"{tid}:{sid}"
-    now = time.monotonic()
-    if key in SESSIONS:
-        SESSIONS.move_to_end(key)
-        SESSIONS[key]["last_used"] = now
-        return SESSIONS[key]
-    if len(SESSIONS) >= _SESSION_CAP:
-        expired = [k for k, v in SESSIONS.items() if now - v.get("last_used", now) > _SESSION_TTL_S]
-        for k in expired:
-            SESSIONS.pop(k, None)
-    while len(SESSIONS) >= _SESSION_CAP:
-        SESSIONS.popitem(last=False)  # least recently used
-    entry = {"turns": [], "log_status": [], "last_used": now}
-    SESSIONS[key] = entry
-    return entry
+    # Coordinate the tombstone check and map insertion with tenant deletion.
+    # The lock is released before any model or storage work in _run_exchange.
+    with _tenant_lock:
+        if tid != "legacy" and _tenant_recently_deleted_locked(tid):
+            raise HTTPException(status_code=410, detail="tenant deleted")
+        now = time.monotonic()
+        if key in SESSIONS:
+            SESSIONS.move_to_end(key)
+            SESSIONS[key]["last_used"] = now
+            return SESSIONS[key]
+        if len(SESSIONS) >= _SESSION_CAP:
+            expired = [k for k, v in SESSIONS.items() if now - v.get("last_used", now) > _SESSION_TTL_S]
+            for k in expired:
+                SESSIONS.pop(k, None)
+        while len(SESSIONS) >= _SESSION_CAP:
+            SESSIONS.popitem(last=False)  # least recently used
+        entry = {"turns": [], "log_status": [], "last_used": now}
+        SESSIONS[key] = entry
+        return entry
 
 
 # ---------------- request/response models ----------------
@@ -1518,5 +1530,6 @@ def local_exchange(body: dict, request: Request):
             return result
         finally:
             _close_state(st)
-            SESSIONS.pop(f"{tenant_id}:{sid}", None)
+            with _tenant_lock:
+                SESSIONS.pop(f"{tenant_id}:{sid}", None)
     return exchange_stream(work) if body.get("stream") is True else work()
