@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -314,11 +315,8 @@ class DownloadManager:
             await self._stream_single(job, url, headers)
 
     async def _stream_parallel(self, job: DownloadJob, url: str, headers: dict[str, str], total: int) -> None:
-        # If a partial file exists and matches size exactly, assume it's complete (rare).
-        if job.temp_path.exists() and job.temp_path.stat().st_size == total:
-            job.downloaded_bytes = total
-            return
-        # Preallocate temp file to full size; per-worker seek+write into non-overlapping regions.
+        # A previous parallel attempt may have preallocated the whole file before failing.
+        # Start each attempt afresh; file length cannot identify completed ranges.
         with open(job.temp_path, "wb") as f:
             f.truncate(total)
         job.downloaded_bytes = 0
@@ -339,18 +337,19 @@ class DownloadManager:
             timeout = httpx.Timeout(30.0, read=120.0)
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, event_hooks={"request": [self._authorize_request]}, headers=worker_headers) as w:
                 async with w.stream("GET", url) as resp:
-                    if resp.status_code not in (200, 206):
-                        body = ""
-                        try:
-                            body = (await resp.aread()).decode(errors="replace")[:200]
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"HTTP {resp.status_code} for range {cs.start}-{cs.end}: {body}")
+                    if resp.status_code != 206:
+                        raise RuntimeError(f"HTTP {resp.status_code} for range {cs.start}-{cs.end}")
+                    content_range = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", resp.headers.get("content-range", ""))
+                    if (content_range is None or
+                            tuple(map(int, content_range.groups())) != (cs.start, cs.end, total)):
+                        raise RuntimeError(f"unexpected Content-Range for range {cs.start}-{cs.end}")
                     with open(job.temp_path, "r+b") as f:
                         f.seek(cs.start)
                         async for buf in resp.aiter_bytes(1024 * 1024):
                             if job._cancel.is_set():
                                 raise asyncio.CancelledError
+                            if cs.downloaded + len(buf) > cs.size:
+                                raise RuntimeError(f"too many bytes for range {cs.start}-{cs.end}")
                             f.write(buf)
                             cs.downloaded += len(buf)
                             now = time.time()
@@ -359,6 +358,8 @@ class DownloadManager:
                                 if len(cs._samples) > 12:
                                     cs._samples = cs._samples[-12:]
                             self._note_progress(job, len(buf))
+                    if cs.downloaded != cs.size:
+                        raise RuntimeError(f"incomplete range {cs.start}-{cs.end}: received {cs.downloaded} of {cs.size} bytes")
 
         tasks = [asyncio.create_task(worker(c)) for c in job.chunks]
         try:
