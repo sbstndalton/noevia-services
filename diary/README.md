@@ -23,6 +23,13 @@ pip install -r requirements.txt
 uvicorn agent.app:app --reload --port 8010
 ```
 
+To run the tests, install the dev requirements (pytest, moto; not part of the Docker image) instead:
+
+```sh
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
 Configuration defaults live in `config/config.yaml`. Environment variables override YAML values. Set an OpenAI-compatible endpoint and valid chat/embedding model IDs before starting a conversation.
 
 ## API and safety
