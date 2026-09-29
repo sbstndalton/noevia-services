@@ -29,6 +29,27 @@ def test_health_models_and_sections(client):
     assert sections["schema"][0]["tier"] == "Common" and any(f["key"] == "ctx-size" for f in sections["schema"][0]["fields"])
 
 
+def test_schema_groups_carry_stable_ids_beside_the_english_label(client):
+    # #598: the web client translates the Advanced group titles from the id; the label stays for older clients.
+    schema = client.get("/api/v1/sections").json()["schema"]
+    ids = {g["tier"]: g["tierId"] for g in schema}
+    assert ids["Common"] == "common" and ids["Speculative decoding"] == "speculative" and ids["Embeddings & misc"] == "misc"
+    assert all(g["tierId"] for g in schema), "every group has an id"
+    assert len({g["tierId"] for g in schema}) == len(schema)
+
+
+def test_uptime_is_sent_in_seconds_beside_the_english_string():
+    # #597: the client formats the span in its own language; `uptime` stays for older clients.
+    from datetime import datetime, timedelta, timezone
+    from app import services
+    started = (datetime.now(timezone.utc) - timedelta(hours=1, minutes=14, seconds=5)).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+    _, text, seconds = services._parse_started_at(started)
+    assert text == "1h 14m" and 4440 <= seconds <= 4450
+    assert services._parse_started_at("") == ("", "", None)
+    assert services._parse_started_at("0001-01-01T00:00:00Z") == ("", "", None)
+    assert services.LlamaBackend(name="x", found=False).uptime_s is None
+
+
 def test_save_is_pinned_to_the_revision_and_keeps_the_preamble(client):
     current = client.get("/api/v1/sections/tiny").json()
     assert current["values"]["ctx-size"] == "4096"

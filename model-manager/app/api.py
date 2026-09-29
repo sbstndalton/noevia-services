@@ -61,7 +61,7 @@ def _field(f: ini.Field) -> dict:
 
 
 def _schema() -> list[dict]:
-    return [{"tier": label, "open": opened, "fields": [_field(f) for f in group]}
+    return [{"tier": label, "tierId": ini.TIER_IDS.get(label), "open": opened, "fields": [_field(f) for f in group]}
             for label, group, opened in ini.FORM_TIERS]
 
 

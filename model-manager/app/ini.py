@@ -298,6 +298,15 @@ FORM_TIERS: tuple[tuple[str, tuple[Field, ...], bool], ...] = (
     ("Embeddings & misc", MISC_FIELDS, False),
 )
 
+# Stable ids for the groups above, sent next to the English label so a client can translate the
+# heading without matching text (#598). Keyed by label; a group added without an id gets none.
+TIER_IDS: dict[str, str] = {
+    "Common": "common", "Runtime tuning": "runtime", "RoPE / YaRN": "rope",
+    "Mixture-of-Experts offload": "moe", "Multimodal / vision": "multimodal",
+    "Speculative decoding": "speculative", "LoRA / control vectors": "lora",
+    "CPU threading": "cpu", "Reasoning / thinking": "reasoning", "Embeddings & misc": "misc",
+}
+
 ALL_FIELDS: tuple[Field, ...] = tuple(f for _, group, _ in FORM_TIERS for f in group)
 ALL_KNOWN_KEYS = {f.key for f in ALL_FIELDS}
 

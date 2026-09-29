@@ -531,6 +531,9 @@ class LlamaBackend:
     short_id: str = ""
     started_at: str = ""
     uptime: str = ""
+    # The same span in seconds, so a client can localise the units itself; `uptime` stays for
+    # older clients (#597).
+    uptime_s: int | None = None
     host_ports: list[str] = field(default_factory=list)
     internal_port: int | None = None
     loaded_model: str | None = None
@@ -541,10 +544,10 @@ class LlamaBackend:
     last_restart_error: str | None = None
 
 
-def _parse_started_at(iso: str) -> tuple[str, str]:
+def _parse_started_at(iso: str) -> tuple[str, str, int | None]:
     # docker returns e.g. "2025-08-11T00:51:00.123456789Z"
     if not iso or iso.startswith("0001"):
-        return "", ""
+        return "", "", None
     try:
         # trim nanoseconds to microseconds
         core, _, frac = iso.partition(".")
@@ -555,7 +558,7 @@ def _parse_started_at(iso: str) -> tuple[str, str]:
             iso_norm = core.replace("Z", "+00:00")
         dt = datetime.fromisoformat(iso_norm)
     except ValueError:
-        return iso, ""
+        return iso, "", None
     local = dt.astimezone().strftime("%Y-%m-%d %H:%M")
     delta = datetime.now(timezone.utc) - dt
     secs = int(delta.total_seconds())
@@ -567,7 +570,7 @@ def _parse_started_at(iso: str) -> tuple[str, str]:
         up = f"{secs // 3600}h {(secs % 3600) // 60}m"
     else:
         up = f"{secs // 86400}d {(secs % 86400) // 3600}h"
-    return local, up
+    return local, up, max(0, secs)
 
 
 def _extract_ports(attrs: dict) -> tuple[list[str], int | None]:
@@ -755,9 +758,10 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
             b.short_id = c.short_id
             attrs = c.attrs or {}
             state = (attrs.get("State") or {})
-            started, up = _parse_started_at(state.get("StartedAt", ""))
+            started, up, up_s = _parse_started_at(state.get("StartedAt", ""))
             b.started_at = started
             b.uptime = up
+            b.uptime_s = up_s
             b.host_ports, b.internal_port = _resolve_internal_port(attrs)
             health_states[i] = str((state.get("Health") or {}).get("Status") or "")
         except NotFound:
