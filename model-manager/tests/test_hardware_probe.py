@@ -140,6 +140,26 @@ def test_probe_200_with_a_loaded_model_returns_its_id(monkeypatch):
     assert loaded == "gemma-e2b" and err is None
 
 
+def test_probe_single_model_server_without_router_status_reports_its_model(monkeypatch):
+    # #580: the embed sidecar is a fixed llama-server, not a router: /v1/models lists the one
+    # model it serves and carries no per-model `status`.
+    payload = {"object": "list", "data": [
+        {"id": "nomic-embed-text-v1", "object": "model", "created": 1, "owned_by": "llamacpp",
+         "meta": {"n_ctx_train": 2048}},
+    ]}
+    _mock_client(monkeypatch, response=_FakeResponse(200, payload))
+    loaded, err = asyncio.run(services._probe_loaded_model("cowork-embed-1", 8080))
+    assert loaded == "nomic-embed-text-v1" and err is None
+
+
+def test_probe_router_entry_with_an_unloaded_status_is_still_not_loaded(monkeypatch):
+    # The single-model rule must not make a router's "unloaded" entries count as loaded.
+    payload = {"data": [{"id": "a", "status": {"value": "unloaded"}}, {"id": "b", "status": {"value": "loading"}}]}
+    _mock_client(monkeypatch, response=_FakeResponse(200, payload))
+    loaded, err = asyncio.run(services._probe_loaded_model("cowork-llama-1", 8080))
+    assert loaded is None and err == "2 configured, none loaded"
+
+
 # ---------- snapshot_llama_backends: what actually reaches the API/Hardware tab ----------
 
 class _FakeImage:
@@ -225,6 +245,17 @@ def test_snapshot_successful_empty_probe_clears_probe_error(monkeypatch):
     _mock_client(monkeypatch, response=_FakeResponse(200, payload))
     [backend] = _snapshot_for(monkeypatch, container)
     assert backend.loaded_model is None
+    assert backend.probe_error is None
+
+
+def test_snapshot_reports_the_embed_sidecars_single_model_as_loaded(monkeypatch):
+    """#580: what Hardware and GET /backends show for the fixed embed llama-server."""
+    monkeypatch.setattr(settings, "llama_default_port", 8080)
+    container = _FakeContainer("cowork-embed-1", _attrs())
+    payload = {"object": "list", "data": [{"id": "nomic-embed-text-v1", "object": "model"}]}
+    _mock_client(monkeypatch, response=_FakeResponse(200, payload))
+    [backend] = _snapshot_for(monkeypatch, container, names=("cowork-embed-1",))
+    assert backend.loaded_model == "nomic-embed-text-v1"
     assert backend.probe_error is None
 
 

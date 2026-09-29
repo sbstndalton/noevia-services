@@ -668,10 +668,13 @@ async def _probe_loaded_model(container_name: str, internal_port: int | None) ->
             items = data.get("data") or []
             if not items:
                 return None, "no models configured"
+            # A router lists every configured model with a per-model `status`; a fixed
+            # single-model llama-server (the embed sidecar, #580) lists just the model it
+            # serves, with no `status` at all -- and it only answers once that model is loaded.
             loaded_ids = [
                 str(it.get("id") or "")
                 for it in items
-                if (it.get("status") or {}).get("value") == "loaded"
+                if not isinstance(it.get("status"), dict) or it["status"].get("value") == "loaded"
             ]
             if loaded_ids:
                 return ", ".join(i for i in loaded_ids if i), None
