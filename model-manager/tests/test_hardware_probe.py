@@ -226,3 +226,33 @@ def test_snapshot_successful_empty_probe_clears_probe_error(monkeypatch):
     [backend] = _snapshot_for(monkeypatch, container)
     assert backend.loaded_model is None
     assert backend.probe_error is None
+
+
+# ---------- issue 549: unreachable vs down ----------
+
+def _attrs_with_health(status):
+    a = _attrs()
+    a["State"] = {"StartedAt": "2026-09-28T00:00:00Z", "Health": {"Status": status}}
+    return a
+
+
+@pytest.mark.parametrize("exc", [httpx.ConnectError("refused"), httpx.ConnectTimeout("slow")])
+def test_healthy_container_the_loader_cannot_connect_to_is_unreachable_not_down(monkeypatch, exc):
+    monkeypatch.setattr(settings, "llama_default_port", 8080)
+    container = _FakeContainer("cowork-embed-1", _attrs_with_health("healthy"))
+    _mock_client(monkeypatch, raises=exc)
+    [backend] = _snapshot_for(monkeypatch, container, names=("cowork-embed-1",))
+    assert backend.status == "running"
+    assert backend.unreachable_but_healthy is True
+    assert backend.probe_error == services._UNREACHABLE_HEALTHY_NOTE
+    assert "refused" not in backend.probe_error
+
+
+@pytest.mark.parametrize("health", ["unhealthy", "starting", ""])
+def test_unhealthy_or_unchecked_container_keeps_the_connection_error(monkeypatch, health):
+    monkeypatch.setattr(settings, "llama_default_port", 8080)
+    container = _FakeContainer("cowork-embed-1", _attrs_with_health(health))
+    _mock_client(monkeypatch, raises=httpx.ConnectError("refused"))
+    [backend] = _snapshot_for(monkeypatch, container, names=("cowork-embed-1",))
+    assert backend.unreachable_but_healthy is False
+    assert backend.probe_error == "connection refused"

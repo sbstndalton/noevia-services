@@ -414,6 +414,9 @@ class LlamaBackend:
     internal_port: int | None = None
     loaded_model: str | None = None
     probe_error: str | None = None
+    # True when the probe could not connect but Docker's own healthcheck reports the container
+    # healthy: the engine is up and merely not reachable from this service's network (#549).
+    unreachable_but_healthy: bool = False
     last_restart_error: str | None = None
 
 
@@ -522,6 +525,10 @@ def _resolve_internal_port(attrs: dict) -> tuple[list[str], int | None]:
 _SOFT_PROBE_NOTE_RE = re.compile(r"^(no models configured|\d+ configured, none loaded)$")
 
 
+_UNREACHABLE_ERRORS = {"connection refused", "timeout"}
+_UNREACHABLE_HEALTHY_NOTE = "not reachable from the model loader (Docker reports it healthy)"
+
+
 def _is_soft_probe_note(message: str | None) -> bool:
     return bool(message) and bool(_SOFT_PROBE_NOTE_RE.match(message))
 
@@ -610,6 +617,7 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
 
     out: list[LlamaBackend] = []
     probe_targets: list[tuple[int, str, int | None]] = []  # (idx, name, internal_port)
+    health_states: dict[int, str] = {}  # idx -> Docker healthcheck status ("" when none defined)
 
     for i, name in enumerate(effective):
         b = LlamaBackend(name=name, found=False, status="not_found")
@@ -627,6 +635,7 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
             b.started_at = started
             b.uptime = up
             b.host_ports, b.internal_port = _resolve_internal_port(attrs)
+            health_states[i] = str((state.get("Health") or {}).get("Status") or "")
         except NotFound:
             pass
         except DockerException as e:
@@ -645,6 +654,12 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
             # A successful probe (loaded, or confirmed nothing loaded) is not an error --
             # only a skipped/failed probe should tell Hardware the state is unavailable.
             out[i].probe_error = None if (loaded or _is_soft_probe_note(err)) else err
+            if out[i].probe_error in _UNREACHABLE_ERRORS and health_states.get(i) == "healthy":
+                # Docker's healthcheck runs inside the container's own network, so "healthy" plus
+                # a refused/timed-out connection from here means this service is not on the
+                # engine's network -- not that the engine is down (issue #549).
+                out[i].probe_error = _UNREACHABLE_HEALTHY_NOTE
+                out[i].unreachable_but_healthy = True
     return out
 
 
