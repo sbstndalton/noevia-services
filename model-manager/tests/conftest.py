@@ -30,5 +30,16 @@ def _gguf(kv: dict) -> bytes:
     "general.architecture": "llama", "llama.context_length": 8192, "llama.embedding_length": 256,
     "llama.block_count": 4, "llama.attention.head_count": 4, "llama.attention.head_count_kv": 2,
     "tokenizer.chat_template": "{{ messages }}"}) + b"\0" * 4096)
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_docker_socket(monkeypatch):
+    """The delete guard consults running containers; tests have no Docker socket. Tests of the
+    guard itself override this with their own fake containers."""
+    from app import services
+    monkeypatch.setattr(services, "_running_containers", lambda: [])
+
+
 INI = "version = 1\n\n[tiny]\nmodel = /models/tiny/tiny-Q4_K_M.gguf\nctx-size = 4096\n"
 (ROOT / "models" / "models.ini").write_text(INI)

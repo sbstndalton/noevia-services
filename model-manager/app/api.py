@@ -141,13 +141,28 @@ async def model_detail(key: str = Query(...)) -> dict:
 
 @router.post("/models/delete")
 def delete_models(body: dict = Body(...)) -> dict:
+    # Check every requested file first: a running container that holds one of them (the embed
+    # sidecar's --model, EMBEDDING_MODEL / RERANK_MODEL) refuses the whole request with 409 and
+    # nothing is deleted, even if the web-side guard was bypassed (#336).
     results = []
+    todo = []
+    containers = None
     for item in body.get("models") or []:
         key = str(item)
         try:
             g = _find_entry(key)
         except HTTPException as e:
             results.append({"key": key, "ok": False, "message": e.detail}); continue
+        try:
+            if containers is None:
+                containers = services._running_containers()
+        except services.ModelInUse as e:
+            raise HTTPException(409, str(e)) from e
+        holders = services.model_holders(g, containers)
+        if holders:
+            raise HTTPException(409, services.in_use_message(g, holders))
+        todo.append((key, g))
+    for key, g in todo:
         ok, msg, freed = services.delete_gguf(g.display_name, g.subdir)
         results.append({"key": key, "ok": ok, "message": msg, "freed": freed, "freedH": human_bytes(freed) if freed else ""})
     return {"results": results}

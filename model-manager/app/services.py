@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import os
+import posixpath
 import re
 import shutil
 import threading
@@ -258,6 +260,118 @@ def snapshot_models_dir() -> ModelsDirSnapshot:
     return snap
 
 
+# ---------- delete guard: files a running container depends on (#336) ----------
+
+class ModelInUse(Exception):
+    """A model file is referenced by a running container; deleting it would break that container."""
+
+
+_MODEL_ENV_KEYS = ("EMBEDDING_MODEL", "EMBED_MODEL", "RERANK_MODEL")
+
+
+def _running_containers() -> list[dict]:
+    """Inspect data for every running container except this one.
+
+    Raises ModelInUse (fail closed) when the Docker socket is there but cannot be read: a delete
+    is irreversible, so "could not check" must not read as "nobody uses it". With no socket
+    configured at all (a plain models-folder install) there is nothing to consult, so [].
+    """
+    client = _docker_client()
+    if client is None:
+        return []
+    try:
+        listed = client.containers.list()
+    except (DockerException, OSError) as e:
+        raise ModelInUse(f"Could not check which containers use this model ({type(e).__name__}); nothing was deleted.") from e
+    own = os.environ.get("HOSTNAME") or ""
+    out = []
+    for c in listed:
+        if c.name == "model-loader" or (own and c.id.startswith(own)):
+            continue
+        out.append({"name": c.name, **(c.attrs or {})})
+    return out
+
+
+def _container_args(attrs: dict) -> list[str]:
+    cfg = attrs.get("Config") or {}
+    args: list[str] = []
+    for part in (cfg.get("Entrypoint"), cfg.get("Cmd"), attrs.get("Args")):
+        if isinstance(part, str):
+            args.append(part)
+        elif isinstance(part, list):
+            args.extend(str(a) for a in part)
+    return args
+
+
+def _env_map(attrs: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in (attrs.get("Config") or {}).get("Env") or []:
+        k, _, v = str(item).partition("=")
+        out[k] = v
+    return out
+
+
+def model_holders(entry: "GgufEntry", containers: list[dict] | None = None) -> list[str]:
+    """Running containers that use this model, each with the reason.
+
+    Two signals, both read from `docker inspect` (the loader has the Docker socket; it does not
+    share a PID namespace with the engines, so /proc/<pid>/fd of their processes is not visible
+    and cannot be used):
+      1. a command-line argument naming one of the model's files (the embed sidecar runs
+         `--model /models/<file>`), matched by models-dir-relative path so a different mount
+         point in the other container still counts;
+      2. EMBEDDING_MODEL / EMBED_MODEL / RERANK_MODEL in the container's environment naming this
+         model ("default" is a placeholder; RERANK_MODEL only counts while the reranker feature
+         is on, matching the web-side guard).
+    """
+    root = settings.models_dir
+    rels: set[str] = set()
+    for p in list(entry.parts) + list(entry.companion_parts):
+        try:
+            rels.add(p.relative_to(root).as_posix())
+        except ValueError:
+            rels.add(p.name)
+    names = {entry.model_id, entry.stem, entry.display_name, *entry.aliases}
+    names.discard("")
+    host_root = (settings.models_host_path or "").rstrip("/")
+    found: list[str] = []
+    for c in containers if containers is not None else _running_containers():
+        why = ""
+        mounts = [(str(m.get("Destination") or "").rstrip("/"), str(m.get("Source") or "").rstrip("/")) for m in c.get("Mounts") or []]
+        for raw in _container_args(c):
+            arg = raw.split("=", 1)[1] if raw.startswith("--") and "=" in raw else raw
+            norm = posixpath.normpath(arg) if arg.startswith("/") else arg
+            for rel in rels:
+                if norm != rel and not norm.endswith("/" + rel):
+                    continue
+                # When the container's mount source and the host models path are both known, the
+                # file must really come from the models folder, not a same-named file elsewhere.
+                mount = next(((d, s) for d, s in mounts if d and norm.startswith(d + "/")), None)
+                if host_root and mount and posixpath.normpath(mount[1] + norm[len(mount[0]):]) != f"{host_root}/{rel}":
+                    continue
+                why = f"its command runs {rel}"
+                break
+            if why:
+                break
+        if not why:
+            env = _env_map(c)
+            rerank_on = env.get("NOEVIA_FEATURE_RAG_RERANK", "").lower() in ("1", "true", "on")
+            for key in _MODEL_ENV_KEYS:
+                v = env.get(key, "").strip()
+                if not v or v.lower() == "default" or (key == "RERANK_MODEL" and not rerank_on):
+                    continue
+                if v in names:
+                    why = f"{key} is set to {v}"
+                    break
+        if why:
+            found.append(f"{c['name']} ({why})")
+    return found
+
+
+def in_use_message(entry: "GgufEntry", holders: list[str]) -> str:
+    return f"{entry.display_name} is in use by a running container: {'; '.join(holders)}. Stop or reconfigure it first; nothing was deleted."
+
+
 def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
     """Delete a GGUF (and all shards). Returns (ok, message, bytes_freed).
     If subdir is empty, matches only flat files with that display_name; otherwise the entry in that subdir."""
@@ -271,6 +385,13 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
         match = next((g for g in snap.ggufs if g.display_name == display_name), None)
     if match is None:
         return False, f"not found: {display_name}", 0
+    # Backstop for callers other than the JSON API (which checks up front and answers 409).
+    try:
+        holders = model_holders(match)
+    except ModelInUse as e:
+        return False, str(e), 0
+    if holders:
+        return False, in_use_message(match, holders), 0
     freed = 0
     removed: list[str] = []
 
