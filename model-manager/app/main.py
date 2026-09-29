@@ -55,6 +55,13 @@ from . import api as _api  # noqa: E402
 app.include_router(_api.router)
 
 
+@app.exception_handler(ini.DuplicateSectionsError)
+async def _duplicate_sections(_request: Request, exc: ini.DuplicateSectionsError):
+    """A write hit a models.ini with repeated [sections]; nothing was changed."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": f"{exc}. Repair the file (remove the repeated section) before saving."}, status_code=409)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     db.init()

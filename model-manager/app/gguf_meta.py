@@ -210,6 +210,26 @@ def _fmt_params(n: Any) -> str | None:
     return str(int(n))
 
 
+# Architectures whose rope scaling llama.cpp applies per layer from the GGUF itself. A global
+# --rope-scale would also scale the layers that must stay unscaled (Gemma 3's sliding-window
+# local layers), so a preset must never carry rope keys for them, declared metadata or not.
+_ROPE_FROM_GGUF_ARCHS = ("gemma3",)
+
+
+def rope_owned_by_gguf(model: dict[str, Any]) -> bool:
+    """True when the GGUF already decides rope scaling and a preset must not override it:
+    the metadata declares a scaling type or factor, or the architecture is one whose per-layer
+    scaling llama.cpp derives itself. `model` is the `summary["model"]` dict."""
+    arch = str(model.get("arch") or "").lower()
+    if any(arch.startswith(a) for a in _ROPE_FROM_GGUF_ARCHS):
+        return True
+    rtype = str(model.get("rope_scaling_type") or "").strip().lower()
+    if rtype not in ("", "none"):
+        return True
+    factor = model.get("rope_scaling_factor")
+    return isinstance(factor, (int, float)) and factor > 0
+
+
 def summarize(raw: dict[str, Any]) -> dict[str, Any]:
     arch = raw.get("general.architecture", "") or ""
 
@@ -242,6 +262,7 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
             "kv_count": raw.get("_kv_count"),
         },
         "model": {
+            "arch": arch,
             "context_length": _scalar_int(a("context_length")),
             "embedding_length": _scalar_int(a("embedding_length")),
             "block_count": _scalar_int(a("block_count")),

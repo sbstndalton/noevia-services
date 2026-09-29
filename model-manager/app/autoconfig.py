@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ini
+from . import gguf_meta, ini
 
 # candidate contexts to try, smallest → largest
 _CTX_CANDIDATES = (
@@ -1926,14 +1926,14 @@ def analyze(*,
             elif not _cur_b and _imt > 2048:      # above llama-server's own default
                 values["batch-size"] = str(_imt)
 
-    # RoPE handling — respect the model's own scaling if declared, otherwise auto-linear
-    # for any ctx we chose that exceeds the model's native ctx.
-    if rope_type and str(rope_type).lower() not in ("none", ""):
-        values["rope-scaling"] = str(rope_type)
-        rope_factor = m.get("rope_scaling_factor")
-        if isinstance(rope_factor, (int, float)) and rope_factor > 0:
-            values["rope-scale"] = str(rope_factor)
-    elif rec_ctx > native_ctx and native_ctx > 0:
+    # RoPE handling. When the GGUF already declares rope scaling (or the architecture, like
+    # Gemma 3, gets per-layer scaling from llama.cpp itself) write NO rope keys: a global
+    # --rope-scale would override the per-layer values for every layer (#568). The one case
+    # where auto-config sets scaling is a chosen ctx beyond n_ctx_train on a model that
+    # declares none. Candidates are capped at native_ctx above, so this is a guard for
+    # callers that raise ctx, not a normal path.
+    rope_owned = gguf_meta.rope_owned_by_gguf(m)
+    if not rope_owned and rec_ctx > native_ctx and native_ctx > 0:
         values["rope-scaling"] = "linear"
         values["rope-scale"] = f"{round(rec_ctx / native_ctx, 1)}"
 
@@ -2071,7 +2071,7 @@ def analyze(*,
         )
 
     # RoPE extension quirk (only when we set linear scaling ourselves)
-    if values.get("rope-scaling") == "linear" and (not rope_type or str(rope_type).lower() in ("none", "")) and native_ctx > 0:
+    if values.get("rope-scaling") == "linear" and not rope_owned and native_ctx > 0:
         scale = values.get("rope-scale", "?")
         quirks.append(f"Extended ctx from native {_fmt_ctx(native_ctx)} to {_fmt_ctx(rec_ctx)} "
                       f"via `rope-scaling=linear, rope-scale={scale}`. Linear scaling degrades quality gracefully up "
@@ -2082,7 +2082,9 @@ def analyze(*,
     is_moe = isinstance(experts, int) and experts > 1
     if not is_moe:
         unavailable.append("cpu-moe / n-cpu-moe (not MoE)")
-    if not rope_type or str(rope_type).lower() == "none":
+    if rope_owned:
+        unavailable.append("rope-scaling (the GGUF sets it per layer; a preset value would override it)")
+    elif not rope_type or str(rope_type).lower() == "none":
         unavailable.append("rope-scaling (model doesn't declare one)")
 
     # MoE-specific quirk: reflect what offload is being applied

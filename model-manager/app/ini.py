@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from . import discover
+from . import discover, gguf_meta
 from .config import settings
 
 BACKUPS_TO_KEEP = 10
@@ -304,6 +304,34 @@ ALL_KNOWN_KEYS = {f.key for f in ALL_FIELDS}
 
 # ---- ini I/O ----
 
+class DuplicateSectionsError(configparser.Error, ValueError):
+    """models.ini declares the same [section] more than once. llama.cpp's router merges the
+    copies silently (the later keys win), so a write on top of that would quietly pick a
+    winner. Refused until the operator repairs the file."""
+
+    def __init__(self, names: list[str]):
+        self.names = names
+        super().__init__("models.ini has duplicate sections: " + ", ".join(f"[{n}]" for n in names))
+
+
+_SECTION_HEADER_RE = re.compile(r"^\s*\[([^\]\r\n]+)\]\s*(?:[;#].*)?$")
+
+
+def duplicate_sections(text: str) -> list[str]:
+    """Section names that appear more than once, in first-duplicate order."""
+    seen: set[str] = set()
+    dups: list[str] = []
+    for line in text.splitlines():
+        m = _SECTION_HEADER_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name in seen and name not in dups:
+            dups.append(name)
+        seen.add(name)
+    return dups
+
+
 def _new_parser() -> configparser.ConfigParser:
     cp = configparser.ConfigParser(strict=False, interpolation=None)
     cp.optionxform = str  # preserve case
@@ -319,16 +347,25 @@ def split_preamble(text: str) -> tuple[str, str]:
     return "".join(lines[:first]), "".join(lines[first:])
 
 
-def parse_ini_text(text: str, source: str = "<models.ini>") -> configparser.ConfigParser:
+def parse_ini_text(text: str, source: str = "<models.ini>", *, allow_duplicates: bool = False) -> configparser.ConfigParser:
+    """Parse models.ini. Duplicate section names raise DuplicateSectionsError unless
+    `allow_duplicates` (read-only views tolerate a damaged file so it can still be shown and
+    repaired; nothing that writes does)."""
+    if not allow_duplicates:
+        dups = duplicate_sections(text)
+        if dups:
+            raise DuplicateSectionsError(dups)
     cp = _new_parser()
     cp._noevia_preamble, body = split_preamble(text)
     cp.read_string(body, source=source)
     return cp
 
 
-def read_ini() -> configparser.ConfigParser:
+def read_ini(*, for_write: bool = False) -> configparser.ConfigParser:
+    """Read models.ini. `for_write=True` refuses a file with duplicate sections."""
     if settings.models_ini_path.exists():
-        return parse_ini_text(settings.models_ini_path.read_text(encoding="utf-8"), str(settings.models_ini_path))
+        return parse_ini_text(settings.models_ini_path.read_text(encoding="utf-8"), str(settings.models_ini_path),
+                              allow_duplicates=not for_write)
     cp = _new_parser()
     cp._noevia_preamble = ""
     return cp
@@ -556,15 +593,14 @@ def suggest_defaults(summary: dict) -> tuple[dict[str, str], list[str]]:
     if summary.get("chat_template"):
         fields["jinja"] = "true"
 
+    # Rope keys are deliberately never written here. This pre-fills ctx-size with the trained
+    # length, so no extension is needed, and where the GGUF declares scaling llama.cpp reads it
+    # (per layer) itself; a global --rope-scale would override that for every layer (#568).
     rope_type = model.get("rope_scaling_type")
-    if rope_type and str(rope_type).lower() != "none":
-        fields["rope-scaling"] = str(rope_type)
-        rope_factor = model.get("rope_scaling_factor")
-        if isinstance(rope_factor, (int, float)) and rope_factor > 0:
-            fields["rope-scale"] = str(rope_factor)
+    if gguf_meta.rope_owned_by_gguf(model):
         rope_orig = model.get("rope_scaling_original_context")
         if isinstance(rope_orig, int) and rope_orig > 0:
-            hints.append(f"Model trained on {rope_orig:,} ctx and scaled with {rope_type}; the pre-filled context ({fields.get('ctx-size', 'N/A')}) uses that scaling.")
+            hints.append(f"Model trained on {rope_orig:,} ctx and scaled with {rope_type}; llama.cpp applies that scaling from the GGUF, so no rope keys are set.")
 
     experts = model.get("expert_count")
     if isinstance(experts, int) and experts > 1:
@@ -590,7 +626,7 @@ def upsert_section(name: str, values: dict[str, str], extras_text: str) -> None:
 def _upsert_section(name: str, values: dict[str, str], extras_text: str) -> None:
     """Create or replace a section. `values` = known form fields (empty strings skipped).
     `extras_text` = raw 'key = value' lines, one per line, appended (last-wins per key)."""
-    cp = read_ini()
+    cp = read_ini(for_write=True)
     if cp.has_section(name):
         cp.remove_section(name)
     cp.add_section(name)
@@ -624,7 +660,7 @@ def delete_section(name: str) -> bool:
 
 
 def _delete_section(name: str) -> bool:
-    cp = read_ini()
+    cp = read_ini(for_write=True)
     if not cp.has_section(name):
         return False
     cp.remove_section(name)
@@ -640,7 +676,7 @@ def rename_section(old: str, new: str) -> bool:
 def _rename_section(old: str, new: str) -> bool:
     if not valid_section_name(new):
         return False
-    cp = read_ini()
+    cp = read_ini(for_write=True)
     if not cp.has_section(old) or cp.has_section(new):
         return False
     items = list(cp.items(old))

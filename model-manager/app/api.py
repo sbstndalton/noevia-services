@@ -224,6 +224,8 @@ def replace_models_ini(body: dict = Body(...)) -> dict:
         raise HTTPException(413, "models.ini exceeds the editor limit")
     try:
         ini.parse_ini_text(text)
+    except ini.DuplicateSectionsError as e:
+        raise HTTPException(400, str(e))
     except Exception:
         raise HTTPException(400, "models.ini text does not parse")
     base = body.get("baseRevision")

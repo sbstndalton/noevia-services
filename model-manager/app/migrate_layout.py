@@ -47,7 +47,7 @@ def run() -> dict:
             skipped.append(f"{f.name}: move failed ({e})")
 
     # ---- pass 2: rewrite ini so every section has explicit `model = <stem>/<file>.gguf`
-    cp = ini.read_ini()
+    cp = ini.read_ini(for_write=True)
     for sec in cp.sections():
         items = dict(cp.items(sec))
         if items.get("model"):
