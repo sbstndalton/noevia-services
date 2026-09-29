@@ -60,6 +60,29 @@ def test_web_field_id_fixture_matches_the_schema():
     assert json.loads(fixture.read_text()) == [f.key for f in ini.ALL_FIELDS]
 
 
+def test_web_backend_notes_fixture_matches_the_service_strings():
+    # apps/web/tests/locale-613-616-620.test.cjs checks every note in this fixture has a translated
+    # wording; this keeps the fixture equal to the strings hw.py and services.py really send.
+    import json
+    import re
+    from pathlib import Path
+    from app import services
+    root = Path(__file__).resolve().parents[3]
+    fixture = root / "apps/web/tests/fixtures/model-manager-backend-notes.json"
+    if not fixture.exists():  # the model-manager image ships without the web app
+        import pytest
+        pytest.skip("apps/web not present")
+    data = json.loads(fixture.read_text())
+    found = []
+    for name in ("hw.py", "services.py"):
+        src = (Path(__file__).resolve().parents[1] / "app" / name).read_text()
+        found += re.findall(r'(?:BackendStats\(ok=False, error=|return None, )"([^"{]+)"', src)
+    soft = [n for n in found if services._is_soft_probe_note(n)]
+    hard = [n for n in found if n not in soft]
+    assert sorted(data["soft"]) == sorted(soft)
+    assert sorted(data["notes"]) == sorted(hard + [services._UNREACHABLE_HEALTHY_NOTE])
+
+
 def _snapshot_with_state(monkeypatch, status, started_at):
     import asyncio
     from app import services
