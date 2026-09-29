@@ -530,7 +530,9 @@ class LlamaBackend:
     image: str = ""
     short_id: str = ""
     started_at: str = ""
-    uptime: str = ""
+    # Time since StartedAt, only while the container is running: an exited or stopped one has no
+    # uptime, and StartedAt is when it *last* started (#603), so both stay None.
+    uptime: str | None = None
     # The same span in seconds, so a client can localise the units itself; `uptime` stays for
     # older clients (#597).
     uptime_s: int | None = None
@@ -760,8 +762,9 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
             state = (attrs.get("State") or {})
             started, up, up_s = _parse_started_at(state.get("StartedAt", ""))
             b.started_at = started
-            b.uptime = up
-            b.uptime_s = up_s
+            if b.status == "running":
+                b.uptime = up or None
+                b.uptime_s = up_s
             b.host_ports, b.internal_port = _resolve_internal_port(attrs)
             health_states[i] = str((state.get("Health") or {}).get("Status") or "")
         except NotFound:

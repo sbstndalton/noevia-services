@@ -56,7 +56,9 @@ def _require_revision(base: str | None) -> None:
 
 
 def _field(f: ini.Field) -> dict:
-    return {"key": f.key, "label": f.label, "kind": f.kind, "choices": list(f.choices),
+    # `id` is the stable handle a client translates the label and help by (#600); it equals the
+    # ini key, which never changes with the wording. `label`/`help` stay as the English fallback.
+    return {"id": f.key, "key": f.key, "label": f.label, "kind": f.kind, "choices": list(f.choices),
             "placeholder": f.placeholder, "help": f.help}
 
 
