@@ -29,7 +29,11 @@ Provision/start using the existing host preflight with `--profile laya` and serv
 POST `/v1/decisions` accepts `{state, question, options:[{id,label}]}` and returns
 `{selected,scores,model,calibrated:false}`. GET `/health` checks worker availability
 without inference. The single worker has a 90-second startup deadline and a
-1.3-second request deadline. A timed-out, crashed, or failed worker is terminated,
+request deadline of 1.3 seconds by default. Set `LAYA_DECISION_TIMEOUT_S`
+(seconds, 0.5 to 2.0; unset keeps 1.3) to change it. A garbage or out-of-range value is
+refused with a startup log line and the default is used. The web decision deadline
+(Settings, at most 2000 ms) must stay at or above this value so web receives Laya's
+answer; the recommended pair is Laya 1.8 s with web 2000 ms. A timed-out, crashed, or failed worker is terminated,
 and one replacement loads in the background. Health reports unready during loading;
 the failed decision is never replayed. Replacement startup uses the same 90-second
 deadline with at most three attempts and short backoff. If all attempts fail, the

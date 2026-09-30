@@ -52,6 +52,32 @@ def worker(pipe):
             pass
 
 
+DEFAULT_DECISION_TIMEOUT_S = 1.3
+MIN_DECISION_TIMEOUT_S, MAX_DECISION_TIMEOUT_S = 0.5, 2.0
+
+
+def decision_timeout_from_env(env=None, log=None):
+    """Worker request deadline from LAYA_DECISION_TIMEOUT_S (seconds, 0.5-2.0).
+
+    Unset/blank uses the default. A garbage or out-of-range value is refused with a
+    log line naming the variable (never a request body) and the default is used.
+    """
+    env = os.environ if env is None else env
+    log = log or (lambda msg: print(msg, flush=True))
+    raw = env.get('LAYA_DECISION_TIMEOUT_S')
+    if raw is None or not raw.strip():
+        return DEFAULT_DECISION_TIMEOUT_S
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        value = float('nan')
+    if not MIN_DECISION_TIMEOUT_S <= value <= MAX_DECISION_TIMEOUT_S:  # also rejects nan/inf
+        log(f'laya: ignoring LAYA_DECISION_TIMEOUT_S={raw.strip()[:32]!r}; it must be a number of seconds '
+            f'from {MIN_DECISION_TIMEOUT_S} to {MAX_DECISION_TIMEOUT_S}. Using {DEFAULT_DECISION_TIMEOUT_S}.')
+        return DEFAULT_DECISION_TIMEOUT_S
+    return value
+
+
 class Runtime:
     def __init__(self, ctx=None, worker_target=worker, startup_timeout=90,
                  decision_timeout=1.3, retry_delays=(0, 2, 8), fatal=os._exit):
@@ -224,7 +250,7 @@ def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
 
 
 if __name__ == '__main__':
-    runtime = Runtime()
+    runtime = Runtime(decision_timeout=decision_timeout_from_env())
     try:
         serve(runtime)
     finally:

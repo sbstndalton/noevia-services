@@ -7,7 +7,7 @@ import queue
 import socket
 import threading
 import time
-from server import Runtime, serve, validate
+from server import Runtime, decision_timeout_from_env, serve, validate
 
 
 def fake_worker(pipe):
@@ -38,6 +38,33 @@ class ValidationTests(unittest.TestCase):
     def test_invalid(self):
         for body in [None, {}, {'state':'x','question':'?', 'options':[]}, {'state':'x','question':'?', 'options':[{'id':'x','label':'X'}]*2}]:
             with self.assertRaises(ValueError): validate(body)
+
+
+class TimeoutEnvTests(unittest.TestCase):
+    def parse(self, **env):
+        logs = []
+        return decision_timeout_from_env(env, logs.append), logs
+
+    def test_default_when_unset_or_blank(self):
+        self.assertEqual(self.parse(), (1.3, []))
+        self.assertEqual(self.parse(LAYA_DECISION_TIMEOUT_S='  '), (1.3, []))
+
+    def test_valid_values_including_bounds(self):
+        for raw, want in [('1.8', 1.8), (' 2 ', 2.0), ('0.5', 0.5), ('1.3', 1.3)]:
+            self.assertEqual(self.parse(LAYA_DECISION_TIMEOUT_S=raw), (want, []))
+
+    def test_out_of_range_falls_back_with_log(self):
+        for raw in ['0.49', '2.01', '0', '-1', '30', 'inf', 'nan']:
+            value, logs = self.parse(LAYA_DECISION_TIMEOUT_S=raw)
+            self.assertEqual(value, 1.3, raw)
+            self.assertEqual(len(logs), 1, raw)
+            self.assertIn('LAYA_DECISION_TIMEOUT_S', logs[0])
+
+    def test_garbage_falls_back_with_log(self):
+        for raw in ['fast', '1.8s', '1,8', '0x10']:
+            value, logs = self.parse(LAYA_DECISION_TIMEOUT_S=raw)
+            self.assertEqual(value, 1.3, raw)
+            self.assertEqual(len(logs), 1, raw)
 
 
 class RecoveryTests(unittest.TestCase):
