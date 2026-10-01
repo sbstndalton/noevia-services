@@ -209,3 +209,133 @@ def test_conversion_is_bounded_to_page_cap_and_the_document_is_not_touched():
     assert seen["page_range"] == (1, extractor.PAGE_CAP)
     assert converted.document is document
     assert converted.page_count == 334
+
+
+# ── #700: a page with real text is never silently reported blank ──────────
+#
+# The Docling side is still stubbed (no models in CI), but the native text
+# layer is read for real, by pypdfium2, from synthetic PDFs built at test time.
+import synthetic_pdfs  # noqa: E402
+
+
+def fixture(tmp_path, pages, name="doc.pdf"):
+    return str(synthetic_pdfs.write(tmp_path / name, pages))
+
+
+def run_pdf(path, items, total, name="doc.pdf", native_text=extractor._native_page_text):
+    document = type("Doc", (), {"pages": {n: None for n in range(1, total + 1)}})()
+    return extractor.extract(path, name, convert=lambda _p: document,
+                             pages_from=fake_pages_from(items), native_text=native_text)
+
+
+def test_text_inside_a_picture_region_falls_back_to_the_native_text_layer(tmp_path):
+    # The #700 shape: a full-page image with selectable text on top. Docling's
+    # layout can file the whole page as one picture and skip its text; the
+    # stub returns nothing for the page, as Docling did on the real document.
+    lines = synthetic_pdfs.page_lines()
+    path = fixture(tmp_path, [("picture-text", lines)])
+    page = run_pdf(path, [], total=1)["pages"][0]
+    assert page["status"] == "degraded"
+    assert page["reason"] == "native-fallback"
+    assert page["method"] == "pdfium"
+    assert lines[0] in page["text"] and lines[-1] in page["text"]
+
+
+def test_a_near_empty_docling_page_also_falls_back(tmp_path):
+    # Docling kept a caption and lost the body: still a silent loss.
+    path = fixture(tmp_path, [("picture-text", synthetic_pdfs.page_lines())])
+    page = run_pdf(path, [FakeText("Figure 1", 1)], total=1)["pages"][0]
+    assert page["status"] == "degraded"
+    assert "aisle 12" in page["text"]
+
+
+def test_a_text_page_docling_read_is_left_alone_and_pdfium_is_not_consulted(tmp_path):
+    lines = synthetic_pdfs.page_lines()
+    path = fixture(tmp_path, [("text", lines)])
+    calls = []
+
+    def spy(p, numbers):
+        calls.append(numbers)
+        return extractor._native_page_text(p, numbers)
+
+    page = run_pdf(path, [FakeText("\n".join(lines), 1)], total=1, native_text=spy)["pages"][0]
+    assert page["status"] == "native"
+    assert page["method"] == "docling"
+    assert "reason" not in page
+    assert calls == [], "a page Docling read in full costs no second parse"
+
+
+def test_a_truly_blank_page_stays_blank(tmp_path):
+    path = fixture(tmp_path, [("blank", [])])
+    page = run_pdf(path, [], total=1)["pages"][0]
+    assert page["status"] == "blank"
+    assert page["text"] == ""
+
+
+def test_a_picture_with_no_text_layer_stays_blank(tmp_path):
+    # A scan with no text layer has nothing to fall back to; it is reported
+    # exactly as before rather than invented.
+    path = fixture(tmp_path, [("picture", [])])
+    assert run_pdf(path, [], total=1)["pages"][0]["status"] == "blank"
+
+
+def test_a_short_text_layer_below_the_threshold_is_not_promoted(tmp_path):
+    # A running head or page number in the text layer is not "substantial".
+    path = fixture(tmp_path, [("picture-text", ["Page 3 of 9"])])
+    assert run_pdf(path, [], total=1)["pages"][0]["status"] == "blank"
+
+
+def test_the_threshold_is_configurable(tmp_path, monkeypatch):
+    path = fixture(tmp_path, [("picture-text", ["Page 3 of 9"])])
+    monkeypatch.setattr(extractor, "NATIVE_FALLBACK_MIN_CHARS", 5)
+    assert run_pdf(path, [], total=1)["pages"][0]["status"] == "degraded"
+    monkeypatch.setenv("DOCLING_NATIVE_FALLBACK_MIN_CHARS", "350")
+    assert extractor._env_int("DOCLING_NATIVE_FALLBACK_MIN_CHARS", 200) == 350
+    for bogus in ["", "lots", "0", "-4"]:
+        monkeypatch.setenv("DOCLING_NATIVE_FALLBACK_MIN_CHARS", bogus)
+        assert extractor._env_int("DOCLING_NATIVE_FALLBACK_MIN_CHARS", 200) == 200, bogus
+
+
+def test_a_mixed_document_reports_each_page_for_what_it_is(tmp_path):
+    lines = synthetic_pdfs.page_lines()
+    path = fixture(tmp_path, [("text", lines), ("picture-text", synthetic_pdfs.page_lines(start=20)), ("blank", [])])
+    out = run_pdf(path, [FakeText("\n".join(lines), 1)], total=3)
+    assert [p["status"] for p in out["pages"]] == ["native", "degraded", "blank"]
+    assert "aisle 20" in out["pages"][1]["text"]
+
+
+def test_only_the_pages_docling_left_short_are_read_natively(tmp_path):
+    path = fixture(tmp_path, [("text", synthetic_pdfs.page_lines()), ("blank", [])])
+    seen = []
+    run_pdf(path, [FakeText("x" * 500, 1)], total=2,
+            native_text=lambda p, numbers: seen.append(list(numbers)) or {})
+    assert seen == [[2]]
+
+
+def test_a_failing_text_layer_read_never_fails_the_conversion(tmp_path):
+    def broken(_path, _numbers):
+        raise RuntimeError("pdfium exploded")
+    out = run_pdf("/unused", [], total=1, native_text=broken)
+    assert out["pages"][0]["status"] == "blank"
+
+
+def test_an_unreadable_file_yields_no_native_text():
+    assert extractor._native_page_text("/does/not/exist.pdf", [1]) == {}
+
+
+def test_non_pdf_formats_never_consult_the_pdf_text_layer():
+    def forbidden(_path, _numbers):
+        raise AssertionError("pdfium must not be asked about a DOCX")
+    document = type("Doc", (), {"pages": {1: None}})()
+    out = extractor.extract("/unused", "memo.docx", convert=lambda _p: document,
+                            pages_from=fake_pages_from([]), native_text=forbidden)
+    assert out["pages"][0]["status"] == "blank"
+
+
+def test_fallback_text_obeys_the_page_cap_and_stays_degraded(tmp_path, monkeypatch):
+    path = fixture(tmp_path, [("picture-text", synthetic_pdfs.page_lines())])
+    monkeypatch.setattr(extractor, "PAGE_TEXT_CAP", 300)
+    page = run_pdf(path, [], total=1)["pages"][0]
+    assert page["status"] == "degraded"
+    assert page["truncated"] is True
+    assert len(page["text"]) == 300

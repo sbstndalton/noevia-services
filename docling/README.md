@@ -113,6 +113,46 @@ produced 32 characters. Nothing in the conversion result separates "empty" from
 is out of scope for Tesseract; a document of it will extract as near-nothing
 with no error raised anywhere.
 
+## Native-text fallback (#700)
+
+The opposite failure to the gap above: a PDF page with a real text layer that
+Docling returns empty. Found in the #262 verification — 1 page of 66 had about
+5k characters of native text and no Docling output, was reported `blank`, and
+the document showed as ready. One way it happens is a page Docling's layout
+files as a single picture region, whose text it then skips.
+
+For PDFs, any page where Docling kept fewer than
+`DOCLING_NATIVE_FALLBACK_MIN_CHARS` (default **200**) non-whitespace
+characters has its own text layer read with pypdfium2 (already in the image
+through the `format-pdf` extra). If that layer holds at least the threshold
+and Docling kept under 10% of it, the native text is used and the page is
+reported `degraded` with `reason: native-fallback`: the words are right, but
+reading order and tables are pdfium's raw order, not Docling's layout. The web
+app shows such a document as partially extracted.
+
+Deliberately not done: walking the text Docling files under picture regions
+(`traverse_pictures=True`). That would change every page with a figure — chart
+labels, axis ticks, logo text — in every document, and fix only one of the ways
+a page can come back empty. The fallback touches only pages that would
+otherwise lose their text, whatever the cause. A page with no text layer
+(a scan, handwriting) still has nothing to fall back to and stays `blank`.
+
+Tests build synthetic PDFs at run time (`synthetic_pdfs.py`): text over a
+full-page image, text only, a blank page, and an image with no text.
+
+Shipping it takes a docling image release (`DOCLING_VERSION`), and it goes
+**before** the web release that carries it: web's `docling.cjs` VERSION moved
+to `…-v3-native-fallback`, so every Docling-read document is re-extracted on
+its next sync, and a re-extraction against the old image would cache the old
+`blank` page under the new key. To check the fallback on the host without a
+real document:
+
+    docker compose -f compose.yaml -f compose.docling.yaml run --rm --entrypoint sh \
+      docling -c 'cd /tmp && python /app/synthetic_pdfs.py && python /app/selftest.py synthetic-picture-text.pdf'
+
+A page reported `degraded` or `native` with the widget-audit text is a pass;
+`blank` is the #700 bug.
+
 ## Posture
 
 Same as `services/ocr`, and for the same reasons: stateless, no volume, no
@@ -132,7 +172,8 @@ no outbound access.
                 "method": "docling", "truncated": false}],
      "total": 12, "truncatedPages": false}
 
-`status` ∈ `native | blank | truncated`. 415 = format this worker cannot read,
+`status` ∈ `native | blank | truncated | degraded`. A `degraded` page also
+carries `"reason": "native-fallback"` and `"method": "pdfium"` (see below). 415 = format this worker cannot read,
 422 = document could not be read, 503 = busy. The client
 (`apps/web/server/docling.cjs`) treats 415/422 as permanent — cache the
 failure, keep the original — and everything else as retryable.

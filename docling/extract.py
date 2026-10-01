@@ -14,12 +14,16 @@ formats that were previously accepted and then silently dropped.
 
 Output contract is the page list apps/web/server/documents.cjs already builds:
     {"number": int, "text": str, "status": str, "method": str, "truncated": bool}
-`status` is one of native | blank | truncated. The caller's vocabulary also
+`status` is one of native | blank | truncated | degraded. A `degraded` page
+also carries `"reason": "native-fallback"`: Docling returned (almost) nothing
+for it, but the PDF's own text layer had real text, so that text was used
+instead (#700). The caller's vocabulary also
 has ocr/unreadable/failed, which this extractor never emits: Docling runs OCR
 inline rather than as a separate pass, and it cannot distinguish an
 unreadable page from an empty one.
 """
 
+import os
 from collections import namedtuple
 
 # What `_convert` hands back. A plain tuple rather than an attribute stashed on
@@ -32,6 +36,28 @@ Converted = namedtuple("Converted", "document page_count")
 PAGE_TEXT_CAP = 200_000
 TOTAL_TEXT_CAP = 2_000_000
 PAGE_CAP = 300
+
+
+def _env_int(name, default):
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Native-text fallback (#700). A PDF page whose text layer holds at least this
+# many non-whitespace characters is not allowed to come back empty: measured in
+# the #262 verification, one page with ~5k characters of native text arrived
+# from Docling with nothing, was reported `blank`, and the document showed as
+# ready. 200 is roughly two short sentences — well above the page numbers,
+# running heads and stray glyphs a picture-only page can carry in its text
+# layer, well below a page of prose.
+NATIVE_FALLBACK_MIN_CHARS = _env_int("DOCLING_NATIVE_FALLBACK_MIN_CHARS", 200)
+# "Near-empty": Docling kept less than this share of the native text. Docling
+# normally recovers the text layer nearly in full on a native page, so a page
+# under 10% has lost its body, not trimmed a header.
+NATIVE_FALLBACK_RATIO = 0.10
 
 # Formats worth accepting here. Anything not listed is refused by name rather
 # than attempted and silently returned empty — the failure mode this whole
@@ -119,8 +145,64 @@ def _pages_from(document):
     return pages
 
 
-def extract(path, name, convert=_convert, pages_from=_pages_from):
-    """Convert one document. `convert`/`pages_from` are injectable for tests."""
+def _native_page_text(path, numbers):
+    """The PDF's own text layer for the given 1-based pages, via pypdfium2.
+
+    pypdfium2 is already in the image: it is what docling's `format-pdf` extra
+    uses for page rendering. It reads only the text layer — no layout, no OCR —
+    which is exactly what makes it a safe witness: if it finds text, the text
+    is there. Any failure (encrypted, malformed) returns what was read so far;
+    the fallback is a safety net and must never fail a conversion that
+    otherwise succeeded.
+    """
+    import pypdfium2 as pdfium
+
+    texts = {}
+    try:
+        document = pdfium.PdfDocument(path)
+    except Exception:
+        return texts
+    try:
+        count = len(document)
+        for number in numbers:
+            if not 1 <= number <= count:
+                continue
+            try:
+                page = document[number - 1]
+                textpage = page.get_textpage()
+                try:
+                    texts[number] = textpage.get_text_range()
+                finally:
+                    textpage.close()
+                    page.close()
+            except Exception:
+                continue
+    finally:
+        document.close()
+    return texts
+
+
+def _visible(text):
+    return sum(1 for ch in text if not ch.isspace())
+
+
+def _clean_native(text):
+    """Normalise pdfium's text: CRLF line ends, trailing spaces, runs of blank lines."""
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    out, gap = [], False
+    for line in lines:
+        if line:
+            if gap and out:
+                out.append("")
+            out.append(line)
+            gap = False
+        else:
+            gap = True
+    return "\n".join(out).strip()
+
+
+def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_native_page_text):
+    """Convert one document. `convert`/`pages_from`/`native_text` are injectable for tests."""
     suffix = "." + str(name).rsplit(".", 1)[-1].lower() if "." in str(name) else ""
     if suffix not in SUPPORTED:
         raise ValueError("unsupported format")
@@ -140,15 +222,47 @@ def extract(path, name, convert=_convert, pages_from=_pages_from):
         declared = len(getattr(document, "pages", {}) or {})
     total = declared or (max(grouped) if grouped else 1)
 
+    numbers = range(1, min(total, PAGE_CAP) + 1)
+    docling_text = {n: "\n\n".join(grouped.get(n, [])) for n in numbers}
+
+    # Native-text fallback (#700), PDFs only. Why this rather than also walking
+    # the text items Docling files under picture regions (iterate_items with
+    # traverse_pictures=True): that would change the output of every page with
+    # a figure — chart labels, axis ticks, logo text — for all documents, while
+    # fixing only one of the ways a page can come back empty. This touches only
+    # pages Docling left (near-)empty, works whatever the cause, and says so.
+    fallback = {}
+    if suffix == ".pdf":
+        candidates = [n for n in numbers if _visible(docling_text[n]) < NATIVE_FALLBACK_MIN_CHARS]
+        if candidates:
+            try:
+                native = native_text(path, candidates) or {}
+            except Exception:
+                # The safety net must not fail a conversion that succeeded;
+                # without it the page is reported exactly as before (blank).
+                native = {}
+            for n, raw in native.items():
+                text = _clean_native(str(raw or ""))
+                seen = _visible(text)
+                if n in docling_text and seen >= NATIVE_FALLBACK_MIN_CHARS \
+                        and _visible(docling_text[n]) < seen * NATIVE_FALLBACK_RATIO:
+                    fallback[n] = text
+
     results = []
     remaining = TOTAL_TEXT_CAP
-    for number in range(1, min(total, PAGE_CAP) + 1):
-        text = "\n\n".join(grouped.get(number, []))
+    for number in numbers:
+        text = fallback.get(number, docling_text[number])
         budget = max(0, min(PAGE_TEXT_CAP, remaining))
         truncated = len(text) > budget
         text = text[:budget]
         remaining -= len(text)
-        if truncated:
+        reason = None
+        if number in fallback:
+            # Degraded rather than native: the words are right, but reading
+            # order, columns and tables are pdfium's raw text order, not
+            # Docling's layout. The caller shows the document as partial.
+            status, reason = "degraded", "native-fallback"
+        elif truncated:
             status = "truncated"
         elif text.strip():
             status = "native"
@@ -163,6 +277,9 @@ def extract(path, name, convert=_convert, pages_from=_pages_from):
             # text recovered", not as "no content present" — see the known gap
             # in services/docling/README.md.
             status = "blank"
-        results.append({"number": number, "text": text, "status": status,
-                        "method": "docling", "truncated": truncated})
+        page = {"number": number, "text": text, "status": status,
+                "method": "pdfium" if reason else "docling", "truncated": truncated}
+        if reason:
+            page["reason"] = reason
+        results.append(page)
     return {"pages": results, "total": total, "truncatedPages": total > PAGE_CAP}
