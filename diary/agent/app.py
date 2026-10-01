@@ -88,6 +88,7 @@ class AppState:
             embed_model=cfg.get("llm.embed_model"),
             timeout_s=float(cfg.get("llm.timeout_s", 300)),
             max_retries=int(cfg.get("llm.max_retries", 3)),
+            embed_base_url=cfg.get("llm.embed_base_url") or "",
         )
         self.llm_aux = LLMClient(
             base_url=cfg.get("llm.aux.base_url"),

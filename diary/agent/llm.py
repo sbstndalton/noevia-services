@@ -36,6 +36,7 @@ class LLMClient:
         timeout_s: float = 300.0,
         max_retries: int = 3,
         retry_backoff_s: float = 2.0,
+        embed_base_url: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.chat_model = chat_model
@@ -47,10 +48,17 @@ class LLMClient:
             headers["Authorization"] = f"Bearer {api_key}"
         # Operator-configured endpoint (not user-supplied), so redirects stay allowed.
         self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, headers=headers, follow_redirects=True)
-
+        # #697: embeddings may have their own server (the CPU `embed` sidecar), so they never ask
+        # the one-model inference engine to swap its chat model out. Like web's EMBEDDING_BASE_URL,
+        # the inference credential is not sent there.
+        embed_base = (embed_base_url or "").rstrip("/")
+        self._embed_client = (
+            make_client(base_url=embed_base, timeout_s=timeout_s, headers={"Content-Type": "application/json"}, follow_redirects=True)
+            if embed_base and embed_base != self.base_url else self._client
+        )
     # ---------------- shared retry plumbing ----------------
 
-    def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse) -> Any:
+    def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse, client=None) -> Any:
         """POST with bounded retries; `parse` validates the response body and
         returns the result. Shared by chat() and embed(), which previously
         duplicated the retry loop (including its bug of sleeping after the
@@ -58,7 +66,7 @@ class LLMClient:
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
-                resp = self._client.post(path, json=payload)
+                resp = (client or self._client).post(path, json=payload)
                 resp.raise_for_status()
                 return parse(resp.json())
             except Exception as exc:  # noqa: BLE001 - retry any transport/parse failure
@@ -196,7 +204,10 @@ class LLMClient:
             {"model": model or self.embed_model, "input": texts},
             "embeddings",
             parse_embed,
+            client=self._embed_client,
         )
 
     def close(self) -> None:
+        if self._embed_client is not self._client:
+            self._embed_client.close()
         self._client.close()

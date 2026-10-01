@@ -9,7 +9,9 @@ ROOT = Path(tempfile.mkdtemp(prefix="model-manager-test-"))
 (ROOT / "models" / "tiny").mkdir(parents=True)
 (ROOT / "data").mkdir()
 os.environ.update(MODELS_DIR=str(ROOT / "models"), MODELS_INI_PATH=str(ROOT / "models" / "models.ini"),
-                  DATA_DIR=str(ROOT / "data"), LLAMA_CONTAINERS="", HOST_RAM_RESERVE_GB="4")
+                  DATA_DIR=str(ROOT / "data"), LLAMA_CONTAINERS="", HOST_RAM_RESERVE_GB="4",
+                  # Startup migration is tested directly (test_cache_ram_bound.py), not on every client.
+                  MIGRATE_CACHE_RAM_ON_START="false")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import gguf_meta, ini
+from .config import settings
 
 # candidate contexts to try, smallest → largest
 _CTX_CANDIDATES = (
@@ -1844,7 +1845,9 @@ def analyze(*,
                 _mib = int(round(_cache_gb * 1024))
                 if _upper_gb * 1024 >= _CACHE_RAM_DEFAULT_MIB:
                     _mib = max(_mib, _CACHE_RAM_DEFAULT_MIB)
-                values["cache-ram"] = str(_mib)
+                # #697: never above the configured cap (LLAMACPP_AUTOCONFIG_CACHE_RAM_MAX_MIB,
+                # default 1024). On a shared-memory GPU the prompt cache competes with the model.
+                values["cache-ram"] = str(min(_mib, settings.cache_ram_limits[0]))
 
     # Reasoning / thinking — infer from chat-template scanning
     features = summary.get("chat_template_features") or {}

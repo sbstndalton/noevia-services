@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import httpx
@@ -13,6 +14,8 @@ from . import bench, db, discover, gguf_meta, hf, hw, ini, services
 from .config import settings
 from .downloader import manager
 from .utils import human_bytes, shard_key
+
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="Model Loader")
 
@@ -67,6 +70,21 @@ def _startup() -> None:
     db.init()
     db.seed_bench_prompts()
     hw.start_sampler()
+    if settings.migrate_cache_ram_on_start:
+        _migrate_cache_ram()
+
+
+def _migrate_cache_ram() -> None:
+    """#697: presets without an explicit prompt cache would run on llama-server's 8 GiB default,
+    and noevia's estimates would add that. Written once through the backed-up writer; the engine
+    reads it on its next reload or restart. A failure is logged, never fatal."""
+    try:
+        changed = ini.migrate_cache_ram()
+    except Exception as e:  # noqa: BLE001 - a malformed file must not stop the service
+        log.warning("cache-ram migration skipped: %s", type(e).__name__)
+        return
+    if changed:
+        log.warning("cache-ram migration: set an explicit bounded cache-ram in %d section(s): %s", len(changed), ", ".join(changed))
 
 
 @app.get("/palette.json")

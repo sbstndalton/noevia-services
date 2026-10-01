@@ -91,6 +91,9 @@ class ContainerRuntimeStats:
     cpu_pct: float
     mem_used_gb: float
     mem_limit_gb: float
+    # #697: anonymous memory (cgroup v2 memory.stat `anon`, v1 `rss`): what the process itself
+    # holds, without the page cache of mmapped model files. None when the kernel reports neither.
+    mem_anon_gb: float | None = None
 
 
 @dataclass
@@ -400,10 +403,12 @@ def _read_container_runtime(container) -> ContainerRuntimeStats | None:
         cache_bytes = int(stats_sub.get("cache") or stats_sub.get("inactive_file") or 0)
         mem_used = max(0, int(mem.get("usage", 0)) - cache_bytes)
         mem_limit = int(mem.get("limit") or 0)
+        anon = stats_sub.get("anon", stats_sub.get("rss"))
         return ContainerRuntimeStats(
             cpu_pct=round(cpu_pct, 1),
             mem_used_gb=round(mem_used / (1024 ** 3), 2),
             mem_limit_gb=round(mem_limit / (1024 ** 3), 1) if mem_limit else 0.0,
+            mem_anon_gb=round(int(anon) / (1024 ** 3), 2) if anon is not None else None,
         )
     except (KeyError, TypeError, ZeroDivisionError, ValueError):
         return None

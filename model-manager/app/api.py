@@ -379,9 +379,34 @@ def delete_section(name: str, baseRevision: str = Query("")) -> dict:
         return {"ok": True, "revision": revision()}
 
 
+def budget_backends(backends: list[dict], budget_gib: float) -> list[dict]:
+    """#697: size autoconfig against the inference memory budget noevia web sends (its admin
+    setting), less the largest prompt cache a preset may hold, so no plan it recommends exceeds the
+    budget. 0 or an invalid figure leaves the backends as discovered."""
+    try:
+        budget = float(budget_gib or 0)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if not (budget > 0) or budget != budget:
+        return backends
+    room = max(0.0, budget - settings.cache_ram_limits[0] / 1024)
+    out = []
+    for b in backends:
+        b = dict(b)
+        b["vram_gb"] = min(float(b.get("vram_gb") or 0), room)
+        cards = b.get("card_vram_gb") or []
+        if cards:
+            # Split the room across cards in proportion, never above any card's own size.
+            total = sum(float(c or 0) for c in cards) or 1.0
+            b["card_vram_gb"] = [min(float(c or 0), room * float(c or 0) / total) for c in cards]
+        out.append(b)
+    return out
+
+
 @router.get("/sections/{name}/autoconfig")
 def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True,
-                       verified_ctx: int = 0, prompt_budget_s: float = 120.0, mode: str = "") -> dict:
+                       verified_ctx: int = 0, prompt_budget_s: float = 120.0, mode: str = "",
+                       budget_gib: float = 0.0) -> dict:
     from .main import _backend_list
     sessions = max(1, min(int(sessions or 1), 8))
     gguf_path, model_rel, rel = _resolve_section_gguf(name)
@@ -404,7 +429,7 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
         history = telemetry.config_history(model_path=model_rel, alias=name)
     except Exception:  # noqa: BLE001 - measurements are optional
         measured, history = telemetry.Stats(), []
-    rec = autoconfig.analyze(summary=summary, file_size=file_size, backends=_backend_list(),
+    rec = autoconfig.analyze(summary=summary, file_size=file_size, backends=budget_backends(_backend_list(), budget_gib),
                              model_rel=model_rel, current_section=ini.get_section(name), preset=preset,
                              n_sessions=sessions, models_dir=settings.models_dir, section_name=name,
                              model_subdir=rel.rsplit("/", 1)[0] if rel and "/" in rel else "", spec_profile=spec,

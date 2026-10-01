@@ -104,8 +104,8 @@ RUNTIME_FIELDS: tuple[Field, ...] = (
           help="Reuse KV cache from a previous request when the new prompt shares a prefix. Set to 1 to enable — huge TTFT win for chat continuations (only new tokens are prompt-evaluated). 0 disables. Free, safe, should almost always be on."),
     Field("kv-unified", "Unified KV cache", "select", choices=_ONOFF,
           help="Share one KV cache across all slots (saves memory) vs. per-slot caches (better cache locality)."),
-    Field("cache-ram", "Cache RAM budget (MiB)", "int", placeholder="8192  ·  -1 = unlimited",
-          help="Server-side RAM budget for prefix / prompt caches. -1 = unlimited, 0 = disable."),
+    Field("cache-ram", "Cache RAM budget (MiB)", "int", placeholder="1024",
+          help="Server-side RAM budget for prefix / prompt caches. 0 = disable. Saved values are capped at the hard maximum (LLAMACPP_CACHE_RAM_HARD_MAX_MIB, default 2048); -1 (unlimited) is stored as that maximum."),
     Field("ctx-checkpoints", "SWA / ctx checkpoints", "int", placeholder="e.g. 8",
           help="How many rolling context checkpoints to retain. More = faster context restoration on branching, more memory."),
     Field("checkpoint-min-step", "Checkpoint min step", "int", placeholder="8192",
@@ -627,6 +627,92 @@ def suggest_defaults(summary: dict) -> tuple[dict[str, str], list[str]]:
     return fields, hints
 
 
+def clamp_cache_ram(value: str, hard_max: int | None = None) -> str:
+    """#697: a cache-ram value as it may be stored. -1 (unbounded) and integers above the hard
+    maximum become the hard maximum; anything else is returned unchanged."""
+    hard = settings.cache_ram_limits[1] if hard_max is None else hard_max
+    text = str(value).strip()
+    if not re.fullmatch(r"-?\d+", text):
+        return text
+    n = int(text)
+    return str(hard) if n < 0 or n > hard else str(n)
+
+
+# Every key llama-server reads as --cache-ram in a preset (the long flag, its short form and the
+# environment name), compared case-insensitively.
+_CACHE_RAM_KEYS = {"cache-ram", "cram", "llama_arg_cache_ram"}
+
+
+def _cache_ram_keys(cp: configparser.ConfigParser, name: str) -> list[str]:
+    if not cp.has_section(name):
+        return []
+    return [k for k in cp.options(name) if k.strip().lstrip("-").lower() in _CACHE_RAM_KEYS]
+
+
+def _effective_cache_ram(cp: configparser.ConfigParser, name: str) -> str | None:
+    """The section's own cache-ram under any alias. Several aliases: the largest integer counts,
+    since which one the router honours is not ours to guess."""
+    values = [cp.get(name, k).strip() for k in _cache_ram_keys(cp, name) if cp.get(name, k).strip() != ""]
+    if not values:
+        return None
+    ints = [v for v in values if re.fullmatch(r"-?\d+", v)]
+    if not ints:
+        return values[-1]
+    return "-1" if any(int(v) < 0 for v in ints) else str(max(int(v) for v in ints))
+
+
+def _bound_cache_ram(cp: configparser.ConfigParser, name: str) -> None:
+    """#697: leave `name` with an explicit, bounded prompt cache under the canonical key. Aliases
+    (cram, LLAMA_ARG_CACHE_RAM) are folded into `cache-ram` before clamping. A section with no
+    value (and no bounded '*' default) would run on llama-server's own 8 GiB default; it gets the
+    autoconfig cap."""
+    cap, hard = settings.cache_ram_limits
+    own = _effective_cache_ram(cp, name)
+    for key in _cache_ram_keys(cp, name):
+        cp.remove_option(name, key)
+    if own is not None:
+        cp.set(name, "cache-ram", clamp_cache_ram(own, hard))
+        return
+    if name == "*":
+        return
+    inherited = _effective_cache_ram(cp, "*")
+    if inherited is not None and clamp_cache_ram(inherited, hard) == inherited:
+        return
+    cp.set(name, "cache-ram", str(cap))
+
+
+def _is_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
+    """Embedding, reranking and system routing (Laya) sections are not chat models."""
+    if name == "*":
+        return False
+    truthy = lambda k: cp.get(name, k, fallback="").strip().lower() in ("true", "1", "on")
+    if truthy("embedding") or truthy("embeddings") or truthy("reranking") or truthy("rerank"):
+        return False
+    model = cp.get(name, "model", fallback=cp.get(name, "m", fallback=""))
+    return not any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
+
+
+def migrate_cache_ram() -> list[str]:
+    """#697 startup migration: give every chat section an explicit, bounded cache-ram (the cap
+    when missing, aliases folded, oversized values clamped), through the normal backed-up write.
+    Returns the sections changed; nothing is written when none needs it."""
+    with WRITE_LOCK:
+        if not settings.models_ini_path.exists():
+            return []
+        cp = read_ini(for_write=True)
+        changed = []
+        for name in cp.sections():
+            if not _is_chat_section(cp, name):
+                continue
+            before = {k: cp.get(name, k) for k in cp.options(name)}
+            _bound_cache_ram(cp, name)
+            if {k: cp.get(name, k) for k in cp.options(name)} != before:
+                changed.append(name)
+        if changed:
+            _atomic_write(cp)
+        return changed
+
+
 def upsert_section(name: str, values: dict[str, str], extras_text: str) -> None:
     with WRITE_LOCK:
         return _upsert_section(name, values, extras_text)
@@ -660,6 +746,7 @@ def _upsert_section(name: str, values: dict[str, str], extras_text: str) -> None
             continue
         cp.set(name, k, v)
 
+    _bound_cache_ram(cp, name)
     _atomic_write(cp)
 
 

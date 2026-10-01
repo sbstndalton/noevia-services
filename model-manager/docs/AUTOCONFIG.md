@@ -194,6 +194,14 @@ generously.
 The upper clamp subtracts host-resident weights, so an offloaded MoE cannot evict its own mmapped
 experts to make room for a prompt cache.
 
+**noevia cap (#697).** On a shared-memory GPU (an AMD APU) host RAM *is* the GPU's memory, and
+two models with 8 GiB caches each livelocked the host. The result above is therefore capped at
+`LLAMACPP_AUTOCONFIG_CACHE_RAM_MAX_MIB` (default 1024). Every section save, including the
+safe-defaults registration of a new GGUF, leaves an explicit `cache-ram`: unset becomes that cap,
+and `-1` or anything above `LLAMACPP_CACHE_RAM_HARD_MAX_MIB` (default 2048) becomes the hard
+maximum. When noevia web calls autoconfig it passes `budget_gib` (its inference memory budget);
+each backend's memory is then sized to that budget less the cache cap.
+
 ## Multimodal projectors
 
 A model is multimodal if its section declares `mmproj`. The projector occupies roughly its file size in VRAM plus ~0.5 GB of encoder scratch, and — importantly — it is **pinned to the main GPU**, not layer-split, so it is charged to device 0 in the per-card check.
