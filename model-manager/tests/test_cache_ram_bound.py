@@ -111,7 +111,7 @@ def test_an_alias_beside_the_canonical_key_cannot_hide_a_larger_value(client):
     assert section["cache-ram"] == "2048" and "LLAMA_ARG_CACHE_RAM" not in section
 
 
-def test_startup_migration_bounds_chat_sections_only_and_keeps_a_backup(monkeypatch):
+def test_startup_migration_bounds_chat_sections_zeroes_embed_rerank_and_keeps_a_backup(monkeypatch):
     path = ROOT / "models" / "models.ini"
     original = (
         "version = 1\n\n"
@@ -125,11 +125,13 @@ def test_startup_migration_bounds_chat_sections_only_and_keeps_a_backup(monkeypa
     backed_up = []
     real = ini._backup_current
     monkeypatch.setattr(ini, "_backup_current", lambda p: (backed_up.append(p.read_text()), real(p)))
-    assert ini.migrate_cache_ram() == ["chat-a", "chat-b"]
+    assert ini.migrate_cache_ram() == ["chat-a", "chat-b", "nomic-embed", "reranker"]
     assert ini.get_section("chat-a")["cache-ram"] == "1024"
     assert ini.get_section("chat-b")["cache-ram"] == "2048" and "LLAMA_ARG_CACHE_RAM" not in ini.get_section("chat-b")
-    for untouched in ("nomic-embed", "reranker", "laya_multilingual_f16"):
-        assert "cache-ram" not in ini.get_section(untouched), untouched
+    # #723: no prompt cache for embedding/reranking, written explicitly; Laya stays untouched.
+    for non_chat in ("nomic-embed", "reranker"):
+        assert ini.get_section(non_chat)["cache-ram"] == "0", non_chat
+    assert "cache-ram" not in ini.get_section("laya_multilingual_f16")
     assert backed_up == [original], "the normal writer backed up the file first"
     text = path.read_text()
     assert ini.migrate_cache_ram() == [] and path.read_text() == text, "idempotent: nothing rewritten"

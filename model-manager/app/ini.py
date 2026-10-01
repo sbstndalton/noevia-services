@@ -675,18 +675,32 @@ def _bound_cache_ram(cp: configparser.ConfigParser, name: str) -> None:
         return
     if name == "*":
         return
+    # #723: llama-server caches prompts only for completion slots, so an embedding or reranking
+    # section gets an explicit 0 and never inherits the 8 GiB default or a '*' cache.
+    if _is_non_chat_section(cp, name):
+        cp.set(name, "cache-ram", "0")
+        return
     inherited = _effective_cache_ram(cp, "*")
     if inherited is not None and clamp_cache_ram(inherited, hard) == inherited:
         return
     cp.set(name, "cache-ram", str(cap))
 
 
+def _is_non_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
+    """Embedding and reranking sections (by flag or by name); they have no prompt cache (#723)."""
+    if name == "*" or not cp.has_section(name):
+        return False
+    truthy = lambda k: cp.get(name, k, fallback="").strip().lower() in ("true", "1", "on")
+    if truthy("embedding") or truthy("embeddings") or truthy("reranking") or truthy("rerank"):
+        return True
+    return bool(re.search(r"embed|rerank", name, re.I))
+
+
 def _is_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
     """Embedding, reranking and system routing (Laya) sections are not chat models."""
     if name == "*":
         return False
-    truthy = lambda k: cp.get(name, k, fallback="").strip().lower() in ("true", "1", "on")
-    if truthy("embedding") or truthy("embeddings") or truthy("reranking") or truthy("rerank"):
+    if _is_non_chat_section(cp, name):
         return False
     model = cp.get(name, "model", fallback=cp.get(name, "m", fallback=""))
     return not any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
@@ -702,7 +716,7 @@ def migrate_cache_ram() -> list[str]:
         cp = read_ini(for_write=True)
         changed = []
         for name in cp.sections():
-            if not _is_chat_section(cp, name):
+            if not _is_chat_section(cp, name) and not _is_non_chat_section(cp, name):
                 continue
             before = {k: cp.get(name, k) for k in cp.options(name)}
             _bound_cache_ram(cp, name)
