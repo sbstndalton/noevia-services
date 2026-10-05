@@ -350,13 +350,23 @@ def record_timings(backend: str, samples: list) -> int:
              s.draft_acc, s.draft_len) for s in samples]
     with _LOCK, _conn() as c:
         before = c.total_changes
-        c.executemany(
-            "INSERT OR IGNORE INTO req_timing("
-            "ts, backend, instance, task, model_path, alias, spec_type, "
-            "prompt_tokens, prompt_tps, gen_tokens, gen_tps, draft_acc, draft_len) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
+        for r in rows:
+            # Instance keys used to be the bare port ("60279"); they are now "<port>@<spawn
+            # second>". A sample already stored under the legacy key must not be stored a
+            # second time when the same log tail is re-read after the upgrade, so skip when a
+            # legacy row for the same (backend, port, task, ts) exists. Only applies to keys
+            # carrying the "@" suffix.
+            legacy = r[2].split("@", 1)[0] if "@" in r[2] else None
+            c.execute(
+                "INSERT OR IGNORE INTO req_timing("
+                "ts, backend, instance, task, model_path, alias, spec_type, "
+                "prompt_tokens, prompt_tps, gen_tokens, gen_tps, draft_acc, draft_len) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+                "WHERE ? IS NULL OR NOT EXISTS ("
+                "  SELECT 1 FROM req_timing WHERE backend = ? AND instance = ? "
+                "  AND task = ? AND ts = ?)",
+                (*r, legacy, backend, legacy, r[3], r[0]),
+            )
         return c.total_changes - before
 
 

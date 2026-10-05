@@ -10,6 +10,7 @@ own preset editor, a calibration run or an operator is never silently overwritte
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import logging
@@ -134,7 +135,10 @@ def _find_entry(key: str) -> services.GgufEntry:
 @router.get("/models/detail")
 async def model_detail(key: str = Query(...)) -> dict:
     g = _find_entry(key)
-    raw = gguf_meta.read_raw(g.parts[0])
+    try:
+        raw = gguf_meta.read_raw(g.parts[0])
+    except (gguf_meta.GgufMetaError, OSError) as e:
+        raise HTTPException(422, f"Could not read the model file: {e}") from e
     summary = gguf_meta.summarize(raw)
     summary.pop("chat_template", None)  # large; the features summary is what the UI shows
     return {**_entry(g, await _loaded_map()), "path": str(g.parts[0]), "summary": _plain(summary)}
@@ -704,7 +708,10 @@ async def search_repo(repo: str = Query(...)) -> dict:
             if summary:
                 for g in groups:
                     if g["files"][0]["path"].lower().endswith(".gguf") and not g["projector"]:
-                        g["estimates"] = _preset_estimates(summary, g["bytes"], (min(mm) / 1024 ** 3) if mm else 0.0)
+                        # Off the event loop: the fit search is CPU-bound and runs on header
+                        # metadata from a remote repo, so it must never stall other requests.
+                        g["estimates"] = await asyncio.to_thread(
+                            _preset_estimates, summary, g["bytes"], (min(mm) / 1024 ** 3) if mm else 0.0)
                         g["nativeCtx"] = (summary.get("model") or {}).get("context_length") or 0
     except httpx.HTTPStatusError as e:
         return {"repo": repo, "error": f"Hugging Face returned HTTP {e.response.status_code}", "groups": []}

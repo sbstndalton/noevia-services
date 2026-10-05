@@ -261,22 +261,32 @@ async def gguf_header(repo_id: str, path: str) -> dict | None:
     headers = dict(_auth_headers())
     headers["Range"] = f"bytes=0-{_HEADER_BYTES - 1}"
     try:
+        # Streamed and capped: a CDN redirect target that ignores Range answers 200 with the
+        # whole file, and `client.get` would buffer all of it. Read at most _HEADER_BYTES.
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code in (401, 403):
+            async with client.stream("GET", url, headers=headers) as r:
+                status = r.status_code
+                body = bytearray()
+                if status in (200, 206):
+                    async for chunk in r.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) >= _HEADER_BYTES:
+                            break
+                    del body[_HEADER_BYTES:]
+        if status in (401, 403):
             # Gated repo. The tree listing is public (so sizes render) but the weights
             # are not, which is why estimates would otherwise vanish with no explanation.
             # 401 = no usable token, 403 = token valid but not granted access to THIS repo.
             _HEADER_GATED[repo_id] = (
-                "needs a Hugging Face token (set one in Settings)" if r.status_code == 401
+                "needs a Hugging Face token (set one in Settings)" if status == 401
                 else "your token lacks access — accept this model's licence on its HF page"
             )
             _HEADER_CACHE[key] = {}
             return None
-        if r.status_code not in (200, 206) or not r.content:
+        if status not in (200, 206) or not body:
             _HEADER_CACHE[key] = {}
             return None
-        summary = gguf_meta.summarize(gguf_meta.read_raw_bytes(r.content))
+        summary = gguf_meta.summarize(gguf_meta.read_raw_bytes(bytes(body)))
     except (httpx.HTTPError, gguf_meta.GgufMetaError, ValueError, OSError):
         _HEADER_CACHE[key] = {}
         return None

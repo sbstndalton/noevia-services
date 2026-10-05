@@ -356,6 +356,20 @@ def _other_traffic(container: str, aliases: set[str], since: float) -> bool:
     return any(s.ts >= since and s.alias and s.alias not in aliases for s in samples)
 
 
+def _abort_start(run_id: int, exc: Exception) -> str:
+    """Undo a start() that failed after claiming the slot: free it and close any run row, so a
+    transient sqlite/docker/thread error does not refuse every later benchmark until restart."""
+    global _STATE
+    with _LOCK:
+        _STATE = JobState()
+    if run_id:
+        try:
+            db.bench_finish_run(run_id, "error", time.time(), f"could not start: {exc}")
+        except Exception:  # noqa: BLE001 - already on the failure path
+            pass
+    return f"could not start the benchmark: {exc}"
+
+
 def start(*, backend: str, aliases: list[str], prompt_ids: list[int],
           reps: int = 3, max_tokens: int = DEFAULT_MAX_TOKENS) -> tuple[bool, str]:
     """Kick off a run in the background. One at a time, refused otherwise."""
@@ -386,24 +400,31 @@ def start(*, backend: str, aliases: list[str], prompt_ids: list[int],
         _STATE = JobState(status="starting", backend=backend,
                           total=len(aliases) * len(prompts) * reps, started_at=started)
 
-    base_url, err = _resolve_endpoint(backend)
-    if err:
+    # Everything between claiming the slot and the worker owning it can raise (a sqlite write,
+    # a docker call, thread creation). Without a release on that path the status stays
+    # "starting", `active` stays true, and every later benchmark is refused until a restart.
+    run_id = 0
+    try:
+        base_url, err = _resolve_endpoint(backend)
+        if err:
+            with _LOCK:
+                _STATE = JobState()      # release the slot; nothing was started
+            return False, err
+
+        _CANCEL.clear()
+        run_id = db.bench_create_run(backend, reps, max_tokens, started)
         with _LOCK:
-            _STATE = JobState()      # release the slot; nothing was started
-        return False, err
+            _STATE.run_id = run_id
+            _STATE.status = "running"
 
-    _CANCEL.clear()
-    run_id = db.bench_create_run(backend, reps, max_tokens, started)
-    with _LOCK:
-        _STATE.run_id = run_id
-        _STATE.status = "running"
-
-    _THREAD = threading.Thread(
-        target=_run, name="benchmark",
-        args=(run_id, backend, base_url, aliases,
-              [(p["name"], p["body"]) for p in prompts], reps, max_tokens),
-        daemon=True)
-    _THREAD.start()
+        _THREAD = threading.Thread(
+            target=_run, name="benchmark",
+            args=(run_id, backend, base_url, aliases,
+                  [(p["name"], p["body"]) for p in prompts], reps, max_tokens),
+            daemon=True)
+        _THREAD.start()
+    except Exception as e:  # noqa: BLE001 - any failure here must release the claimed slot
+        return False, _abort_start(run_id, e)
     return True, ""
 
 
@@ -657,33 +678,37 @@ def start_sweep(*, backend: str, aliases: list[str], n_prompt: int = 512, n_gen:
         # Same atomic claim as start(); see the note there.
         _STATE = JobState(status="starting", backend=backend, started_at=started)
 
-    from . import ini
-    targets: list[tuple[str, str, list[str]]] = []
-    for a in aliases:
-        vals = ini.get_section(a) or {}
-        rel = str(vals.get("model", "")).strip()
-        if not rel:
-            with _LOCK:
-                _STATE = JobState()      # release the slot; nothing was started
-            return False, f"section '{a}' has no model path"
-        # models.ini paths are what llama-server is given, and the sweep container mounts the
-        # same models directory at the same place, so they resolve unchanged.
-        targets.append((a, rel, sweep_args_for_section(a)))
+    run_id = 0
+    try:
+        from . import ini
+        targets: list[tuple[str, str, list[str]]] = []
+        for a in aliases:
+            vals = ini.get_section(a) or {}
+            rel = str(vals.get("model", "")).strip()
+            if not rel:
+                with _LOCK:
+                    _STATE = JobState()      # release the slot; nothing was started
+                return False, f"section '{a}' has no model path"
+            # models.ini paths are what llama-server is given, and the sweep container mounts the
+            # same models directory at the same place, so they resolve unchanged.
+            targets.append((a, rel, sweep_args_for_section(a)))
 
-    _CANCEL.clear()
-    run_id = db.bench_create_run(backend, reps, n_gen, started)
-    with _LOCK:
-        _STATE.run_id = run_id
-        _STATE.status = "running"
-        _STATE.total = len(targets)
-        # A sweep's unit of work is a model, not a request - it invokes llama-bench once per
-        # model and that one invocation yields several measurements. Saying "requests" here
-        # made a six-model sweep read "6 / 6 requests" while producing 36 of them.
-        _STATE.unit = "models"
-    _THREAD = threading.Thread(target=_run_sweep, name="benchmark-sweep",
-                               args=(run_id, backend, targets, n_prompt, n_gen, depths, reps),
-                               daemon=True)
-    _THREAD.start()
+        _CANCEL.clear()
+        run_id = db.bench_create_run(backend, reps, n_gen, started)
+        with _LOCK:
+            _STATE.run_id = run_id
+            _STATE.status = "running"
+            _STATE.total = len(targets)
+            # A sweep's unit of work is a model, not a request - it invokes llama-bench once per
+            # model and that one invocation yields several measurements. Saying "requests" here
+            # made a six-model sweep read "6 / 6 requests" while producing 36 of them.
+            _STATE.unit = "models"
+        _THREAD = threading.Thread(target=_run_sweep, name="benchmark-sweep",
+                                   args=(run_id, backend, targets, n_prompt, n_gen, depths, reps),
+                                   daemon=True)
+        _THREAD.start()
+    except Exception as e:  # noqa: BLE001 - any failure here must release the claimed slot
+        return False, _abort_start(run_id, e)
     return True, ""
 
 

@@ -230,6 +230,16 @@ def _parse_ts(line: str) -> float:
         return 0.0
 
 
+def instance_key(port: str, spawn_ts: float) -> str:
+    """Stable identity of one spawned child: its port plus the second it was spawned.
+
+    A port alone is not an identity - the router reuses ports across respawns. The spawn
+    timestamp comes from the log line itself, so re-reading the same tail yields the same key
+    (ingest stays idempotent). Without a timestamp the bare port is all there is.
+    """
+    return f"{port}@{int(spawn_ts)}" if spawn_ts else port
+
+
 def parse_log(text: str) -> tuple[list[Sample], list[ServerConfig]]:
     """Turn raw `docker logs -t` output into completed samples.
 
@@ -241,7 +251,12 @@ def parse_log(text: str) -> tuple[list[Sample], list[ServerConfig]]:
     pending_port = ""
     pending_argv: list[str] = []
     by_pid: dict[str, ServerConfig] = {}
-    spec_of: dict[str, str] = {}                      # port -> spec-type incl. its knobs
+    spec_of: dict[str, str] = {}                      # instance key -> spec-type incl. its knobs
+    # port -> instance key of the newest spawn on that port. The router hands a respawned child
+    # the same port as one that died, and every storage row is keyed by instance; keying by the
+    # bare port would make the new child's tasks collide with the old child's (INSERT OR IGNORE
+    # would then silently drop them) and would overwrite the old child's argv record.
+    key_of_port: dict[str, str] = {}
     samples: dict[tuple[str, int], Sample] = {}
 
     def _flush_spawn() -> None:
@@ -270,7 +285,9 @@ def parse_log(text: str) -> tuple[list[Sample], list[ServerConfig]]:
         m = _RE_SPAWN.search(line)
         if m:
             _flush_spawn()
-            pending_alias, pending_port = m.group(1), m.group(2)
+            port = m.group(2)
+            pending_alias, pending_port = m.group(1), instance_key(port, ts)
+            key_of_port[port] = pending_port
             # Bind immediately: even if the argv block is cut off by the tail boundary, the
             # alias is already known and every later line from this instance can be attributed.
             by_pid[pending_port] = ServerConfig(instance=pending_port, alias=pending_alias,
@@ -291,7 +308,7 @@ def parse_log(text: str) -> tuple[list[Sample], list[ServerConfig]]:
         m = _RE_LOAD.search(line)
         if m:
             _flush_spawn()
-            pid, path = m.group(1), m.group(2)
+            pid, path = key_of_port.get(m.group(1), m.group(1)), m.group(2)
             rec = by_pid.get(pid) or ServerConfig(instance=pid)
             rec.model_path = path
             if not rec.first_seen:
@@ -303,7 +320,7 @@ def parse_log(text: str) -> tuple[list[Sample], list[ServerConfig]]:
             m = rx.search(line)
             if not m:
                 continue
-            pid, task = m.group(1), int(m.group(3))
+            pid, task = key_of_port.get(m.group(1), m.group(1)), int(m.group(3))
             key = (pid, task)
             s = samples.get(key)
             if s is None:

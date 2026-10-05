@@ -1158,6 +1158,14 @@ def cap_context(memory_ctx: int, candidates: list[int], *, prompt_tps: float = 0
     return (fitting[-1] if fitting else min(limit, memory_ctx)), reason
 
 
+# Deepest public LLMs have ~60-130 transformer blocks (Llama 3.1 405B: 126). Fit search loops
+# over layers x context candidates, and the block count can come from an untrusted remote GGUF
+# header, so an absurd value (0xFFFFFFFF) would spin for minutes on the event loop. 4096 is
+# ~30x the deepest real model: no legitimate file is refused, and the worst accepted input
+# costs a few hundred thousand iterations.
+MAX_BLOCK_COUNT = 4096
+
+
 def analyze(*,
             summary: dict,
             file_size: int,
@@ -1183,6 +1191,13 @@ def analyze(*,
     arch = (summary.get("arch") or "").lower()
     m = summary.get("model") or {}
     layers = int(m.get("block_count") or 0)
+    if layers > MAX_BLOCK_COUNT or layers < 0:
+        return Recommendation(
+            plans=[], recommended_backend="", recommended_ctx=0,
+            error=(f"This model's metadata declares an implausible block_count ({layers}; "
+                   f"real models have well under {MAX_BLOCK_COUNT}). The file is corrupt or "
+                   "hostile, so no context size is recommended."),
+        )
     heads = int(m.get("attention_head_count") or 1)
     embed = int(m.get("embedding_length") or 0)
     head_dim = embed // heads if heads > 0 else 0

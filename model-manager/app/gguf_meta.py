@@ -22,6 +22,15 @@ _SCALAR_FMT: dict[int, tuple[str, int]] = {
 
 MAX_ARRAY_ELEMENTS_KEPT = 8
 MAX_STRING_LEN = 200_000
+# Keys are short identifiers ("llama.attention.head_count"); the GGUF spec itself caps them at 65535.
+MAX_KEY_LEN = 65_535
+# Real files carry tens to low thousands of KV pairs; this stops a multi-GB file of empty pairs
+# building a multi-GB dict.
+MAX_KV_COUNT = 100_000
+# Total string characters kept across all values (chat templates run to tens of KB).
+MAX_RETAINED_CHARS = 16_000_000
+# One array nested directly inside another is accepted; deeper is rejected.
+MAX_ARRAY_DEPTH = 1
 
 # subset of llama.cpp LlamaFileType — enough to name every real-world GGUF quant
 FILE_TYPE_NAMES: dict[int, str] = {
@@ -47,41 +56,105 @@ _CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 
 
-def _read_string(f) -> str:
-    n = struct.unpack("<Q", f.read(8))[0]
-    if n > MAX_STRING_LEN:
-        chunk = f.read(n)
-        return chunk[:MAX_STRING_LEN].decode("utf-8", errors="replace") + "…[truncated]"
-    return f.read(n).decode("utf-8", errors="replace")
+class _Source:
+    """A seekable stream plus how many bytes are left in it.
+
+    Every length, count and skip in a GGUF header is attacker-controlled: it is read from a
+    file the user dropped in the models directory or from a remote repo's first megabyte. The
+    parser therefore never trusts one without comparing it with what the stream can actually
+    still supply, and never hands one straight to read() or seek() (a multi-GB length makes a
+    buffered reader reserve that much memory; a value >= 2**63 raises OverflowError).
+    """
+
+    def __init__(self, f) -> None:
+        self.f = f
+        start = f.tell()
+        self.size = f.seek(0, 2)
+        f.seek(start)
+        self.retained = 0     # characters of string data kept so far, across the whole header
+        self.ran_out = False  # an array declared more elements than the stream holds
+
+    def run_out(self) -> None:
+        """An array's elements outrun the stream. Normal for a range-fetched header, whose big
+        tokenizer arrays are cut off at the first megabyte, so the array keeps its count and
+        sample; the parse just ends here (and says so) rather than guessing at what follows."""
+        self.ran_out = True
+        self.f.seek(0, 2)
+
+    def remaining(self) -> int:
+        return max(0, self.size - self.f.tell())
+
+    def read(self, n: int) -> bytes:
+        if n < 0 or n > self.remaining():
+            raise GgufMetaError("header is truncated or declares a length past the end of the data")
+        return self.f.read(n)
+
+    def skip(self, n: int) -> None:
+        if n < 0 or n > self.remaining():
+            raise GgufMetaError("header is truncated or declares a length past the end of the data")
+        self.f.seek(n, 1)
+
+    def unpack(self, fmt: str, size: int):
+        return struct.unpack(fmt, self.read(size))[0]
 
 
-def _skip_string(f) -> None:
-    n = struct.unpack("<Q", f.read(8))[0]
-    f.seek(n, 1)
+def _read_string(src: _Source, *, max_len: int = MAX_STRING_LEN) -> str:
+    n = src.unpack("<Q", 8)
+    if n > src.remaining():
+        raise GgufMetaError(f"string length {n} runs past the end of the data")
+    if n > max_len:
+        # Keep the head, step over the rest: reading all n bytes would pull an arbitrarily
+        # large run of the file into memory just to throw nearly all of it away.
+        chunk = src.read(max_len)
+        src.skip(n - max_len)
+        text = chunk.decode("utf-8", errors="replace") + "…[truncated]"
+    else:
+        text = src.read(n).decode("utf-8", errors="replace")
+    src.retained += len(text)
+    if src.retained > MAX_RETAINED_CHARS:
+        raise GgufMetaError("header holds implausibly much string data")
+    return text
 
 
-def _read_value(f, vtype: int):
+def _skip_string(src: _Source) -> None:
+    n = src.unpack("<Q", 8)
+    src.skip(n)
+
+
+def _read_value(src: _Source, vtype: int, depth: int = 0):
     if vtype in _SCALAR_FMT:
         fmt, size = _SCALAR_FMT[vtype]
-        return struct.unpack(fmt, f.read(size))[0]
+        return src.unpack(fmt, size)
     if vtype == _STRING:
-        return _read_string(f)
+        return _read_string(src)
     if vtype == _ARRAY:
-        subtype = struct.unpack("<I", f.read(4))[0]
-        count = struct.unpack("<Q", f.read(8))[0]
+        subtype = src.unpack("<I", 4)
+        count = src.unpack("<Q", 8)
+        if subtype == _ARRAY and depth >= MAX_ARRAY_DEPTH:
+            # Arrays of arrays of arrays: nothing real emits them, and each level multiplies
+            # what has to be walked - an attacker's header would recurse without bound.
+            raise GgufMetaError("arrays nested more than one level deep are not supported")
+        if subtype not in _SCALAR_FMT and subtype not in (_STRING, _ARRAY):
+            raise GgufMetaError(f"unknown array element type {subtype}")
         if count > MAX_ARRAY_ELEMENTS_KEPT:
-            sample = [_read_value(f, subtype) for _ in range(MAX_ARRAY_ELEMENTS_KEPT)]
+            if subtype == _ARRAY:
+                raise GgufMetaError(f"unsupported nested array subtype {subtype}")
+            sample = [_read_value(src, subtype, depth + 1) for _ in range(MAX_ARRAY_ELEMENTS_KEPT)]
             remaining = count - MAX_ARRAY_ELEMENTS_KEPT
             if subtype == _STRING:
-                for _ in range(remaining):
-                    _skip_string(f)
-            elif subtype in _SCALAR_FMT:
-                _, size = _SCALAR_FMT[subtype]
-                f.seek(size * remaining, 1)
+                try:
+                    for _ in range(remaining):
+                        _skip_string(src)
+                except GgufMetaError:
+                    src.run_out()
             else:
-                raise GgufMetaError(f"unsupported nested array subtype {subtype}")
+                _, size = _SCALAR_FMT[subtype]
+                if size * remaining > src.remaining():
+                    src.run_out()
+                else:
+                    src.skip(size * remaining)
             return {"_array": True, "count": count, "sample": sample}
-        return [_read_value(f, subtype) for _ in range(count)]
+        return [_read_value(src, subtype, depth + 1) for _ in range(count)]
     raise GgufMetaError(f"unknown value type {vtype}")
 
 
@@ -91,30 +164,34 @@ def _read_raw_stream(f) -> dict[str, Any]:
     Split out from _read_raw so the same parser can run over a range-fetched header
     (io.BytesIO) as well as a local file — metadata lives at the very start of a GGUF,
     so the first ~1 MB is enough to read every KV pair without pulling the weights.
+
+    Hostile or corrupt input never raises out of here past the magic check: a bad length,
+    count or nesting depth is recorded as `_error` and parsing stops with whatever was read.
     """
-    if True:
-        magic = f.read(4)
-        if magic != b"GGUF":
-            raise GgufMetaError(f"not a GGUF file (magic={magic!r})")
-        version = struct.unpack("<I", f.read(4))[0]
-        tensor_count = struct.unpack("<Q", f.read(8))[0]
-        kv_count = struct.unpack("<Q", f.read(8))[0]
-        out: dict[str, Any] = {
-            "_gguf_version": version,
-            "_tensor_count": tensor_count,
-            "_kv_count": kv_count,
-        }
+    src = _Source(f)
+    magic = src.f.read(4)
+    if magic != b"GGUF":
+        raise GgufMetaError(f"not a GGUF file (magic={magic!r})")
+    version = src.unpack("<I", 4)
+    tensor_count = src.unpack("<Q", 8)
+    kv_count = src.unpack("<Q", 8)
+    out: dict[str, Any] = {
+        "_gguf_version": version,
+        "_tensor_count": tensor_count,
+        "_kv_count": kv_count,
+    }
+    if kv_count > MAX_KV_COUNT:
+        out["_error"] = f"stopped at KV read: implausible kv_count {kv_count}"
+        return out
+    try:
         for _ in range(kv_count):
-            try:
-                key = _read_string(f)
-                vtype = struct.unpack("<I", f.read(4))[0]
-                out[key] = _read_value(f, vtype)
-            except GgufMetaError as e:
-                out["_error"] = f"stopped at KV read: {e}"
-                break
-            except (struct.error, OSError) as e:
-                out["_error"] = f"stopped at KV read: {e}"
-                break
+            key = _read_string(src, max_len=MAX_KEY_LEN)
+            vtype = src.unpack("<I", 4)
+            out[key] = _read_value(src, vtype)
+    except (GgufMetaError, struct.error, OSError, OverflowError, MemoryError, RecursionError) as e:
+        out["_error"] = f"stopped at KV read: {e or type(e).__name__}"
+    if src.ran_out and "_error" not in out:
+        out["_error"] = "stopped at KV read: array runs past the end of the data"
     return out
 
 
@@ -260,6 +337,9 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
             "gguf_version": raw.get("_gguf_version"),
             "tensor_count": raw.get("_tensor_count"),
             "kv_count": raw.get("_kv_count"),
+            # Set when the header was cut short or malformed: the rest of the summary is then
+            # whatever parsed before the fault, not the whole story.
+            "header_error": raw.get("_error"),
         },
         "model": {
             "arch": arch,
