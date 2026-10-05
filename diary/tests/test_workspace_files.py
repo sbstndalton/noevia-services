@@ -5,6 +5,7 @@ import pytest
 from fastapi import HTTPException
 from agent.workspace_files import MemoryBackend, file_list, file_read, file_write, memory_text, safe_path
 from agent.app import entry_target
+from tests.test_dedicated_storage import volume  # noqa: F401 (fixture)
 
 class Journal:
     def __init__(self): self.dirty = []
@@ -183,3 +184,58 @@ def test_write_onto_directory_path_is_409_and_not_left_dirty(err):
         file_write(st, {'path': 'memory/a.md', 'content': 'x', 'version': None})
     assert exc.value.status_code == 409
     assert st.journal.dirty == []
+
+
+def _status_error(status):
+    import httpx
+    request = httpx.Request('PROPFIND', 'https://dav.example.test/remote.php/dav/files/alice/')
+    return httpx.HTTPStatusError(f"Client error '{status}'", request=request, response=httpx.Response(status, request=request))
+
+
+@pytest.mark.parametrize('status', [401, 403])
+def test_a_refused_storage_login_is_a_424_with_a_stable_code_not_a_500(volume, monkeypatch, status):
+    # #849: the WebDAV backend's raise_for_status used to escape /api/files as an unhandled 500.
+    from fastapi.testclient import TestClient
+    import agent.app as appmod
+    from tests.test_dedicated_storage import request, A
+    state = appmod._tenant_state(request(A), recover=False)
+    def refuse(*args, **kwargs):
+        raise _status_error(status)
+    monkeypatch.setattr(state.store.backend, 'list_dir', refuse, raising=False)
+    monkeypatch.setattr(state.store.backend, 'get_text', refuse, raising=False)
+    client = TestClient(appmod.app, raise_server_exceptions=False)
+    headers = {'X-Cowork-User-ID': A}
+    listing = client.get('/api/files', headers=headers)
+    assert listing.status_code == 424
+    assert listing.json()['code'] == 'storageLoginRejected'
+    assert 'Storage login rejected' in listing.json()['detail']
+    reading = client.post('/api/file', json={'path': 'a.md'}, headers=headers)
+    assert reading.status_code == 424
+    assert reading.json()['code'] == 'storageLoginRejected'
+
+
+def test_other_storage_failures_are_not_reported_as_a_rejected_login(volume, monkeypatch):
+    from fastapi.testclient import TestClient
+    import agent.app as appmod
+    from tests.test_dedicated_storage import request, A
+    state = appmod._tenant_state(request(A), recover=False)
+    def broken(*args, **kwargs):
+        raise _status_error(500)
+    monkeypatch.setattr(state.store.backend, 'list_dir', broken, raising=False)
+    response = TestClient(appmod.app, raise_server_exceptions=False).get('/api/files', headers={'X-Cowork-User-ID': A})
+    assert response.status_code == 500
+    assert 'code' not in (response.json() if response.headers.get('content-type', '').startswith('application/json') else {})
+
+
+def test_the_guard_leaves_writes_alone(volume, monkeypatch):
+    # The guard wraps the two read routes only; a 401 raised on a save is not remapped (#849 scope).
+    from fastapi.testclient import TestClient
+    import agent.app as appmod
+    from tests.test_dedicated_storage import request, A
+    state = appmod._tenant_state(request(A), recover=False)
+    def refuse(*args, **kwargs):
+        raise _status_error(401)
+    monkeypatch.setattr(state.store.backend, 'put', refuse, raising=False)
+    monkeypatch.setattr(appmod, '_reindex_dirty', lambda st: None)
+    response = TestClient(appmod.app, raise_server_exceptions=False).put('/api/file', json={'path': 'new.md', 'content': 'x', 'version': None}, headers={'X-Cowork-User-ID': A})
+    assert response.status_code != 424

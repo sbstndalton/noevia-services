@@ -1,11 +1,33 @@
 """Tenant-relative Markdown files, guarded writes, and ephemeral browser corpora."""
 import hashlib
 import re
+from contextlib import contextmanager
+import httpx
 from fastapi import HTTPException
 
 MAX_FILE = 512 * 1024
 MAX_TOTAL = 12 * 1024 * 1024
 MAX_FILES = 500
+
+
+class StorageLoginRejected(Exception):
+    """The storage server answered 401/403 to the saved login (#849). The web proxy words it for the
+    person ("Storage login rejected ... Settings → Diary & storage"); `code` is the stable key."""
+    code = 'storageLoginRejected'
+    message = 'Storage login rejected. Check your storage credentials in Settings → Diary & storage.'
+
+
+@contextmanager
+def storage_login_guard():
+    """Turn a WebDAV 401/403 raised while READING storage into StorageLoginRejected, which the app
+    answers with a 4xx instead of an unhandled 500. Wrap reads only: a write that fails keeps
+    whatever handling it has today, and the journal is never touched here."""
+    try:
+        yield
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code in (401, 403):
+            raise StorageLoginRejected() from exc
+        raise
 
 
 def safe_path(path, directory=False):

@@ -1398,7 +1398,7 @@ if __name__ == "__main__":
 
 
 # Diary workspace routes share the same tenant resolution as the conversation.
-from .workspace_files import file_list, file_read, file_write, directory_create, MemoryBackend, reference_text
+from .workspace_files import file_list, file_read, file_write, directory_create, MemoryBackend, reference_text, StorageLoginRejected, storage_login_guard
 
 
 def entry_target(body):
@@ -1417,18 +1417,27 @@ def entry_target(body):
         raise HTTPException(400, "Invalid diary date/time; include a timezone offset")
 
 
+@app.exception_handler(StorageLoginRejected)
+async def storage_login_rejected(request: Request, exc: StorageLoginRejected):
+    # 424, not 401/403: the caller is signed in to noevia, it is the storage server that refused the
+    # saved login, and a 401 would make the browser think the noevia session ended (#849).
+    return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=424)
+
+
 @app.get("/api/files")
 def workspace_files(request: Request, path: str = ""):
     if not check_auth(request):
         raise HTTPException(401, "unauthorized")
-    return {"files": file_list(_tenant_state(request).store, path)}
+    with storage_login_guard():
+        return {"files": file_list(_tenant_state(request).store, path)}
 
 
 @app.post("/api/file")
 def workspace_file(body: dict, request: Request):
     if not check_auth(request):
         raise HTTPException(401, "unauthorized")
-    return file_read(_tenant_state(request).store, body.get("path", ""))
+    with storage_login_guard():
+        return file_read(_tenant_state(request).store, body.get("path", ""))
 
 
 @app.put("/api/file")
