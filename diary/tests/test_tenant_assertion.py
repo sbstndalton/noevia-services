@@ -35,11 +35,22 @@ def signed(user, method, path, extra=None, key=KEY, ts=None, nonce=None, query=b
     return headers
 
 
+def flip_last_char(value):
+    """Always differs from `value` (a fixed replacement collides with it ~1/1024 for a random signature, #847).
+    'A' and 'E' are both canonical final base64url chars of a 32-byte digest."""
+    return value[:-1] + ('E' if value[-1] == 'A' else 'A')
+
+
 def b64(obj):
     return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip('=')
 
 
 # ── verify() ────────────────────────────────────────────────────────────────
+
+def test_flip_last_char_always_changes_the_value():
+    for v in ('v2.abcAA', 'v2.abcAE', 'v2.abcAB'):
+        assert flip_last_char(v) != v and flip_last_char(v)[:-1] == v[:-1]
+
 
 def test_valid_assertion_verifies_once_and_replay_is_refused():
     h = signed(A, 'GET', '/api/day')
@@ -51,7 +62,7 @@ def test_valid_assertion_verifies_once_and_replay_is_refused():
     lambda h: {**h, 'X-Cowork-User-ID': B},                       # another tenant, same assertion
     lambda h: {**h, 'X-Cowork-Storage': b64({'kind': 'local'})},  # swapped storage descriptor
     lambda h: {**h, 'X-Cowork-Legacy-Owner': '1'},                # added legacy-owner marker
-    lambda h: {**h, ta.HEADER: h[ta.HEADER][:-2] + 'AA'},         # forged signature
+    lambda h: {**h, ta.HEADER: flip_last_char(h[ta.HEADER])},     # forged signature (always differs)
     lambda h: {k: v for k, v in h.items() if k != ta.HEADER},     # missing
     lambda h: {**h, ta.HEADER: 'v2.garbage'},                     # malformed
     lambda h: {**h, ta.HEADER: 'v1' + h[ta.HEADER][2:]},          # v1 is not accepted
