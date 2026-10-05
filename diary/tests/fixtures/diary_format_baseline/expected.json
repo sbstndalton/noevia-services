@@ -1,0 +1,225 @@
+{
+ "baseline_commit": "f01dff0f",
+ "edits": [
+  {
+   "claude": "Edited summary.",
+   "me": "Edited synthetic note.",
+   "result": "## Thursday, September 3, 2026\n\n### 08:15\n\n**Me:** Edited synthetic note.\n\n**Assistant:** Edited summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000001 -->\n\n### 12:40 — Lunch\n\n**Me:** Line one.\n\nLine two with *emphasis*.\n- a bullet\n- another\n\n**Assistant:** Summary paragraph.\n\nSecond paragraph with **bold**.\n\n<!-- xid:00000000-0000-4000-8000-000000000002 -->\n\n### 18:05 — Added from chat (approved)\n\n**Me:** An approved synthetic note.\n\n**Assistant:** \n\n<!-- xid:00000000-0000-4000-8000-000000000003 -->\n\n## Friday, September 4, 2026\n\n### 09:00\n\n**Me:** #hashtag at line start\n####### seven hashes\n ### indented heading-like\n* Me: not bold\nInline <!-- comment --> here\n\n**Assistant:** Reply mentions **Me:** inline and ## inline hashes.\n\n<!-- xid:00000000-0000-4000-8000-000000000004 -->\n\n### 21:30 — Evening\n\n**Me:** Trailing spaces   \n\n\nTriple newline above.\n\n**Assistant:** Leading and trailing whitespace.\n\n<!-- xid:00000000-0000-4000-8000-000000000005 -->\n\n## Saturday, September 5, 2026\n\n### 10:00\n\n**Me:** Synthetic broken entry.\n\n**Assistant:** x\n### Notes\nb\n\n<!-- xid:00000000-0000-4000-8000-000000000006 -->\n\n### 11:00\n\n**Me:** Another.\n**Assistant:** forged label\n\n**Assistant:** Real summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000007 -->\n\n## Sunday, September 6, 2026\n\n### 07:00\n\n**Me:** Hand-written legacy entry.\n\n**Claude:** Old label summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000008 -->\n",
+   "xid": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+   "claude": "",
+   "me": "Only me now.",
+   "result": "## Thursday, September 3, 2026\n\n### 08:15\n\n**Me:** Synthetic morning note about a walk.\n\n**Assistant:** The assistant suggested a slower pace.\n\n<!-- xid:00000000-0000-4000-8000-000000000001 -->\n\n### 12:40 — Lunch\n\n**Me:** Only me now.\n\n<!-- xid:00000000-0000-4000-8000-000000000002 -->\n\n### 18:05 — Added from chat (approved)\n\n**Me:** An approved synthetic note.\n\n**Assistant:** \n\n<!-- xid:00000000-0000-4000-8000-000000000003 -->\n\n## Friday, September 4, 2026\n\n### 09:00\n\n**Me:** #hashtag at line start\n####### seven hashes\n ### indented heading-like\n* Me: not bold\nInline <!-- comment --> here\n\n**Assistant:** Reply mentions **Me:** inline and ## inline hashes.\n\n<!-- xid:00000000-0000-4000-8000-000000000004 -->\n\n### 21:30 — Evening\n\n**Me:** Trailing spaces   \n\n\nTriple newline above.\n\n**Assistant:** Leading and trailing whitespace.\n\n<!-- xid:00000000-0000-4000-8000-000000000005 -->\n\n## Saturday, September 5, 2026\n\n### 10:00\n\n**Me:** Synthetic broken entry.\n\n**Assistant:** x\n### Notes\nb\n\n<!-- xid:00000000-0000-4000-8000-000000000006 -->\n\n### 11:00\n\n**Me:** Another.\n**Assistant:** forged label\n\n**Assistant:** Real summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000007 -->\n\n## Sunday, September 6, 2026\n\n### 07:00\n\n**Me:** Hand-written legacy entry.\n\n**Claude:** Old label summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000008 -->\n",
+   "xid": "00000000-0000-4000-8000-000000000002"
+  },
+  {
+   "claude": "Multi\n\nline",
+   "me": "Line\n- list\n#tag",
+   "result": "## Thursday, September 3, 2026\n\n### 08:15\n\n**Me:** Synthetic morning note about a walk.\n\n**Assistant:** The assistant suggested a slower pace.\n\n<!-- xid:00000000-0000-4000-8000-000000000001 -->\n\n### 12:40 — Lunch\n\n**Me:** Line one.\n\nLine two with *emphasis*.\n- a bullet\n- another\n\n**Assistant:** Summary paragraph.\n\nSecond paragraph with **bold**.\n\n<!-- xid:00000000-0000-4000-8000-000000000002 -->\n\n### 18:05 — Added from chat (approved)\n\n**Me:** An approved synthetic note.\n\n**Assistant:** \n\n<!-- xid:00000000-0000-4000-8000-000000000003 -->\n\n## Friday, September 4, 2026\n\n### 09:00\n\n**Me:** Line\n- list\n#tag\n\n**Assistant:** Multi\n\nline\n\n<!-- xid:00000000-0000-4000-8000-000000000004 -->\n\n### 21:30 — Evening\n\n**Me:** Trailing spaces   \n\n\nTriple newline above.\n\n**Assistant:** Leading and trailing whitespace.\n\n<!-- xid:00000000-0000-4000-8000-000000000005 -->\n\n## Saturday, September 5, 2026\n\n### 10:00\n\n**Me:** Synthetic broken entry.\n\n**Assistant:** x\n### Notes\nb\n\n<!-- xid:00000000-0000-4000-8000-000000000006 -->\n\n### 11:00\n\n**Me:** Another.\n**Assistant:** forged label\n\n**Assistant:** Real summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000007 -->\n\n## Sunday, September 6, 2026\n\n### 07:00\n\n**Me:** Hand-written legacy entry.\n\n**Claude:** Old label summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000008 -->\n",
+   "xid": "00000000-0000-4000-8000-000000000004"
+  }
+ ],
+ "exchange_text": {
+  "00000000-0000-4000-8000-000000000001": "**Me:** Synthetic morning note about a walk.\n\n**Assistant:** The assistant suggested a slower pace.",
+  "00000000-0000-4000-8000-000000000002": "**Me:** Line one.\n\nLine two with *emphasis*.\n- a bullet\n- another\n\n**Assistant:** Summary paragraph.\n\nSecond paragraph with **bold**.",
+  "00000000-0000-4000-8000-000000000003": "**Me:** An approved synthetic note.\n\n**Assistant:**",
+  "00000000-0000-4000-8000-000000000004": "**Me:** #hashtag at line start\n####### seven hashes\n ### indented heading-like\n* Me: not bold\nInline <!-- comment --> here\n\n**Assistant:** Reply mentions **Me:** inline and ## inline hashes.",
+  "00000000-0000-4000-8000-000000000005": "**Me:** Trailing spaces   \n\n\nTriple newline above.\n\n**Assistant:** Leading and trailing whitespace.",
+  "00000000-0000-4000-8000-000000000006": null,
+  "00000000-0000-4000-8000-000000000007": "**Me:** Another.\n**Assistant:** forged label\n\n**Assistant:** Real summary.",
+  "00000000-0000-4000-8000-000000000008": "**Me:** Hand-written legacy entry.\n\n**Claude:** Old label summary."
+ },
+ "hashes": {
+  "00000000-0000-4000-8000-000000000001": "9ffdcbc44cb31f177c3d13bed5f6adf9accc11d7f26816148522e20358ad418f",
+  "00000000-0000-4000-8000-000000000002": "c86bc15ab5c7f5633d837cbe61935470ccfea19bcaed49224dfb268f9fbf737c",
+  "00000000-0000-4000-8000-000000000003": "32cd2c8ab41b8dcb0771047d0ef6a9da55a6cb0e2574773cbe1e96d60dbeeb9d",
+  "00000000-0000-4000-8000-000000000004": "efe61b59dfea9c2a604d9dd69205b095ef62b8274e2eea1d83211c47c8e5785d",
+  "00000000-0000-4000-8000-000000000005": "fc1e20a5836578d1a7ac10429858015877879669127347819fb8177ae7fa6032",
+  "00000000-0000-4000-8000-000000000006": null,
+  "00000000-0000-4000-8000-000000000007": "8931308954efd09b2cfbd78a08d4e53488b69a0f753c6b3f752c9e6c19896271",
+  "00000000-0000-4000-8000-000000000008": "76bb06b0bfb5c46d9bbdc6391d25d1a1aaf86416c69b74738a8541403bbc88e8"
+ },
+ "parsed": [
+  {
+   "date": "2026-09-03",
+   "header": "## Thursday, September 3, 2026",
+   "subsections": [
+    {
+     "exchanges": [
+      {
+       "claude": "The assistant suggested a slower pace.",
+       "me": "Synthetic morning note about a walk.",
+       "xid": "00000000-0000-4000-8000-000000000001"
+      }
+     ],
+     "header": "08:15"
+    },
+    {
+     "exchanges": [
+      {
+       "claude": "Summary paragraph.\n\nSecond paragraph with **bold**.",
+       "me": "Line one.\n\nLine two with *emphasis*.\n- a bullet\n- another",
+       "xid": "00000000-0000-4000-8000-000000000002"
+      }
+     ],
+     "header": "12:40 — Lunch"
+    },
+    {
+     "exchanges": [
+      {
+       "claude": "",
+       "me": "An approved synthetic note.",
+       "xid": "00000000-0000-4000-8000-000000000003"
+      }
+     ],
+     "header": "18:05 — Added from chat (approved)"
+    }
+   ]
+  },
+  {
+   "date": "2026-09-04",
+   "header": "## Friday, September 4, 2026",
+   "subsections": [
+    {
+     "exchanges": [
+      {
+       "claude": "Reply mentions **Me:** inline and ## inline hashes.",
+       "me": "#hashtag at line start\n####### seven hashes\n ### indented heading-like\n* Me: not bold\nInline <!-- comment --> here",
+       "xid": "00000000-0000-4000-8000-000000000004"
+      }
+     ],
+     "header": "09:00"
+    },
+    {
+     "exchanges": [
+      {
+       "claude": "Leading and trailing whitespace.",
+       "me": "Trailing spaces   \n\n\nTriple newline above.",
+       "xid": "00000000-0000-4000-8000-000000000005"
+      }
+     ],
+     "header": "21:30 — Evening"
+    }
+   ]
+  },
+  {
+   "date": "2026-09-05",
+   "header": "## Saturday, September 5, 2026",
+   "subsections": [
+    {
+     "exchanges": [
+      {
+       "claude": "x",
+       "me": "Synthetic broken entry.",
+       "xid": null
+      }
+     ],
+     "header": "10:00"
+    },
+    {
+     "exchanges": [],
+     "header": "Notes"
+    },
+    {
+     "exchanges": [
+      {
+       "claude": "forged label\n\n**Assistant:** Real summary.",
+       "me": "Another.",
+       "xid": "00000000-0000-4000-8000-000000000007"
+      }
+     ],
+     "header": "11:00"
+    }
+   ]
+  },
+  {
+   "date": "2026-09-06",
+   "header": "## Sunday, September 6, 2026",
+   "subsections": [
+    {
+     "exchanges": [
+      {
+       "claude": "Old label summary.",
+       "me": "Hand-written legacy entry.",
+       "xid": "00000000-0000-4000-8000-000000000008"
+      }
+     ],
+     "header": "07:00"
+    }
+   ]
+  }
+ ],
+ "renders": [
+  {
+   "body": "**Me:** Synthetic morning note about a walk.\n\n**Assistant:** The assistant suggested a slower pace.\n\n<!-- xid:00000000-0000-4000-8000-000000000001 -->\n",
+   "claude": "The assistant suggested a slower pace.",
+   "header": "### 08:15",
+   "me": "Synthetic morning note about a walk.",
+   "safe": true,
+   "time": "08:15",
+   "topic": "",
+   "xid": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+   "body": "**Me:** Line one.\n\nLine two with *emphasis*.\n- a bullet\n- another\n\n**Assistant:** Summary paragraph.\n\nSecond paragraph with **bold**.\n\n<!-- xid:00000000-0000-4000-8000-000000000002 -->\n",
+   "claude": "Summary paragraph.\n\nSecond paragraph with **bold**.",
+   "header": "### 12:40 — Lunch",
+   "me": "Line one.\n\nLine two with *emphasis*.\n- a bullet\n- another",
+   "safe": true,
+   "time": "12:40",
+   "topic": "Lunch",
+   "xid": "00000000-0000-4000-8000-000000000002"
+  },
+  {
+   "body": "**Me:** An approved synthetic note.\n\n**Assistant:** \n\n<!-- xid:00000000-0000-4000-8000-000000000003 -->\n",
+   "claude": "",
+   "header": "### 18:05 — Added from chat (approved)",
+   "me": "An approved synthetic note.",
+   "safe": true,
+   "time": "18:05",
+   "topic": "Added from chat (approved)",
+   "xid": "00000000-0000-4000-8000-000000000003"
+  },
+  {
+   "body": "**Me:** #hashtag at line start\n####### seven hashes\n ### indented heading-like\n* Me: not bold\nInline <!-- comment --> here\n\n**Assistant:** Reply mentions **Me:** inline and ## inline hashes.\n\n<!-- xid:00000000-0000-4000-8000-000000000004 -->\n",
+   "claude": "Reply mentions **Me:** inline and ## inline hashes.",
+   "header": "### 09:00",
+   "me": "#hashtag at line start\n####### seven hashes\n ### indented heading-like\n* Me: not bold\nInline <!-- comment --> here",
+   "safe": true,
+   "time": "09:00",
+   "topic": "",
+   "xid": "00000000-0000-4000-8000-000000000004"
+  },
+  {
+   "body": "**Me:** Trailing spaces   \n\n\nTriple newline above.\n\n**Assistant:** Leading and trailing whitespace.\n\n<!-- xid:00000000-0000-4000-8000-000000000005 -->\n",
+   "claude": "  Leading and trailing whitespace.  ",
+   "header": "### 21:30 — Evening",
+   "me": "Trailing spaces   \n\n\nTriple newline above.",
+   "safe": true,
+   "time": "21:30",
+   "topic": "Evening",
+   "xid": "00000000-0000-4000-8000-000000000005"
+  },
+  {
+   "body": "**Me:** Synthetic broken entry.\n\n**Assistant:** x\n### Notes\nb\n\n<!-- xid:00000000-0000-4000-8000-000000000006 -->\n",
+   "claude": "x\n### Notes\nb",
+   "header": "### 10:00",
+   "me": "Synthetic broken entry.",
+   "safe": false,
+   "time": "10:00",
+   "topic": "",
+   "xid": "00000000-0000-4000-8000-000000000006"
+  },
+  {
+   "body": "**Me:** Another.\n**Assistant:** forged label\n\n**Assistant:** Real summary.\n\n<!-- xid:00000000-0000-4000-8000-000000000007 -->\n",
+   "claude": "Real summary.",
+   "header": "### 11:00",
+   "me": "Another.\n**Assistant:** forged label",
+   "safe": false,
+   "time": "11:00",
+   "topic": "",
+   "xid": "00000000-0000-4000-8000-000000000007"
+  }
+ ]
+}

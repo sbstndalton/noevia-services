@@ -859,12 +859,5 @@ class CorpusStore:
             out = out[:max_chars] + "\n…(standing sections truncated)"
         return out
 
-    def month_registered(self, day: date) -> bool:
-        if self.entry_layout == "daily":
-            return self.backend.exists(self.daily_path(day))
-        index_text, _ = self.read_index()
-        idx = fmt.parse_index(index_text)
-        return any(self.month_filename(day) in link for link in idx.month_links)
-
     def new_xid(self) -> str:
         return str(uuid.uuid4())

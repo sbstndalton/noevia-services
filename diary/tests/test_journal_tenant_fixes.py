@@ -178,7 +178,10 @@ def test_delete_tenant_clears_only_its_chat_sessions(client):  # noqa: F811
     assert exc.value.status_code == 410
 
 
-def test_delete_blocks_session_creation_during_removal(client, monkeypatch):  # noqa: F811
+def test_delete_refuses_session_creation_during_removal(client, monkeypatch):  # noqa: F811
+    # The tombstone is recorded before the directory is removed, so a session
+    # for the tenant is refused (410) at once, without waiting for the removal
+    # (#804: _tenant_lock is no longer held across it).
     entered, release = threading.Event(), threading.Event()
     session_started, session_done = threading.Event(), threading.Event()
     real_rmtree = appmod.shutil.rmtree
@@ -211,7 +214,9 @@ def test_delete_blocks_session_creation_during_removal(client, monkeypatch):  # 
         assert entered.wait(5)
         creator.start()
         assert session_started.wait(5)
-        assert not session_done.wait(0.1)
+        assert session_done.wait(5)  # answered while rmtree is still paused
+        assert late == {"status": 410}
+        assert not appmod._tenant_lock.locked()
     finally:
         release.set()
         deleter.join(5)

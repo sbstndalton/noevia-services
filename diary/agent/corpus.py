@@ -74,12 +74,58 @@ def canonical_day_header(d: date) -> str:
 
 def render_subsection_header(now: Optional[datetime] = None, topic: str = "") -> str:
     stamp = (now or datetime.now()).strftime("%H:%M")
+    # The header is one line: a line break in the topic would let it start a day header.
+    topic = _LINE_BREAKS_RE.sub(" ", topic or "")
     return f"### {stamp} — {topic.strip()}" if topic.strip() else f"### {stamp}"
 
 
+# Every separator str.splitlines() (and therefore parse_diary) treats as a line break.
+_LINE_BREAK_CHARS = "\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+_LINE_BREAKS_RE = re.compile("[" + _LINE_BREAK_CHARS + "]+")
+# Line starts parse_diary/_exchange_bounds/_append_buf_to_sub read as structure.
+_HEADING_LINE_RE = re.compile(r"#{1,6}(?=[ \t]|\Z)")
+_ROLE_LINE_RE = re.compile(r"\*\*(?:Me|Assistant|Claude):\*\*")
+_MARKER_OPEN_RE = re.compile(r"<!--(?=\s*xid:)")
+
+
+def escape_entry_text(text: str) -> str:
+    """Markdown-escape saved prose so it can never become diary structure (#803).
+
+    Structure (day/subsection headers, Me/Assistant labels, xid markers) is written
+    by code only. Prose that contains such a line (a model summary with "### Key
+    points", a pasted transcript with "**Assistant:**", an echoed xid comment) is
+    escaped the standard Markdown way, so viewers still show the original characters:
+
+      - a line starting with 1-6 '#' then a space/tab/end  -> '\\' prefix
+      - a line starting with **Me:** / **Assistant:** / **Claude:**  -> '\\*\\*' prefix
+      - '<!--' opening an xid comment anywhere, even split across lines  -> '<\\!--'
+
+    The first line is not escaped for headings: the renderers put it after a
+    '**Me:** ' / '**Assistant:** ' label, so it is not at a line start. Labels ARE
+    escaped on the first line too: the parser reads the text right after '**Me:** '
+    as a fresh string, so a message opening with '**Assistant:**' would otherwise
+    hand the owner's words to the assistant.
+    Idempotent (an escaped line no longer matches), so re-saving edited text and
+    journal replays produce identical bytes. Text without such lines is unchanged,
+    and parsing is unchanged, so entries already on disk read exactly as before.
+    """
+    # MARKER_RE's \s* spans line breaks, so match on the whole text, not per line.
+    text = _MARKER_OPEN_RE.sub("<\\!--", text)
+    out = []
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        body = line.rstrip(_LINE_BREAK_CHARS)
+        end = line[len(body):]
+        if i and _HEADING_LINE_RE.match(body):
+            body = "\\" + body
+        elif _ROLE_LINE_RE.match(body):
+            body = "\\*\\*" + body[2:]
+        out.append(body + end)
+    return "".join(out)
+
+
 def render_exchange(me: str, claude: str, xid: str) -> str:
-    me_clean = me.strip()
-    claude_clean = claude.strip()
+    me_clean = escape_entry_text(me.strip())
+    claude_clean = escape_entry_text(claude.strip())
     return (
         f"**Me:** {me_clean}\n\n"
         f"**Assistant:** {claude_clean}\n\n"
@@ -267,8 +313,8 @@ def replace_exchange_text(text: str, xid: str, new_me: str, new_claude: str) -> 
     marker = f"<!-- xid:{xid} -->"
     block_end = marker_idx
 
-    me_clean = new_me.strip()
-    claude_clean = new_claude.strip()
+    me_clean = escape_entry_text(new_me.strip())
+    claude_clean = escape_entry_text(new_claude.strip())
     replacement: List[str] = [f"**Me:** {me_clean}"]
     if claude_clean:
         replacement.extend(["", f"**Assistant:** {claude_clean}"])

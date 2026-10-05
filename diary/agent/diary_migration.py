@@ -62,6 +62,10 @@ class LegacyWriteGuard:
         self.backend, self.managed = backend, managed
 
     def __getattr__(self, key):
+        if key == 'create_directory':
+            # Exists only when the wrapped backend has it (WebDAV/S3 do not), so
+            # directory_create's capability check answers 405, not a 500 (#805).
+            return self._guarded_create_directory(getattr(self.backend, key))
         return getattr(self.backend, key)
 
     @contextmanager
@@ -77,8 +81,10 @@ class LegacyWriteGuard:
                 raise RuntimeError('Diary moved into the app. Reload before writing; this request was not saved to the old corpus.')
             return self.backend.put(*args, **kwargs)
 
-    def create_directory(self, *args, **kwargs):
-        with self.managed.migration_lock():
-            if self.managed.active():
-                raise RuntimeError('Diary moved into the app. Reload before writing.')
-            return self.backend.create_directory(*args, **kwargs)
+    def _guarded_create_directory(self, create):
+        def create_directory(*args, **kwargs):
+            with self.managed.migration_lock():
+                if self.managed.active():
+                    raise RuntimeError('Diary moved into the app. Reload before writing.')
+                return create(*args, **kwargs)
+        return create_directory

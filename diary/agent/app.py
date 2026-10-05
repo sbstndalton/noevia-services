@@ -647,6 +647,20 @@ def delete_tenant(request: Request) -> JSONResponse:
         return JSONResponse({"error": "tenant assertion required"}, status_code=401)
     user_id = user_id.lower()
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    # Under _tenant_lock only bookkeeping (#804): tombstone first, so every new
+    # request for this tenant is refused (410) from here on, then unregister its
+    # states and sessions. _close_state waits for the tenant's store write lock,
+    # which can be held across network I/O (WebDAV writes, embedding reindex), so
+    # closing and deleting happen after the lock is released — other tenants'
+    # requests never wait on this tenant's storage.
+    with _tenant_lock:
+        _mark_tenant_deleted_locked(user_id)
+        doomed = [_tenant_states.pop(key) for key in list(_tenant_states) if key.startswith(f"{user_id}:")]
+        for key in list(SESSIONS):
+            if key.startswith(f"{user_id}:"):
+                SESSIONS.pop(key, None)
+    # After the tombstone: a backup request that cached a backend before it is
+    # dropped here; one that starts after it is refused (api_storage_backup).
     with _backup_backends_lock:
         backup_backend = _backup_backends.pop(user_id, None)
     if backup_backend is not None:
@@ -654,16 +668,12 @@ def delete_tenant(request: Request) -> JSONResponse:
             backup_backend.close()
         except Exception:  # noqa: BLE001
             pass
-    with _tenant_lock:
-        for key, state in list(_tenant_states.items()):
-            if key.startswith(f"{user_id}:"):
-                _close_state(state)
-                _tenant_states.pop(key, None)
-        shutil.rmtree(root, ignore_errors=True)
-        _mark_tenant_deleted_locked(user_id)
-        for key in list(SESSIONS):
-            if key.startswith(f"{user_id}:"):
-                SESSIONS.pop(key, None)
+    # Closing marks each store closed after any in-flight guarded write
+    # finishes; later writes through a stale reference raise StoreClosed
+    # instead of recreating files under the deleted root.
+    for state in doomed:
+        _close_state(state)
+    shutil.rmtree(root, ignore_errors=True)
     return JSONResponse({"ok": True})
 
 
@@ -818,13 +828,6 @@ def _reindex_today(st: AppState, day) -> None:
         log.warning("background reindex failed: %s", exc)
 
 
-def run_in_threadpool_sync(fn, *args):
-    """Run a blocking callable off the event loop (FastAPI sync def endpoints
-    already run in a threadpool, but month listing does WebDAV I/O worth
-    keeping off it even from other contexts)."""
-    return fn(*args)
-
-
 # ---------------- API (browser UI) ----------------
 
 
@@ -898,7 +901,7 @@ def api_months(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     st = _tenant_state(request)
-    months = run_in_threadpool_sync(st.store.list_months)
+    months = st.store.list_months()
     return JSONResponse({"months": months})
 
 
@@ -976,7 +979,7 @@ def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid base_hash"}, status_code=400)
     st = _tenant_state(request)
     try:
-        path, day_iso, new_hash = run_in_threadpool_sync(st.store.edit_exchange, xid, req.me, req.assistant, req.month, req.base_hash)
+        path, day_iso, new_hash = st.store.edit_exchange(xid, req.me, req.assistant, req.month, req.base_hash)
     except EditConflict as exc:
         return JSONResponse({"error": str(exc), "conflict": True, "current_hash": exc.current_hash, "current_text": exc.current_text}, status_code=409)
     except CorpusError as exc:
@@ -1005,7 +1008,7 @@ def api_external_sources(request: Request) -> JSONResponse:
     results = []
     total = 0
     for p in paths:
-        scan = run_in_threadpool_sync(scan_source, p)
+        scan = scan_source(p)
         total += scan["total"]
         results.append(scan)
     return JSONResponse({"configured": True, "sources": results, "total": total})
@@ -1130,6 +1133,16 @@ def _get_backup_backend(user_id: str, root: Path) -> ManagedCorpusBackend:
         return backend
 
 
+def _drop_backup_backend(user_id: str, backend: ManagedCorpusBackend) -> None:
+    with _backup_backends_lock:
+        if _backup_backends.get(user_id) is backend:
+            _backup_backends.pop(user_id, None)
+    try:
+        backend.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @app.post("/api/storage-backup")
 def api_storage_backup(request: Request):
     if not check_auth(request):
@@ -1142,9 +1155,24 @@ def api_storage_backup(request: Request):
         raise HTTPException(400, "invalid tenant")
     _require_tenant_assertion(request)
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    # Opening a ManagedCorpusBackend creates the folder and database, so a backup
+    # racing an account deletion must not open one for a deleted tenant (#805).
+    with _tenant_lock:
+        if _tenant_recently_deleted_locked(user_id):
+            raise HTTPException(status_code=410, detail="tenant deleted")
     if not (root / 'managed-diary.db').exists():
         return {"mode": "legacy"}
     managed = _get_backup_backend(user_id, root)
+    with _tenant_lock:
+        deleted = _tenant_recently_deleted_locked(user_id)
+    if deleted:
+        # Lost the race: the deletion ran between the checks above and may have
+        # removed the root before the backend was opened (which recreated it).
+        # delete_tenant tombstones before it drops cached backup backends, so a
+        # deletion after this check still closes and removes this one.
+        _drop_backup_backend(user_id, managed)
+        shutil.rmtree(root, ignore_errors=True)
+        raise HTTPException(status_code=410, detail="tenant deleted")
     storage = _request_storage(request)
     if not managed.destination(storage) or not managed.active():
         return managed.status(storage)
@@ -1390,15 +1418,23 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
     if body.get("stream") is True and body.get("diary_events") is True:
         # noevia activity protocol; preserve the existing OpenAI JSON surface.
         entry_time, entry_day = entry_target(body)
+        # Resolve the tenant BEFORE the 200 starts (#802): 428 (send the storage
+        # secret), 410, 403, 400 and 503 must reach web as real statuses — web
+        # retries with the secret only on an actual 428. Off the event loop:
+        # building a state does SQLite/backend setup. Recovery (journal replay,
+        # remote writes, reindex) can take minutes, so it stays inside the
+        # stream, where keep-alives cover it, exactly as before.
+        st = await run_in_threadpool(_tenant_state, request, recover=False)
         def work(emit):
-            st = _tenant_state(request)
+            _recover_state(st)
             sess = _session(session_id, tenant_id)
             if prior and not sess["turns"]:
                 sess["turns"].extend(prior)
             return _run_exchange(st, last, session_id, tenant_id, entry_time, entry_day,
                                  True, optional_reference(body), emit)
         return exchange_stream(work)
-    st = _tenant_state(request)
+    # Tenant recovery does remote writes and embeddings: never on the event loop (#805).
+    st = await run_in_threadpool(_tenant_state, request)
     sess = _session(session_id, tenant_id)
     if prior and not sess["turns"]:
         sess["turns"].extend(prior)  # seed short client-thread context

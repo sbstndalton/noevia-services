@@ -72,8 +72,9 @@ def test_v1_stream_keeps_tenant_and_one_exchange(monkeypatch):
     st=SimpleNamespace()
     calls=[]
     monkeypatch.setattr(appmod,'check_auth',lambda r:True)
-    def state(request):
+    def state(request, recover=True):
         assert request.headers['X-Cowork-User-ID']==tenant
+        assert recover is False  # resolved before the stream; recovery runs inside it
         return st
     monkeypatch.setattr(appmod,'_tenant_state',state)
     def exchange(actual,message,sid,owner,now,day,background,extra,emit):
