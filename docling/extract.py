@@ -36,6 +36,15 @@ Converted = namedtuple("Converted", "document page_count")
 PAGE_TEXT_CAP = 200_000
 TOTAL_TEXT_CAP = 2_000_000
 PAGE_CAP = 300
+# Docling's own admission limits (#854), passed to convert(). The server already
+# refuses bodies over 25 MB, so FILE_SIZE_CAP is defence in depth. The page
+# limit applies to non-PDF inputs only: Docling counts sheets, slides and
+# frames as pages there and, unlike `page_range` (which only trims what is
+# converted), a document over `max_num_pages` is REJECTED before any work is
+# done. PDFs keep today's behaviour of converting the first PAGE_CAP pages of
+# any length of book. The wall-clock limit lives in server.py/isolation.py.
+FILE_SIZE_CAP = 25 * 1024 * 1024
+NON_PDF_MAX_PAGES = 1000
 
 
 def _env_int(name, default):
@@ -109,7 +118,10 @@ def _convert(path):
     global _converter
     if _converter is None:
         _converter = _build_converter()
-    result = _converter.convert(path, page_range=(1, PAGE_CAP))
+    limits = {"max_file_size": FILE_SIZE_CAP}
+    if not str(path).lower().endswith(".pdf"):
+        limits["max_num_pages"] = NON_PDF_MAX_PAGES
+    result = _converter.convert(path, page_range=(1, PAGE_CAP), **limits)
     source_pages = getattr(getattr(result, "input", None), "page_count", None)
     if not isinstance(source_pages, bool) and isinstance(source_pages, int) and source_pages > 0:
         return Converted(result.document, source_pages)

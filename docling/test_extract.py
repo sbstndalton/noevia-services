@@ -188,7 +188,7 @@ def test_conversion_is_bounded_to_page_cap_and_the_document_is_not_touched():
     not silently dropped in a refactor, and uses StrictDoc so a future
     setattr() on the document fails here rather than in production.
     """
-    seen = {}
+    seen = []
     document = StrictDoc({1: None})
 
     class FakeResult:
@@ -197,18 +197,45 @@ def test_conversion_is_bounded_to_page_cap_and_the_document_is_not_touched():
             self.input = type("In", (), {"page_count": 334})()
 
     class FakeConverter:
-        def convert(self, path, page_range=None):
-            seen["page_range"] = page_range
+        def convert(self, path, **kwargs):
+            seen.append(kwargs)
             return FakeResult()
 
     extractor._converter = FakeConverter()
     try:
-        converted = extractor._convert("/unused")
+        converted = extractor._convert("/unused.pdf")
+        extractor._convert("/unused.xlsx")
     finally:
         extractor._converter = None
-    assert seen["page_range"] == (1, extractor.PAGE_CAP)
+    pdf, other = seen
+    assert pdf["page_range"] == other["page_range"] == (1, extractor.PAGE_CAP)
     assert converted.document is document
     assert converted.page_count == 334
+
+
+def test_non_pdf_inputs_get_docling_admission_limits_and_pdfs_keep_theirs():
+    """#854: sheets/slides/frames are pages to Docling, and a document over
+    max_num_pages is rejected before any work. PDFs must NOT get that limit:
+    they are converted up to PAGE_CAP however long the book is."""
+    seen = {}
+
+    class FakeConverter:
+        def convert(self, path, **kwargs):
+            seen[path] = kwargs
+            return type("R", (), {"document": StrictDoc({}), "input": None})()
+
+    extractor._converter = FakeConverter()
+    try:
+        for name in ["a.pdf", "A.PDF", "a.xlsx", "a.html", "a.png", "a.tiff"]:
+            extractor._convert("/x/" + name)
+    finally:
+        extractor._converter = None
+    for name in ["a.pdf", "A.PDF"]:
+        assert "max_num_pages" not in seen["/x/" + name]
+    for name in ["a.xlsx", "a.html", "a.png", "a.tiff"]:
+        assert seen["/x/" + name]["max_num_pages"] == extractor.NON_PDF_MAX_PAGES
+    assert all(call["max_file_size"] == extractor.FILE_SIZE_CAP for call in seen.values())
+    assert extractor.NON_PDF_MAX_PAGES > extractor.PAGE_CAP  # never rejects what page_range would have trimmed to 300
 
 
 # ── #700: a page with real text is never silently reported blank ──────────

@@ -47,9 +47,11 @@ RUN HF_HUB_OFFLINE=0 docling-tools models download -o /opt/docling-models \
     && chmod -R a+rX /opt/docling-models
 
 WORKDIR /app
+# isolation.py + isolated_worker.py run each conversion in a child process the server can kill
+# on a deadline or client disconnect (#854); the server cannot start without them.
 # synthetic_pdfs.py builds the #700 fixtures so selftest.py can be pointed at a
 # known text-over-picture page on the host without any real document.
-COPY server.py extract.py selftest.py synthetic_pdfs.py ./
+COPY server.py extract.py isolation.py isolated_worker.py selftest.py synthetic_pdfs.py ./
 USER 65534:65534
 EXPOSE 8031
 HEALTHCHECK --interval=30s --timeout=6s --start-period=120s --retries=3 \

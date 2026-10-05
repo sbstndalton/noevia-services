@@ -172,8 +172,28 @@ no outbound access.
                 "method": "docling", "truncated": false}],
      "total": 12, "truncatedPages": false}
 
+### Per-document limits (#854)
+
+Every input type has a wall-clock limit, enforced by **killing the conversion**, not by asking
+Docling nicely: each conversion runs in a long-lived child process (`isolation.py`,
+`isolated_worker.py`) that holds the converter and its models, so they load once. The server kills
+the child's whole process group (taking any `tesseract` it started with it) when
+
+- the deadline passes: **3600 s** for `.pdf`/`.tif`/`.tiff` (`DOCLING_DOCUMENT_TIMEOUT_SECONDS`,
+  kept under the web client's 65 min abort so it receives an answer), **600 s** for everything
+  else (`DOCLING_OTHER_TIMEOUT_SECONDS`) -> `422`;
+- the requester disconnects -> nothing is sent, the slot is freed at once;
+- the child dies on its own (an OOM kill) -> `422`; the next document starts a fresh child, which
+  pays one model load.
+
+Docling's own `document_timeout` is deliberately not used: only its PDF pipelines honour it, and
+when it fires it returns a partial result, which would show the missing pages as `blank` on a
+document reported ready. Non-PDF inputs also get `max_num_pages=1000` (sheets, slides, frames; a
+document over it is rejected before any work) and every input `max_file_size=25 MB`. A PDF is still
+converted up to `PAGE_CAP` pages of any length.
+
 `status` ∈ `native | blank | truncated | degraded`. A `degraded` page also
 carries `"reason": "native-fallback"` and `"method": "pdfium"` (see below). 415 = format this worker cannot read,
-422 = document could not be read, 503 = busy. The client
+422 = document could not be read or exceeded its time limit, 503 = busy. The client
 (`apps/web/server/docling.cjs`) treats 415/422 as permanent — cache the
 failure, keep the original — and everything else as retryable.
