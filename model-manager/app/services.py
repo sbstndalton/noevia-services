@@ -395,7 +395,7 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
     freed = 0
     removed: list[str] = []
 
-    # Whole-directory delete when this model is the only model in its subdir.
+    # Whole-directory delete when this model is the only model in its folder tree.
     #
     # Downloads land one model per directory, and everything beside the weights there is
     # support material for THAT model: projectors (often more than one), chat_template.jinja,
@@ -404,95 +404,197 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
     # below silently does nothing and the orphans persist invisibly. Measured on a real
     # deletion: 3.3 GB of projectors left behind.
     #
-    # Guarded on there being no OTHER main GGUF present, so a directory someone has put two
-    # models into degrades to per-file deletion rather than taking the neighbour with it.
-    hf = re.match(r"^(models--[^/]+)/snapshots/[^/]+$", match.subdir or "")
+    # #798: guarded on a RECURSIVE search finding no other model anywhere below the folder (the
+    # scan reads four levels, so `A/x.gguf` beside `A/old/y.gguf` are two models), and on the
+    # folder not being the models root, a configured download location or a mount point. In any
+    # of those cases it degrades to per-file deletion rather than taking a neighbour with it.
+    hf = _HF_CACHE_RE.match(match.subdir or "")
     if hf:
         return _delete_hf_snapshot(match, hf.group(1))
+    own = {p for p in list(match.parts) + list(match.companion_parts)}
     if match.subdir:
         subpath = settings.models_dir / match.subdir
-        own = {p.resolve() for p in list(match.parts) + list(match.companion_parts)}
-        try:
-            others = [
-                q for q in subpath.iterdir()
-                if q.is_file() and q.suffix.lower() == ".gguf"
-                and not ini._is_companion(q.name) and q.resolve() not in own
-            ]
-        except OSError:
-            others = []
-        if not others and subpath.is_dir():
+        if subpath.is_dir() and not _protected_dir(subpath) and not _other_models_below(subpath, own):
             try:
                 for q in sorted(subpath.rglob("*")):
-                    if q.is_file():
+                    if q.is_file() and not q.is_symlink():
                         freed += q.stat().st_size
+                    if q.is_file() or q.is_symlink():
                         removed.append(q.name)
                 shutil.rmtree(subpath)
                 return True, f"deleted {len(removed)} file(s), removed {match.subdir}/", freed
             except OSError as e:
                 return False, f"failed to remove {match.subdir}/: {e}", freed
 
-    # Fallback: shared directory, or a flat file with no directory of its own.
-    paths_to_remove: list[Path] = list(match.parts) + list(match.companion_parts)
+    # Per-file: a shared or protected directory, or a flat file with no directory of its own.
+    # The model's own shards always go. Its companions (projectors, draft heads) only go when it
+    # is the sole model in its folder: Q4 and Q8 of one model routinely share one mmproj, and
+    # deleting Q4 must not strand Q8 without its projector.
+    paths_to_remove: list[Path] = list(match.parts)
+    if match.companion_parts and not _other_models_beside(match):
+        paths_to_remove += list(match.companion_parts)
     for p in paths_to_remove:
         try:
-            size = p.stat().st_size
+            size = p.stat().st_size if not p.is_symlink() else 0
             p.unlink()
             freed += size
             removed.append(p.name)
         except OSError as e:
             return False, f"failed to delete {p.name}: {e}. removed so far: {removed}", freed
-    # if this entry lived in a subdir, remove the dir when empty
+    # if this entry lived in a subdir, remove the dir when empty (never a protected one)
     if match.subdir:
         subpath = settings.models_dir / match.subdir
         try:
-            if subpath.is_dir() and not any(subpath.iterdir()):
+            if subpath.is_dir() and not _protected_dir(subpath) and not any(subpath.iterdir()):
                 subpath.rmdir()
         except OSError:
             pass
     return True, f"deleted {len(removed)} file(s)", freed
 
 
+# models--owner--repo/snapshots/<revision>[/<nested folder>...], optionally inside a download
+# location (e.g. a Hugging Face cache mounted at /models/hf). Group 1 is the repository folder.
+_HF_CACHE_RE = re.compile(r"^((?:[^/]+/)*?models--[^/]+)/snapshots/[^/]+(?:/.+)?$")
+
+
+def _download_target_dirs() -> set[Path]:
+    """Folders the user configured as download locations (MODEL_DOWNLOAD_TARGETS)."""
+    root = settings.models_dir
+    out: set[Path] = set()
+    for name in (settings.model_download_targets or "").split(","):
+        name = name.strip().strip("/")
+        if name:
+            out.add(Path(os.path.abspath(root / name)))
+    return out
+
+
+def _protected_dir(path: Path) -> bool:
+    """True for a folder model deletion must never remove: the models root, a configured download
+    location, a mount point, a symlinked folder, or anything outside the models folder."""
+    root = Path(os.path.abspath(settings.models_dir))
+    here = Path(os.path.abspath(path))
+    if here == root or root not in here.parents:
+        return True
+    if here in _download_target_dirs():
+        return True
+    try:
+        return path.is_symlink() or os.path.ismount(path)
+    except OSError:
+        return True
+
+
+def _is_gguf_name(name: str) -> bool:
+    return name.lower().endswith(".gguf")
+
+
+def _other_models_below(folder: Path, own: set[Path]) -> bool:
+    """True if any GGUF under `folder` (any depth) is not this model's own file.
+
+    In the folder itself only main models count -- a companion there is folded into this model
+    (or is an un-paired leftover the whole-folder delete may take). Below it, ANY GGUF counts:
+    a nested folder is a different listing row, even when all it holds is a projector.
+    """
+    def _raise(err: OSError) -> None:
+        raise err
+    try:
+        for dirpath, _dirnames, filenames in os.walk(folder, followlinks=False, onerror=_raise):
+            here = Path(dirpath)
+            nested = here != folder
+            if nested and os.path.ismount(dirpath):
+                return True   # a filesystem mounted inside: rmtree would empty it
+            for name in filenames:
+                if not _is_gguf_name(name):
+                    continue
+                q = here / name
+                if q in own:
+                    continue
+                if nested or not ini._is_companion(name):
+                    return True
+    except OSError:
+        return True   # cannot tell: fail closed to per-file deletion
+    return False
+
+
+def _other_models_beside(match: "GgufEntry") -> bool:
+    """True if another main model shares this model's folder (directly, not below it)."""
+    folder = match.parts[0].parent if match.parts else settings.models_dir / match.subdir
+    own = set(match.parts)
+    try:
+        return any(q.is_file() and _is_gguf_name(q.name) and q not in own and not ini._is_companion(q.name)
+                   for q in folder.iterdir())
+    except OSError:
+        return True
+
+
 def _delete_hf_snapshot(match: "GgufEntry", repo_dir: str) -> tuple[bool, str, int]:
     """Delete a model stored in Hugging Face's cache layout.
 
     Snapshot files are links into blobs/, so removing the link alone frees nothing. Remove
-    this model's files and the blobs they point to (unless another snapshot still uses a
-    blob), and the whole repository folder once no snapshot is left.
+    this model's files and the blobs they point to (unless another link anywhere in the repo's
+    snapshots still uses a blob), and the whole repository folder once no snapshot is left.
+    The model may sit directly in snapshots/<rev>/ or in a nested quant folder below it (#801).
     """
     root = settings.models_dir
-    snapshot = root / match.subdir
+    folder = root / match.subdir
     repo = root / repo_dir
-    own = list(match.parts) + list(match.companion_parts)
-    try:
-        others = [q for q in snapshot.iterdir() if q.suffix.lower() == ".gguf" and not ini._is_companion(q.name) and q not in own]
-    except OSError:
-        others = []
-    victims = own if others else [q for q in snapshot.iterdir() if q.is_file() or q.is_symlink()]
+    snaps = repo / "snapshots"
+    own = set(match.parts) | set(match.companion_parts)
+    if _other_models_below(folder, own):
+        # Other models share this folder or sit below it: this model's files only. Companions
+        # only when no other main model sits beside it (a shared projector stays).
+        victims = list(match.parts)
+        if not _other_models_beside(match):
+            victims += list(match.companion_parts)
+    else:
+        victims = sorted(q for q in folder.rglob("*") if q.is_file() or q.is_symlink())
+    victim_set = set(victims)
+    # Blobs still referenced by any link that is not being deleted: another snapshot, a sibling
+    # quant folder in the same snapshot, or a neighbour file in this one.
     in_use: set[Path] = set()
-    for snap_dir in (repo / "snapshots").iterdir() if (repo / "snapshots").is_dir() else []:
-        if snap_dir == snapshot:
-            continue
-        for q in snap_dir.rglob("*"):
-            if q.is_symlink():
-                in_use.add(q.resolve())
+    if snaps.is_dir():
+        for q in snaps.rglob("*"):
+            if q.is_symlink() and q not in victim_set:
+                try:
+                    in_use.add(q.resolve())
+                except (OSError, RuntimeError):   # RuntimeError: a symlink loop before 3.13
+                    pass
     freed, removed = 0, []
     try:
+        repo_real = repo.resolve()
         for q in victims:
-            target = q.resolve()
-            if target.is_file() and target not in in_use and target != q:
-                freed += target.stat().st_size
-                target.unlink()
-            elif q.is_file() and not q.is_symlink():
+            try:
+                target = q.resolve()
+            except RuntimeError:   # a symlink loop before 3.13: nothing behind it to free
+                target = None
+            if q.is_symlink():
+                if target is not None and target.is_file() and target not in in_use and repo_real in target.parents:
+                    freed += target.stat().st_size
+                    target.unlink()
+            elif q.is_file():
                 freed += q.stat().st_size
             q.unlink()
             removed.append(q.name)
-        if snapshot.is_dir() and not any(snapshot.iterdir()):
-            snapshot.rmdir()
-        snaps = repo / "snapshots"
-        if not snaps.is_dir() or not any(snaps.iterdir()):
+        # Tidy empty folders inside the model's folder, then from it up to (not including)
+        # snapshots/.
+        if folder.is_dir():
+            for d in sorted((d for d in folder.rglob("*") if d.is_dir() and not d.is_symlink()),
+                            key=lambda d: len(d.parts), reverse=True):
+                if not any(d.iterdir()) and not _protected_dir(d):
+                    d.rmdir()
+        here = folder
+        while here != snaps and snaps in here.parents and not _protected_dir(here):
+            if here.is_dir() and not any(here.iterdir()):
+                here.rmdir()
+                here = here.parent
+            else:
+                break
+        if (not snaps.is_dir() or not any(snaps.iterdir())) and not _protected_dir(repo):
+            for q in repo.rglob("*"):
+                if q.is_file() and not q.is_symlink():
+                    freed += q.stat().st_size
             shutil.rmtree(repo)
             return True, f"deleted {len(removed)} file(s), removed {repo_dir}/", freed
-    except OSError as e:
+    except (OSError, RuntimeError) as e:
         return False, f"failed while deleting {match.display_name}: {e}", freed
     return True, f"deleted {len(removed)} file(s)", freed
 

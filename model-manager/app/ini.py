@@ -367,6 +367,7 @@ def parse_ini_text(text: str, source: str = "<models.ini>", *, allow_duplicates:
     cp = _new_parser()
     cp._noevia_preamble, body = split_preamble(text)
     cp.read_string(body, source=source)
+    cp._noevia_source = text  # what writes edit in place (#800)
     return cp
 
 
@@ -377,6 +378,7 @@ def read_ini(*, for_write: bool = False) -> configparser.ConfigParser:
                               allow_duplicates=not for_write)
     cp = _new_parser()
     cp._noevia_preamble = ""
+    cp._noevia_source = ""
     return cp
 
 
@@ -789,6 +791,12 @@ def _rename_section(old: str, new: str) -> bool:
     cp = read_ini(for_write=True)
     if not cp.has_section(old) or cp.has_section(new):
         return False
+    # #800: only the header line changes; comments and layout inside the section stay.
+    renamed = _rename_header(getattr(cp, "_noevia_source", None), cp, old, new)
+    if renamed is not None:
+        with WRITE_LOCK:
+            _replace_file(settings.models_ini_path, renamed)
+        return True
     items = list(cp.items(old))
     cp.remove_section(old)
     cp.add_section(new)
@@ -861,14 +869,194 @@ def _replace_file(path, text: str, *, base_revision: str | None = None) -> None:
             pass
 
 
-def _atomic_write(cp: configparser.ConfigParser) -> None:
+def _render_full(cp: configparser.ConfigParser) -> str:
+    """The whole file re-serialised by configparser (comments are lost). Only a fallback now."""
     buf = io.StringIO()
     cp.write(buf, space_around_delimiters=True)
     preamble = getattr(cp, "_noevia_preamble", "")
     if preamble and not preamble.endswith("\n"):
         preamble += "\n"
+    return preamble + buf.getvalue()
+
+
+def _own_sections(cp: configparser.ConfigParser) -> dict[str, dict[str, str]]:
+    """Each section's own keys (never [DEFAULT]'s), as configparser resolved them."""
+    return {name: dict(cp._sections[name]) for name in cp.sections()}
+
+
+_OPTION_RE = re.compile(r"(?P<option>.*?)\s*[=:]\s*(?P<value>.*)$")
+
+
+def _raw_layout(text: str) -> list[dict]:
+    """Line spans of every section in `text`: header index, end (next header or EOF) and, per key
+    line, [key, first line, end line (exclusive, continuation lines included), indent]. Mirrors
+    configparser closely enough for single-line values; the caller verifies the result anyway."""
+    lines = text.splitlines(keepends=True)
+    first = next((i for i, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+    sections: list[dict] = []
+    cur: dict | None = None
+    key: list | None = None
+    for i in range(first, len(lines)):
+        line = lines[i]
+        bare = line.rstrip("\r\n")
+        stripped = bare.strip()
+        indent = len(bare) - len(bare.lstrip())
+        if key is not None and stripped and stripped[0] not in "#;" and indent > key[3]:
+            key[2] = i + 1   # continuation of a multi-line value
+            continue
+        m = _SECTION_HEADER_RE.match(bare)
+        if m:
+            if cur is not None:
+                cur["end"] = i
+            cur = {"name": m.group(1), "header": i, "end": len(lines), "keys": [], "match": m}
+            sections.append(cur)
+            key = None
+            continue
+        if cur is None or not stripped or stripped[0] in "#;":
+            key = None
+            continue
+        mo = _OPTION_RE.match(stripped)
+        if not mo:
+            key = None
+            continue
+        key = [mo.group("option").rstrip(), i, i + 1, indent]
+        cur["keys"].append(key)
+    return sections
+
+
+def _format_option(key: str, value: str, newline: str) -> str:
+    return f"{key} = {value}".replace("\n", newline + "\t") + newline
+
+
+def _line_ending(line: str, default: str) -> str:
+    if line.endswith("\r\n"):
+        return "\r\n"
+    return "\n" if line.endswith("\n") else default
+
+
+def _render_preserving(source: str, cp: configparser.ConfigParser) -> str | None:
+    """`source` with only the differences between it and `cp` applied (#800).
+
+    Unchanged sections, comments, blank lines, the preamble and earlier duplicate keys stay
+    byte-for-byte. In a changed section a changed key is rewritten on its own (last) line, a
+    removed key loses every line it had, and new keys follow the section's last key. A removed
+    section loses its header and keys; a new one is appended. Returns None when the edit cannot be
+    made safely (the caller falls back to a full rewrite).
+    """
+    try:
+        old = _own_sections(parse_ini_text(source, allow_duplicates=False)) if source.strip() else {}
+    except (configparser.Error, ValueError):
+        return None
+    new = _own_sections(cp)
+    nl = "\r\n" if "\r\n" in source else "\n"
+    lines = source.splitlines(keepends=True)
+    layout = _raw_layout(source)
+    if sorted(sec["name"] for sec in layout if sec["name"] in old) != sorted(old):
+        return None
+    replace: dict[int, str] = {}         # line index -> new text ("" deletes the line)
+    after: dict[int, list[str]] = {}     # line index -> lines inserted after it
+    for sec in layout:
+        name = sec["name"]
+        if name not in old:
+            continue                     # e.g. [DEFAULT]: not ours to touch
+        if name not in new:
+            stop = max((k[2] for k in sec["keys"]), default=sec["header"] + 1)
+            for i in range(sec["header"], stop):
+                replace[i] = ""
+            # Don't leave a double gap behind: drop blank lines that followed the section when a
+            # blank line (or the start of the sections) already precedes it, or when it was last.
+            j = stop
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            prev_blank = sec["header"] == 0 or not lines[sec["header"] - 1].strip()
+            if j == len(lines):
+                for i in range(stop, j):
+                    replace[i] = ""
+                k = sec["header"] - 1
+                while k >= 0 and not lines[k].strip() and replace.get(k) != "":
+                    replace[k] = ""
+                    k -= 1
+            elif prev_blank:
+                for i in range(stop, j):
+                    replace[i] = ""
+            continue
+        o, n = old[name], new[name]
+        if o == n:
+            continue
+        spans: dict[str, list[list]] = {}
+        for k in sec["keys"]:
+            spans.setdefault(k[0], []).append(k)
+        for key, kspans in spans.items():
+            if key not in n:
+                for span in kspans:
+                    for i in range(span[1], span[2]):
+                        replace[i] = ""
+            elif o.get(key) != n[key]:
+                last = kspans[-1]
+                for i in range(last[1], last[2]):
+                    replace[i] = ""
+                replace[last[1]] = _format_option(key, n[key], _line_ending(lines[last[2] - 1], nl))
+        added = [k for k in n if k not in spans]
+        if added:
+            anchor = max((k[2] for k in sec["keys"]), default=sec["header"] + 1) - 1
+            ending = _line_ending(lines[anchor], nl)
+            if anchor not in replace and not lines[anchor].endswith("\n"):
+                replace[anchor] = lines[anchor] + nl   # the file's last line had no newline
+            after[anchor] = [_format_option(k, n[k], ending) for k in added]
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        out.append(replace.get(i, line))
+        out.extend(after.get(i, []))
+    text = "".join(out)
+    appended = [name for name in new if name not in old]
+    if appended:
+        if text and not text.endswith("\n"):
+            text += nl
+        for name in appended:
+            if text.strip() and not text.endswith(nl + nl) and text != nl:
+                text += nl
+            text += f"[{name}]{nl}" + "".join(_format_option(k, v, nl) for k, v in new[name].items())
+    try:
+        check = parse_ini_text(text)
+    except (configparser.Error, ValueError):
+        return None
+    if _own_sections(check) != new or check._noevia_preamble != getattr(cp, "_noevia_preamble", ""):
+        return None
+    return text
+
+
+def _rename_header(source: str | None, cp: configparser.ConfigParser, old: str, new: str) -> str | None:
+    """`source` with only the `[old]` header renamed to `[new]` (#800); None if that is unsafe."""
+    if not source:
+        return None
+    lines = source.splitlines(keepends=True)
+    hits = [sec for sec in _raw_layout(source) if sec["name"] == old]
+    if len(hits) != 1:
+        return None
+    sec = hits[0]
+    m = sec["match"]
+    line = lines[sec["header"]]
+    lines[sec["header"]] = line[:m.start(1)] + new + line[m.end(1):]
+    text = "".join(lines)
+    expected = _own_sections(cp)
+    expected[new] = expected.pop(old)
+    try:
+        check = parse_ini_text(text)
+    except (configparser.Error, ValueError):
+        return None
+    return text if _own_sections(check) == expected else None
+
+
+def _atomic_write(cp: configparser.ConfigParser) -> None:
+    """Write `cp` back to models.ini. A parser read from the file is written as an in-place edit
+    of the text it was read from, so comments and layout outside what changed survive (#800);
+    anything else, or an edit that would not reproduce `cp` exactly, is fully re-serialised."""
+    source = getattr(cp, "_noevia_source", None)
+    text = _render_preserving(source, cp) if source is not None else None
+    if text is None:
+        text = _render_full(cp)
     with WRITE_LOCK:
-        _replace_file(settings.models_ini_path, preamble + buf.getvalue())
+        _replace_file(settings.models_ini_path, text)
 
 
 def write_raw_text(text: str, base_revision: str | None = None) -> None:
