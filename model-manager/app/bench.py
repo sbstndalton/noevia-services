@@ -475,21 +475,6 @@ def _run(run_id: int, backend: str, base_url: str, aliases: list[str],
     _CANCEL.clear()
 
 
-def estimate_seconds(n_aliases: int, n_prompts: int, reps: int, max_tokens: int) -> int:
-    """Rough duration for the confirmation dialog.
-
-    Deliberately pessimistic. A number that undersells the disruption is worse than one that
-    oversells it: the whole point of showing it is so nobody starts an hour-long run thinking
-    it will take five minutes.
-    """
-    load_s = 25.0                        # cold load of a mid-size model, per variant
-    # Assume a request uses roughly 60% of its cap rather than all of it: models stop when they
-    # are done, and measured completions ran 550-2400 tokens against a 4096 cap. Costing every
-    # request at the full cap made the estimate grow with a number that is rarely reached.
-    per_req_s = 4.0 + (max_tokens * 0.6) / 35.0
-    return int(n_aliases * (load_s + n_prompts * reps * per_req_s))
-
-
 # ---------------------------------------------------------------- throughput sweeps
 #
 # Prompt-processing and generation throughput are llama.cpp's own `llama bench` territory, and

@@ -446,7 +446,7 @@ def _fake_repo_detail(monkeypatch, files):
 
 
 def test_search_repo_excludes_imatrix_from_groups_and_never_probes_it(client, monkeypatch):
-    from app import hf, main
+    from app import helpers, hf
     queued = _fake_repo_detail(monkeypatch, [
         ("Qwen_Qwen3.5-4B-Q4_K_M.gguf", int(2.6e9), "Q4_K_M"),
         ("Qwen_Qwen3.5-4B-imatrix.gguf", 3_500_000, None),
@@ -458,7 +458,7 @@ def test_search_repo_excludes_imatrix_from_groups_and_never_probes_it(client, mo
         probed.append(path)
         return {"model": {"context_length": 32768}}
     monkeypatch.setattr(hf, "gguf_header", fake_header)
-    monkeypatch.setattr(main, "_preset_estimates", lambda summary, size, mmproj_gb=0.0: [{"key": "fast", "label": "Fast", "ctx": 8192}])
+    monkeypatch.setattr(helpers, "_preset_estimates", lambda summary, size, mmproj_gb=0.0: [{"key": "fast", "label": "Fast", "ctx": 8192}])
 
     r = client.get("/api/v1/search/repo", params={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF"})
     assert r.status_code == 200
@@ -486,37 +486,6 @@ def test_search_repo_keeps_an_unrecognised_quant_but_drops_imatrix_and_tiny_stra
     assert r.status_code == 200
     paths = {g["files"][0]["path"] for g in r.json()["groups"]}
     assert paths == {"model.gguf"}
-
-
-def test_legacy_html_repo_view_also_excludes_imatrix_and_tiny_strays(client, monkeypatch):
-    """The older server-rendered route (`_repo_files.html` via app.main.search_repo) duplicates
-    the React repo-detail view's grouping and must not regress independently — see #342."""
-    from app import hf
-    detail = hf.HfRepoDetail(id="bartowski/Qwen_Qwen3.5-4B-GGUF", files=[
-        hf.HfFile(path="model.gguf", size=int(2.0e9), quant=None,
-                  shard_base="model.gguf", shard_index=None, shard_total=None),
-        hf.HfFile(path="model-imatrix.gguf", size=3_500_000, quant=None,
-                  shard_base="model-imatrix.gguf", shard_index=None, shard_total=None),
-        hf.HfFile(path="extras/stray.gguf", size=5_000_000, quant=None,
-                  shard_base="extras/stray.gguf", shard_index=None, shard_total=None),
-        hf.HfFile(path="mmproj-F16.gguf", size=1_000_000, quant="F16",
-                  shard_base="mmproj-F16.gguf", shard_index=None, shard_total=None),
-    ], readme_snippet=None)
-
-    async def repo_detail(repo):
-        return detail
-    monkeypatch.setattr(hf, "repo_detail", repo_detail)
-
-    async def no_header(*a, **kw):
-        return None
-    monkeypatch.setattr(hf, "gguf_header", no_header)
-
-    r = client.get("/search/repo/bartowski/Qwen_Qwen3.5-4B-GGUF")
-    assert r.status_code == 200, r.text
-    body = r.text
-    assert "model.gguf" in body and "mmproj-F16.gguf" in body
-    assert "model-imatrix.gguf" not in body
-    assert "extras/stray.gguf" not in body
 
 
 def test_downloads_reject_an_imatrix_path_with_a_clear_400(client, monkeypatch):

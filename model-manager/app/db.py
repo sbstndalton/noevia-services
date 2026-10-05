@@ -255,22 +255,6 @@ def record_download(*, repo_id: str, filename: str, dest_path: str, total_bytes:
         )
 
 
-def recent_downloads(limit: int = 50) -> list[sqlite3.Row]:
-    with _LOCK, _conn() as c:
-        return list(c.execute(
-            "SELECT * FROM download_history ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall())
-
-
-def owner_by_filename() -> dict[str, str]:
-    """filename -> owner, from successful downloads."""
-    with _LOCK, _conn() as c:
-        rows = c.execute(
-            "SELECT filename, repo_id FROM download_history WHERE status = 'done'"
-        ).fetchall()
-    return {r["filename"]: (r["repo_id"].split("/", 1)[0] if "/" in r["repo_id"] else r["repo_id"]) for r in rows}
-
-
 def downloaded_files_by_repo() -> dict[str, list[str]]:
     """{repo_id: [filename, ...]} of successfully-downloaded files, one entry per repo."""
     with _LOCK, _conn() as c:
@@ -340,12 +324,6 @@ def delete_prompt(pid: int) -> bool:
     with _LOCK, _conn() as c:
         cur = c.execute("DELETE FROM prompts WHERE id = ?", (pid,))
         return cur.rowcount > 0
-
-
-def get_prompt(pid: int) -> dict | None:
-    with _LOCK, _conn() as c:
-        r = c.execute("SELECT id, name, body FROM prompts WHERE id = ?", (pid,)).fetchone()
-        return dict(r) if r else None
 
 
 def download_records() -> list[dict]:
@@ -659,7 +637,6 @@ BADGE_CATEGORIES = (
     ("vision", "Vision"),
 )
 BADGE_KEYS = frozenset(k for k, _ in BADGE_CATEGORIES)
-BADGE_LABELS = dict(BADGE_CATEGORIES)
 
 
 def badge_set(alias: str, category: str, rating: int, note: str = "",

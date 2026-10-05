@@ -1,9 +1,8 @@
 """JSON API for noevia's model management screens.
 
 noevia's web server is the only client: it authenticates administrators and forwards
-requests here over the internal Compose network. This module reuses the same service
-functions as the original server-rendered pages, so both stay consistent while the pages
-are phased out.
+requests here over the internal Compose network. This is the service's only surface: the
+original server-rendered pages were removed (#806).
 
 Every models.ini write is pinned to the file revision the client last read (sha256 of
 the file) and fails with 409 when the file changed since, so an edit made by noevia's
@@ -116,7 +115,7 @@ async def overview() -> dict:
 async def models() -> dict:
     snap = services.snapshot_models_dir()
     loaded = await _loaded_map()
-    from .main import _badges_for_files
+    from .helpers import _badges_for_files
     badges = _badges_for_files(snap)
     return {"models": [_entry(g, loaded, badges) for g in snap.ggufs if not g.is_companion],
             "unregistered": ini.unregistered_gguf_stems(), "revision": revision()}
@@ -181,7 +180,7 @@ def sections() -> dict:
 
 
 def _resolve_section_gguf(name: str) -> tuple[Path | None, str, str | None]:
-    from .main import _resolve_section_gguf as resolve
+    from .helpers import _resolve_section_gguf as resolve
     return resolve(name)
 
 
@@ -192,7 +191,7 @@ def section(name: str, defaults: bool = False) -> dict:
     current = ini.get_section(name)
     hints: list[str] = []
     if defaults or current is None:
-        from .main import _gguf_hints_for
+        from .helpers import _gguf_hints_for
         values, hints = _gguf_hints_for(name)
         extras = ""
     else:
@@ -288,7 +287,7 @@ def _register_safe_defaults(name: str) -> dict:
         raise HTTPException(404, "no downloaded GGUF matches this name")
     if rel in ini._files_claimed_by_sections():
         raise HTTPException(409, "another settings section already uses this file")
-    from .main import _gguf_hints_for
+    from .helpers import _gguf_hints_for
     values, _hints = _gguf_hints_for(name)
     if not values.get("model"):
         values["model"] = f"/models/{rel}"
@@ -407,7 +406,7 @@ def budget_backends(backends: list[dict], budget_gib: float) -> list[dict]:
 def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str = "", vision: bool = True,
                        verified_ctx: int = 0, prompt_budget_s: float = 120.0, mode: str = "",
                        budget_gib: float = 0.0) -> dict:
-    from .main import _backend_list
+    from .helpers import _backend_list
     sessions = max(1, min(int(sessions or 1), 8))
     gguf_path, model_rel, rel = _resolve_section_gguf(name)
     if gguf_path is None or not gguf_path.is_file():
@@ -591,7 +590,7 @@ async def search(q: str = "", sort: str = "fit", limit: int = 30, trustedOnly: b
     """
     import asyncio
     from . import discover, hf
-    from .main import _backend_list, _downloaded_and_still_present
+    from .helpers import _backend_list, _downloaded_and_still_present
     hub_sort = "trendingScore" if sort in ("fit", "trending") else sort
     try:
         found = await hf.search_models(q.strip(), sort=hub_sort, limit=max(1, min(int(limit or 30), 60)))
@@ -668,7 +667,7 @@ async def _repo_files_cached(repo: str) -> list[dict]:
 async def search_repo(repo: str = Query(...)) -> dict:
     import httpx
     from . import discover, hf
-    from .main import _preset_estimates
+    from .helpers import _preset_estimates
     groups: list[dict] = []
     gated = ""
     try:
@@ -782,7 +781,7 @@ async def download_draft_head(name: str, body: dict = Body(...)) -> dict:
 async def start_download(body: dict = Body(...)) -> dict:
     import httpx
     from . import discover, hf
-    from .main import _dest_for_companion, _dest_for_main, _model_stem
+    from .helpers import _dest_for_companion, _dest_for_main, _model_stem
     repo, path, url = str(body.get("repo") or ""), str(body.get("path") or ""), str(body.get("url") or "").strip()
     target = str(body.get("target") or "")
     if target not in {t["id"] for t in download_targets()}:
@@ -878,7 +877,7 @@ def clear_downloads() -> dict:
 @router.post("/models/check-updates")
 async def check_updates() -> dict:
     from . import hf
-    from .main import _update_status_map
+    from .helpers import _update_status_map
     records = db.download_records()
     if records:
         await hf.check_updates_for(records)
@@ -887,7 +886,7 @@ async def check_updates() -> dict:
 
 @router.get("/models/updates")
 def update_status() -> dict:
-    from .main import _update_status_map
+    from .helpers import _update_status_map
     return {"status": _update_status_map(services.snapshot_models_dir())}
 
 
@@ -968,7 +967,7 @@ def benchmark_cancel() -> dict:
 
 @router.get("/benchmark/runs/{run_id}")
 def benchmark_run(run_id: int) -> dict:
-    from .main import _bench_charts
+    from .helpers import _bench_charts
     run = db.bench_run(run_id)
     if run is None:
         raise HTTPException(404, "run not found")

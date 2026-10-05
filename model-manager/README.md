@@ -1,6 +1,14 @@
 # Model Loader
 
-A browser UI for managing llama.cpp GGUF models and containers on a personal homelab box. FastAPI + HTMX + Alpine + Tailwind, no build step, one Docker container.
+> **noevia status (#806).** This directory is Model Loader folded into noevia. Its server-rendered
+> browser pages, the command palette and the OpenWebUI integration have been removed: the service
+> now serves only the JSON API under `/api/v1` (see `docs/spec-model-loader-api-v1.md`), and
+> noevia web's admin screens (Settings, Models & routing) are the interface. The rest of this file
+> is the upstream README, kept for the behaviour it documents (downloads, autoconfig, benchmarks,
+> badges, backend discovery); where it says "page", "panel", "dashboard" or "OpenWebUI", read the
+> matching noevia screen or API route. Pages and OpenWebUI sync described below no longer exist here.
+
+A tool for managing llama.cpp GGUF models and containers on a personal homelab box. FastAPI, one Docker container.
 
 ![The Model Loader overview page: disk and backend summary, live GPU utilisation and VRAM sparklines, per-GPU breakdown, recent downloads, and the models.ini sections](docs/model_loader.png)
 

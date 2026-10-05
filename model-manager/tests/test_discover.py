@@ -118,7 +118,7 @@ def test_search_endpoint_judges_against_this_server(client, monkeypatch):
     monkeypatch.setattr(api.hf, "search_models", search_models)
     monkeypatch.setattr(api, "_repo_files_cached", repo_files)
     monkeypatch.setattr(api.hf, "owner_avatars", avatars)
-    from app import main as mm
+    from app import helpers as mm
     monkeypatch.setattr(mm, "_backend_list", lambda: [{"name": "engine", "vram_gb": 14.0}])
 
     body = client.get("/api/v1/search?q=fits").json()

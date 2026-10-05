@@ -34,10 +34,6 @@ class GpuCard:
     device: str = ""
 
     @property
-    def vram_free_gb(self) -> float:
-        return round(max(0.0, self.vram_total_gb - self.vram_used_gb), 2)
-
-    @property
     def vram_pct(self) -> float:
         return round(100.0 * self.vram_used_gb / self.vram_total_gb, 1) if self.vram_total_gb else 0.0
 

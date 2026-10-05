@@ -1,5 +1,9 @@
 # Troubleshooting
 
+> The browser pages and the OpenWebUI integration this file mentions were removed in #806; noevia web
+> is the interface and the service answers `/api/v1/*` only. Sections about the Containers/Models
+> pages and OpenWebUI describe the upstream tool and no longer apply here.
+
 ## Container OOMs at the autoconfig-recommended ctx
 
 Autoconfig's default overhead is 8% for multi-GPU. If a real load exceeds this (some fine-tunes, some quant methods, unusual chat templates with huge system prompts), drop to the next lower ctx candidate in the [candidate list](AUTOCONFIG.md#candidate-context-sizes). Don't type arbitrary values — stick to the list, they're aligned to llama.cpp's internal buckets.

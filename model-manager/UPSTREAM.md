@@ -7,5 +7,7 @@ https://github.com/scratchhax/model-loader at commit
 The first commit that added this directory contains the upstream files unchanged, apart
 from omitting the documentation screenshots. Every later change is a noevia change and is
 visible in git history. noevia drives it through the JSON API in `app/api.py` and renders
-all screens in its own web app; the original server-rendered pages remain only until the
-native screens replace them.
+all screens in its own web app. The original server-rendered pages (HTMX/Alpine/Tailwind
+templates, the command palette) and the OpenWebUI integration were removed in #806; the
+service now answers `/api/v1/*` only, and the `app/helpers.py` module holds the few helpers
+the API took from the old page module.
