@@ -72,7 +72,6 @@ class S3CorpusBackend:
         self._client = make_client(base_url=self.base, timeout_s=timeout_s)
         self._conditions_checked = False
         self._condition_lock = threading.Lock()
-        self._etag_cache: Dict[str, Optional[str]] = {}
 
     # ---------------- paths ----------------
 
@@ -155,45 +154,58 @@ class S3CorpusBackend:
         query: Optional[dict] = None,
         headers: Optional[dict] = None,
         data: bytes = b"",
+        stream: bool = False,
     ) -> httpx.Response:
+        """Send one (signed) request. With stream=True the body is not read;
+        the caller must close the response."""
         path = self._path(key)
         if not self.secret_key:
             # Unsigned mode: no credentials configured (public/position-authed buckets).
-            resp = self._client.request(method, path, params=query, content=data, headers=dict(headers or {}))
+            send_headers = dict(headers or {})
         else:
-            signed = self._signed_headers(method, path, query, data, headers)
-            resp = self._client.request(method, path, params=query, content=data, headers=signed)
+            send_headers = self._signed_headers(method, path, query, data, headers)
+        if stream:
+            resp = self._client.send(
+                self._client.build_request(method, path, params=query, content=data, headers=send_headers),
+                stream=True,
+            )
+        else:
+            resp = self._client.request(method, path, params=query, content=data, headers=send_headers)
         # User-configured endpoint: refuse bounced requests (see util.ensure_not_redirect).
-        ensure_not_redirect(resp)
+        try:
+            ensure_not_redirect(resp)
+        except Exception:
+            resp.close()
+            raise
         return resp
 
     # ---------------- primitives ----------------
 
+    # Default cap for reads that don't specify their own budget (get/get_text,
+    # and put's pre-read). Matches WebDAVCorpusBackend.DEFAULT_READ_LIMIT: a
+    # user-configured endpoint must not be able to stream an unbounded object
+    # into the shared Diary process's memory (#860).
+    DEFAULT_READ_LIMIT = 64 * 1024 * 1024
+
     def get(self, remote_path: str) -> Tuple[Optional[bytes], Optional[str]]:
         """Fetch object bytes + ETag. Returns (None, None) if the object is absent."""
-        resp = self._request("GET", self._key(remote_path))
-        if resp.status_code == 404:
-            self._etag_cache[remote_path] = None
-            return None, None
-        resp.raise_for_status()
-        etag = clean_etag(resp.headers.get("ETag"))
-        self._etag_cache[remote_path] = etag
-        return resp.content, etag
+        return self.get_bounded(remote_path, self.DEFAULT_READ_LIMIT)
 
-    def get_bounded(self, remote_path: str, limit: int):
-        path = self._path(self._key(remote_path))
-        headers = self._signed_headers('GET', path, None, b'') if self.secret_key else {}
-        with self._client.stream('GET', path, headers=headers) as resp:
-            ensure_not_redirect(resp)
+    def get_bounded(self, remote_path: str, limit: int) -> Tuple[Optional[bytes], Optional[str]]:
+        """Stream object bytes with a strict decoded-size budget."""
+        resp = self._request("GET", self._key(remote_path), stream=True)
+        try:
             if resp.status_code == 404:
                 return None, None
             resp.raise_for_status()
             data = bytearray()
             for chunk in resp.iter_bytes(65536):
                 if len(data) + len(chunk) > limit:
-                    raise ValueError('Import file exceeds its safety limit')
+                    raise ValueError('File exceeds its safety limit')
                 data.extend(chunk)
             return bytes(data), clean_etag(resp.headers.get('ETag'))
+        finally:
+            resp.close()
 
     def get_text(self, remote_path: str) -> Tuple[Optional[str], Optional[str]]:
         data, etag = self.get(remote_path)
@@ -270,7 +282,6 @@ class S3CorpusBackend:
                             "S3 storage did not report an ETag for the written object; "
                             "conditional updates cannot be verified against this server."
                         )
-                    self._etag_cache[remote_path] = etag
                     return True, etag, resp.status_code
                 status = resp.status_code
                 if status not in (412, 409, 405):

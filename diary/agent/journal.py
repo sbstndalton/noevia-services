@@ -63,7 +63,13 @@ class Journal:
         self._lock = threading.RLock()
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # index.db is shared with the Retriever's connection. Its writes are
+        # short (embedding happens outside any transaction, #858), so wait for
+        # them rather than failing an enqueue with 'database is locked' after
+        # sqlite's 5 s default. The rollback journal mode is kept on purpose:
+        # WAL would rewrite existing index.db headers and keep recent commits
+        # in index.db-wal until a checkpoint, breaking "one file to back up".
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()

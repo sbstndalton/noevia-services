@@ -324,3 +324,19 @@ def test_put_raises_clearly_when_no_etag_is_ever_available(monkeypatch):
     with pytest.raises(RuntimeError, match='did not report an ETag'):
         backend.put('notes/a.md', b'hello')
     backend.close()
+
+
+def test_get_enforces_the_default_read_limit(s3_url, monkeypatch):
+    """#860: a user-configured endpoint returning a huge object must not be
+    buffered whole into the shared Diary process (WebDAV already capped)."""
+    monkeypatch.setattr(S3CorpusBackend, "DEFAULT_READ_LIMIT", 1024 * 1024, raising=False)
+    STATE.objects["diary/big.md"] = {"body": b"x" * (3 * 1024 * 1024), "version": 1}
+    STATE.objects["diary/small.md"] = {"body": b"synthetic small note", "version": 1}
+    backend = make_backend(s3_url)
+    with pytest.raises(ValueError, match="safety limit"):
+        backend.get("big.md")
+    with pytest.raises(ValueError, match="safety limit"):
+        backend.get_text("big.md")
+    assert backend.get("small.md") == (b"synthetic small note", '"v1"')
+    assert backend.get("missing.md") == (None, None)
+    backend.close()

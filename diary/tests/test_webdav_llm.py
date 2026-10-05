@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from agent.llm import LLMClient
-from agent.webdav import WebDAVClient
+from agent.webdav import WebDAVCorpusBackend
 
 
 class FakeDAVHandler(BaseHTTPRequestHandler):
@@ -62,14 +62,14 @@ def dav_url():
 
 
 def test_get_returns_etag(dav_url):
-    dav = WebDAVClient(dav_url, "u", "p")
+    dav = WebDAVCorpusBackend(dav_url, "u", "p")
     text, etag = dav.get_text("file.md")
     assert text == "hello\n"
     assert etag == '"v1"'
 
 
 def test_put_with_stale_etag_conflicts_then_fresh_succeeds(dav_url):
-    dav = WebDAVClient(dav_url, "u", "p")
+    dav = WebDAVCorpusBackend(dav_url, "u", "p")
     text, etag = dav.get_text("file.md")
     # another writer bumps the etag behind our backs
     FakeDAVHandler.state["version"] += 100
@@ -84,13 +84,13 @@ def test_put_with_stale_etag_conflicts_then_fresh_succeeds(dav_url):
 
 
 def test_get_missing_file(dav_url):
-    dav = WebDAVClient(dav_url, "u", "p")
+    dav = WebDAVCorpusBackend(dav_url, "u", "p")
     text, etag = dav.get_text("missing.md")
     assert text is None and etag is None
 
 
 def test_list_dir_uses_generic_webdav_base_path(monkeypatch):
-    dav = WebDAVClient("https://cloud.example/dav/user/", "u", "p")
+    dav = WebDAVCorpusBackend("https://cloud.example/dav/user/", "u", "p")
 
     class Response:
         status_code = 207
@@ -115,7 +115,7 @@ def test_list_dir_uses_generic_webdav_base_path(monkeypatch):
 
 
 def test_daily_write_creates_parent_collections(monkeypatch):
-    dav = WebDAVClient("https://cloud.example/dav/user/", "u", "p")
+    dav = WebDAVCorpusBackend("https://cloud.example/dav/user/", "u", "p")
     calls = []
 
     class Response:

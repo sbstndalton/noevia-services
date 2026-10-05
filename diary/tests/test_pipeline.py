@@ -163,6 +163,12 @@ class _StubRetriever:
     def reindex_file(self, *a, **k):
         return 0
 
+    def prepare_reindex(self, *a, **k):
+        return None
+
+    def apply_reindex(self, *a, **k):
+        return 0
+
     def search(self, *a, **k):
         return []
 

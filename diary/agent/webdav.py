@@ -3,7 +3,6 @@
 Design (irreplaceable-data discipline):
   - Writes are conditional: GET current content + ETag, build new content, PUT with If-Match.
   - On 412 Precondition Failed (concurrent change), re-GET and retry, bounded.
-  - Last-modified maps are cached per (path, etag) to avoid GETs on every append.
   - Bytes never written blind: every PUT carries a precondition.
 """
 from __future__ import annotations
@@ -51,8 +50,6 @@ class WebDAVCorpusBackend:
         # the 3xx response rather than raising, and raise_for_status() does not
         # treat 3xx as an error — so every call site checks explicitly below.
         self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, auth=self.auth)
-        self._etag_cache: Dict[str, Optional[str]] = {}
-        self._lm_cache: Dict[str, Optional[str]] = {}
 
     @staticmethod
     def _ensure_not_redirect(resp) -> None:
@@ -92,10 +89,7 @@ class WebDAVCorpusBackend:
                 if len(data) + len(chunk) > limit:
                     raise ValueError('File exceeds its safety limit')
                 data.extend(chunk)
-            etag = clean_etag(resp.headers.get('ETag'))
-            self._etag_cache[remote_path] = etag
-            self._lm_cache[remote_path] = resp.headers.get('Last-Modified')
-            return bytes(data), etag
+            return bytes(data), clean_etag(resp.headers.get('ETag'))
 
     def get_text(self, remote_path: str) -> Tuple[Optional[str], Optional[str]]:
         data, etag = self.get(remote_path)
@@ -145,9 +139,7 @@ class WebDAVCorpusBackend:
             resp = self._client.put(url, content=data, headers=headers)
             self._ensure_not_redirect(resp)
             if resp.status_code in (200, 201, 204):
-                etag = clean_etag(resp.headers.get("ETag"))
-                self._etag_cache[remote_path] = etag
-                return True, etag, resp.status_code
+                return True, clean_etag(resp.headers.get("ETag")), resp.status_code
             if resp.status_code in (412, 409) or (if_match is None and resp.status_code == 405):
                 # Precondition failed or conflict: caller may re-GET and retry; we back off lightly.
                 import time
@@ -221,7 +213,3 @@ class WebDAVCorpusBackend:
 
     def close(self) -> None:
         self._client.close()
-
-
-# Compatibility import for one release.
-WebDAVClient = WebDAVCorpusBackend

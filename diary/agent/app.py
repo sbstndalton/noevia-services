@@ -97,11 +97,7 @@ class AppState:
             max_retries=int(cfg.get("llm.max_retries", 3)),
         )
         self.store = CorpusStore(cfg, self.backend, self.journal)
-        self.retrieval = Retriever(
-            Path(cfg.get("retrieval.db_path")),
-            self.llm_main,
-            embed_batch_size=int(cfg.get("retrieval.embed_batch_size", 8)),
-        )
+        self.retrieval = Retriever(Path(cfg.get("retrieval.db_path")), self.llm_main)
         self.assembler = ContextAssembler(self.store, self.retrieval, cfg)
         templates_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "logging.md"
         templates = yaml.safe_load(templates_path.read_text(encoding="utf-8"))
@@ -791,9 +787,26 @@ def _reindex_dirty(st: AppState) -> None:
 
 
 def _reindex_today(st: AppState, day) -> None:
+    """Background refresh of one document after an append or import.
+
+    Embeds without holding any lock, then writes the index under the store
+    write lock only if the document still holds the text that was embedded
+    (#859). Otherwise an edit saved and reindexed meanwhile (by _reindex_dirty,
+    which clears its dirty flag) would be overwritten with pre-edit text and
+    search would serve it until the next reindex. A skipped run loses
+    nothing: whichever write changed the document owns its reindex (an
+    exchange starts its own background run; edits mark the document dirty).
+    """
     try:
-        month_text, _ = st.store.read_month(day)
-        st.retrieval.reindex_file(st.store.document_path(day), month_text)
+        document = st.store.document_path(day)
+        text, _ = st.store.backend.get_text(document)
+        plan = st.retrieval.prepare_reindex(document, text)
+        with st.store._write_lock:
+            current, _ = st.store.backend.get_text(document)
+            if current != text:
+                log.info("background reindex skipped: the document changed while it was being embedded")
+                return
+            st.retrieval.apply_reindex(plan)
     except Exception as exc:  # noqa: BLE001
         log.warning("background reindex failed: %s", exc)
 

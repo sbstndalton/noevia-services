@@ -303,3 +303,102 @@ def test_backup_backend_reused_across_calls(tmp_path, storage):
     second = appmod._get_backup_backend(user_id, root)
     assert first is second
     assert len(appmod._backup_backends) == 1
+
+
+def _remote_objects(remote_root, tenant):
+    """{object key: bytes} for every content object a backup wrote."""
+    base = remote_root / 'Diary' / 'noevia-backups' / tenant / 'objects'
+    return {str(p.relative_to(remote_root)): p.read_bytes() for p in base.rglob('*') if p.is_file()} if base.exists() else {}
+
+
+def _assert_objects_match_their_checksums(remote_root, tenant):
+    import hashlib
+    objects = _remote_objects(remote_root, tenant)
+    for key, data in objects.items():
+        # objects/<sha256>/<name>: the directory name IS the content checksum.
+        assert hashlib.sha256(data).hexdigest() == key.split('/')[-2], key
+    return objects
+
+
+def _manifests(remote_root, tenant):
+    base = remote_root / 'Diary' / 'noevia-backups' / tenant / 'manifests'
+    return sorted(base.glob('*.json')) if base.exists() else []
+
+
+def test_edit_during_backup_never_uploads_new_bytes_under_old_checksum(managed, tmp_path, storage):
+    """#857: b.md is saved while a.md's object is being uploaded. The run must
+    not store b.md's new bytes under its old checksum; it aborts without a
+    manifest, stays pending (not failed), and the next run backs up the new
+    snapshot, which restores."""
+    import hashlib
+    from agent.backup_restore import restore
+    remote_root = tmp_path / 'remote'
+    remote = LocalCorpusBackend(str(remote_root))
+    managed.put('a.md', b'alpha v1')
+    managed.put('b.md', b'bravo v1')
+    old_b = hashlib.sha256(b'bravo v1').hexdigest()
+    original = remote.put
+    edited = []
+
+    def put(path, data, **kwargs):
+        if '/objects/' in path and path.endswith('/a.md') and not edited:
+            _, version = managed.get('b.md')
+            assert managed.put('b.md', b'bravo v2 (edited mid-backup)', if_match=version)[0]
+            edited.append(path)
+        return original(path, data, **kwargs)
+
+    remote.put = put
+    status = managed.backup(remote, storage, now=time.time() + 10)
+    assert edited, 'the edit hook never ran'
+    assert status['backup'] == 'pending' and status['error'] is None
+    assert _manifests(remote_root, managed.tenant) == []
+    objects = _assert_objects_match_their_checksums(remote_root, managed.tenant)
+    assert not any(f'/objects/{old_b}/' in key for key in objects)
+    with managed.db() as db:
+        assert db.execute('SELECT COUNT(*) FROM backups').fetchone()[0] == 0  # no failure, no backoff
+
+    # The edit pushed the debounce out; the next run backs up the new snapshot.
+    remote.put = original
+    assert managed.backup(remote, storage, now=time.time() + 20)['backup'] == 'complete'
+    _assert_objects_match_their_checksums(remote_root, managed.tenant)
+    [manifest_path] = _manifests(remote_root, managed.tenant)
+    manifest = json.loads(manifest_path.read_bytes())
+    for row in manifest['files']:
+        assert hashlib.sha256((remote_root / row['object']).read_bytes()).hexdigest() == row['sha256']
+    out = tmp_path / 'restored'
+    assert restore(remote_root, manifest_path, out)['files'] == 2
+    assert (out / 'a.md').read_bytes() == b'alpha v1'
+    assert (out / 'b.md').read_bytes() == b'bravo v2 (edited mid-backup)'
+
+
+def test_delete_during_backup_aborts_without_empty_object(managed, tmp_path, storage):
+    """#857: a file deleted mid-backup used to be uploaded as b'' under its old
+    checksum, leaving a permanently wrong immutable object."""
+    from types import SimpleNamespace
+    from agent.corpus_store import CorpusStore
+    from agent.workspace_ops import delete, stat
+    remote_root = tmp_path / 'remote'
+    remote = LocalCorpusBackend(str(remote_root))
+    managed.put('a.md', b'alpha')
+    managed.put('b.md', b'bravo')
+    store = CorpusStore(SimpleNamespace(get=lambda key, default=None: default), managed, None)
+    original = remote.put
+    deleted = []
+
+    def put(path, data, **kwargs):
+        if '/objects/' in path and path.endswith('/a.md') and not deleted:
+            deleted.append(delete(store, {'path': 'b.md', 'version': stat(store, 'b.md')['version']}))
+        return original(path, data, **kwargs)
+
+    remote.put = put
+    assert managed.backup(remote, storage, now=time.time() + 10)['backup'] == 'pending'
+    assert deleted, 'the delete hook never ran'
+    assert _manifests(remote_root, managed.tenant) == []
+    objects = _assert_objects_match_their_checksums(remote_root, managed.tenant)
+    assert b'' not in objects.values() and not any(key.endswith('/b.md') for key in objects)
+    remote.put = original
+    assert managed.backup(remote, storage, now=time.time() + 20)['backup'] == 'complete'
+    [manifest_path] = _manifests(remote_root, managed.tenant)
+    paths = [row['path'] for row in json.loads(manifest_path.read_bytes())['files']]
+    assert 'a.md' in paths and 'b.md' not in paths
+    _assert_objects_match_their_checksums(remote_root, managed.tenant)

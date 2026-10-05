@@ -29,6 +29,10 @@ def safe_key(path):
     return path
 
 
+class _SnapshotChanged(Exception):
+    """A file changed or disappeared after the backup listed its checksum."""
+
+
 _migration_locks = {}
 _migration_guard = threading.Lock()
 _migration_depth = threading.local()
@@ -284,15 +288,34 @@ class ManagedCorpusBackend:
                     # written, but a corrupted/edited remote object must still
                     # be detected rather than silently trusted (see
                     # test_remote_conflict_preserves_remote_and_local).
+                    #
+                    # The version is part of the lookup (#857): saves continue
+                    # while a backup runs, so a path-only read could return
+                    # newer bytes (or nothing, after a delete) and store them
+                    # under the old checksum. That object would be wrong for
+                    # ever: restore rejects the manifest, and the immutable
+                    # object makes every later run fail as a remote conflict.
                     with self.db() as fdb:
-                        row = fdb.execute('SELECT data FROM files WHERE path=?', (path,)).fetchone()
-                    data = bytes(row[0]) if row else b''
+                        row = fdb.execute('SELECT data FROM files WHERE path=? AND version=?', (path, version)).fetchone()
+                    if row is None:
+                        raise _SnapshotChanged(path)
+                    data = bytes(row[0])
+                    if digest(data) != version:
+                        raise ValueError('Stored file does not match its checksum')
                     self._create_verified(remote, object_path, data)
                     manifest['files'].append({'path': path, 'sha256': version, 'object': object_path})
                 body = json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode()
                 self._create_verified(remote, base + '/manifests/' + digest(body) + '.json', body)
                 with self.db() as db:
                     db.execute('INSERT OR REPLACE INTO backups VALUES (?,?,?,0,0,NULL)', (destination, generation, time.time()))
+            except _SnapshotChanged:
+                # A save, move or delete landed mid-run. It also advanced the
+                # generation and pushed `due` out, so the run is simply
+                # abandoned: no manifest and no further object is written, the
+                # backups row is untouched (status stays pending) and the next
+                # run after the debounce backs up the new snapshot. Objects
+                # already verified are content-addressed and remain correct.
+                pass
             except Exception:
                 # Never persist server exceptions/URLs: these can contain credentials.
                 with self.db() as db:

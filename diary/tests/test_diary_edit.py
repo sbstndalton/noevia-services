@@ -355,6 +355,13 @@ class _FakeRetriever:
         type(self).calls.append((file_name, month_text))
         return 0
 
+    def prepare_reindex(self, file_name, month_text):
+        return (file_name, month_text)
+
+    def apply_reindex(self, plan):
+        type(self).calls.append(plan)
+        return 0
+
     def search(self, *a, **k):
         return []
 
