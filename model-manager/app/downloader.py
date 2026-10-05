@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -173,13 +174,38 @@ def safe_dest(filename: str) -> Path:
     return settings.models_dir / filename
 
 
+# RFC 9110 sec. 8.8.2.2: a Last-Modified value is a strong validator only when it is at least a
+# second older than the response's Date (two uploads inside one second would share it). Be
+# conservative and ask for a minute.
+LAST_MODIFIED_MIN_AGE_S = 60
+
+
+def _http_date(value: str | None) -> float | None:
+    try:
+        parsed = parsedate_to_datetime((value or "").strip())
+    except (TypeError, ValueError, IndexError):
+        return None
+    if parsed is None or parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
 def _validator(headers) -> str:
-    """An If-Range validator for a response: its strong ETag, else Last-Modified, else ''.
-    A weak ETag (W/...) may not be used with If-Range."""
+    """An If-Range validator for a response: its strong ETag, else a strong Last-Modified, else ''.
+    A weak ETag (W/...) may not be used with If-Range, and Last-Modified counts only when it is
+    at least LAST_MODIFIED_MIN_AGE_S before the response Date (the local clock when the response
+    has none); an unparsable, future or too-recent one gives no validator, so no resume."""
     etag = (headers.get("etag") or "").strip()
     if etag and not etag.startswith("W/"):
         return etag
-    return (headers.get("last-modified") or "").strip()
+    last_modified = (headers.get("last-modified") or "").strip()
+    modified = _http_date(last_modified)
+    if modified is None:
+        return ""
+    now = _http_date(headers.get("date"))
+    if now is None:
+        now = time.time()
+    return last_modified if now - modified >= LAST_MODIFIED_MIN_AGE_S else ""
 
 
 def _validator_path(job: "DownloadJob") -> Path:

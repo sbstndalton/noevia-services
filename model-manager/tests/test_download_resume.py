@@ -255,9 +255,54 @@ def test_validator_is_stored_while_partial_and_removed_once_installed(monkeypatc
 
 
 def test_weak_etag_falls_back_to_last_modified():
-    assert downloader._validator({"etag": 'W/"x"', "last-modified": "Mon, 05 Oct 2026 10:00:00 GMT"}) == "Mon, 05 Oct 2026 10:00:00 GMT"
+    old = {"last-modified": "Mon, 05 Oct 2026 10:00:00 GMT", "date": "Mon, 05 Oct 2026 12:00:00 GMT"}
+    assert downloader._validator({"etag": 'W/"x"', **old}) == old["last-modified"]
     assert downloader._validator({"etag": '"x"', "last-modified": "y"}) == '"x"'
     assert downloader._validator({}) == ""
+
+
+def test_last_modified_is_a_validator_only_when_a_minute_older_than_the_response_date():
+    date = "Mon, 05 Oct 2026 12:00:00 GMT"
+
+    def v(last_modified, date=date):
+        return downloader._validator({"last-modified": last_modified, "date": date})
+    assert v("Mon, 05 Oct 2026 11:59:00 GMT") == "Mon, 05 Oct 2026 11:59:00 GMT"      # exactly 60 s
+    assert v("Mon, 05 Oct 2026 11:59:01 GMT") == ""                                    # 59 s: could share a second
+    assert v("Mon, 05 Oct 2026 12:00:00 GMT") == ""                                    # modified "now"
+    assert v("Mon, 05 Oct 2026 12:30:00 GMT") == ""                                    # in the future
+    assert v("not a date") == "" and v("") == ""
+    # A strong ETag is unaffected by the age rule.
+    assert downloader._validator({"etag": '"e"', "last-modified": "Mon, 05 Oct 2026 12:00:00 GMT", "date": date}) == '"e"'
+
+
+def test_missing_date_uses_the_local_clock(monkeypatch):
+    monkeypatch.setattr(downloader.time, "time", lambda: 1_790_000_000.0)    # 2026-09-21 14:13:20 UTC
+    assert downloader._validator({"last-modified": "Mon, 21 Sep 2026 14:00:00 GMT"}) == "Mon, 21 Sep 2026 14:00:00 GMT"
+    assert downloader._validator({"last-modified": "Mon, 21 Sep 2026 14:13:00 GMT"}) == ""
+
+
+def test_a_just_modified_last_modified_is_not_stored_so_the_partial_is_never_resumed(monkeypatch, tmp_path):
+    fresh = {"last-modified": "Mon, 05 Oct 2026 11:59:59 GMT", "date": "Mon, 05 Oct 2026 12:00:00 GMT"}
+
+    def short(req):
+        if req.method == "HEAD":
+            return _head(req)
+        return httpx.Response(200, content=PAYLOAD[:12], headers={"content-length": "12", **fresh})
+    job, _ = _run(monkeypatch, tmp_path, short)
+    assert job.status == "error"
+    assert not (tmp_path / "model.gguf.download.validator").exists()
+
+    seen_if_range = []
+
+    def full(req):
+        if req.method == "HEAD":
+            return httpx.Response(200, headers={"content-length": str(len(PAYLOAD)), **fresh})
+        seen_if_range.append(req.headers.get("range"))
+        return httpx.Response(200, content=PAYLOAD)
+    job, _ = _run(monkeypatch, tmp_path, full, partial=None)
+    assert job.status == "done", job.error
+    assert seen_if_range == [None], "no validator: the partial is discarded, not resumed with a Range"
+    assert job.dest_path.read_bytes() == PAYLOAD
 
 
 def test_416_for_a_longer_partial_starts_over(monkeypatch, tmp_path):

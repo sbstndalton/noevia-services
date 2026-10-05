@@ -468,6 +468,44 @@ def _download_target_dirs() -> set[Path]:
     return out
 
 
+MOUNTINFO_PATH = "/proc/self/mountinfo"
+
+
+def _unescape_mountinfo(field: str) -> str:
+    """Decode the \\NNN octal escapes the kernel uses for space, tab, newline and backslash."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _mount_points() -> set[str] | None:
+    """Mount points listed in /proc/self/mountinfo (field 5 of each line), or None where that file
+    is unavailable (not Linux, no /proc), in which case os.path.ismount is all there is."""
+    try:
+        with open(MOUNTINFO_PATH, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    points: set[str] = set()
+    for line in lines:
+        fields = line.split(" ")
+        if len(fields) > 4:
+            points.add(os.path.normpath(_unescape_mountinfo(fields[4])))
+    return points
+
+
+def _is_mount_point(path, points: set[str] | None = None) -> bool:
+    """True when `path` is a mount point. os.path.ismount compares st_dev with the parent's, so it
+    misses a bind mount of a folder from the same filesystem (equal st_dev); mountinfo does not.
+    Pass `points` (from _mount_points) to avoid re-reading the file for every folder of a walk."""
+    if os.path.ismount(path):
+        return True
+    if points is None:
+        points = _mount_points()
+    if not points:
+        return False
+    here = os.path.abspath(path)
+    return here in points or os.path.realpath(path) in points
+
+
 def _protected_dir(path: Path) -> bool:
     """True for a folder model deletion must never remove: the models root, a configured download
     location, a mount point, a symlinked folder, or anything outside the models folder."""
@@ -478,7 +516,7 @@ def _protected_dir(path: Path) -> bool:
     if here in _download_target_dirs():
         return True
     try:
-        return path.is_symlink() or os.path.ismount(path)
+        return path.is_symlink() or _is_mount_point(path)
     except OSError:
         return True
 
@@ -496,11 +534,12 @@ def _other_models_below(folder: Path, own: set[Path]) -> bool:
     """
     def _raise(err: OSError) -> None:
         raise err
+    mounts = _mount_points()
     try:
         for dirpath, _dirnames, filenames in os.walk(folder, followlinks=False, onerror=_raise):
             here = Path(dirpath)
             nested = here != folder
-            if nested and os.path.ismount(dirpath):
+            if nested and _is_mount_point(dirpath, mounts):
                 return True   # a filesystem mounted inside: rmtree would empty it
             for name in filenames:
                 if not _is_gguf_name(name):

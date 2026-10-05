@@ -227,6 +227,67 @@ def test_filesystem_mounted_inside_a_model_folder_is_never_emptied(monkeypatch):
     assert not m.exists() and (inner / "keep.bin").exists()
 
 
+def _mountinfo(tmp_path, monkeypatch, *mount_points: str) -> None:
+    """A synthetic /proc/self/mountinfo listing `mount_points` (same st_dev as their parents)."""
+    lines = [f"{100 + i} 1 8:1 /data{i} {mp} rw,relatime shared:1 - ext4 /dev/sda1 rw"
+             for i, mp in enumerate(mount_points)]
+    f = tmp_path / "mountinfo"
+    f.write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr(services, "MOUNTINFO_PATH", str(f))
+
+
+def test_same_device_bind_mount_inside_a_model_folder_is_never_emptied(monkeypatch, tmp_path):
+    # os.path.ismount is stat-only and says False for a bind mount from the same filesystem;
+    # /proc/self/mountinfo still lists it.
+    folder = MODELS / "dl-bind"
+    m = _model(folder / "bind-Q4.gguf")
+    inner = folder / "shared with space"
+    inner.mkdir()
+    (inner / "keep.bin").write_bytes(b"k" * 64)
+    assert not os.path.ismount(inner)
+    _mountinfo(tmp_path, monkeypatch, "/proc", str(inner).replace(" ", "\\040"))
+    ok, msg, _ = _delete("dl-bind/bind-Q4.gguf")
+    assert ok, msg
+    assert not m.exists() and (inner / "keep.bin").exists()
+
+
+def test_without_the_mountinfo_entry_the_same_folder_is_ordinary_content(monkeypatch, tmp_path):
+    folder = MODELS / "dl-plain"
+    m = _model(folder / "plain-Q4.gguf")
+    inner = folder / "scratch"
+    inner.mkdir()
+    (inner / "x.bin").write_bytes(b"k")
+    _mountinfo(tmp_path, monkeypatch, "/proc", str(MODELS / "other"))
+    ok, msg, _ = _delete("dl-plain/plain-Q4.gguf")
+    assert ok, msg
+    assert not folder.exists()
+
+
+def test_same_device_bind_mount_is_a_protected_folder(monkeypatch, tmp_path):
+    folder = MODELS / "dl-bound"
+    folder.mkdir()
+    assert not os.path.ismount(folder)
+    assert not services._protected_dir(folder)
+    _mountinfo(tmp_path, monkeypatch, str(folder))
+    assert services._protected_dir(folder)
+
+
+def test_missing_mountinfo_falls_back_to_ismount(monkeypatch, tmp_path):
+    monkeypatch.setattr(services, "MOUNTINFO_PATH", str(tmp_path / "absent"))
+    assert services._mount_points() is None
+    folder = MODELS / "dl-fallback"
+    folder.mkdir()
+    assert not services._is_mount_point(folder)
+    real = os.path.ismount
+    monkeypatch.setattr(os.path, "ismount", lambda p: os.path.abspath(p) == str(folder) or real(p))
+    assert services._is_mount_point(folder)
+
+
+def test_mountinfo_octal_escapes_are_decoded(monkeypatch, tmp_path):
+    _mountinfo(tmp_path, monkeypatch, "/a\\040b/c\\134d", "/tab\\011x")
+    assert services._mount_points() == {"/a b/c\\d", "/tab\tx"}
+
+
 def test_symlink_loop_in_a_hf_snapshot_does_not_crash_the_delete():
     repo = MODELS / "models--acme--shared-GGUF"
     blob = _blob(repo, "sha-loop", 600)
