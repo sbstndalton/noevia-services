@@ -366,9 +366,9 @@ class _FakeRetriever:
 
 
 def test_edit_endpoint_updates_corpus_and_reindexes(client):
-    r = client.post("/api/chat", json={"message": "Feeling good about the new agent."})
+    r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Feeling good about the new agent."}]})
     assert r.status_code == 200
-    logged_xid = r.json()["xid"]
+    logged_xid = r.json()["diary"]["xid"]
     st = appmod.get_state()
 
     r2 = client.post("/api/entries/edit", json={"xid": logged_xid, "me": "Corrected words.", "assistant": "Summary prose.", "month": datetime.now().strftime("%Y-%m")})

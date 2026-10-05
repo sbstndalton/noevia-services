@@ -33,7 +33,7 @@ def test_append_writes_today_once_and_is_idempotent(client):
 
 
 def test_append_never_touches_existing_exchanges(client):
-    r = client.post("/api/chat", json={"message": "Original synthetic words."})
+    r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Original synthetic words."}]})
     assert r.status_code == 200
     st = appmod.get_state()
     before, _ = st.store.read_month(datetime.now().date())

@@ -164,7 +164,7 @@ def test_delete_tenant_clears_only_its_chat_sessions(client):  # noqa: F811
     user_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     deleted = appmod._session("one", user_id.upper())
     deleted["turns"].append({"role": "user", "content": "synthetic private prompt"})
-    appmod._session("two", user_id)["log_status"].append({"assistant": "synthetic reply"})
+    appmod._session("two", user_id)["turns"].append({"role": "companion", "content": "synthetic reply"})
     survivor = appmod._session("one", U2)
     survivor["turns"].append({"role": "user", "content": "other tenant"})
 

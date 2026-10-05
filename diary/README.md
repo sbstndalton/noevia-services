@@ -1,6 +1,6 @@
 # Diary Companion service
 
-Diary Companion is Cowork's optional, independently runnable FastAPI service. It provides a browser UI and an OpenAI-compatible `/v1` API, assembles diary context for conversations, and records selected exchanges into daily Markdown files.
+Diary Companion is Cowork's optional, independently runnable FastAPI service. It has no UI of its own (noevia web is its only client). It exposes `/api/*` storage and entry endpoints plus an OpenAI-compatible `POST /v1/chat/completions`, assembles diary context for conversations, and records selected exchanges into daily Markdown files.
 
 ## Storage
 
@@ -35,11 +35,9 @@ Configuration defaults live in `config/config.yaml`. Environment variables overr
 ## API and safety
 
 - `GET /api/health`
-- `POST /api/chat`
 - `GET /api/day`
 - `GET /api/months`
 - `POST /api/entries/edit` — guarded correction of one logged exchange (see Editing below)
-- `GET /v1/models`
 - `POST /v1/chat/completions`
 
 Set `DIARY_AUTH_TOKEN` before network exposure. The SQLite database contains the retrieval index and durable write journal and must live on persistent storage.
@@ -65,7 +63,7 @@ corrections. Past entries are editable in the app, but only through
   `base_hash` keeps the older last-write-wins behaviour for existing clients;
 - rejects a `month` hint that is not `YYYY-MM` with `400`.
 
-Editing is a human-initiated, visible action in the UI. The assistant never
+Editing is a human-initiated, visible action in noevia's web UI. The assistant never
 rewrites the user's words on its own, and no pipeline step edits corpus text.
 
 ## Thoughtful diary conversations

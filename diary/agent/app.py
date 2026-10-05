@@ -1,7 +1,8 @@
 """Diary Companion Agent — FastAPI application.
 
-Single-user web UI (port 8010) for chatting with the companion and observing the
-automatic diary-logging pipeline (logged / skipped, with manual re-log).
+Companion service (port 8010) behind noevia's web server: diary context assembly,
+the automatic diary-logging pipeline (logged / skipped), and the tenant storage API.
+It serves no UI of its own; noevia web is the only client.
 
 Auth model:
   - `ui.auth_token` (env DIARY_AUTH_TOKEN) empty  -> open (LAN-only mode). The
@@ -10,14 +11,12 @@ Auth model:
   - DIARY_TENANT_KEY set -> every request naming a tenant (X-Cowork-User-ID)
     must carry a valid X-Cowork-Tenant-Assertion (agent/tenant_assertion.py).
   - token set -> all /api/* and /v1/* endpoints require `Authorization: Bearer <token>`
-    (or `X-Diary-Token`). The `/` page shell and /static are open; the browser stores
-    the token in localStorage and sends it on every call.
+    (or `X-Diary-Token`).
 
-OpenAI-compatible surface (for Solair AI / any OpenAI-format client):
-  GET  /v1/models
+OpenAI-compatible surface (used by noevia web's Diary alias):
   POST /v1/chat/completions   -> the companion answers THROUGH the diary pipeline:
        every exchange is skip-classified and auto-logged server-side, regardless of
-       which client sent it (browser UI or phone app).
+       which client sent it.
 
 Run:  uvicorn agent.app:app --host 0.0.0.0 --port 8010
 """
@@ -44,8 +43,7 @@ from typing import Dict, Optional
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 from .streaming import exchange_stream
 from pydantic import BaseModel
@@ -602,7 +600,6 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.add_middleware(TenantAssertionMiddleware)
-app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 
 @app.exception_handler(StorageUnavailable)
@@ -717,22 +714,12 @@ def _session(session_id: str, tenant_id: str = "legacy") -> dict:
                 SESSIONS.pop(k, None)
         while len(SESSIONS) >= _SESSION_CAP:
             SESSIONS.popitem(last=False)  # least recently used
-        entry = {"turns": [], "log_status": [], "last_used": now}
+        entry = {"turns": [], "last_used": now}
         SESSIONS[key] = entry
         return entry
 
 
 # ---------------- request/response models ----------------
-
-
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str = "default"
-
-
-class RelogRequest(BaseModel):
-    index: int
-    session_id: str = "default"
 
 
 class EditEntryRequest(BaseModel):
@@ -746,16 +733,7 @@ class EditEntryRequest(BaseModel):
     base_hash: Optional[str] = None
 
 
-# ---------------- pages ----------------
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    template_path = Path(__file__).parent / "static" / "index.html"
-    return template_path.read_text(encoding="utf-8")
-
-
-# ---------------- shared conversation core (UI + /v1 both use this) ----------------
+# ---------------- shared conversation core (the /v1 exchange paths use this) ----------------
 
 
 def optional_reference(body: dict) -> str:
@@ -790,16 +768,8 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
         {"role": "user", "content": message},
         {"role": "companion", "content": visible},
     ])
-    sess["log_status"].append({
-        "decision": outcome.decision,
-        "xid": outcome.xid,
-        "reason": outcome.reason,
-        "user": message,
-        "assistant": visible,
-    })
 
     del sess["turns"][:-32]
-    del sess["log_status"][:-32]
     if background:
         threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
     return {"reply": visible, "reasoning": getattr(reply, "reasoning", ""), "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
@@ -828,45 +798,7 @@ def _reindex_today(st: AppState, day) -> None:
         log.warning("background reindex failed: %s", exc)
 
 
-# ---------------- API (browser UI) ----------------
-
-
-@app.post("/api/chat")
-def api_chat(req: ChatRequest, request: Request) -> JSONResponse:
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    message = req.message.strip()
-    if not message:
-        return JSONResponse({"error": "empty message"}, status_code=400)
-    st = _tenant_state(request)  # fail-closed: outside the try so an identity error is not masked as a model error
-    try:
-        result = _run_exchange(st, message, req.session_id, request.headers.get("X-Cowork-User-ID", "legacy"))
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        log.exception("chat failed")
-        return JSONResponse({"error": f"model error: {exc}"}, status_code=502)
-    return JSONResponse(result)
-
-
-@app.post("/api/relog")
-def api_relog(req: RelogRequest, request: Request) -> JSONResponse:
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = _tenant_state(request)
-    sess = _session(req.session_id, request.headers.get("X-Cowork-User-ID", "legacy"))
-    try:
-        item = sess["log_status"][req.index]
-    except IndexError:
-        return JSONResponse({"error": "no such exchange"}, status_code=404)
-    outcome = st.pipeline.relog_last(
-        user_message=item["user"],
-        assistant_message=item["assistant"],
-        now=datetime.now(),
-    )
-    item["decision"] = outcome.decision
-    item["xid"] = outcome.xid
-    return JSONResponse({"decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason})
+# ---------------- API ----------------
 
 
 @app.get("/api/day")
@@ -1370,22 +1302,7 @@ def api_health(request: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
-# ---------------- OpenAI-compatible surface (Solair AI & friends) ----------------
-
-
-@app.get("/v1/models")
-def v1_models(request: Request) -> JSONResponse:
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    st = _tenant_state(request)
-    model_id = "diary-companion"
-    return JSONResponse({
-        "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "created": 0, "owned_by": "diary-companion"},
-            {"id": st.cfg.get("llm.chat_model") or model_id, "object": "model", "created": 0, "owned_by": "cowork"},
-        ],
-    })
+# ---------------- OpenAI-compatible surface (noevia web Diary alias) ----------------
 
 
 @app.post("/v1/chat/completions")
@@ -1394,7 +1311,7 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
 
     The LAST user message becomes the diary exchange; earlier messages in the client's
     thread are passed as session context so short back-and-forth stays coherent. The
-    exchange is skip-classified and auto-logged exactly like a UI chat — the client
+    exchange is skip-classified and auto-logged exactly like any chat — the client
     cannot bypass the diary pipeline.
     """
     if not check_auth(request):

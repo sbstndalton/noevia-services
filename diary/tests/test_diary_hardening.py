@@ -104,7 +104,7 @@ def test_exchange_hash_ignores_sibling_exchanges():
 
 
 def test_edit_endpoint_returns_409_with_current_text(client):
-    xid = client.post("/api/chat", json={"message": "Synthetic entry one."}).json()["xid"]
+    xid = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Synthetic entry one."}]}).json()["diary"]["xid"]
     month = datetime.now().strftime("%Y-%m")
     st = appmod.get_state()
     base = exchange_hash(st.store.read_month(datetime.now().date())[0], xid)

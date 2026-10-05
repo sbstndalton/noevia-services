@@ -163,22 +163,6 @@ class LoggingPipeline:
         self.maintain_index(user_message, summary, day.isoformat())
         return LogOutcome(decision="logged", xid=xid, reason="")
 
-    def relog_last(self, user_message: str, assistant_message: str, topic: str = "", now: Optional[datetime] = None) -> LogOutcome:
-        """Manual re-log button — bypasses the skip classifier only; idempotent via journal+markers."""
-        now = now or datetime.now()
-        summary = self.summarize(assistant_message)
-        try:
-            xid = self.store.log_exchange(
-                day=now.date(),
-                sub_header=topic,
-                me_text=user_message,
-                claude_text=summary,
-                now=now,
-            )
-            return LogOutcome(decision="logged", xid=xid, reason="manual re-log")
-        except Exception as exc:  # noqa: BLE001
-            return LogOutcome(decision="error", xid=None, reason=str(exc))
-
 
 def _json_extract(text: str) -> str:
     """Extract the first JSON object from a model reply (defensive against prose/fences)."""
