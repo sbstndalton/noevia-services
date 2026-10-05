@@ -46,7 +46,6 @@ corpus:
 
 retrieval:
   db_path: data/index.db
-  embed_batch_size: 8
   top_k: 8
   max_context_tokens: 5200
   min_score: 0.30

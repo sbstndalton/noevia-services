@@ -72,6 +72,40 @@ def test_samples_already_stored_under_the_legacy_bare_port_key_are_not_duplicate
     assert db.record_timings(backend, samples) == 1
 
 
+def test_a_bare_port_fallback_does_not_re_insert_a_task_stored_under_port_at_spawn():
+    """#884: once the spawn line scrolls out of the log tail the parser falls back to the bare
+    port for the same task; it must not add a second row next to the "<port>@<ts>" one."""
+    db.init()
+    backend = "test-straddle"
+    with_spawn, _ = telemetry.parse_log(_log())
+    assert all("@" in s.instance for s in with_spawn)
+    assert db.record_timings(backend, with_spawn) == 2
+    # the tail now begins after both spawn lines, so the same tasks come back with bare keys
+    tail_only = "\n".join(_request("2026-10-05T10:00:05.000000000Z", 60279, 3, 100.0)
+                          + _request("2026-10-05T11:00:05.000000000Z", 60279, 3, 140.0))
+    bare, _ = telemetry.parse_log(tail_only)
+    assert bare and all("@" not in s.instance for s in bare)
+    assert db.record_timings(backend, bare) == 0
+    rows = [r for r in db.recent_timings(alias="alpha", min_gen_tokens=1) if r["backend"] == backend]
+    assert len(rows) == 2 and all("@" in r["instance"] for r in rows)
+
+
+def test_the_bare_guard_is_per_backend_task_and_timestamp():
+    db.init()
+    backend = "test-straddle-scope"
+    spawned, _ = telemetry.parse_log("\n".join(_spawn("2026-10-05T10:00:00.000000000Z", "alpha", 60279, "/models/a.gguf")
+                                                + _request("2026-10-05T10:00:05.000000000Z", 60279, 3, 100.0)))
+    assert db.record_timings(backend, spawned) == 1
+    def bare(ts, port, task):
+        s, _ = telemetry.parse_log("\n".join(_request(ts, port, task, 90.0)))
+        return s
+    # a different task, timestamp, port or backend is a genuinely different sample
+    assert db.record_timings(backend, bare("2026-10-05T10:00:05.000000000Z", 60279, 4)) == 1
+    assert db.record_timings(backend, bare("2026-10-05T10:09:05.000000000Z", 60279, 3)) == 1
+    assert db.record_timings(backend, bare("2026-10-05T10:00:05.000000000Z", 6027, 3)) == 1   # prefix, not substring
+    assert db.record_timings(backend + "-other", bare("2026-10-05T10:00:05.000000000Z", 60279, 3)) == 1
+
+
 def test_instance_key_is_stable_and_degrades_to_the_port_without_a_timestamp():
     assert telemetry.instance_key("60279", 0.0) == "60279"
     assert telemetry.instance_key("60279", 1759658400.9) == telemetry.instance_key("60279", 1759658400.2)

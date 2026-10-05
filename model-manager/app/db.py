@@ -81,6 +81,9 @@ def init() -> None:
                 ON req_timing(model_path, ts DESC);
             CREATE INDEX IF NOT EXISTS req_timing_alias
                 ON req_timing(alias, ts DESC);
+            -- record_timings' de-dupe guards look rows up by (backend, task, ts)
+            CREATE INDEX IF NOT EXISTS req_timing_dedupe
+                ON req_timing(backend, task, ts);
             -- The arguments one spawned llama-server instance was given. Stored whole, as
             -- JSON, rather than as columns for the flags that seemed interesting: what makes
             -- two runs different is discovered by diffing these, so a fixed column set would
@@ -352,20 +355,29 @@ def record_timings(backend: str, samples: list) -> int:
         before = c.total_changes
         for r in rows:
             # Instance keys used to be the bare port ("60279"); they are now "<port>@<spawn
-            # second>". A sample already stored under the legacy key must not be stored a
-            # second time when the same log tail is re-read after the upgrade, so skip when a
-            # legacy row for the same (backend, port, task, ts) exists. Only applies to keys
-            # carrying the "@" suffix.
-            legacy = r[2].split("@", 1)[0] if "@" in r[2] else None
+            # second>". The same task can reach us under either form: a tail read after the
+            # upgrade still carries legacy rows, and the parser falls back to the bare port when
+            # a spawn line has scrolled out of the log tail while the task's lines have not.
+            # So de-dupe both ways on (backend, port, task, ts):
+            #   "<port>@<s>" is skipped if the bare "<port>" row exists, and
+            #   "<port>"     is skipped if any "<port>@..." row exists.
+            if "@" in r[2]:
+                legacy, prefix = r[2].split("@", 1)[0], None
+            else:
+                legacy, prefix = None, r[2] + "@"
             c.execute(
                 "INSERT OR IGNORE INTO req_timing("
                 "ts, backend, instance, task, model_path, alias, spec_type, "
                 "prompt_tokens, prompt_tps, gen_tokens, gen_tps, draft_acc, draft_len) "
                 "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
-                "WHERE ? IS NULL OR NOT EXISTS ("
+                "WHERE (? IS NULL OR NOT EXISTS ("
                 "  SELECT 1 FROM req_timing WHERE backend = ? AND instance = ? "
-                "  AND task = ? AND ts = ?)",
-                (*r, legacy, backend, legacy, r[3], r[0]),
+                "  AND task = ? AND ts = ?)) "
+                "AND (? IS NULL OR NOT EXISTS ("
+                "  SELECT 1 FROM req_timing WHERE backend = ? AND task = ? AND ts = ? "
+                "  AND substr(instance, 1, length(?)) = ?))",
+                (*r, legacy, backend, legacy, r[3], r[0],
+                 prefix, backend, r[3], r[0], prefix, prefix),
             )
         return c.total_changes - before
 

@@ -11,7 +11,8 @@ from app import services
 
 MODELS = ROOT / "models"
 MADE = ["dl-nest", "dl-a", "dl-mnt", "dl-archive", "dl-single", "dl-pair", "models--acme--nested-GGUF",
-        "models--acme--shared-GGUF", "flat-dl-Q4.gguf", "dl-outside-target.txt"]
+        "models--acme--shared-GGUF", "flat-dl-Q4.gguf", "dl-outside-target.txt",
+        "dl-bind", "dl-plain", "dl-bound", "dl-fallback", "dl-bind-target"]
 
 
 @pytest.fixture(autouse=True)
@@ -319,3 +320,15 @@ def test_symlink_loop_runtime_error_is_handled(monkeypatch):
     ok, msg, freed = _delete("models--acme--shared-GGUF/snapshots/rev1/m-Q4_K_M.gguf")
     assert ok, msg
     assert not repo.exists() and freed >= 600
+
+
+def test_same_device_bind_mount_is_offered_as_a_download_target(monkeypatch, tmp_path):
+    from app import api
+    monkeypatch.setattr(services.settings, "model_download_targets", "")
+    folder = MODELS / "dl-bind-target"
+    folder.mkdir()
+    assert not os.path.ismount(folder)
+    _mountinfo(tmp_path, monkeypatch, "/proc")
+    assert "dl-bind-target" not in [t["id"] for t in api.download_targets()]
+    _mountinfo(tmp_path, monkeypatch, str(folder))
+    assert "dl-bind-target" in [t["id"] for t in api.download_targets()]

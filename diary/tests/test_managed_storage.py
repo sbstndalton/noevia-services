@@ -402,3 +402,38 @@ def test_delete_during_backup_aborts_without_empty_object(managed, tmp_path, sto
     paths = [row['path'] for row in json.loads(manifest_path.read_bytes())['files']]
     assert 'a.md' in paths and 'b.md' not in paths
     _assert_objects_match_their_checksums(remote_root, managed.tenant)
+
+
+def test_an_aborted_backup_run_is_logged_without_paths_or_tenant(managed, tmp_path, storage, caplog):
+    """#885: the abort is correct (#857) but used to be a silent `pass`."""
+    import logging
+    from types import SimpleNamespace
+    from agent.corpus_store import CorpusStore
+    from agent.workspace_ops import delete, stat
+    remote_root = tmp_path / 'remote'
+    remote = LocalCorpusBackend(str(remote_root))
+    managed.put('secret-title.md', b'alpha')
+    managed.put('b.md', b'bravo')
+    store = CorpusStore(SimpleNamespace(get=lambda key, default=None: default), managed, None)
+    original = remote.put
+    deleted = []
+
+    def put(path, data, **kwargs):
+        if '/objects/' in path and path.endswith('/b.md') and not deleted:
+            deleted.append(delete(store, {'path': 'secret-title.md', 'version': stat(store, 'secret-title.md')['version']}))
+        return original(path, data, **kwargs)
+
+    remote.put = put
+    with caplog.at_level(logging.WARNING, logger='agent.managed_storage'):
+        assert managed.backup(remote, storage, now=time.time() + 10)['backup'] == 'pending'
+    assert deleted
+    [record] = [r for r in caplog.records if 'abandoned' in r.getMessage()]
+    text = record.getMessage()
+    assert 'files verified' in text
+    assert 'secret-title' not in text and managed.tenant not in text and 'http' not in text
+    # a clean run logs no abandonment
+    caplog.clear()
+    remote.put = original
+    with caplog.at_level(logging.WARNING, logger='agent.managed_storage'):
+        assert managed.backup(remote, storage, now=time.time() + 20)['backup'] == 'complete'
+    assert not [r for r in caplog.records if 'abandoned' in r.getMessage()]

@@ -120,17 +120,21 @@ def test_error_surfaces_in_the_summary():
 
 
 def test_models_detail_on_a_hostile_file_never_500s():
+    import shutil
     d = ROOT / "models" / "evil"
     d.mkdir(exist_ok=True)
-    (d / "evil-Q4_K_M.gguf").write_bytes(
-        _header(1) + _s("general.architecture") + struct.pack("<I", STRING)
-        + struct.pack("<Q", (1 << 64) - 1) + b"x" * 64)
-    (d / "notgguf-Q4_K_M.gguf").write_bytes(b"NOPE" + b"\0" * 64)
-    with TestClient(app) as c:
-        r = c.get("/api/v1/models/detail?key=evil/evil-Q4_K_M.gguf")
-        assert r.status_code == 200 and r.json()["summary"]["general"]["header_error"]
-        assert c.get("/api/v1/models/detail?key=evil/notgguf-Q4_K_M.gguf").status_code == 422
-        assert c.get("/api/v1/models").status_code == 200
+    try:
+        (d / "evil-Q4_K_M.gguf").write_bytes(
+            _header(1) + _s("general.architecture") + struct.pack("<I", STRING)
+            + struct.pack("<Q", (1 << 64) - 1) + b"x" * 64)
+        (d / "notgguf-Q4_K_M.gguf").write_bytes(b"NOPE" + b"\0" * 64)
+        with TestClient(app) as c:
+            r = c.get("/api/v1/models/detail?key=evil/evil-Q4_K_M.gguf")
+            assert r.status_code == 200 and r.json()["summary"]["general"]["header_error"]
+            assert c.get("/api/v1/models/detail?key=evil/notgguf-Q4_K_M.gguf").status_code == 422
+            assert c.get("/api/v1/models").status_code == 200
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # --- #870: implausible block_count -------------------------------------------------------
@@ -168,7 +172,12 @@ def test_search_repo_runs_estimates_off_the_event_loop_and_survives_a_hostile_he
         hf.HfFile(path="m-Q4_K_M.gguf", size=int(2.6e9), quant="Q4_K_M",
                   shard_base="m-Q4_K_M.gguf", shard_index=None, shard_total=None)], readme_snippet=None)
 
+    loop_threads = []
+
     async def repo_detail(repo):
+        # Runs on the event loop: TestClient serves the app on a portal thread, not the main
+        # thread, so "not the main thread" proves nothing. Compare against the loop's own thread.
+        loop_threads.append(threading.current_thread())
         return detail
 
     async def header(repo, path):
@@ -191,4 +200,5 @@ def test_search_repo_runs_estimates_off_the_event_loop_and_survives_a_hostile_he
         r = c.get("/api/v1/search/repo", params={"repo": "o/r-GGUF"})
     assert r.status_code == 200 and time.monotonic() - t0 < 2.0
     assert r.json()["groups"][0]["estimates"] == []
-    assert threads and all(t is not threading.main_thread() for t in threads)
+    assert threads and loop_threads
+    assert all(t is not loop_threads[0] for t in threads)

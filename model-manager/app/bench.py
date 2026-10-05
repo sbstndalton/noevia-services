@@ -32,6 +32,7 @@ which happens before any request exists to report it.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -73,6 +74,14 @@ _CONNECT_TIMEOUT_S = 15.0
 # Generous: this read spans a cold model load on a 27B, which is tens of seconds before a
 # single byte comes back.
 _READ_TIMEOUT_S = 900.0
+
+log = logging.getLogger("model-manager.bench")
+
+# Stamped on every llama-bench container this module starts, and the only thing startup
+# recovery (reap_orphans) selects on: a container without it was not created here and is never
+# touched.
+SWEEP_LABEL = "noevia.model-manager.bench"
+ORPHAN_RETRY_S = 5.0
 
 _LOCK = threading.Lock()
 _CANCEL = threading.Event()
@@ -604,6 +613,7 @@ def run_sweep_once(backend: str, model_path: str, extra: list[str],
         "image": image, "command": cmd, "entrypoint": "/app/llama",
         "volumes": binds, "detach": True, "remove": False,
         "network_mode": "none",   # nothing here needs the network, so keep it off the LAN
+        "labels": {SWEEP_LABEL: "1"},
     }
     if wants_gpu:
         kwargs["device_requests"] = [_docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])]
@@ -611,6 +621,14 @@ def run_sweep_once(backend: str, model_path: str, extra: list[str],
     try:
         cont = client.containers.run(**kwargs)
     except Exception as e:  # noqa: BLE001
+        # run() = create + start: a failed start leaves the created container behind, with no
+        # handle returned. Ours carry the label, so clear any `created` one (this run is the
+        # only sweep, so it cannot be another run's).
+        try:
+            for left in client.containers.list(all=True, filters={"label": f"{SWEEP_LABEL}=1", "status": "created"}):
+                left.remove(force=True)
+        except Exception:  # noqa: BLE001
+            pass
         return [], f"{type(e).__name__}: {e}"
 
     try:
@@ -661,6 +679,83 @@ def run_sweep_once(backend: str, model_path: str, extra: list[str],
             cont.remove(force=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _sweep_containers(client) -> list:
+    return list(client.containers.list(all=True, filters={"label": f"{SWEEP_LABEL}=1"}))
+
+
+def reap_orphans() -> dict:
+    """Startup recovery (#886). Sweep containers run detached and are removed by the worker that
+    started them, so one still present when this process starts belongs to a run whose state
+    died with the previous process: nobody will collect its output, and it may hold GPU memory
+    for up to its 30 minute limit, against the one-model memory budget.
+
+    Only containers carrying SWEEP_LABEL are considered. Finished ones are removed; running ones
+    are killed and removed. If a running one cannot be stopped, the job state is set to
+    'running' so the web app keeps its maintenance hold, and a watcher keeps retrying until the
+    container is gone. Returns {"reaped": n, "stuck": n}; never raises (docker may be absent).
+    """
+    global _THREAD, _STATE
+    out = {"reaped": 0, "stuck": 0}
+    with _LOCK:
+        if _STATE.active:     # a run of this process owns its own container
+            return out
+    try:
+        from . import services
+        client = services._docker_client()
+        if client is None:
+            return out
+        found = _sweep_containers(client)
+    except Exception as e:  # noqa: BLE001 - recovery must never stop the service starting
+        log.warning("benchmark orphan check skipped: %s", type(e).__name__)
+        return out
+    stuck = []
+    for c in found:
+        if not _stop_and_remove(c):
+            stuck.append(c)
+            continue
+        out["reaped"] += 1
+    if out["reaped"]:
+        log.warning("removed %d leftover llama-bench container(s) from a previous run", out["reaped"])
+    if stuck:
+        out["stuck"] = len(stuck)
+        log.warning("%d leftover llama-bench container(s) could not be stopped; reporting the benchmark as active", len(stuck))
+        with _LOCK:
+            _STATE = JobState(status="running", backend="", started_at=time.time(),
+                              # unit "models" is what web's adopt() requires to re-take its hold
+                              unit="models", total=1,
+                              current="stopping a llama-bench left over from before a restart",
+                              lines=["a llama-bench container from before a restart is still running; stopping it"])
+        _THREAD = threading.Thread(target=_watch_orphans, args=(stuck,), name="benchmark-orphans", daemon=True)
+        _THREAD.start()
+    return out
+
+
+def _stop_and_remove(c) -> bool:
+    """True once the container is gone (or never ran). Any docker error counts as not yet."""
+    try:
+        # No explicit kill: docker answers 409 "is not running" for a container left in `created`
+        # (a failed start), which would make it unremovable here. remove(force=True) stops a
+        # running one itself and removes any state.
+        c.remove(force=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        # Already removed by someone else is success; anything else is retried by the caller.
+        return type(e).__name__ == "NotFound"
+
+
+def _watch_orphans(containers: list) -> None:
+    global _STATE
+    pending = list(containers)
+    while pending:
+        time.sleep(ORPHAN_RETRY_S)
+        pending = [c for c in pending if not _stop_and_remove(c)]
+    with _LOCK:
+        _STATE.status = "error"
+        _STATE.finished_at = time.time()
+        _STATE.error = "a benchmark was interrupted by a model-manager restart; its leftover container was stopped"
+        _STATE.current = ""
 
 
 def start_sweep(*, backend: str, aliases: list[str], n_prompt: int = 512, n_gen: int = 128,

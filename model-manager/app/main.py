@@ -40,6 +40,11 @@ def _startup() -> None:
     db.init()
     db.seed_bench_prompts()
     hw.start_sampler()
+    try:
+        from . import bench
+        bench.reap_orphans()
+    except Exception as e:  # noqa: BLE001 - recovery is best effort; startup continues
+        log.warning("benchmark orphan check failed: %s", type(e).__name__)
     if settings.migrate_cache_ram_on_start:
         _migrate_cache_ram()
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 import threading
@@ -17,6 +18,8 @@ from contextlib import contextmanager
 import fcntl
 import os
 from .dedicated_storage import StorageUnavailable
+
+log = logging.getLogger(__name__)
 
 
 def digest(data):
@@ -250,6 +253,7 @@ class ManagedCorpusBackend:
     def backup(self, remote, storage, now=None):
         """Idempotent full manifest; immutable content objects are deduplicated."""
         now = time.time() if now is None else now
+        started = time.monotonic()
         destination = self.destination(storage)
         if not destination or not self.active():
             return self.status(storage)
@@ -315,7 +319,13 @@ class ManagedCorpusBackend:
                 # backups row is untouched (status stays pending) and the next
                 # run after the debounce backs up the new snapshot. Objects
                 # already verified are content-addressed and remain correct.
-                pass
+                #
+                # Logged at warning (#885; Diary has no logging config, so info never reaches docker logs) because status() just says 'pending', and a run that is
+                # abandoned over and over during a long editing session otherwise leaves no
+                # trace while lastBackedUp ages. Counts only: never a path, URL or tenant.
+                log.warning('managed backup abandoned at generation %s: a save landed mid-run '
+                         '(%d of %d files verified, %.1fs); retrying after the debounce',
+                         generation, len(manifest['files']), len(file_meta), time.monotonic() - started)
             except Exception:
                 # Never persist server exceptions/URLs: these can contain credentials.
                 with self.db() as db:

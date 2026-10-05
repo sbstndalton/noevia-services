@@ -742,8 +742,11 @@ def download_targets() -> list[dict]:
     out = [{"id": "", "label": "Models folder", "path": str(root)}]
     names = {n.strip() for n in settings.model_download_targets.split(",") if n.strip()}
     try:
+        # mountinfo as well as os.path.ismount: a same-filesystem bind mount has the parent's
+        # st_dev and only the former sees it. Read once for the whole scan.
+        mounts = services._mount_points()
         for entry in os.scandir(root):
-            if entry.is_dir(follow_symlinks=False) and os.path.ismount(entry.path):
+            if entry.is_dir(follow_symlinks=False) and services._is_mount_point(entry.path, mounts):
                 names.add(entry.name)
     except OSError:
         pass
