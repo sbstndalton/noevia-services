@@ -1,6 +1,7 @@
 """Minimal GGUF v3 metadata reader. Zero deps beyond stdlib."""
 from __future__ import annotations
 
+import math
 import struct
 import threading
 from pathlib import Path
@@ -307,7 +308,23 @@ def rope_owned_by_gguf(model: dict[str, Any]) -> bool:
     return isinstance(factor, (int, float)) and factor > 0
 
 
+def _finite(v: Any) -> Any:
+    """Copy of a parsed value with every NaN/+-Infinity float replaced by None (#901).
+
+    GGUF float metadata is attacker-controlled bytes, so it can be non-finite. Python's json
+    would emit NaN/Infinity, which Starlette's JSONResponse (allow_nan=False) refuses with a
+    500, and int(nan)/int(inf) in the scalar helpers raise. null is what the Rust port emits."""
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {k: _finite(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_finite(x) for x in v]
+    return v
+
+
 def summarize(raw: dict[str, Any]) -> dict[str, Any]:
+    raw = _finite(raw)
     arch = raw.get("general.architecture", "") or ""
 
     def a(key: str, default: Any = None) -> Any:

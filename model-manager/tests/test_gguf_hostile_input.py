@@ -137,6 +137,86 @@ def test_models_detail_on_a_hostile_file_never_500s():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- #901: non-finite float metadata ---------------------------------------------------------
+
+F32, F64 = 6, 12
+
+
+def _nonfinite_gguf() -> bytes:
+    """Synthetic header: NaN float32, +Inf float64 and -Inf float32 array element, plus a finite float."""
+    return (
+        _header(7)
+        + _s("general.architecture") + struct.pack("<I", STRING) + _s("llama")
+        + _s("llama.rope.freq_base") + struct.pack("<If", F32, float("nan"))
+        + _s("llama.rope.scaling.factor") + struct.pack("<Id", F64, float("inf"))
+        + _s("llama.expert_count") + struct.pack("<Id", F64, float("inf"))
+        + _s("llama.context_length") + struct.pack("<Id", F64, float("nan"))
+        + _s("llama.attention.head_count_kv") + struct.pack("<IIQ", ARRAY, F32, 2)
+        + struct.pack("<ff", float("-inf"), 8.0)
+        + _s("general.parameter_count") + struct.pack("<If", F32, float("nan"))
+    )
+
+
+def _assert_json_safe(value) -> None:
+    import json
+    json.dumps(value, allow_nan=False)  # what Starlette's JSONResponse does
+
+
+def test_non_finite_floats_become_null_in_the_summary():
+    summary = gguf_meta.summarize(gguf_meta.read_raw_bytes(_nonfinite_gguf()))
+    m = summary["model"]
+    assert m["rope_freq_base"] is None
+    assert m["rope_scaling_factor"] is None
+    assert m["expert_count"] is None and m["context_length"] is None
+    assert summary["general"]["params_raw"] is None and summary["general"]["params"] is None
+    assert m["attention_head_count_kv"] == [None, 8.0]
+    assert not summary["general"]["header_error"]
+    _assert_json_safe(summary)
+
+
+def test_finite_floats_are_untouched_by_the_sanitiser():
+    buf = (_header(2) + _s("general.architecture") + struct.pack("<I", STRING) + _s("llama")
+           + _s("llama.rope.freq_base") + struct.pack("<If", F32, 500000.0))
+    assert gguf_meta.summarize(gguf_meta.read_raw_bytes(buf))["model"]["rope_freq_base"] == 500000.0
+
+
+def test_models_detail_with_non_finite_floats_returns_200_with_nulls():
+    import shutil
+    d = ROOT / "models" / "nonfinite"
+    d.mkdir(exist_ok=True)
+    try:
+        (d / "nan-Q4_K_M.gguf").write_bytes(_nonfinite_gguf())
+        with TestClient(app) as c:
+            r = c.get("/api/v1/models/detail?key=nonfinite/nan-Q4_K_M.gguf")
+            assert r.status_code == 200
+            m = r.json()["summary"]["model"]
+            assert m["rope_freq_base"] is None and m["rope_scaling_factor"] is None
+            assert c.get("/api/v1/models").status_code == 200
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_autoconfig_and_suggest_defaults_survive_non_finite_metadata():
+    from app import ini
+    summary = gguf_meta.summarize(gguf_meta.read_raw_bytes(_nonfinite_gguf()))
+    ini.suggest_defaults(summary)
+    rec = autoconfig.analyze(summary=summary, file_size=4 * 1024 ** 3, backends=_BACKEND, vision=False)
+    _assert_json_safe(__import__("dataclasses").asdict(rec))
+
+
+def test_kv_first_int_ignores_nulled_entries():
+    assert autoconfig._kv_first_int({"_array": True, "count": 20, "sample": [None, 8, 8, None]}) == 8
+    assert autoconfig._kv_first_int({"_array": True, "count": 20, "sample": [None, None]}, default=3) == 3
+    assert autoconfig._kv_first_int([None, 8], default=3) == 3
+
+
+def test_model_shape_survives_infinite_expert_count(tmp_path):
+    from app import services
+    p = tmp_path / "inf.gguf"
+    p.write_bytes(_nonfinite_gguf())
+    assert services.model_shape(p).expert_count == 0
+
+
 # --- #870: implausible block_count -------------------------------------------------------
 
 _BACKEND = [{"name": "engine", "vendor": "unknown", "vram_gb": 14.0, "gpu_count": 1,

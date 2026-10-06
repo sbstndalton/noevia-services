@@ -82,7 +82,7 @@ def model_shape(path: Path) -> ModelShape:
         v = kv.get(f"{arch}.{suffix}")
         try:
             return int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: int(inf) from a hostile float
             return 0
 
     return ModelShape(arch=arch, expert_count=_int("expert_count"),

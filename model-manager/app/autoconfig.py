@@ -131,9 +131,12 @@ def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
         if sample:
             counts: dict[int, int] = {}
             for v in sample:
+                if v is None:  # a non-finite float in the GGUF, nulled by summarize (#901)
+                    continue
                 counts[int(v)] = counts.get(int(v), 0) + 1
-            return max(counts, key=lambda k: counts[k])
-    if isinstance(kv_heads, list) and kv_heads:
+            if counts:
+                return max(counts, key=lambda k: counts[k])
+    if isinstance(kv_heads, list) and kv_heads and kv_heads[0] is not None:
         return int(kv_heads[0])
     return default
 
