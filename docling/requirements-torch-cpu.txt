@@ -1,0 +1,23 @@
+# CPU-only torch and torchvision for the docling image, locked with hashes.
+#
+# Installed by the Dockerfile with
+#   pip install --no-deps --require-hashes --index-url https://download.pytorch.org/whl/cpu -r requirements-torch-cpu.txt
+# The "+cpu" local version is the whole point: plain `torch==2.14.0` on PyPI is the CUDA build and
+# drags in multiple GB of nvidia-* wheels that this image never runs (see the Dockerfile). Their
+# dependencies (numpy, pillow, sympy, networkx, jinja2, filelock, fsspec, ...) are locked in
+# requirements.txt.
+#
+# Versions: torch 2.14.0 and torchvision 0.29.0, verified against the live cowork-docling:f6885a55
+# `pip freeze` on 2026-10-06 (all packages match). Hashes are the sha256 of the cp312 manylinux_2_28
+# x86_64 and aarch64 wheels on the index; pip accepts any listed hash.
+#
+# To bump: choose new versions, then replace the hashes from the index page
+# (https://download.pytorch.org/whl/cpu/torch/ and .../torchvision/, the #sha256= fragments).
+
+torch==2.14.0+cpu \
+    --hash=sha256:a09987c95ec4cffdb6df798d3d641558110a334cfccce22f2f046d83142bc260 \
+    --hash=sha256:da8140c3d4a41500d29710e35bf8e66a4295ec31026487c69f54a3f583310f8d
+
+torchvision==0.29.0+cpu \
+    --hash=sha256:a6bab91c40d469a656d361b8ec60ebdfd86c515ad47b2cd5037d17db30414d75 \
+    --hash=sha256:8ac096fe796dfacbd174be86f7ab3595a39eabc341d2ee2e48557032ec1d57c4

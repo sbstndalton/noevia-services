@@ -164,6 +164,16 @@ are generic because exception text can quote document content.
 conversion can never stall on a download and the container works on a host with
 no outbound access.
 
+## Reproducible build and release path (#890)
+
+The image build is pinned end to end: `requirements.txt` and `requirements-torch-cpu.txt` are
+hash-locked (`pip install --no-deps --require-hashes`; edit `requirements.in` and regenerate, the
+header of `requirements.txt` has the command), and `download_models.py` fetches the layout and
+TableFormer models at exact Hugging Face commits instead of the floating `main` that
+`docling-tools models download` resolves. `test_requirements_pinned.py` fails on any unpinned
+package. Releases that only change the six application files do **not** rebuild: they ship as an
+overlay FROM the running image, documented in `docs/deployment.md` ("Docling release path").
+
 ## Contract
 
 `POST /extract`, body = raw bytes, `X-Document-Name` header. Returns:

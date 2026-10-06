@@ -1,0 +1,13 @@
+# Input for requirements.txt (see requirements.txt header for the regeneration command).
+# torch and torchvision are NOT locked here: they come from the CPU wheel index and are locked
+# in requirements-torch-cpu.txt. They are listed so the resolver sees docling's torch needs.
+torch==2.14.0
+torchvision==0.29.0
+docling-slim[convert-core,models-local,format-pdf,format-office,format-opendocument,format-html,feat-ocr-tesserocr]==2.129.0
+opencv-python-headless<5
+# Pinned to the versions in the live cowork-docling:f6885a55 image (verified against its
+# `pip freeze` on 2026-10-06); the resolver would otherwise pick newer releases.
+filelock==3.32.3
+fsspec==2026.7.0
+numpy==2.5.2
+setuptools==78.1.0
