@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     llamacpp_cache_ram_hard_max_mib: int = 2048
     # Startup migration that writes an explicit cache-ram into chat sections missing one.
     migrate_cache_ram_on_start: bool = True
+    # #909: which GGUF metadata parser produces summaries: "python" (default) or "rust" (the
+    # gguf-meta binary baked into the image). Invalid values mean python, with one warning.
+    gguf_parser: str = "python"
+    # The gguf-meta binary: a name looked up on PATH, or an absolute path.
+    gguf_meta_bin: str = "gguf-meta"
 
     @property
     def cache_ram_limits(self) -> tuple[int, int]:

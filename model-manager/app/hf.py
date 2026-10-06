@@ -286,7 +286,8 @@ async def gguf_header(repo_id: str, path: str) -> dict | None:
         if status not in (200, 206) or not body:
             _HEADER_CACHE[key] = {}
             return None
-        summary = gguf_meta.summarize(gguf_meta.read_raw_bytes(bytes(body)))
+        # Off the event loop: with GGUF_PARSER=rust this runs a subprocess.
+        summary = await asyncio.to_thread(gguf_meta.summarize_bytes, bytes(body))
     except (httpx.HTTPError, gguf_meta.GgufMetaError, ValueError, OSError):
         _HEADER_CACHE[key] = {}
         return None

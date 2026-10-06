@@ -1,8 +1,15 @@
 """Minimal GGUF v3 metadata reader. Zero deps beyond stdlib."""
 from __future__ import annotations
 
+import copy
+import json
+import logging
 import math
+import os
+import shutil
 import struct
+import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -406,3 +413,178 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
         "chat_template_features": scan_chat_template_features(raw.get("tokenizer.chat_template") or ""),
     }
 
+
+
+# --- Parser switch (#909) ---------------------------------------------------------------------
+# GGUF_PARSER=rust runs the bounded Rust reader from sbstndalton/noevia-rs (`gguf-meta <path>`,
+# baked into the image at release/versions.lock's NOEVIA_RS_REF) instead of the Python parser
+# above. It ships dark: the default is python, and every Rust failure (missing binary, nonzero
+# exit, timeout, oversized or malformed output) falls back to the Python parser, so callers see
+# exactly the Python behaviour, errors included. Only summaries go through Rust; read_raw()
+# (raw key/value access, e.g. services.model_shape) stays Python.
+
+PARSERS = ("python", "rust")
+GGUF_META_TIMEOUT_S = 10.0
+GGUF_META_STDOUT_CAP = 4 * 1024 * 1024
+# Always objects in a summary ("arch" is copied from the file, so it may be any JSON type).
+_SUMMARY_KEYS = ("general", "model", "tokenizer")
+
+_log = logging.getLogger(__name__)
+_LOGGED: set[str] = set()
+_LOGGED_LOCK = threading.Lock()
+# (path|mtime|size) -> Rust summary, or None when Rust failed on that version of the file (so a
+# file Rust cannot read is not re-spawned on every page render; Python answers instead).
+_RUST_CACHE: dict[str, dict[str, Any] | None] = {}
+
+
+def _log_once(reason: str, message: str) -> None:
+    with _LOGGED_LOCK:
+        if reason in _LOGGED:
+            return
+        _LOGGED.add(reason)
+    _log.warning(message)
+
+
+def _setting(name: str, env: str, default: str) -> str:
+    # gguf_meta.py is also loaded straight from its file by noevia-rs's fixture generator, where
+    # the package (and so .config) is absent: fall back to the environment there.
+    try:
+        from .config import settings
+        return str(getattr(settings, name, default) or "")
+    except ImportError:
+        return os.environ.get(env, default)
+
+
+def parser_choice() -> str:
+    """The configured GGUF parser: "python" (default) or "rust". Anything else is python."""
+    value = _setting("gguf_parser", "GGUF_PARSER", "python").strip().lower() or "python"
+    if value not in PARSERS:
+        _log_once("invalid_setting",
+                  f"GGUF_PARSER={value!r} is not one of {', '.join(PARSERS)}; using python")
+        return "python"
+    return value
+
+
+def _rust_binary() -> str | None:
+    configured = _setting("gguf_meta_bin", "GGUF_META_BIN", "gguf-meta").strip() or "gguf-meta"
+    if os.sep in configured:
+        return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
+    return shutil.which(configured)
+
+
+def _rust_fail(reason: str, detail: str) -> None:
+    _log_once(f"rust:{reason}", f"gguf-meta failed ({reason}: {detail}); using the Python GGUF parser")
+
+
+def _run_rust(path: Path) -> dict[str, Any] | None:
+    """Summarise `path` with the gguf-meta binary, or None (after logging once per reason) when
+    it cannot. No shell: the path is one argv element. Output is capped and time-limited."""
+    binary = _rust_binary()
+    if binary is None:
+        _rust_fail("missing_binary", "gguf-meta not found or not executable")
+        return None
+    try:
+        proc = subprocess.Popen(
+            [binary, os.fspath(Path(path).absolute())],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            close_fds=True, shell=False,
+        )
+    except OSError as e:
+        _rust_fail("spawn_error", str(e))
+        return None
+    buf = bytearray()
+
+    def pump() -> None:
+        try:
+            while len(buf) <= GGUF_META_STDOUT_CAP:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+        except (OSError, ValueError):
+            pass
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    reader.join(GGUF_META_TIMEOUT_S)
+    try:
+        if reader.is_alive():
+            _rust_fail("timeout", f"no result within {GGUF_META_TIMEOUT_S:g} s")
+            return None
+        if len(buf) > GGUF_META_STDOUT_CAP:
+            _rust_fail("output_too_large", f"more than {GGUF_META_STDOUT_CAP} bytes on stdout")
+            return None
+        try:
+            code = proc.wait(timeout=GGUF_META_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            _rust_fail("timeout", "process did not exit after closing stdout")
+            return None
+        if code != 0:
+            _rust_fail("nonzero_exit", f"exit status {code}")
+            return None
+        try:
+            summary = json.loads(bytes(buf).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as e:
+            _rust_fail("bad_json", type(e).__name__)
+            return None
+        if not isinstance(summary, dict) or "arch" not in summary \
+                or not all(isinstance(summary.get(k), dict) for k in _SUMMARY_KEYS):
+            _rust_fail("bad_json", "not a summary object")
+            return None
+        # Same sanitiser as the Python path (#901): Rust already emits null, this is belt and braces.
+        return _finite(summary)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        reader.join(1)
+        if proc.stdout:
+            proc.stdout.close()
+
+
+def summarize_path(path: Path) -> dict[str, Any]:
+    """summarize(read_raw(path)) through the configured parser. The single entry point every
+    file summary goes through; raises what the Python parser raises."""
+    path = Path(path)
+    if parser_choice() == "rust":
+        st = path.stat()
+        key = f"{path}|{st.st_mtime_ns}|{st.st_size}"
+        with _CACHE_LOCK:
+            hit = key in _RUST_CACHE
+            cached = _RUST_CACHE.get(key)
+        if not hit:
+            cached = _run_rust(path)
+            with _CACHE_LOCK:
+                _RUST_CACHE[key] = cached
+        if cached is not None:
+            return copy.deepcopy(cached)
+    return summarize(read_raw(path))
+
+
+def summarize_bytes(buf: bytes) -> dict[str, Any]:
+    """summarize(read_raw_bytes(buf)) through the configured parser (e.g. a range-fetched
+    remote header). With rust the bytes go through a private temp file."""
+    if parser_choice() == "rust":
+        summary = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="gguf-head-", suffix=".gguf")
+        except OSError as e:
+            _rust_fail("tempfile", str(e))
+        else:
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(buf)
+                summary = _run_rust(Path(tmp))
+            except OSError as e:
+                _rust_fail("tempfile", str(e))
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if summary is not None:
+            return summary
+    return summarize(read_raw_bytes(buf))

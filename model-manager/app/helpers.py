@@ -203,7 +203,7 @@ def _gguf_hints_for(name: str) -> tuple[dict[str, str], list[str]]:
     if gguf_path is None or not gguf_path.is_file():
         return {}, [f"No GGUF found for `{name}` — cannot suggest defaults from metadata."]
     try:
-        summary = gguf_meta.summarize(gguf_meta.read_raw(gguf_path))
+        summary = gguf_meta.summarize_path(gguf_path)
     except (gguf_meta.GgufMetaError, OSError) as e:
         return {}, [f"Could not read GGUF: {e}"]
     values, hints = ini.suggest_defaults(summary)
@@ -286,7 +286,7 @@ def _predicted_vram_gb(section: str) -> float | None:
         gguf_path, model_rel, rel = _resolve_section_gguf(section)
         if gguf_path is None or not gguf_path.is_file():
             return None
-        summary = gguf_meta.summarize(gguf_meta.read_raw(gguf_path))
+        summary = gguf_meta.summarize_path(gguf_path)
         backends = _backend_list()
         if not backends:
             return None

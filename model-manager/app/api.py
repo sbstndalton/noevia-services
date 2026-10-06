@@ -136,10 +136,10 @@ def _find_entry(key: str) -> services.GgufEntry:
 async def model_detail(key: str = Query(...)) -> dict:
     g = _find_entry(key)
     try:
-        raw = gguf_meta.read_raw(g.parts[0])
+        # Off the event loop: with GGUF_PARSER=rust this runs a subprocess (#909).
+        summary = await asyncio.to_thread(gguf_meta.summarize_path, g.parts[0])
     except (gguf_meta.GgufMetaError, OSError) as e:
         raise HTTPException(422, f"Could not read the model file: {e}") from e
-    summary = gguf_meta.summarize(raw)
     summary.pop("chat_template", None)  # large; the features summary is what the UI shows
     return {**_entry(g, await _loaded_map()), "path": str(g.parts[0]), "summary": _plain(summary)}
 
@@ -314,7 +314,7 @@ def _register_safe_defaults(name: str) -> dict:
 
 def _builtin_mtp_layers(gguf_path) -> int:
     try:
-        return int((gguf_meta.summarize(gguf_meta.read_raw(gguf_path)).get("model") or {}).get("nextn_predict_layers") or 0)
+        return int((gguf_meta.summarize_path(gguf_path).get("model") or {}).get("nextn_predict_layers") or 0)
     except (gguf_meta.GgufMetaError, OSError, ValueError):
         return 0
 
@@ -333,7 +333,7 @@ async def section_draft_heads(name: str) -> dict:
         raise HTTPException(404, "no model file for this section")
     subdir = rel.rsplit("/", 1)[0] if "/" in rel else ""
     local = autoconfig._find_mtp(settings.models_dir, name, subdir)
-    builtin = _builtin_mtp_layers(gguf_path)
+    builtin = await asyncio.to_thread(_builtin_mtp_layers, gguf_path)
     out = {"section": name, "local": local, "builtinLayers": builtin, "available": bool(local or builtin),
            "remote": [], "mtpBuild": None, "repo": None, "modes": autoconfig.MODE_SPEC_PROFILE}
     repo = db.repo_for_file(Path(rel).name)
@@ -416,7 +416,7 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
     if gguf_path is None or not gguf_path.is_file():
         return {"error": f"No model file found for '{name}'."}
     try:
-        summary = gguf_meta.summarize(gguf_meta.read_raw(gguf_path))
+        summary = gguf_meta.summarize_path(gguf_path)
     except (gguf_meta.GgufMetaError, OSError) as e:
         return {"error": f"Could not read the model file: {e}"}
     file_size = gguf_path.stat().st_size
