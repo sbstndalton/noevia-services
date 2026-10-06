@@ -433,6 +433,30 @@ def record_server_configs(backend: str, configs: list) -> int:
     return len(rows)
 
 
+def server_instances_on_port(backend: str, port: str) -> list[dict]:
+    """Stored "<port>@<spawn second>" instances of `backend`, newest first_seen first.
+
+    Lets the log parser attribute a request whose spawn line has left the log tail (#904). The
+    router reuses ports, so the caller picks the newest one that had spawned by the request.
+    """
+    import json as _json
+    prefix = f"{port}@"
+    with _LOCK, _conn() as c:
+        rows = c.execute(
+            "SELECT instance, alias, model_path, argv_json, first_seen FROM server_config "
+            "WHERE backend = ? AND substr(instance, 1, length(?)) = ? AND first_seen > 0 "
+            "ORDER BY first_seen DESC", (backend, prefix, prefix)).fetchall()
+    out = []
+    for r in rows:
+        try:
+            argv = _json.loads(r["argv_json"] or "{}")
+        except ValueError:
+            argv = {}
+        out.append({"instance": r["instance"], "alias": r["alias"],
+                    "model_path": r["model_path"], "argv": argv, "first_seen": r["first_seen"]})
+    return out
+
+
 def timings_by_instance(*, model_path: str = "", alias: str = "",
                         min_gen_tokens: int = 0) -> list[sqlite3.Row]:
     """Per-instance aggregates for one model, newest instance first.
