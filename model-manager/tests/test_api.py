@@ -48,7 +48,7 @@ def test_schema_fields_carry_stable_ids_beside_the_english_text(client):
 
 
 def test_web_field_id_fixture_matches_the_schema():
-    # apps/web/tests/i18n.test.cjs checks every id in this fixture has a translated label and help;
+    # apps/web/tests/server/i18n.test.cjs checks every id in this fixture has a translated label and help;
     # this keeps the fixture equal to the schema, in order, so neither side can drift alone.
     import json
     from pathlib import Path
@@ -61,7 +61,7 @@ def test_web_field_id_fixture_matches_the_schema():
 
 
 def test_web_backend_notes_fixture_matches_the_service_strings():
-    # apps/web/tests/locale-613-616-620.test.cjs checks every note in this fixture has a translated
+    # apps/web/tests/server/locale-613-616-620.test.cjs checks every note in this fixture has a translated
     # wording; this keeps the fixture equal to the strings hw.py and services.py really send.
     import json
     import re
