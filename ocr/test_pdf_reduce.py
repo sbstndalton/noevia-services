@@ -30,6 +30,66 @@ class ReductionTests(unittest.TestCase):
             raise subprocess.CalledProcessError(1,args)
         with patch('pdf_reduce.subprocess.run',side_effect=run), self.assertRaises(ValueError): reduce_pdf(b'%PDF-synthetic')
 
+class ReductionDeadlineTests(unittest.TestCase):
+    """#914: the worker's whole budget must stay below the web's 180 s abort."""
+
+    def fake(self, durations, text='Synthetic full text'):
+        """Fake clock + subprocess.run: each step consumes durations[tool] seconds, or its whole
+        timeout (then raises TimeoutExpired) when durations[tool] is None or exceeds it."""
+        clock = [1000.0]
+        calls = []
+        def run(args, **kwargs):
+            timeout = kwargs['timeout']
+            calls.append((args[0], timeout))
+            take = durations.get(args[0])
+            if take is None or take > timeout:
+                clock[0] += timeout
+                raise subprocess.TimeoutExpired(args, timeout)
+            clock[0] += take
+            if args[0] == 'pdfinfo':
+                return subprocess.CompletedProcess(args, 0, stdout=b'Pages: 1\nEncrypted: no\n')
+            if args[0] == 'pdftotext':
+                Path(args[-1]).write_text(text)
+            return subprocess.CompletedProcess(args, 0)
+        return calls, run, (lambda: clock[0])
+
+    def reduce(self, durations, **kw):
+        calls, run, now = self.fake(durations, **kw)
+        with patch('pdf_reduce.subprocess.run', side_effect=run), patch('time.monotonic', now):
+            try:
+                return calls, reduce_pdf(b'%PDF-synthetic'), None
+            except ValueError as error:
+                return calls, None, error
+
+    def test_slow_steps_never_get_more_than_the_overall_budget(self):
+        calls, result, error = self.reduce({'pdfinfo': 15, 'pdftotext': None, 'gs': None})
+        self.assertLess(sum(t for _, t in calls), 180)
+        self.assertLessEqual(sum(t for _, t in calls), 160)
+        self.assertIsNotNone(error)  # no text recovered, no reduced PDF: clean refusal
+
+    def test_gs_timeout_still_falls_back_to_native_text_within_budget(self):
+        calls, result, error = self.reduce({'pdfinfo': 15, 'pdftotext': 45, 'gs': None})
+        self.assertEqual(result['kind'], 'text')
+        self.assertLess(sum(t for _, t in calls), 180)
+        self.assertEqual(dict(calls)['gs'], 160 - 15 - 45)  # min(120, remaining)
+
+    def test_exhausted_budget_stops_launching_subprocesses_and_fails_cleanly(self):
+        calls, result, error = self.reduce({'pdfinfo': 161})
+        self.assertEqual([name for name, _ in calls], ['pdfinfo'])
+        self.assertIsInstance(error, ValueError)
+
+    def test_normal_run_keeps_the_per_step_limits(self):
+        calls, result, error = self.reduce({'pdfinfo': 1, 'pdftotext': 1, 'gs': 1})
+        self.assertEqual(dict(calls), {'pdfinfo': 15, 'pdftotext': 45, 'gs': 120})
+
+    def test_budget_is_below_the_web_abort(self):
+        import re
+        from pdf_reduce import REDUCE_DEADLINE_SECONDS
+        web = (Path(__file__).resolve().parents[2] / 'apps/web/server/pdf-reduce.cjs').read_text()
+        if 'AbortSignal.timeout' not in web:
+            self.skipTest('web source not present')
+        abort = int(re.search(r'AbortSignal\.timeout\((\d+)\)', web)[1]) / 1000
+        self.assertLess(REDUCE_DEADLINE_SECONDS, abort)
 
 
 @unittest.skipIf(ENGINES, ENGINES)
