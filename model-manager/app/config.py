@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     gguf_parser: str = "python"
     # The gguf-meta binary: a name looked up on PATH, or an absolute path.
     gguf_meta_bin: str = "gguf-meta"
+    # #964: which implementation turns a Hugging Face tree listing into file entries: "python"
+    # (default) or "rust" (the model-files binary baked into the image; fails closed).
+    model_files_impl: str = "python"
+    # The model-files binary: a name looked up on PATH, or an absolute path.
+    model_files_bin: str = "model-files"
 
     @property
     def cache_ram_limits(self) -> tuple[int, int]:

@@ -1,0 +1,7719 @@
+{
+ "version": 1,
+ "unidata_version": "15.0.0",
+ "reference": "noevia-services model-manager/app/model_files.py files_from_tree_py",
+ "cases": [
+  {
+   "name": "empty",
+   "input": "[]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "plain_gguf",
+   "input": "[{\"type\": \"file\", \"path\": \"model-Q4_K_M.gguf\", \"size\": 123}]",
+   "expect": {
+    "files": [
+     {
+      "path": "model-Q4_K_M.gguf",
+      "size": 123,
+      "quant": "Q4_K_M",
+      "shard_base": "model-Q4_K_M.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_wins",
+   "input": "[{\"type\": \"file\", \"path\": \"m.Q8_0.gguf\", \"size\": 1, \"lfs\": {\"size\": 999, \"oid\": \"x\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.Q8_0.gguf",
+      "size": 999,
+      "quant": "Q8_0",
+      "shard_base": "m.Q8_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_zero_falls_back",
+   "input": "[{\"type\": \"file\", \"path\": \"m.gguf\", \"size\": 7, \"lfs\": {\"size\": 0}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_without_size",
+   "input": "[{\"type\": \"file\", \"path\": \"m.gguf\", \"size\": 7, \"lfs\": {\"oid\": \"x\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "no_size_is_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"m.gguf\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "directory_skipped",
+   "input": "[{\"type\": \"directory\", \"path\": \"sub\"}, {\"type\": \"file\", \"path\": \"sub/x-IQ2_XXS.gguf\", \"size\": 3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "sub/x-IQ2_XXS.gguf",
+      "size": 3,
+      "quant": "IQ2_XXS",
+      "shard_base": "sub/x-IQ2_XXS.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "non_gguf_skipped",
+   "input": "[{\"type\": \"file\", \"path\": \"README.md\", \"size\": 5}, {\"type\": \"file\", \"path\": \"config.json\", \"size\": 2}, {\"type\": \"file\", \"path\": \"x.safetensors\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "support_files",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj-F16.gguf\"}, {\"type\": \"file\", \"path\": \"vision.mmproj\"}, {\"type\": \"file\", \"path\": \"chat_template.jinja\"}, {\"type\": \"file\", \"path\": \"sub/tokenizer.model\"}, {\"type\": \"file\", \"path\": \"tokenizer.model.bak\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj-F16.gguf",
+      "size": 0,
+      "quant": "F16",
+      "shard_base": "mmproj-F16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "vision.mmproj",
+      "size": 0,
+      "quant": null,
+      "shard_base": "vision.mmproj",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "chat_template.jinja",
+      "size": 0,
+      "quant": null,
+      "shard_base": "chat_template.jinja",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "sub/tokenizer.model",
+      "size": 0,
+      "quant": null,
+      "shard_base": "sub/tokenizer.model",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "case_insensitive_ext",
+   "input": "[{\"type\": \"file\", \"path\": \"BIG.GGUF\", \"size\": 1}, {\"type\": \"file\", \"path\": \"MMPROJ.GGUF\"}, {\"type\": \"file\", \"path\": \"x.Gguf\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "BIG.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "BIG.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "MMPROJ.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "MMPROJ.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "x.Gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "x.Gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_set",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_M/model-Q4_K_M-00001-of-00003.gguf\", \"size\": 11}, {\"type\": \"file\", \"path\": \"Q4_K_M/model-Q4_K_M-00002-of-00003.gguf\", \"size\": 12}, {\"type\": \"file\", \"path\": \"Q4_K_M/model-Q4_K_M-00003-of-00003.gguf\", \"size\": 13}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_K_M/model-Q4_K_M-00001-of-00003.gguf",
+      "size": 11,
+      "quant": "Q4_K_M",
+      "shard_base": "Q4_K_M/model-Q4_K_M.gguf",
+      "shard_index": 1,
+      "shard_total": 3
+     },
+     {
+      "path": "Q4_K_M/model-Q4_K_M-00002-of-00003.gguf",
+      "size": 12,
+      "quant": "Q4_K_M",
+      "shard_base": "Q4_K_M/model-Q4_K_M.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     },
+     {
+      "path": "Q4_K_M/model-Q4_K_M-00003-of-00003.gguf",
+      "size": 13,
+      "quant": "Q4_K_M",
+      "shard_base": "Q4_K_M/model-Q4_K_M.gguf",
+      "shard_index": 3,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_set_mixed_dirs",
+   "input": "[{\"type\": \"file\", \"path\": \"a/m-00001-of-00002.gguf\"}, {\"type\": \"file\", \"path\": \"b/m-00002-of-00002.gguf\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "a/m-00001-of-00002.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "a/m.gguf",
+      "shard_index": 1,
+      "shard_total": 2
+     },
+     {
+      "path": "b/m-00002-of-00002.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "b/m.gguf",
+      "shard_index": 2,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "missing_type_and_path",
+   "input": "[{\"path\": \"x.gguf\"}, {\"type\": \"file\"}, {}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "type_not_string",
+   "input": "[{\"type\": 1, \"path\": 5}, {\"type\": null, \"path\": null}, {\"type\": [\"file\"]}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "non_file_with_bad_path_skipped",
+   "input": "[{\"type\": \"directory\", \"path\": 5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "duplicate_keys_last_wins",
+   "input": "[{\"type\":\"file\",\"path\":\"a.gguf\",\"path\":\"b-Q5_K_S.gguf\",\"size\":1,\"size\":2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "b-Q5_K_S.gguf",
+      "size": 2,
+      "quant": "Q5_K_S",
+      "shard_base": "b-Q5_K_S.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "key_order_irrelevant",
+   "input": "[{\"size\":9,\"path\":\"z.gguf\",\"type\":\"file\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "z.gguf",
+      "size": 9,
+      "quant": null,
+      "shard_base": "z.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "escaped_unicode",
+   "input": "[{\"type\":\"file\",\"path\":\"\\u00e9-\\ud83d\\ude00-Q6_K.gguf\",\"size\":1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9-\ud83d\ude00-Q6_K.gguf",
+      "size": 1,
+      "quant": "Q6_K",
+      "shard_base": "\u00e9-\ud83d\ude00-Q6_K.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "whitespace_everywhere",
+   "input": " [ { \"type\" : \"file\" ,\n\t\"path\" : \"w.gguf\" , \"size\" : 4 } ]\r\n",
+   "expect": {
+    "files": [
+     {
+      "path": "w.gguf",
+      "size": 4,
+      "quant": null,
+      "shard_base": "w.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_lower",
+   "input": "[{\"type\": \"file\", \"path\": \"m.q4_k_m.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.q4_k_m.gguf",
+      "size": 1,
+      "quant": "Q4_K_M",
+      "shard_base": "m.q4_k_m.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_iq",
+   "input": "[{\"type\": \"file\", \"path\": \"m-IQ3_XXS.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-IQ3_XXS.gguf",
+      "size": 1,
+      "quant": "IQ3_XXS",
+      "shard_base": "m-IQ3_XXS.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_bf16",
+   "input": "[{\"type\": \"file\", \"path\": \"m-BF16.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-BF16.gguf",
+      "size": 1,
+      "quant": "BF16",
+      "shard_base": "m-BF16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_fp8",
+   "input": "[{\"type\": \"file\", \"path\": \"m-fp8.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-fp8.gguf",
+      "size": 1,
+      "quant": "FP8",
+      "shard_base": "m-fp8.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_fp4",
+   "input": "[{\"type\": \"file\", \"path\": \"m.FP4.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.FP4.gguf",
+      "size": 1,
+      "quant": "FP4",
+      "shard_base": "m.FP4.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_f32",
+   "input": "[{\"type\": \"file\", \"path\": \"m.f32.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m.f32.gguf",
+      "size": 1,
+      "quant": "F32",
+      "shard_base": "m.f32.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_none",
+   "input": "[{\"type\": \"file\", \"path\": \"model.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "model.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "model.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_glued_left",
+   "input": "[{\"type\": \"file\", \"path\": \"xQ4_K.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "xQ4_K.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "xQ4_K.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_glued_right",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_Kx.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_Kx.gguf",
+      "size": 1,
+      "quant": "Q4_KX",
+      "shard_base": "Q4_Kx.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_trailing_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "m-Q4_.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_long_tail",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_K_M_L_XL_0.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_K_M_L_XL_0.gguf",
+      "size": 1,
+      "quant": "Q4_K_M_L_XL_0",
+      "shard_base": "m-Q4_K_M_L_XL_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_first_wins",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q2_K-Q8_0.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q2_K-Q8_0.gguf",
+      "size": 1,
+      "quant": "Q2_K",
+      "shard_base": "m-Q2_K-Q8_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_in_dir",
+   "input": "[{\"type\": \"file\", \"path\": \"Q5_K_M/model.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q5_K_M/model.gguf",
+      "size": 1,
+      "quant": "Q5_K_M",
+      "shard_base": "Q5_K_M/model.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_digits_only",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q12345.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q12345.gguf",
+      "size": 1,
+      "quant": "Q12345",
+      "shard_base": "m-Q12345.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_F16_vs_Q",
+   "input": "[{\"type\": \"file\", \"path\": \"F16-Q4_0.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "F16-Q4_0.gguf",
+      "size": 1,
+      "quant": "F16",
+      "shard_base": "F16-Q4_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_ud_prefix",
+   "input": "[{\"type\": \"file\", \"path\": \"m-UD-Q4_K_XL.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-UD-Q4_K_XL.gguf",
+      "size": 1,
+      "quant": "Q4_K_XL",
+      "shard_base": "m-UD-Q4_K_XL.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_backtrack_tail",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_K_\\u00e9.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_K_\u00e9.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "m-Q4_K_\u00e9.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_word_after_digit",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4\\u00e9.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4\u00e9.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "m-Q4\u00e9.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_superscript",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4\\u00b2.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4\u00b2.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "m-Q4\u00b2.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_arabic_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q\\u0664_K.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q\u0664_K.gguf",
+      "size": 1,
+      "quant": "Q\u0664_K",
+      "shard_base": "m-Q\u0664_K.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_fullwidth_digit",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q\\uff14.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q\uff14.gguf",
+      "size": 1,
+      "quant": "Q\uff14",
+      "shard_base": "m-Q\uff14.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_dotted_I",
+   "input": "[{\"type\": \"file\", \"path\": \"m-\\u0130Q4_K.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-\u0130Q4_K.gguf",
+      "size": 1,
+      "quant": "\u0130Q4_K",
+      "shard_base": "m-\u0130Q4_K.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_dotless_i",
+   "input": "[{\"type\": \"file\", \"path\": \"m-\\u0131q4_k.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-\u0131q4_k.gguf",
+      "size": 1,
+      "quant": "IQ4_K",
+      "shard_base": "m-\u0131q4_k.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_long_s",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_\\u017f.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_\u017f.gguf",
+      "size": 1,
+      "quant": "Q4_S",
+      "shard_base": "m-Q4_\u017f.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_kelvin",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_\\u212a_M.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_\u212a_M.gguf",
+      "size": 1,
+      "quant": "Q4_\u212a_M",
+      "shard_base": "m-Q4_\u212a_M.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_combining_mark",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_K\\u0301.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_K\u0301.gguf",
+      "size": 1,
+      "quant": "Q4_K",
+      "shard_base": "m-Q4_K\u0301.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_underscore_word",
+   "input": "[{\"type\": \"file\", \"path\": \"_Q4_K.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "_Q4_K.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "_Q4_K.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_bf16_glued",
+   "input": "[{\"type\": \"file\", \"path\": \"BF16x.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "BF16x.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "BF16x.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_iq_no_digit",
+   "input": "[{\"type\": \"file\", \"path\": \"m-IQ_K.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-IQ_K.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "m-IQ_K.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_mmproj_f16",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj-model-f16.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj-model-f16.gguf",
+      "size": 1,
+      "quant": "F16",
+      "shard_base": "mmproj-model-f16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "quant_newline",
+   "input": "[{\"type\": \"file\", \"path\": \"m-Q4_K\\n.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-Q4_K\n.gguf",
+      "size": 1,
+      "quant": "Q4_K",
+      "shard_base": "m-Q4_K\n.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_basic",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00001-of-00002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00001-of-00002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": 1,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_upper_of",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00001-OF-00002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00001-OF-00002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m-00001-OF-00002.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_six_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"m-000001-of-000002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-000001-of-000002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m-000001-of-000002.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_four_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"m-0001-of-0002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-0001-of-0002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m-0001-of-0002.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_inner_dot",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00001-of-00002.part.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00001-of-00002.part.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m-00001-of-00002.part.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_two_patterns",
+   "input": "[{\"type\": \"file\", \"path\": \"a-00001-of-00009-00002-of-00003.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "a-00001-of-00009-00002-of-00003.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "a-00001-of-00009.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_arabic",
+   "input": "[{\"type\": \"file\", \"path\": \"m-\\u0660\\u0660\\u0660\\u0660\\u0661-of-\\u0660\\u0660\\u0660\\u0660\\u0662.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-\u0660\u0660\u0660\u0660\u0661-of-\u0660\u0660\u0660\u0660\u0662.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": 1,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_fullwidth",
+   "input": "[{\"type\": \"file\", \"path\": \"m-\\uff10\\uff10\\uff10\\uff10\\uff11-of-\\uff10\\uff10\\uff10\\uff10\\uff13.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-\uff10\uff10\uff10\uff10\uff11-of-\uff10\uff10\uff10\uff10\uff13.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": 1,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_math_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"m-\\ud835\\udfce\\ud835\\udfce\\ud835\\udfce\\ud835\\udfd8\\ud835\\udfe1-of-\\ud835\\udfce\\ud835\\udfce\\ud835\\udfce\\ud835\\udfcf\\ud835\\udfd0.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-\ud835\udfce\ud835\udfce\ud835\udfce\ud835\udfd8\ud835\udfe1-of-\ud835\udfce\ud835\udfce\ud835\udfce\ud835\udfcf\ud835\udfd0.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": 9,
+      "shard_total": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_zero_of_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00000-of-00000.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00000-of-00000.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": 0,
+      "shard_total": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_index_past_total",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00009-of-00002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00009-of-00002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.gguf",
+      "shard_index": 9,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_only_suffix",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-00002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00001-of-00002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": 1,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_in_directory",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00001-of-00002.d/x.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00001-of-00002.d/x.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m-00001-of-00002.d/x.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_mmproj",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj-00001-of-00002.gguf\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj-00001-of-00002.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": 1,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "shard_trailing_dot",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00001-of-00002.mmproj\", \"size\": 2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "m-00001-of-00002.mmproj",
+      "size": 2,
+      "quant": null,
+      "shard_base": "m.mmproj",
+      "shard_index": 1,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "newline_suffix_skipped",
+   "input": "[{\"type\": \"file\", \"path\": \"m-00001-of-00002.gguf\\n\", \"size\": 1}, {\"type\": \"file\", \"path\": \"m.gguf\\n\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "kelvin_tokenizer",
+   "input": "[{\"type\": \"file\", \"path\": \"to\\u212aenizer.model\", \"size\": 1}, {\"type\": \"file\", \"path\": \"TO\\u212aENIZER.MODEL\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "to\u212aenizer.model",
+      "size": 1,
+      "quant": null,
+      "shard_base": "to\u212aenizer.model",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "TO\u212aENIZER.MODEL",
+      "size": 0,
+      "quant": null,
+      "shard_base": "TO\u212aENIZER.MODEL",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "dotted_capital_i_suffix",
+   "input": "[{\"type\": \"file\", \"path\": \"chat_template.j\\u0130nja\"}, {\"type\": \"file\", \"path\": \"x.ggu\\u0130\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "traversal_paths_listed_verbatim",
+   "input": "[{\"type\": \"file\", \"path\": \"../../etc/x.gguf\", \"size\": 1}, {\"type\": \"file\", \"path\": \"/abs/y.gguf\"}, {\"type\": \"file\", \"path\": \"a\\\\b.gguf\"}, {\"type\": \"file\", \"path\": \"..\\\\..\\\\z-Q4_0.gguf\"}, {\"type\": \"file\", \"path\": \"./.gguf\"}, {\"type\": \"file\", \"path\": \".gguf\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "../../etc/x.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "../../etc/x.gguf",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "/abs/y.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "/abs/y.gguf",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "a\\b.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "a\\b.gguf",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "..\\..\\z-Q4_0.gguf",
+      "size": 0,
+      "quant": "Q4_0",
+      "shard_base": "..\\..\\z-Q4_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": "./.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "./.gguf",
+      "shard_index": null,
+      "shard_total": null
+     },
+     {
+      "path": ".gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "control_and_nul",
+   "input": "[{\"type\":\"file\",\"path\":\"a\\u0000b\\u001f-Q4_0.gguf\",\"size\":1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "a\u0000b\u001f-Q4_0.gguf",
+      "size": 1,
+      "quant": "Q4_0",
+      "shard_base": "a\u0000b\u001f-Q4_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_int",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 42}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 42,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_int",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": 42}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 42,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": 0}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_negative",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": -5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -5,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_negative",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": -5}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -5,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_true",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_true",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": true}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_false",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": false}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_false",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": false}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_null",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_null",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": null}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_trunc",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 1.9}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_trunc",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": 1.9}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_neg_trunc",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": -1.9}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -1,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_neg_trunc",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": -1.9}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -1,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_neg_half",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": -0.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_neg_half",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": -0.5}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_big",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 1e+300}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_big",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": 1e+300}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_2_53",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 9007199254740992.0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 9007199254740992,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_2_53",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": 9007199254740992.0}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 9007199254740992,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_tiny",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 5e-324}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_tiny",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": 5e-324}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_float_neg_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": -0.0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_float_neg_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": -0.0}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"123\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 123,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"123\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 123,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_spaces",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \" \\t12\\n \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 12,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_spaces",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \" \\t12\\n \"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 12,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_underscores",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1_000_000\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1000000,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_underscores",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1_000_000\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1000000,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_double_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1__0\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_double_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1__0\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_leading_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"_1\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_leading_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"_1\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_trailing_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1_\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_trailing_underscore",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1_\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_plus",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"+5\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 5,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_plus",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"+5\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 5,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_minus",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"-5\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -5,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_minus",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"-5\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -5,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_minus_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"-0\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_minus_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"-0\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_leading_zeros",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"007\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_leading_zeros",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"007\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_arabic",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\\u0661\\u0662\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 12,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_arabic",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\\u0661\\u0662\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 12,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_fullwidth",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\\uff11\\uff12\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 12,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_fullwidth",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\\uff11\\uff12\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 12,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_nel_space",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\\u0085 7\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_nel_space",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\\u0085 7\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_ideographic_space",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\\u30007\\u3000\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_ideographic_space",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\\u30007\\u3000\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 7,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_ascii_fs",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\\u001c7\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_ascii_fs",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\\u001c7\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_blank",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"  \"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_blank",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"  \"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"0\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"0\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_float",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1.5\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_float",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1.5\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_exp",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1e3\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_exp",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1e3\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_hex",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"0x10\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_hex",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"0x10\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_sign_space",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"- 1\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_sign_space",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"- 1\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_double_sign",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"--1\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_double_sign",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"--1\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_mixed_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1\\u0662\\uff13\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 123,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_mixed_digits",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1\\u0662\\uff13\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 123,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_str_superscript",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"\\u00b2\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_superscript",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"\\u00b2\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_nul",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"1\\u00002\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_nul",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"1\\u00002\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_underscore_after_sign",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"-_1\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_size_str_underscore_after_sign",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"-_1\"}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_str_long",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": \"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_str_long",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": \"9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999\"}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_list_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": []}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_list_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": []}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_list",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": [1]}]",
+   "expect": {
+    "error": "TypeError"
+   }
+  },
+  {
+   "name": "lfs_size_list",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": [1]}}]",
+   "expect": {
+    "error": "TypeError"
+   }
+  },
+  {
+   "name": "size_dict_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": {}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_size_dict_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": {}}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_dict",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": {\"a\": 1}}]",
+   "expect": {
+    "error": "TypeError"
+   }
+  },
+  {
+   "name": "lfs_size_dict",
+   "input": "[{\"type\": \"file\", \"path\": \"s.gguf\", \"size\": 3, \"lfs\": {\"size\": {\"a\": 1}}}]",
+   "expect": {
+    "error": "TypeError"
+   }
+  },
+  {
+   "name": "size_literal_huge_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":1000000000000000000000000000000000000000000000000000000000000}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1000000000000000000000000000000000000000000000000000000000000,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_literal_huge_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":1000000000000000000000000000000000000000000000000000000000000}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 1000000000000000000000000000000000000000000000000000000000000,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_literal_neg_huge_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":-99999999999999999999999999999999999999999999999999999999999999999999999999999999}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -99999999999999999999999999999999999999999999999999999999999999999999999999999999,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_literal_neg_huge_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":-99999999999999999999999999999999999999999999999999999999999999999999999999999999}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": -99999999999999999999999999999999999999999999999999999999999999999999999999999999,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_literal_exp_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":1E2}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 100,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_literal_exp_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":1E2}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 100,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_literal_frac_exp",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":12.5e1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 125,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_literal_frac_exp",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":12.5e1}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 125,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_literal_overflow",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":1e400}]",
+   "expect": {
+    "error": "OverflowError"
+   }
+  },
+  {
+   "name": "lfs_literal_overflow",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":1e400}}]",
+   "expect": {
+    "error": "OverflowError"
+   }
+  },
+  {
+   "name": "size_literal_underflow",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":1e-400}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_literal_underflow",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":1e-400}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "size_literal_nan",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":NaN}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "lfs_literal_nan",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":NaN}}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "size_literal_inf",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":Infinity}]",
+   "expect": {
+    "error": "OverflowError"
+   }
+  },
+  {
+   "name": "lfs_literal_inf",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":Infinity}}]",
+   "expect": {
+    "error": "OverflowError"
+   }
+  },
+  {
+   "name": "size_literal_neg_inf",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":-Infinity}]",
+   "expect": {
+    "error": "OverflowError"
+   }
+  },
+  {
+   "name": "lfs_literal_neg_inf",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":-Infinity}}]",
+   "expect": {
+    "error": "OverflowError"
+   }
+  },
+  {
+   "name": "size_literal_neg_zero_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":-0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_literal_neg_zero_int",
+   "input": "[{\"type\":\"file\",\"path\":\"s.gguf\",\"size\":3,\"lfs\":{\"size\":-0}}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "s.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_str",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": \"x\"}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "lfs_list_empty",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": []}]",
+   "expect": {
+    "files": [
+     {
+      "path": "l.gguf",
+      "size": 4,
+      "quant": null,
+      "shard_base": "l.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_list",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": [1]}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "lfs_zero",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "l.gguf",
+      "size": 4,
+      "quant": null,
+      "shard_base": "l.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_one",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": 1}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "lfs_true",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": true}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "lfs_false",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": false}]",
+   "expect": {
+    "files": [
+     {
+      "path": "l.gguf",
+      "size": 4,
+      "quant": null,
+      "shard_base": "l.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_null",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "l.gguf",
+      "size": 4,
+      "quant": null,
+      "shard_base": "l.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "lfs_empty_str",
+   "input": "[{\"type\": \"file\", \"path\": \"l.gguf\", \"size\": 4, \"lfs\": \"\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "l.gguf",
+      "size": 4,
+      "quant": null,
+      "shard_base": "l.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "entry_int",
+   "input": "[{\"type\": \"file\", \"path\": \"ok.gguf\"}, 5]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "entry_str",
+   "input": "[{\"type\": \"file\", \"path\": \"ok.gguf\"}, \"x.gguf\"]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "entry_null",
+   "input": "[{\"type\": \"file\", \"path\": \"ok.gguf\"}, null]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "entry_list",
+   "input": "[{\"type\": \"file\", \"path\": \"ok.gguf\"}, []]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "entry_bool",
+   "input": "[{\"type\": \"file\", \"path\": \"ok.gguf\"}, true]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "path_int",
+   "input": "[{\"type\": \"file\", \"path\": 5}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "path_null",
+   "input": "[{\"type\": \"file\", \"path\": null}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "path_list",
+   "input": "[{\"type\": \"file\", \"path\": [\"a.gguf\"]}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "path_dict",
+   "input": "[{\"type\": \"file\", \"path\": {}}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "path_bool",
+   "input": "[{\"type\": \"file\", \"path\": false}]",
+   "expect": {
+    "error": "AttributeError"
+   }
+  },
+  {
+   "name": "bad_size_on_skipped_entry",
+   "input": "[{\"type\": \"file\", \"path\": \"README.md\", \"size\": \"nope\"}, {\"type\": \"file\", \"path\": \"ok.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "ok.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "ok.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "bad_size_after_good",
+   "input": "[{\"type\": \"file\", \"path\": \"ok.gguf\", \"size\": 1}, {\"type\": \"file\", \"path\": \"bad.gguf\", \"size\": \"nope\"}]",
+   "expect": {
+    "error": "ValueError"
+   }
+  },
+  {
+   "name": "random_000",
+   "input": "[{\"type\": \"file\", \"path\": \"72\\u01309\\ud835\\udfcf KQ4_K_MF16P8\\ud835\\udfcfmmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "72\u01309\ud835\udfcf KQ4_K_MF16P8\ud835\udfcfmmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "72\u01309\ud835\udfcf KQ4_K_MF16P8\ud835\udfcfmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_001",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017f\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_002",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFf\\u013124 Sfp8\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_003",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212a6Q4-00001-of-00002IQ2_XXS5\\u00e9\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_004",
+   "input": "[{\"type\": \"file\", \"path\": \".IQ2_XXS.GGUFmmproj\\u00e9s0IQ2_XXS\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_005",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017f\\u00b2.\\u0301\\u0130-00001-of-000026.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u017f\u00b2.\u0301\u0130-00001-of-000026.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u017f\u00b2.\u0301\u0130-00001-of-000026.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_006",
+   "input": "[{\"type\": \"file\", \"path\": \"Xtokenizer.modelKIF16\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_007",
+   "input": "[{\"type\": \"file\", \"path\": \"-\\u0130S\\u0131\\u212a-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-\u0130S\u0131\u212a-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "-\u0130S\u0131\u212a.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_008",
+   "input": "[{\"type\": \"file\", \"path\": \"9mmproj.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "9mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "9mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_009",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9i.lpm\\u0131pLQqmmproj.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9i.lpm\u0131pLQqmmproj.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "\u00e9i.lpm\u0131pLQqmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_010",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085Q6kIQ2_XXSlIQ2_XXS.f-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0085Q6kIQ2_XXSlIQ2_XXS.f-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u0085Q6kIQ2_XXSlIQ2_XXS.f.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_011",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_012",
+   "input": "[{\"type\": \"file\", \"path\": \"L.MLKMxs\\uff14X1.GGUF\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "L.MLKMxs\uff14X1.GGUF",
+      "size": 2,
+      "quant": null,
+      "shard_base": "L.MLKMxs\uff14X1.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_013",
+   "input": "[{\"type\": \"file\", \"path\": \"i.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "i.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "i.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_014",
+   "input": "[{\"type\": \"file\", \"path\": \"b\\u00e9.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "b\u00e9.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "b\u00e9.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_015",
+   "input": "[{\"type\": \"file\", \"path\": \"M\\uff146fp8\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_016",
+   "input": "[{\"type\": \"file\", \"path\": \"8l.GGUF\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8l.GGUF",
+      "size": 3,
+      "quant": null,
+      "shard_base": "8l.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_017",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0660\\n\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_018",
+   "input": "[{\"type\": \"file\", \"path\": \"f\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_019",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085-00002-of-00003.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0085-00002-of-00003.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\u0085.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_020",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131m\\ud835\\udfcf.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0131m\ud835\udfcf.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u0131m\ud835\udfcf.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_021",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131qBIQ2_XXS\\u0660\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_022",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0664smmproj9\\u00b2\\u0085\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_023",
+   "input": "[{\"type\": \"file\", \"path\": \"mkfp8-00001-of-00002q\\n\\u212a\\u212a6\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_024",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131p77S\\u0085\\u0085\\u00e9i.gguf0\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_025",
+   "input": "[{\"type\": \"file\", \"path\": \"B\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_026",
+   "input": "[{\"type\": \"file\", \"path\": \"PL1\\u0664Kb\\n\\uff14\\u3000mmproj.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "PL1\u0664Kb\n\uff14\u3000mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "PL1\u0664Kb\n\uff14\u3000mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_027",
+   "input": "[{\"type\": \"file\", \"path\": \"kf\\ud835\\udfcf4\\n-\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_028",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXSfp8li1\\u0664k\\u01305\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_029",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u30006QBF16kmmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u30006QBF16kmmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u30006QBF16kmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_030",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14\\u00b2k\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_031",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0664\\u00e9IQ2_XXSF\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_032",
+   "input": "[{\"type\": \"file\", \"path\": \"Immproj.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Immproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "Immproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_033",
+   "input": "[{\"type\": \"file\", \"path\": \"KP\\u00e9\\u0130F16BF16\\u01309\\u3000FP.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "KP\u00e9\u0130F16BF16\u01309\u3000FP.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "KP\u00e9\u0130F16BF16\u01309\u3000FP.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_034",
+   "input": "[{\"type\": \"file\", \"path\": \" kQBF16X \\u017f\\u3000_\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_035",
+   "input": "[{\"type\": \"file\", \"path\": \"BkF16IQ2_XXSF-00001-of-00002-00002-of-00003.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "BkF16IQ2_XXSF-00001-of-00002-00002-of-00003.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "BkF16IQ2_XXSF-00001-of-00002.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_036",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9mIQ2_XXS9Bfp8l-00001-of-00002-00002-of-00003.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9mIQ2_XXS9Bfp8l-00001-of-00002-00002-of-00003.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\u00e9mIQ2_XXS9Bfp8l-00001-of-00002.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_037",
+   "input": "[{\"type\": \"file\", \"path\": \"fp8Pb\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_038",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0301Fl-MMQ\\u3000s\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_039",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\n.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\n.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_040",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0664-of-\\u0131\\u00e9\\u0664IQ2_XXSpS2mmproj.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0664-of-\u0131\u00e9\u0664IQ2_XXSpS2mmproj.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "\u0664-of-\u0131\u00e9\u0664IQ2_XXSpS2mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_041",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u3000\\n\\u0660KImmproj.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u3000\n\u0660KImmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u3000\n\u0660KImmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_042",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131-of-\\u00e9\\ud835\\udfcf\\uff146.GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0131-of-\u00e9\ud835\udfcf\uff146.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u0131-of-\u00e9\ud835\udfcf\uff146.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_043",
+   "input": "[{\"type\": \"file\", \"path\": \"XF\\u017f7fX \\u0660P\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_044",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212aq\\u3000\\ud835\\udfcf\\u00e9.GGUF\\ud835\\udfcf\\u00853-of--00002-of-00003.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u212aq\u3000\ud835\udfcf\u00e9.GGUF\ud835\udfcf\u00853-of--00002-of-00003.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\u212aq\u3000\ud835\udfcf\u00e9.GGUF\ud835\udfcf\u00853-of-.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_045",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFF16\\uff14Mb\\u212ab-00001-of-00002i-of-.4mmproj.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUFF16\uff14Mb\u212ab-00001-of-00002i-of-.4mmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": ".GGUFF16\uff14Mb\u212ab-00001-of-00002i-of-.4mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_046",
+   "input": "[{\"type\": \"file\", \"path\": \"k.M\\u066036X1b-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "k.M\u066036X1b-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "k.M\u066036X1b.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_047",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_048",
+   "input": "[{\"type\": \"file\", \"path\": \"Lmmproj.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Lmmproj.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "Lmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_049",
+   "input": "[{\"type\": \"file\", \"path\": \"5\\ud835\\udfcf\\u00853-Q.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "5\ud835\udfcf\u00853-Q.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "5\ud835\udfcf\u00853-Q.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_050",
+   "input": "[{\"type\": \"file\", \"path\": \"K\\u0660\\ud835\\udfcffp8.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "K\u0660\ud835\udfcffp8.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "K\u0660\ud835\udfcffp8.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_051",
+   "input": "[{\"type\": \"file\", \"path\": \"m\\u03013p_\\u00e9\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_052",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b2qp3\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_053",
+   "input": "[{\"type\": \"file\", \"path\": \"8sL-Fx\\u212a\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_054",
+   "input": "[{\"type\": \"file\", \"path\": \"I\\n\\u00854mmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "I\n\u00854mmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "I\n\u00854mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_055",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131\\u0664-00002-of-00003.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0131\u0664-00002-of-00003.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "\u0131\u0664.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_056",
+   "input": "[{\"type\": \"file\", \"path\": \"4xb\\u0131Q-\\u017f-6/.\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_057",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0664qQ4_K_MQI-00002-of-00003.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0664qQ4_K_MQI-00002-of-00003.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\u0664qQ4_K_MQI.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_058",
+   "input": "[{\"type\": \"file\", \"path\": \"6mfp83.ggufbxbkfp8-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "6mfp83.ggufbxbkfp8-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "6mfp83.ggufbxbkfp8.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_059",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212a.GGUF1\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_060",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14-00002-of-00003.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\uff14-00002-of-00003.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\uff14.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_061",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXS6s\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_062",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n\\u0660/fbQ4_K_Ms\\u00b2.GGUFmmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\n\u0660/fbQ4_K_Ms\u00b2.GGUFmmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\n\u0660/fbQ4_K_Ms\u00b2.GGUFmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_063",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9mmproj.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9mmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u00e9mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_064",
+   "input": "[{\"type\": \"file\", \"path\": \"XS6.q2\\u212aif\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_065",
+   "input": "[{\"type\": \"file\", \"path\": \"I\\u3000s839.GGUFQIQ4_K_M\\u017f-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "I\u3000s839.GGUFQIQ4_K_M\u017f-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "I\u3000s839.GGUFQIQ4_K_M\u017f.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_066",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212a.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u212a.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u212a.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_067",
+   "input": "[{\"type\": \"file\", \"path\": \"p\\u0301K\\u017fx\\u0130\\u0660\\u0301\\ntokenizer.modelfF16\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_068",
+   "input": "[{\"type\": \"file\", \"path\": \"S\\u0301mmproj.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "S\u0301mmproj.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "S\u0301mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_069",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14bf-00001-of-00002Qi7\\u30007\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_070",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14QK9/b3\\u30000\\u00b2\\u0301.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\uff14QK9/b3\u30000\u00b2\u0301.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "\uff14QK9/b3\u30000\u00b2\u0301.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_071",
+   "input": "[{\"type\": \"file\", \"path\": \"bk\\u00b21916.gguf 2\\u0660-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "bk\u00b21916.gguf 2\u0660-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "bk\u00b21916.gguf 2\u0660.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_072",
+   "input": "[{\"type\": \"file\", \"path\": \"k\\u0660 XMLBF16\\u0130B\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_073",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0660tokenizer.modelF16\\u017fk.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0660tokenizer.modelF16\u017fk.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u0660tokenizer.modelF16\u017fk.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_074",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017f.GGUFmmproj.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u017f.GGUFmmproj.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u017f.GGUFmmproj.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_075",
+   "input": "[{\"type\": \"file\", \"path\": \"-of-mmproj.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-of-mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "-of-mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_076",
+   "input": "[{\"type\": \"file\", \"path\": \" Xb-00002-of-00003.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": " Xb-00002-of-00003.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": " Xb.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_077",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_078",
+   "input": "[{\"type\": \"file\", \"path\": \"2\\u00b25q\\ud835\\udfcf\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_079",
+   "input": "[{\"type\": \"file\", \"path\": \"BX5mmproj.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "BX5mmproj.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "BX5mmproj.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_080",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": ".GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_081",
+   "input": "[{\"type\": \"file\", \"path\": \"0\\u212aXP\\u0130.gguf-of-bl-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "0\u212aXP\u0130.gguf-of-bl-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "0\u212aXP\u0130.gguf-of-bl.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_082",
+   "input": "[{\"type\": \"file\", \"path\": \"M\\ud835\\udfcfi\\u3000lK\\u0301F16.GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "M\ud835\udfcfi\u3000lK\u0301F16.GGUF",
+      "size": 1,
+      "quant": "F16",
+      "shard_base": "M\ud835\udfcfi\u3000lK\u0301F16.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_083",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_084",
+   "input": "[{\"type\": \"file\", \"path\": \"2q\\ud835\\udfcf.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "2q\ud835\udfcf.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "2q\ud835\udfcf.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_085",
+   "input": "[{\"type\": \"file\", \"path\": \"8\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_086",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_087",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_088",
+   "input": "[{\"type\": \"file\", \"path\": \"B\\uff1425\\u0301\\u212a\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_089",
+   "input": "[{\"type\": \"file\", \"path\": \"6BF16\\u0085\\u0085\\uff14_SQf\\u017f p.GGUF\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "6BF16\u0085\u0085\uff14_SQf\u017f p.GGUF",
+      "size": 8,
+      "quant": null,
+      "shard_base": "6BF16\u0085\u0085\uff14_SQf\u017f p.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_090",
+   "input": "[{\"type\": \"file\", \"path\": \"fI\\n5BF16fF16-P\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_091",
+   "input": "[{\"type\": \"file\", \"path\": \"3F16k-00002-of-00003.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "3F16k-00002-of-00003.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "3F16k.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_092",
+   "input": "[{\"type\": \"file\", \"path\": \"BF16.GGUF\\u0664\\u017f\\u0660M\\u3000IQ2_XXS4.ggufxmmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "BF16.GGUF\u0664\u017f\u0660M\u3000IQ2_XXS4.ggufxmmproj.gguf",
+      "size": 77,
+      "quant": "BF16",
+      "shard_base": "BF16.GGUF\u0664\u017f\u0660M\u3000IQ2_XXS4.ggufxmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_093",
+   "input": "[{\"type\": \"file\", \"path\": \"F16\\u0131-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "F16\u0131-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "F16\u0131.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_094",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-00002\\u00b2i\\u00e90f\\u0660.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00001-of-00002\u00b2i\u00e90f\u0660.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "-00001-of-00002\u00b2i\u00e90f\u0660.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_095",
+   "input": "[{\"type\": \"file\", \"path\": \"8\\n\\ud835\\udfcfm-of-p86_\\u3000B\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_096",
+   "input": "[{\"type\": \"file\", \"path\": \"pf1\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_097",
+   "input": "[{\"type\": \"file\", \"path\": \"kX2P\\u3000\\u0130I8-00002-of-00003.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "kX2P\u3000\u0130I8-00002-of-00003.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "kX2P\u3000\u0130I8.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_098",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0301Q4_K_M\\u0660\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_099",
+   "input": "[{\"type\": \"file\", \"path\": \"\\ud835\\udfcf\\u0664p1-of-\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_100",
+   "input": "[{\"type\": \"file\", \"path\": \".M1p\\uff14.IQ2_XXSfmmproj.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".M1p\uff14.IQ2_XXSfmmproj.gguf",
+      "size": 0,
+      "quant": "IQ2_XXSFMMPROJ",
+      "shard_base": ".M1p\uff14.IQ2_XXSfmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_101",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130B1\\u0664\\u0085f-00001-of-00002\\u00857IQ2_XXS\\u3000.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0130B1\u0664\u0085f-00001-of-00002\u00857IQ2_XXS\u3000.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\u0130B1\u0664\u0085f-00001-of-00002\u00857IQ2_XXS\u3000.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_102",
+   "input": "[{\"type\": \"file\", \"path\": \"sK4\\u212a\\u0660F16mQS\\u00858.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "sK4\u212a\u0660F16mQS\u00858.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "sK4\u212a\u0660F16mQS\u00858.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_103",
+   "input": "[{\"type\": \"file\", \"path\": \"Blx\\u212a2-\\u0131\\u00b2\\u00e9\\u0130mmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Blx\u212a2-\u0131\u00b2\u00e9\u0130mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "Blx\u212a2-\u0131\u00b2\u00e9\u0130mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_104",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085F56-of-tokenizer.model4M\\u0660-00002-of-00003.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0085F56-of-tokenizer.model4M\u0660-00002-of-00003.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\u0085F56-of-tokenizer.model4M\u0660.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_105",
+   "input": "[{\"type\": \"file\", \"path\": \"Bx1q\\u212ammprojp\\u212a\\u00e9pF16i.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Bx1q\u212ammprojp\u212a\u00e9pF16i.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "Bx1q\u212ammprojp\u212a\u00e9pF16i.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_106",
+   "input": "[{\"type\": \"file\", \"path\": \"M.ggufQL\\u00b2.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "M.ggufQL\u00b2.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "M.ggufQL\u00b2.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_107",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_108",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUF\\u212a3\\u00b2tokenizer.model\\u0130\\u0301\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_109",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_110",
+   "input": "[{\"type\": \"file\", \"path\": \"XI.ggufqfp8kXIQ2_XXS.ggufmmproj.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "XI.ggufqfp8kXIQ2_XXS.ggufmmproj.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "XI.ggufqfp8kXIQ2_XXS.ggufmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_111",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_112",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9B\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_113",
+   "input": "[{\"type\": \"file\", \"path\": \"tokenizer.model5L2\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_114",
+   "input": "[{\"type\": \"file\", \"path\": \"-x/\\u0131Q_7s.GGUF\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-x/\u0131Q_7s.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "-x/\u0131Q_7s.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_115",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0301\\uff14_\\u0301\\ud835\\udfcfF16sX.GGUFxBF16\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_116",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085-00002-of-00003.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0085-00002-of-00003.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\u0085.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_117",
+   "input": "[{\"type\": \"file\", \"path\": \"-X\\u00b28-00001-of-00002Q4_K_Mpp.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-X\u00b28-00001-of-00002Q4_K_Mpp.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "-X\u00b28-00001-of-00002Q4_K_Mpp.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_118",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXS\\u008556\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_119",
+   "input": "[{\"type\": \"file\", \"path\": \"q\\u00853BF16f6 I\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_120",
+   "input": "[{\"type\": \"file\", \"path\": \"q\\ud835\\udfcfb\\u212a6.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "q\ud835\udfcfb\u212a6.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "q\ud835\udfcfb\u212a6.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_121",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\\u0301Pitokenizer.model\\u3000mx/9lmmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf\u0301Pitokenizer.model\u3000mx/9lmmproj.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": ".gguf\u0301Pitokenizer.model\u3000mx/9lmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_122",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14\\u00b2\\u01313Bxqk5\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_123",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u06645-.\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_124",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_125",
+   "input": "[{\"type\": \"file\", \"path\": \"58Q4_K_M\\u0085lpmmproj5.GGUF\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "58Q4_K_M\u0085lpmmproj5.GGUF",
+      "size": -3,
+      "quant": null,
+      "shard_base": "58Q4_K_M\u0085lpmmproj5.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_126",
+   "input": "[{\"type\": \"file\", \"path\": \"-Q4_K_M\\u00e92S\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_127",
+   "input": "[{\"type\": \"file\", \"path\": \"imM_IQ2_XXSQM3 -\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_128",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_129",
+   "input": "[{\"type\": \"file\", \"path\": \"6/13.gguf-p\\n-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "6/13.gguf-p\n-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "6/13.gguf-p\n.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_130",
+   "input": "[{\"type\": \"file\", \"path\": \"x0x\\u3000\\ud835\\udfcf.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "x0x\u3000\ud835\udfcf.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "x0x\u3000\ud835\udfcf.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_131",
+   "input": "[{\"type\": \"file\", \"path\": \"tokenizer.modeltokenizer.modelmmmproj.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "tokenizer.modeltokenizer.modelmmmproj.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "tokenizer.modeltokenizer.modelmmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_132",
+   "input": "[{\"type\": \"file\", \"path\": \"4Q4_K_M- \\ud835\\udfcf\\u0301\\uff14IQ2_XXSfL\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_133",
+   "input": "[{\"type\": \"file\", \"path\": \"F-00001-of-00002Q_I.GGUF\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "F-00001-of-00002Q_I.GGUF",
+      "size": 2,
+      "quant": null,
+      "shard_base": "F-00001-of-00002Q_I.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_134",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_135",
+   "input": "[{\"type\": \"file\", \"path\": \"-\\u01312S-00002-of-00003.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-\u01312S-00002-of-00003.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "-\u01312S.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_136",
+   "input": "[{\"type\": \"file\", \"path\": \"_-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "_-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "_.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_137",
+   "input": "[{\"type\": \"file\", \"path\": \"L\\u3000Xs\\u00e93-of-pIQ2_XXS2Q4_K_MIQ2_XXS-00002-of-00003.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "L\u3000Xs\u00e93-of-pIQ2_XXS2Q4_K_MIQ2_XXS-00002-of-00003.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "L\u3000Xs\u00e93-of-pIQ2_XXS2Q4_K_MIQ2_XXS.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_138",
+   "input": "[{\"type\": \"file\", \"path\": \"/s-of-K4F\\u0664.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "/s-of-K4F\u0664.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "/s-of-K4F\u0664.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_139",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj\\u03013q\\u0301\\u017fkX_\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_140",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0301\\u0130Lq\\u0301Q4_K_Mmb.GGUF\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0301\u0130Lq\u0301Q4_K_Mmb.GGUF",
+      "size": 0,
+      "quant": "Q4_K_MMB",
+      "shard_base": "\u0301\u0130Lq\u0301Q4_K_Mmb.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_141",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_142",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212ak5Q4_K_MQQ4_K_Mk/\\u212a-00002-of-00003.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u212ak5Q4_K_MQQ4_K_Mk/\u212a-00002-of-00003.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u212ak5Q4_K_MQQ4_K_Mk/\u212a.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_143",
+   "input": "[{\"type\": \"file\", \"path\": \"pk\\u0131.GGUF-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "pk\u0131.GGUF-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "pk\u0131.GGUF.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_144",
+   "input": "[{\"type\": \"file\", \"path\": \"/s\\u03010fp8s\\u00e9\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_145",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_M.\\u0130.GGUF\\u0130x\\u0664\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_146",
+   "input": "[{\"type\": \"file\", \"path\": \".\\u0130q .gguf4qs0mmproj.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".\u0130q .gguf4qs0mmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": ".\u0130q .gguf4qs0mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_147",
+   "input": "[{\"type\": \"file\", \"path\": \"-B3\\u0660x.F16Ps\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_148",
+   "input": "[{\"type\": \"file\", \"path\": \"1XF_M9xpKs\\u212a\\uff14.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "1XF_M9xpKs\u212a\uff14.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "1XF_M9xpKs\u212a\uff14.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_149",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-00002\\u0664qfBF16QIQ2_XXS.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00001-of-00002\u0664qfBF16QIQ2_XXS.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "-00001-of-00002\u0664qfBF16QIQ2_XXS.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_150",
+   "input": "[{\"type\": \"file\", \"path\": \"6m.-mmproj.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "6m.-mmproj.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "6m.-mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_151",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff1491.ggufxP5Xi.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\uff1491.ggufxP5Xi.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\uff1491.ggufxP5Xi.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_152",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": ".GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_153",
+   "input": "[{\"type\": \"file\", \"path\": \" SF\\u0085BF16.GGUF.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": " SF\u0085BF16.GGUF.GGUF",
+      "size": 1,
+      "quant": "BF16",
+      "shard_base": " SF\u0085BF16.GGUF.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_154",
+   "input": "[{\"type\": \"file\", \"path\": \"/b7Q4_K_MBF16.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "/b7Q4_K_MBF16.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "/b7Q4_K_MBF16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_155",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXS.\\u00e9\\ud835\\udfcfmmproj.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "IQ2_XXS.\u00e9\ud835\udfcfmmproj.gguf",
+      "size": 1099511627776,
+      "quant": "IQ2_XXS",
+      "shard_base": "IQ2_XXS.\u00e9\ud835\udfcfmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_156",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212a.gguf-00001-of-00002fp8\\u0301xPf\\u212aF16\\u3000F16mmproj.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u212a.gguf-00001-of-00002fp8\u0301xPf\u212aF16\u3000F16mmproj.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\u212a.gguf-00001-of-00002fp8\u0301xPf\u212aF16\u3000F16mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_157",
+   "input": "[{\"type\": \"file\", \"path\": \"tokenizer.model\\u30004Q..gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "tokenizer.model\u30004Q..gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "tokenizer.model\u30004Q..gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_158",
+   "input": "[{\"type\": \"file\", \"path\": \"f\\uff14.\\u0301px-of-pb\\u00b2F\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_159",
+   "input": "[{\"type\": \"file\", \"path\": \"-of-\\u00e92XlS.ggufQ4_K_Mmmproj.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-of-\u00e92XlS.ggufQ4_K_Mmmproj.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "-of-\u00e92XlS.ggufQ4_K_Mmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_160",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u3000-00001-of-00002S/q\\u212aQ.GGUFF16.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u3000-00001-of-00002S/q\u212aQ.GGUFF16.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u3000-00001-of-00002S/q\u212aQ.GGUFF16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_161",
+   "input": "[{\"type\": \"file\", \"path\": \"tokenizer.model1_/.\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_162",
+   "input": "[{\"type\": \"file\", \"path\": \"XPB\\u00856lMp0P .mmproj.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "XPB\u00856lMp0P .mmproj.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "XPB\u00856lMp0P .mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_163",
+   "input": "[{\"type\": \"file\", \"path\": \"pSp\\nF\\n7\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_164",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXSpmqQ4_K_M.7\\u0131Q4_K_M\\u3000K-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "IQ2_XXSpmqQ4_K_M.7\u0131Q4_K_M\u3000K-00002-of-00003.gguf",
+      "size": 3,
+      "quant": "IQ2_XXSPMQQ4_K_M",
+      "shard_base": "IQ2_XXSpmqQ4_K_M.7\u0131Q4_K_M\u3000K.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_165",
+   "input": "[{\"type\": \"file\", \"path\": \"Kb\\u212ak48.GGUF.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Kb\u212ak48.GGUF.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "Kb\u212ak48.GGUF.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_166",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017fBB_\\u0301\\u3000\\n_.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u017fBB_\u0301\u3000\n_.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\u017fBB_\u0301\u3000\n_.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_167",
+   "input": "[{\"type\": \"file\", \"path\": \"lmmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "lmmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "lmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_168",
+   "input": "[{\"type\": \"file\", \"path\": \"f8\\u300031IQ2_XXS\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_169",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_170",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0664k.ggufQ4_K_MK\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_171",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u3000QI\\uff147\\u017fx\\u0664.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u3000QI\uff147\u017fx\u0664.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u3000QI\uff147\u017fx\u0664.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_172",
+   "input": "[{\"type\": \"file\", \"path\": \"Qq_-00001-of-00002BF16-00001-of-00002BQKm82\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_173",
+   "input": "[{\"type\": \"file\", \"path\": \"b.GGUF\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "b.GGUF",
+      "size": 8,
+      "quant": null,
+      "shard_base": "b.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_174",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_M .MIF\\u06603.GGUF\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_K_M .MIF\u06603.GGUF",
+      "size": 2,
+      "quant": "Q4_K_M",
+      "shard_base": "Q4_K_M .MIF\u06603.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_175",
+   "input": "[{\"type\": \"file\", \"path\": \"p-of-\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_176",
+   "input": "[{\"type\": \"file\", \"path\": \"7\\u01314l\\uff14\\u212aQQm\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_177",
+   "input": "[{\"type\": \"file\", \"path\": \"p8-of-l\\nB-.gguf \", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_178",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131k.\\n\\n.GGUFQ.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0131k.\n\n.GGUFQ.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\u0131k.\n\n.GGUFQ.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_179",
+   "input": "[{\"type\": \"file\", \"path\": \"3MSp\\ud835\\udfcf0B\\u017f\\u06646IQ2_XXS\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_180",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-00002.GGUF.GGUFs.m.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00001-of-00002.GGUF.GGUFs.m.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "-00001-of-00002.GGUF.GGUFs.m.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_181",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_182",
+   "input": "[{\"type\": \"file\", \"path\": \"l_Q-00001-of-00002\\ud835\\udfcfIQ2_XXS7\\u0085.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "l_Q-00001-of-00002\ud835\udfcfIQ2_XXS7\u0085.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "l_Q-00001-of-00002\ud835\udfcfIQ2_XXS7\u0085.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_183",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_184",
+   "input": "[{\"type\": \"file\", \"path\": \"tokenizer.model35\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_185",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-00002mfpb-00002-of-00003.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00001-of-00002mfpb-00002-of-00003.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "-00001-of-00002mfpb.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_186",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14mmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\uff14mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\uff14mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_187",
+   "input": "[{\"type\": \"file\", \"path\": \"IBF16/6BF166\\u0660\\u0301PxmQ4_K_M.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "IBF16/6BF166\u0660\u0301PxmQ4_K_M.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "IBF16/6BF166\u0660\u0301PxmQ4_K_M.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_188",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf.\\u0131\\u00e9\\uff149m\\u01308\\u0130-of-B\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_189",
+   "input": "[{\"type\": \"file\", \"path\": \"7\\u0664mmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "7\u0664mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "7\u0664mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_190",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\\u212a7tokenizer.model\\u017f.0-00001-of-00002\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_191",
+   "input": "[{\"type\": \"file\", \"path\": \"8.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "8.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_192",
+   "input": "[{\"type\": \"file\", \"path\": \"SKBF16\\n.GGUF\\u008515.GGUF\\ni.GGUF\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "SKBF16\n.GGUF\u008515.GGUF\ni.GGUF",
+      "size": 3,
+      "quant": null,
+      "shard_base": "SKBF16\n.GGUF\u008515.GGUF\ni.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_193",
+   "input": "[{\"type\": \"file\", \"path\": \"BF/ m0BF16k7\\ud835\\udfcfLfp8\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_194",
+   "input": "[{\"type\": \"file\", \"path\": \"f\\u0660\\u3000IQ2_XXS.gguf\\u0130iqIQ2_XXS-00002-of-00003.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "f\u0660\u3000IQ2_XXS.gguf\u0130iqIQ2_XXS-00002-of-00003.gguf",
+      "size": 2,
+      "quant": "IQ2_XXS",
+      "shard_base": "f\u0660\u3000IQ2_XXS.gguf\u0130iqIQ2_XXS.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_195",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130mB\\n.gguf\\n\\u0301mmproj.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0130mB\n.gguf\n\u0301mmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u0130mB\n.gguf\n\u0301mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_196",
+   "input": "[{\"type\": \"file\", \"path\": \"X.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "X.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "X.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_197",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130\\u00e9\\n.gguf312Q4_K_M6\\u00b2 .gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0130\u00e9\n.gguf312Q4_K_M6\u00b2 .gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "\u0130\u00e9\n.gguf312Q4_K_M6\u00b2 .gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_198",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130\\u0664f.\\u00e9m7\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_199",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_200",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFS\\uff14\\u3000KXlSM27.GGUF\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUFS\uff14\u3000KXlSM27.GGUF",
+      "size": -3,
+      "quant": null,
+      "shard_base": ".GGUFS\uff14\u3000KXlSM27.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_201",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_202",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017fXIq.BF16 L3_0.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u017fXIq.BF16 L3_0.gguf",
+      "size": 8,
+      "quant": "BF16",
+      "shard_base": "\u017fXIq.BF16 L3_0.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_203",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085F1642lii\\u0301\\ud835\\udfcf\\u0131-00002-of-00003.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0085F1642lii\u0301\ud835\udfcf\u0131-00002-of-00003.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\u0085F1642lii\u0301\ud835\udfcf\u0131.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_204",
+   "input": "[{\"type\": \"file\", \"path\": \"b4.s\\u0131Q4_K_M\\u3000X\\u0660Q4_K_M8\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_205",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\n-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\n.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_206",
+   "input": "[{\"type\": \"file\", \"path\": \"8\\u212af-00001-of-00002If.gguf/\\u212ax.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8\u212af-00001-of-00002If.gguf/\u212ax.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "8\u212af-00001-of-00002If.gguf/\u212ax.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_207",
+   "input": "[{\"type\": \"file\", \"path\": \"3.mmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "3.mmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "3.mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_208",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_MQ\\u212aQB 5/3F.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_K_MQ\u212aQB 5/3F.gguf",
+      "size": 77,
+      "quant": "Q4_K_MQ\u212aQB",
+      "shard_base": "Q4_K_MQ\u212aQB 5/3F.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_209",
+   "input": "[{\"type\": \"file\", \"path\": \"X6M\\ud835\\udfcf6\\u0085K9\\u30009\\ud835\\udfcf.gguf.GGUF\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "X6M\ud835\udfcf6\u0085K9\u30009\ud835\udfcf.gguf.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "X6M\ud835\udfcf6\u0085K9\u30009\ud835\udfcf.gguf.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_210",
+   "input": "[{\"type\": \"file\", \"path\": \"s\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_211",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9/7b.BF16xfp8\\u0130\\u00b2-00002-of-00003.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9/7b.BF16xfp8\u0130\u00b2-00002-of-00003.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\u00e9/7b.BF16xfp8\u0130\u00b2.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_212",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9I\\ud835\\udfcf1S\\u06644fp8fp8p\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_213",
+   "input": "[{\"type\": \"file\", \"path\": \"sqq \\u3000.GGUF.GGUFXF.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "sqq \u3000.GGUF.GGUFXF.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "sqq \u3000.GGUF.GGUFXF.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_214",
+   "input": "[{\"type\": \"file\", \"path\": \"8sF16P1\\u0664l\\u017f\\u0131\\u0660\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_215",
+   "input": "[{\"type\": \"file\", \"path\": \"Slf\\u017f\\n\\u00b26-of-_F16F16\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_216",
+   "input": "[{\"type\": \"file\", \"path\": \"B\\u212a\\u0131\\u00e9\\u06644\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_217",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017f\\u212ai\\u0660\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_218",
+   "input": "[{\"type\": \"file\", \"path\": \"_.gguf3..GGUF6\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_219",
+   "input": "[{\"type\": \"file\", \"path\": \"-\\u017fs.GGUFfp8-8\\u212aP1\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_220",
+   "input": "[{\"type\": \"file\", \"path\": \"x3\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_221",
+   "input": "[{\"type\": \"file\", \"path\": \"tokenizer.model\\nPII.GGUF-of-SmP7-00002-of-00003.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "tokenizer.model\nPII.GGUF-of-SmP7-00002-of-00003.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "tokenizer.model\nPII.GGUF-of-SmP7.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_222",
+   "input": "[{\"type\": \"file\", \"path\": \"\\ud835\\udfcf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_223",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_224",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXStokenizer.model\\u017f\\uff14KXMmmproj.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "IQ2_XXStokenizer.model\u017f\uff14KXMmmproj.gguf",
+      "size": 1099511627776,
+      "quant": "IQ2_XXSTOKENIZER",
+      "shard_base": "IQ2_XXStokenizer.model\u017f\uff14KXMmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_225",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_MQ4_K_M\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_226",
+   "input": "[{\"type\": \"file\", \"path\": \"XBF16\\u0085\\u0664\\u00b21iQ4_K_MK.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "XBF16\u0085\u0664\u00b21iQ4_K_MK.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "XBF16\u0085\u0664\u00b21iQ4_K_MK.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_227",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFXqP\\u0664\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_228",
+   "input": "[{\"type\": \"file\", \"path\": \"/S\\ud835\\udfcf-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "/S\ud835\udfcf-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "/S\ud835\udfcf.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_229",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017fpmmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u017fpmmproj.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "\u017fpmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_230",
+   "input": "[{\"type\": \"file\", \"path\": \".X.8\\u212a\\nQ4_K_M\\u0301\\u0085/\\u0085mmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".X.8\u212a\nQ4_K_M\u0301\u0085/\u0085mmproj.gguf",
+      "size": -3,
+      "quant": "Q4_K_M",
+      "shard_base": ".X.8\u212a\nQ4_K_M\u0301\u0085/\u0085mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_231",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_232",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130mmproj-of-Q4_K_MmmprojIQ2_XXS\\u3000\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_233",
+   "input": "[{\"type\": \"file\", \"path\": \"f\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_234",
+   "input": "[{\"type\": \"file\", \"path\": \"3\\u0085\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_235",
+   "input": "[{\"type\": \"file\", \"path\": \"BF16\\nif\\u06605\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_236",
+   "input": "[{\"type\": \"file\", \"path\": \"B3\\u0301f\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_237",
+   "input": "[{\"type\": \"file\", \"path\": \"q\\u00e9fp8q\\u00e9xP.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "q\u00e9fp8q\u00e9xP.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "q\u00e9fp8q\u00e9xP.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_238",
+   "input": "[{\"type\": \"file\", \"path\": \"-of-\\u00b2\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_239",
+   "input": "[{\"type\": \"file\", \"path\": \"p.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "p.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "p.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_240",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-00002\\u212aqfp8 45.ggufpi1.GGUF\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00001-of-00002\u212aqfp8 45.ggufpi1.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "-00001-of-00002\u212aqfp8 45.ggufpi1.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_241",
+   "input": "[{\"type\": \"file\", \"path\": \"_PIQ2_XXSK\\u212a\\u0085mmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "_PIQ2_XXSK\u212a\u0085mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "_PIQ2_XXSK\u212a\u0085mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_242",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf0.b\\u0085Q4_K_MI//.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf0.b\u0085Q4_K_MI//.GGUF",
+      "size": 1099511627776,
+      "quant": "Q4_K_MI",
+      "shard_base": ".gguf0.b\u0085Q4_K_MI//.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_243",
+   "input": "[{\"type\": \"file\", \"path\": \"13Q4_K_Mfp8Q4_K_M.GGUF/_\\u017f.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "13Q4_K_Mfp8Q4_K_M.GGUF/_\u017f.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "13Q4_K_Mfp8Q4_K_M.GGUF/_\u017f.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_244",
+   "input": "[{\"type\": \"file\", \"path\": \"k_Q6\\n\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_245",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u3000f.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u3000f.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u3000f.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_246",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130-00002-of-00003.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0130-00002-of-00003.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\u0130.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_247",
+   "input": "[{\"type\": \"file\", \"path\": \"fp8KIQ2_XXS-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "fp8KIQ2_XXS-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "fp8KIQ2_XXS.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_248",
+   "input": "[{\"type\": \"file\", \"path\": \"X1.gguf4 .GGUFXFK\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_249",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_M.GGUF\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_K_M.GGUF",
+      "size": 2,
+      "quant": "Q4_K_M",
+      "shard_base": "Q4_K_M.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_250",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff14mmprojI\\u30007-of-F16K\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_251",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_M4IQ2_XXS-00002-of-00003.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_K_M4IQ2_XXS-00002-of-00003.gguf",
+      "size": 77,
+      "quant": "Q4_K_M4IQ2_XXS",
+      "shard_base": "Q4_K_M4IQ2_XXS.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_252",
+   "input": "[{\"type\": \"file\", \"path\": \"3\\u212a\\u00e9xX-8q\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_253",
+   "input": "[{\"type\": \"file\", \"path\": \"f\\u0085K\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_254",
+   "input": "[{\"type\": \"file\", \"path\": \"mmprojQ.GGUF\\uff14\\u0301.\\u0131\\ud835\\udfcf.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmprojQ.GGUF\uff14\u0301.\u0131\ud835\udfcf.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "mmprojQ.GGUF\uff14\u0301.\u0131\ud835\udfcf.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_255",
+   "input": "[{\"type\": \"file\", \"path\": \"Q\\u0131IQ2_XXSf\\u00e9\\u017fF16.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q\u0131IQ2_XXSf\u00e9\u017fF16.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "Q\u0131IQ2_XXSf\u00e9\u017fF16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_256",
+   "input": "[{\"type\": \"file\", \"path\": \"kMQ4_K_Ms1-0\\u3000.gguf9lL\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_257",
+   "input": "[{\"type\": \"file\", \"path\": \".ggufS/.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".ggufS/.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": ".ggufS/.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_258",
+   "input": "[{\"type\": \"file\", \"path\": \"8\\u0664.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8\u0664.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "8\u0664.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_259",
+   "input": "[{\"type\": \"file\", \"path\": \"f/\\u0660\\u3000F163\\u017f.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "f/\u0660\u3000F163\u017f.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "f/\u0660\u3000F163\u017f.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_260",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085035-00001-of-00002F16tokenizer.model.XLQ4_K_Mmmproj.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0085035-00001-of-00002F16tokenizer.model.XLQ4_K_Mmmproj.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\u0085035-00001-of-00002F16tokenizer.model.XLQ4_K_Mmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_261",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b2\\u212a\\u00e9\\u0131Q4_K_M2mmproj.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00b2\u212a\u00e9\u0131Q4_K_M2mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u00b2\u212a\u00e9\u0131Q4_K_M2mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_262",
+   "input": "[{\"type\": \"file\", \"path\": \"kB6\\u00b27\\ud835\\udfcf6.gguf3\\u0130\\u0664fp8.GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "kB6\u00b27\ud835\udfcf6.gguf3\u0130\u0664fp8.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "kB6\u00b27\ud835\udfcf6.gguf3\u0130\u0664fp8.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_263",
+   "input": "[{\"type\": \"file\", \"path\": \"MxF16K\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_264",
+   "input": "[{\"type\": \"file\", \"path\": \"5BF16/-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "5BF16/-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "5BF16/.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_265",
+   "input": "[{\"type\": \"file\", \"path\": \"mQ4_K_M\\u0301f.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mQ4_K_M\u0301f.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "mQ4_K_M\u0301f.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_266",
+   "input": "[{\"type\": \"file\", \"path\": \"0.gguf9\\ns-00001-of-00002-of-F16m.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "0.gguf9\ns-00001-of-00002-of-F16m.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "0.gguf9\ns-00001-of-00002-of-F16m.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_267",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9Si_\\ud835\\udfcf6q3mmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9Si_\ud835\udfcf6q3mmproj.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "\u00e9Si_\ud835\udfcf6q3mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_268",
+   "input": "[{\"type\": \"file\", \"path\": \"\\nBF16BF16BF16b.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\nBF16BF16BF16b.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\nBF16BF16BF16b.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_269",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFfp8Q4_K_M\\ud835\\udfcf6\\u3000\\n\\u0664\\u0085mmproj.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUFfp8Q4_K_M\ud835\udfcf6\u3000\n\u0664\u0085mmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": ".GGUFfp8Q4_K_M\ud835\udfcf6\u3000\n\u0664\u0085mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_270",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9mfQ4_K_M-XMIQ2_XXSK\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_271",
+   "input": "[{\"type\": \"file\", \"path\": \"1.q_.GGUF\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "1.q_.GGUF",
+      "size": -3,
+      "quant": null,
+      "shard_base": "1.q_.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_272",
+   "input": "[{\"type\": \"file\", \"path\": \"SM6iQ4_K_M9k\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_273",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0660\\ud835\\udfcfsQ4_K_Mb\\u0085\\u30001p.GGUFB\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_274",
+   "input": "[{\"type\": \"file\", \"path\": \"8\\ud835\\udfcf-00002-of-00003.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8\ud835\udfcf-00002-of-00003.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "8\ud835\udfcf.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_275",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_276",
+   "input": "[{\"type\": \"file\", \"path\": \"-.. .GGUF\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-.. .GGUF",
+      "size": 77,
+      "quant": null,
+      "shard_base": "-.. .GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_277",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n1qIQ2_XXSl\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_278",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_279",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u3000mmproj.GGUFllXL.GGUF1-00002-of-00003.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u3000mmproj.GGUFllXL.GGUF1-00002-of-00003.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "\u3000mmproj.GGUFllXL.GGUF1.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_280",
+   "input": "[{\"type\": \"file\", \"path\": \"9s-BF16k\\u0664mtokenizer.model.GGUF\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "9s-BF16k\u0664mtokenizer.model.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "9s-BF16k\u0664mtokenizer.model.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_281",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0660Q\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_282",
+   "input": "[{\"type\": \"file\", \"path\": \"7\\ud835\\udfcf.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "7\ud835\udfcf.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "7\ud835\udfcf.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_283",
+   "input": "[{\"type\": \"file\", \"path\": \"BF16-00001-of-0000224\\u017f4\\u212a/L.ggufmmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "BF16-00001-of-0000224\u017f4\u212a/L.ggufmmproj.gguf",
+      "size": 77,
+      "quant": "BF16",
+      "shard_base": "BF16-00001-of-0000224\u017f4\u212a/L.ggufmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_284",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9l-of-bq3\\u0131-00001-of-00002/q.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9l-of-bq3\u0131-00001-of-00002/q.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "\u00e9l-of-bq3\u0131-00001-of-00002/q.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_285",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-000025fp84Q-of-\\u0131\\u0664\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_286",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_287",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\\u0085-\\u0085\\uff14p86lqPQ4_K_Mmmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf\u0085-\u0085\uff14p86lqPQ4_K_Mmmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": ".gguf\u0085-\u0085\uff14p86lqPQ4_K_Mmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_288",
+   "input": "[{\"type\": \"file\", \"path\": \"8.GGUF\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8.GGUF",
+      "size": 3,
+      "quant": null,
+      "shard_base": "8.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_289",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u212a.ggufBF16\\u00e910fp8tokenizer.model\\n\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_290",
+   "input": "[{\"type\": \"file\", \"path\": \"-00001-of-000027\\u212afp8\\u212a0Q4_K_M39I\\u0660s\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_291",
+   "input": "[{\"type\": \"file\", \"path\": \"XL\\uff14 KF16.GGUF5mmproj.gguf\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "XL\uff14 KF16.GGUF5mmproj.gguf",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "XL\uff14 KF16.GGUF5mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_292",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e93-tokenizer.modelP7I\\u0664\\u3000-00002-of-00003.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e93-tokenizer.modelP7I\u0664\u3000-00002-of-00003.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "\u00e93-tokenizer.modelP7I\u0664\u3000.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_293",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUF74i/KlLIQ2_XXS.GGUFtokenizer.model\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUF74i/KlLIQ2_XXS.GGUFtokenizer.model",
+      "size": -3,
+      "quant": null,
+      "shard_base": ".GGUF74i/KlLIQ2_XXS.GGUFtokenizer.model",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_294",
+   "input": "[{\"type\": \"file\", \"path\": \"-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_295",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b22tokenizer.model5-5\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_296",
+   "input": "[{\"type\": \"file\", \"path\": \"-of-3\\u0664-00001-of-00002-00001-of-00002.GGUF-of-.GGUF\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-of-3\u0664-00001-of-00002-00001-of-00002.GGUF-of-.GGUF",
+      "size": -3,
+      "quant": null,
+      "shard_base": "-of-3\u0664-00001-of-00002-00001-of-00002.GGUF-of-.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_297",
+   "input": "[{\"type\": \"file\", \"path\": \"7p\\u017f.GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "7p\u017f.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "7p\u017f.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_298",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_299",
+   "input": "[{\"type\": \"file\", \"path\": \"89-00001-of-000023\\nl.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "89-00001-of-000023\nl.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "89-00001-of-000023\nl.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_300",
+   "input": "[{\"type\": \"file\", \"path\": \"F16p\\u00b2l\\uff14.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "F16p\u00b2l\uff14.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "F16p\u00b2l\uff14.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_301",
+   "input": "[{\"type\": \"file\", \"path\": \"7F16\\u3000btokenizer.modelIQ2_XXS\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_302",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n6p\\ud835\\udfcfI.GGUF\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\n6p\ud835\udfcfI.GGUF",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\n6p\ud835\udfcfI.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_303",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_304",
+   "input": "[{\"type\": \"file\", \"path\": \"6\\n\\ud835\\udfcfS\\u0664.kQ4_K_MBF16Xi\\u00b2-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "6\n\ud835\udfcfS\u0664.kQ4_K_MBF16Xi\u00b2-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "6\n\ud835\udfcfS\u0664.kQ4_K_MBF16Xi\u00b2.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_305",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n\\u00859qLmmprojtokenizer.model\\u0131kIQ2_XXS0i.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\n\u00859qLmmprojtokenizer.model\u0131kIQ2_XXS0i.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\n\u00859qLmmprojtokenizer.model\u0131kIQ2_XXS0i.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_306",
+   "input": "[{\"type\": \"file\", \"path\": \"k1mmprojIQ2_XXS2B\\u01313.ggufm\\u00b2\\u0130\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_307",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b2Qb4i\\u0130mmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00b2Qb4i\u0130mmproj.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "\u00b2Qb4i\u0130mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_308",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b2IQ2_XXS20Q4_K_M2m\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_309",
+   "input": "[{\"type\": \"file\", \"path\": \"x-\\u212aS\\u3000\\uff14\\uff14B\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_310",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFQ1f-00001-of-00002\\u3000fp88I-\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_311",
+   "input": "[{\"type\": \"file\", \"path\": \"IQ2_XXSimmprojqIQ2_XXSK-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "IQ2_XXSimmprojqIQ2_XXSK-00002-of-00003.gguf",
+      "size": 1,
+      "quant": "IQ2_XXSIMMPROJQIQ2_XXSK",
+      "shard_base": "IQ2_XXSimmprojqIQ2_XXSK.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_312",
+   "input": "[{\"type\": \"file\", \"path\": \"1L.GGUFB\\ud835\\udfcf6\\uff14.GGUF\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "1L.GGUFB\ud835\udfcf6\uff14.GGUF",
+      "size": -3,
+      "quant": null,
+      "shard_base": "1L.GGUFB\ud835\udfcf6\uff14.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_313",
+   "input": "[{\"type\": \"file\", \"path\": \"Fxfp8\\u0664-45.GGUF\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Fxfp8\u0664-45.GGUF",
+      "size": 77,
+      "quant": null,
+      "shard_base": "Fxfp8\u0664-45.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_314",
+   "input": "[{\"type\": \"file\", \"path\": \"X0-of-\\u0664bfp8Q-00001-of-00002.GGUF\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "X0-of-\u0664bfp8Q-00001-of-00002.GGUF",
+      "size": 8,
+      "quant": null,
+      "shard_base": "X0-of-\u0664bfp8Q.GGUF",
+      "shard_index": 1,
+      "shard_total": 2
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_315",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0301i\\u212a0s\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_316",
+   "input": "[{\"type\": \"file\", \"path\": \"s-00001-of-00002KM.Q\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_317",
+   "input": "[{\"type\": \"file\", \"path\": \"\\n\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_318",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_319",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFil3\\u00b2.gguf.GGUF_B\\u0664\\u212a\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_320",
+   "input": "[{\"type\": \"file\", \"path\": \"Ffp8Mf\\u0085s\\n\\n.GGUF-K\\u017f.GGUF\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Ffp8Mf\u0085s\n\n.GGUF-K\u017f.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "Ffp8Mf\u0085s\n\n.GGUF-K\u017f.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_321",
+   "input": "[{\"type\": \"file\", \"path\": \"/\\u00e9Q4_K_M4B\\ud835\\udfcf\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_322",
+   "input": "[{\"type\": \"file\", \"path\": \".s\\u0664X\\u0130.5/sM\\u0130fmmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".s\u0664X\u0130.5/sM\u0130fmmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": ".s\u0664X\u0130.5/sM\u0130fmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_323",
+   "input": "[{\"type\": \"file\", \"path\": \"90m\\u00b2Bmf0mmproj.gguf\\u017f8.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "90m\u00b2Bmf0mmproj.gguf\u017f8.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "90m\u00b2Bmf0mmproj.gguf\u017f8.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_324",
+   "input": "[{\"type\": \"file\", \"path\": \"X\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_325",
+   "input": "[{\"type\": \"file\", \"path\": \"7/-00001-of-000022fp8/fp8b4I\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_326",
+   "input": "[{\"type\": \"file\", \"path\": \"F16P Smmproj\\u00e9\\n\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_327",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0660\\u01300.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0660\u01300.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u0660\u01300.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_328",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_329",
+   "input": "[{\"type\": \"file\", \"path\": \"M3\\u0660FQ4_K_MBF160MQ4_K_MIQ2_XXSKfmmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "M3\u0660FQ4_K_MBF160MQ4_K_MIQ2_XXSKfmmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "M3\u0660FQ4_K_MBF160MQ4_K_MIQ2_XXSKfmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_330",
+   "input": "[{\"type\": \"file\", \"path\": \"IBF16.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "IBF16.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "IBF16.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_331",
+   "input": "[{\"type\": \"file\", \"path\": \"fp8Bmmproj.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "fp8Bmmproj.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": "fp8Bmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_332",
+   "input": "[{\"type\": \"file\", \"path\": \"2.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "2.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "2.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_333",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e9Q4_K_M\\nmmproj.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00e9Q4_K_M\nmmproj.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u00e9Q4_K_M\nmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_334",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj.gguf\", \"size\": \"77\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj.gguf",
+      "size": 77,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_335",
+   "input": "[{\"type\": \"file\", \"path\": \"\\ntokenizer.model\\u0130\\u017fB-9\\u0660\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_336",
+   "input": "[{\"type\": \"file\", \"path\": \"7290\\ud835\\udfcf8\\u06644mmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "7290\ud835\udfcf8\u06644mmproj.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "7290\ud835\udfcf8\u06644mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_337",
+   "input": "[{\"type\": \"file\", \"path\": \"F168BF16\\u0131\\u00e9Q4_K_M\\u0301B\\u0130.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "F168BF16\u0131\u00e9Q4_K_M\u0301B\u0130.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "F168BF16\u0131\u00e9Q4_K_M\u0301B\u0130.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_338",
+   "input": "[{\"type\": \"file\", \"path\": \"B40 \\u0130-K2\\u00e9\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_339",
+   "input": "[{\"type\": \"file\", \"path\": \"LP\\u0660 \\u0130P-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "LP\u0660 \u0130P-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "LP\u0660 \u0130P.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_340",
+   "input": "[{\"type\": \"file\", \"path\": \"\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_341",
+   "input": "[{\"type\": \"file\", \"path\": \"/\\ud835\\udfcf\\u013170b\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_342",
+   "input": "[{\"type\": \"file\", \"path\": \"\\ntokenizer.model\\ud835\\udfcf\\u212ai2\\u0085.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\ntokenizer.model\ud835\udfcf\u212ai2\u0085.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\ntokenizer.model\ud835\udfcf\u212ai2\u0085.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_343",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u017fF16Lm\\u0130Lfp89Bm.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u017fF16Lm\u0130Lfp89Bm.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "\u017fF16Lm\u0130Lfp89Bm.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_344",
+   "input": "[{\"type\": \"file\", \"path\": \"S\\uff14MmK8\\u0130 IX/\\n\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_345",
+   "input": "[{\"type\": \"file\", \"path\": \"BF167Q4_K_MqLB\\nmmproj\", \"size\": \"77\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_346",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUF\\u00b2\\u017ff\\nf-00001-of-00002-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".GGUF\u00b2\u017ff\nf-00001-of-00002-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": ".GGUF\u00b2\u017ff\nf-00001-of-00002.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_347",
+   "input": "[{\"type\": \"file\", \"path\": \"LQf7\\u0660f\", \"size\": -3}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_348",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b2-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u00b2-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "\u00b2.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_349",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_MX\\u212aBF165mK6\\uff14BF16\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_350",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0664p-00001-of-00002\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_351",
+   "input": "[{\"type\": \"file\", \"path\": \".\\ntokenizer.modelmmproj.gguf\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".\ntokenizer.modelmmproj.gguf",
+      "size": 8,
+      "quant": null,
+      "shard_base": ".\ntokenizer.modelmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_352",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0131-00001-of-00002mmprojX6\\u0664B.GGUF\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0131-00001-of-00002mmprojX6\u0664B.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "\u0131-00001-of-00002mmprojX6\u0664B.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_353",
+   "input": "[{\"type\": \"file\", \"path\": \".ggufqb\\uff14-00002-of-00003.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".ggufqb\uff14-00002-of-00003.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".ggufqb\uff14.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_354",
+   "input": "[{\"type\": \"file\", \"path\": \"6tokenizer.modelM\\u00b23\\u0664\\u00e9Q4_K_M5-00002-of-00003.gguf\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "6tokenizer.modelM\u00b23\u0664\u00e9Q4_K_M5-00002-of-00003.gguf",
+      "size": 2,
+      "quant": null,
+      "shard_base": "6tokenizer.modelM\u00b23\u0664\u00e9Q4_K_M5.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_355",
+   "input": "[{\"type\": \"file\", \"path\": \".GGUFF16\\ud835\\udfcfF16\\u0660/-00001-of-00002\\u0130-of-\\u3000\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_356",
+   "input": "[{\"type\": \"file\", \"path\": \"p3\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_357",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u3000Q4_K_M9p\\u00e9BF16fp8.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u3000Q4_K_M9p\u00e9BF16fp8.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "\u3000Q4_K_M9p\u00e9BF16fp8.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_358",
+   "input": "[{\"type\": \"file\", \"path\": \"P71f\\u0131k\\u00e99-\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_359",
+   "input": "[{\"type\": \"file\", \"path\": \".gguftokenizer.model\\u017f_Q4_K_M\\u30001-\\u01305.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguftokenizer.model\u017f_Q4_K_M\u30001-\u01305.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".gguftokenizer.model\u017f_Q4_K_M\u30001-\u01305.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_360",
+   "input": "[{\"type\": \"file\", \"path\": \"8.\\u0085s3\\u212am-00002-of-00003.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "8.\u0085s3\u212am-00002-of-00003.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "8.\u0085s3\u212am.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_361",
+   "input": "[{\"type\": \"file\", \"path\": \"sxFp\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_362",
+   "input": "[{\"type\": \"file\", \"path\": \"K0F16S.GGUFm.Mm8.GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "K0F16S.GGUFm.Mm8.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "K0F16S.GGUFm.Mm8.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_363",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0130mmproj3B\\nM\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_364",
+   "input": "[{\"type\": \"file\", \"path\": \"msk\\ud835\\udfcf.gguf3\\n3X\\u212a.gguf-00002-of-00003.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "msk\ud835\udfcf.gguf3\n3X\u212a.gguf-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "msk\ud835\udfcf.gguf3\n3X\u212a.gguf.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_365",
+   "input": "[{\"type\": \"file\", \"path\": \"F16BmQmi5i\\u3000.GGUF\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "F16BmQmi5i\u3000.GGUF",
+      "size": 1,
+      "quant": null,
+      "shard_base": "F16BmQmi5i\u3000.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_366",
+   "input": "[{\"type\": \"file\", \"path\": \"fF16-of-271Q\\u0301mmproj\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_367",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0301345/.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\u0301345/.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "\u0301345/.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_368",
+   "input": "[{\"type\": \"file\", \"path\": \"qIQ2_XXSS\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_369",
+   "input": "[{\"type\": \"file\", \"path\": \"s\\u3000\\u3000-of- _.XF163\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_370",
+   "input": "[{\"type\": \"file\", \"path\": \"K F16\\u0131\\u212aQ4_K_M\\u017fQ4_K_MF\", \"size\": 1}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_371",
+   "input": "[{\"type\": \"file\", \"path\": \"K\\u0130pQ4_K_M9\\u212apIQ2_XXSs\\u0301\\ud835\\udfcf\\ud835\\udfcf\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_372",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00b2IPS/\\u0130m3mmproj7\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_373",
+   "input": "[{\"type\": \"file\", \"path\": \".gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": ".gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_374",
+   "input": "[{\"type\": \"file\", \"path\": \"B-of-xB \\u0660\\u066484B\\u0664tokenizer.model\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "B-of-xB \u0660\u066484B\u0664tokenizer.model",
+      "size": 0,
+      "quant": null,
+      "shard_base": "B-of-xB \u0660\u066484B\u0664tokenizer.model",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_375",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_M\\uff14.gguf\", \"size\": true}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q4_K_M\uff14.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "Q4_K_M\uff14.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_376",
+   "input": "[{\"type\": \"file\", \"path\": \"L-00001-of-00002.gguf3_s\\u00b2tokenizer.model\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "L-00001-of-00002.gguf3_s\u00b2tokenizer.model",
+      "size": 3,
+      "quant": null,
+      "shard_base": "L-00001-of-00002.gguf3_s\u00b2tokenizer.model",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_377",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085/7.4\\u212a\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_378",
+   "input": "[{\"type\": \"file\", \"path\": \"xfp8\\u0301\\u0131BF16\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_379",
+   "input": "[{\"type\": \"file\", \"path\": \"-of-.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "-of-.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "-of-.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_380",
+   "input": "[{\"type\": \"file\", \"path\": \"2p\\u0660-00001-of-00002Q.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "2p\u0660-00001-of-00002Q.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "2p\u0660-00001-of-00002Q.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_381",
+   "input": "[{\"type\": \"file\", \"path\": \"1\\u0660m68\\u0664XF.GGUF\", \"size\": 2.5}]",
+   "expect": {
+    "files": [
+     {
+      "path": "1\u0660m68\u0664XF.GGUF",
+      "size": 2,
+      "quant": null,
+      "shard_base": "1\u0660m68\u0664XF.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_382",
+   "input": "[{\"type\": \"file\", \"path\": \"B9b-00001-of-00002\\u0301P.GGUF\\u0131\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_383",
+   "input": "[{\"type\": \"file\", \"path\": \"F-of-0mmprojS\\uff14\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_384",
+   "input": "[{\"type\": \"file\", \"path\": \"Q\\u00b2Ltokenizer.modelIQ2_XXS\\u00857-00001-of-00002Xmmproj.gguf\", \"size\": \"\\u0663\"}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Q\u00b2Ltokenizer.modelIQ2_XXS\u00857-00001-of-00002Xmmproj.gguf",
+      "size": 3,
+      "quant": null,
+      "shard_base": "Q\u00b2Ltokenizer.modelIQ2_XXS\u00857-00001-of-00002Xmmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_385",
+   "input": "[{\"type\": \"file\", \"path\": \"Kk \\u0085tokenizer.model.gguf\", \"size\": null}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Kk \u0085tokenizer.model.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "Kk \u0085tokenizer.model.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_386",
+   "input": "[{\"type\": \"file\", \"path\": \"mmproj.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "mmproj.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_387",
+   "input": "[{\"type\": \"file\", \"path\": \"Pl4lBF16M.gguf\\u00e9-00002-of-00003.gguf\", \"size\": 1}]",
+   "expect": {
+    "files": [
+     {
+      "path": "Pl4lBF16M.gguf\u00e9-00002-of-00003.gguf",
+      "size": 1,
+      "quant": null,
+      "shard_base": "Pl4lBF16M.gguf\u00e9.gguf",
+      "shard_index": 2,
+      "shard_total": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_388",
+   "input": "[{\"type\": \"file\", \"path\": \"k\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_389",
+   "input": "[{\"type\": \"file\", \"path\": \"/\\u0301BF16-of-sIX\\u017f2\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_390",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u00e95tokenizer.modelfim\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_391",
+   "input": "[{\"type\": \"file\", \"path\": \"f\\u3000\\u0664F161QB\\u017fi.Bm\", \"size\": true}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_392",
+   "input": "[{\"type\": \"file\", \"path\": \"s.GGUF\\u00e9-f.GGUFF16.GGUF\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "s.GGUF\u00e9-f.GGUFF16.GGUF",
+      "size": 0,
+      "quant": null,
+      "shard_base": "s.GGUF\u00e9-f.GGUFF16.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_393",
+   "input": "[{\"type\": \"file\", \"path\": \"M3m_K\\u3000\\u00851\\u0085\\u3000mmproj.gguf\", \"size\": -3}]",
+   "expect": {
+    "files": [
+     {
+      "path": "M3m_K\u3000\u00851\u0085\u3000mmproj.gguf",
+      "size": -3,
+      "quant": null,
+      "shard_base": "M3m_K\u3000\u00851\u0085\u3000mmproj.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_394",
+   "input": "[{\"type\": \"file\", \"path\": \"_40kI.gguf\", \"size\": 0}]",
+   "expect": {
+    "files": [
+     {
+      "path": "_40kI.gguf",
+      "size": 0,
+      "quant": null,
+      "shard_base": "_40kI.gguf",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_395",
+   "input": "[{\"type\": \"file\", \"path\": \"\\uff140.GGUF\", \"size\": 1099511627776}]",
+   "expect": {
+    "files": [
+     {
+      "path": "\uff140.GGUF",
+      "size": 1099511627776,
+      "quant": null,
+      "shard_base": "\uff140.GGUF",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_396",
+   "input": "[{\"type\": \"file\", \"path\": \"Q4_K_MqK\", \"size\": null}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_397",
+   "input": "[{\"type\": \"file\", \"path\": \".\\uff14\\ud835\\udfcfx.GGUFtokenizer.model\", \"size\": \" 8 \"}]",
+   "expect": {
+    "files": [
+     {
+      "path": ".\uff14\ud835\udfcfx.GGUFtokenizer.model",
+      "size": 8,
+      "quant": null,
+      "shard_base": ".\uff14\ud835\udfcfx.GGUFtokenizer.model",
+      "shard_index": null,
+      "shard_total": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "random_398",
+   "input": "[{\"type\": \"file\", \"path\": \"\\u0085X-of-1_b\", \"size\": 0}]",
+   "expect": {
+    "files": []
+   }
+  },
+  {
+   "name": "random_399",
+   "input": "[{\"type\": \"file\", \"path\": \"3\\u0130.\\u3000\\u00e98\\u017f\", \"size\": 2.5}]",
+   "expect": {
+    "files": []
+   }
+  }
+ ]
+}

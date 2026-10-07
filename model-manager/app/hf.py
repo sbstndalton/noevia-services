@@ -10,8 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import db
-from .utils import shard_key
+from . import db, model_files
 
 log = logging.getLogger(__name__)
 
@@ -30,14 +29,6 @@ def is_token_origin(url: str) -> bool:
                 and parsed.password is None and not any(c.isspace() for c in url))
     except ValueError:
         return False
-
-_QUANT_RE = re.compile(r"\b(I?Q\d+(?:_[A-Z0-9]+)*|F16|F32|BF16|FP8|FP4)\b", re.IGNORECASE)
-
-
-def infer_quant(filename: str) -> str | None:
-    m = _QUANT_RE.search(filename)
-    return m.group(0).upper() if m else None
-
 
 def get_token() -> str:
     return db.get_setting("hf_token", "")
@@ -201,32 +192,12 @@ async def repo_detail(repo_id: str, revision: str = "main") -> HfRepoDetail:
             # to loop forever, but this should never happen for a real repo.
             pass
 
-    files: list[HfFile] = []
-    for e in entries:
-        if e.get("type") != "file":
-            continue
-        path = e.get("path", "")
-        if not path.lower().endswith(".gguf") and not _is_support_file(path):
-            continue
-        # HF tree entries: size is under "size" for direct files; LFS files have "lfs": {"size": ...}
-        size = int((e.get("lfs") or {}).get("size") or e.get("size") or 0)
-        base, idx, tot = shard_key(path)
-        files.append(HfFile(
-            path=path,
-            size=size,
-            quant=infer_quant(path),
-            shard_base=base,
-            shard_index=idx,
-            shard_total=tot,
-        ))
+    # #964: listing -> file entries, by MODEL_FILES_IMPL (python by default; rust fails closed
+    # with model_files.ModelFilesError, which the app answers with a 502). Off the event loop:
+    # the rust path runs a subprocess with a 10 s timeout.
+    files = [HfFile(**f) for f in await asyncio.to_thread(model_files.files_from_tree, entries)]
     files.sort(key=lambda f: (not f.path.lower().endswith(".gguf"), f.path.lower()))
     return HfRepoDetail(id=repo_id, files=files, readme_snippet=None)
-
-
-def _is_support_file(path: str) -> bool:
-    low = path.lower()
-    # things llama.cpp sometimes needs alongside a GGUF
-    return low.endswith((".mmproj", "mmproj.gguf", "chat_template.jinja", "tokenizer.model"))
 
 
 _HEADER_BYTES = 1024 * 1024      # GGUF metadata sits at the very start of the file
