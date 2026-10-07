@@ -10,8 +10,9 @@ Split out of [sbstndalton/noevia](https://github.com/sbstndalton/noevia) `servic
 history filtered to those paths; the last commit names the noevia SHA it was cut from
 (`Split-Source:`).
 
-**Until the cutover in `docs/repo-split-cutover.md` (in noevia) is done, noevia is still the source
-of truth.** This repo is re-extracted at the cut SHA and force-replaced, so do not commit here yet.
+This repo is the source of truth for these paths since the cutover (noevia #952, cut at noevia
+`f42f65f1`). A release uses the SHA pinned as `NOEVIA_SERVICES_REF` in noevia's
+`release/versions.lock`; bump it there to ship a change made here.
 
 Tests use synthetic fixtures only. Never send prompts to the real Diary or touch its corpus.
 
