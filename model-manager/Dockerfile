@@ -2,14 +2,15 @@
 # noevia model manager: Model Loader (scratchhax/model-loader, MIT) folded into noevia.
 # JSON API only (/api/v1); noevia web renders every screen.
 
-# gguf-meta (#909): the bounded Rust GGUF reader from sbstndalton/noevia-rs, pinned to
-# release/versions.lock's NOEVIA_RS_REF and fetched as an anonymous tarball whose sha256 is
-# checked before anything is built. Used only when GGUF_PARSER=rust (default python).
+# gguf-meta (#909) and model-files (#964): bounded Rust leaves from sbstndalton/noevia-rs,
+# pinned to release/versions.lock's NOEVIA_RS_REF and fetched as an anonymous tarball whose
+# sha256 is checked before anything is built. gguf-meta is used only when GGUF_PARSER=rust,
+# model-files only when MODEL_FILES_IMPL=rust (both default python).
 # Built on bookworm (glibc 2.36); the runtime base below is Debian bookworm or newer, and glibc
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm AS gguf-meta
-ARG NOEVIA_RS_REF=14e08ddb2cd8e7434c1dacb7dec2c58aa80934e9
-ARG NOEVIA_RS_SHA256=39fce679c3950b957fe168e21c6f6ae632b35c85179f663ff6deba2693358eec
+ARG NOEVIA_RS_REF=306bd9a7264be815cfaae9f0430596206ba3adcb
+ARG NOEVIA_RS_SHA256=f3f2aa98dcacd6f8961162da420ef4ef57c5e1aaa6e310e32b81106cee896a34
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -18,8 +19,9 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta \
- && ./target/release/gguf-meta --help 2>&1 | grep -q usage
+ && cargo build --release --locked -p gguf-meta -p model-files-cli \
+ && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
+ && ./target/release/model-files --help 2>&1 | grep -q usage
 
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
@@ -27,6 +29,7 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY --from=gguf-meta /src/target/release/gguf-meta /usr/local/bin/gguf-meta
+COPY --from=gguf-meta /src/target/release/model-files /usr/local/bin/model-files
 COPY LICENSE ./
 COPY app ./app
 EXPOSE 8090

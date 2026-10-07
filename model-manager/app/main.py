@@ -5,7 +5,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from . import db, hw, ini
+from . import db, hw, ini, model_files
 from .config import settings
 
 log = logging.getLogger(__name__)
@@ -33,6 +33,14 @@ async def _duplicate_sections(_request: Request, exc: ini.DuplicateSectionsError
     """A write hit a models.ini with repeated [sections]; nothing was changed."""
     from fastapi.responses import JSONResponse
     return JSONResponse({"detail": f"{exc}. Repair the file (remove the repeated section) before saving."}, status_code=409)
+
+
+@app.exception_handler(model_files.ModelFilesError)
+async def _model_files_refused(_request: Request, exc: model_files.ModelFilesError):
+    """MODEL_FILES_IMPL=rust could not check a repository listing; nothing was served from it."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": "The repository file list could not be checked, so it was not used. "
+                                   "See the model manager log."}, status_code=502)
 
 
 @app.on_event("startup")
