@@ -1,0 +1,322 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diary:
+    name: Diary test suite
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws/services/diary
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-core
+          path: sib/noevia-core
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-services
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: ws/services/diary
+          push: false
+          cache-from: type=gha,scope=diary
+          cache-to: type=gha,mode=max,scope=diary
+
+  docling:
+    name: Docling extraction contract
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws/services/docling
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-core
+          path: sib/noevia-core
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-services
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install pytest==9.1.1 "pypdfium2!=4.30.1,>=4.30.0,<6.0.0"
+      - run: python -m pytest -q
+
+  ocr:
+    name: OCR service tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws/services/ocr
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-core
+          path: sib/noevia-core
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-services
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Install OCR engines
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu ghostscript poppler-utils
+      - run: pip install pytest==9.1.1
+      - run: python -m pytest -q -rs
+
+  laya:
+    name: Laya service tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws/services/laya
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-core
+          path: sib/noevia-core
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-services
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install pytest==9.1.1
+      - run: python -m pytest -q
+
+  model-manager:
+    name: Model manager test suite
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws/services/model-manager
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-core
+          path: sib/noevia-core
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-services
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest==9.1.1 pytest-asyncio==1.4.0
+      - run: python -m pytest -q
+      # gguf-meta (sbstndalton/noevia-rs) at the Dockerfile's pinned ref, checksum-verified, then
+      # compared with the Python parser (#909).
+      - name: Fetch noevia-rs at the pinned ref
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ARG NOEVIA_RS_REF=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG NOEVIA_RS_SHA256=//p' Dockerfile)
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "Dockerfile NOEVIA_RS_REF is not a 40-char SHA"; exit 1; }
+          curl -fsSL -o /tmp/noevia-rs.tar.gz "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
+          echo "$sum  /tmp/noevia-rs.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/noevia-rs"
+          tar -xzf /tmp/noevia-rs.tar.gz -C "$RUNNER_TEMP/noevia-rs" --strip-components=1
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ runner.temp }}/noevia-rs
+      - name: Build gguf-meta
+        working-directory: ${{ runner.temp }}/noevia-rs
+        run: cargo build --release --locked -p gguf-meta
+      - name: Differential test (gguf-meta vs Python parser)
+        env:
+          GGUF_META_BIN: ${{ runner.temp }}/noevia-rs/target/release/gguf-meta
+          GGUF_META_FIXTURES: ${{ runner.temp }}/noevia-rs/crates/gguf/tests/fixtures
+        run: python -m pytest -q -rs tests/test_gguf_meta_differential.py tests/test_gguf_parser_switch.py
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: ws/services/model-manager
+          push: false
+          cache-from: type=gha,scope=model-manager
+          cache-to: type=gha,mode=max,scope=model-manager
