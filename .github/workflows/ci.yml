@@ -222,7 +222,9 @@ jobs:
         env:
           DOCX_TEXT_BIN: ${{ runner.temp }}/noevia-rs/target/release/docx-text
         run: |
-          cmp tests/fixtures/docx-text.v1.json "$RUNNER_TEMP/noevia-rs/crates/docx-text/tests/fixtures/docx-text.v1.json"
+          for f in docx-text.v1.json docx-producers.v1.json; do
+            cmp "tests/fixtures/$f" "$RUNNER_TEMP/noevia-rs/crates/docx-text/tests/fixtures/$f"
+          done
           python -m pytest -q -rs -s test_docx_text_differential.py test_docx_text_switch.py
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)

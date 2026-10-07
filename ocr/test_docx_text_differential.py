@@ -20,6 +20,7 @@ from pathlib import Path
 from docx_text import extract_docx_py
 
 FIXTURES = Path(__file__).parent / 'tests' / 'fixtures' / 'docx-text.v1.json'
+PRODUCERS = Path(__file__).parent / 'tests' / 'fixtures' / 'docx-producers.v1.json'
 BIN = os.environ.get('DOCX_TEXT_BIN', '')
 MESSAGES = {
     'Invalid DOCX container': 'container',
@@ -103,6 +104,25 @@ class Differential(unittest.TestCase):
             if c['kind'] == 'case' and 'stricter' not in c:
                 self.assertEqual(rs, py, f"{c['name']}: class differs from Python")
         print('docx-text differential:', counts)
+
+    def test_python_extracts_every_producer_file(self):
+        for c in json.loads(PRODUCERS.read_text())['cases']:
+            self.assertEqual(python(base64.b64decode(c['docx']))[1], c['python'], c['name'])
+            self.assertNotIn('error', c['python'], c['name'])
+
+    @unittest.skipUnless(BIN, 'DOCX_TEXT_BIN not set: no docx-text binary to compare')
+    def test_binary_extracts_producer_files_like_python(self):
+        """python-docx, pandoc, LibreOffice, textutil and zip re-packs (synthetic content): the
+        binary returns Python's exact text, except the recorded deliberate refusals."""
+        for c in json.loads(PRODUCERS.read_text())['cases']:
+            data = base64.b64decode(c['docx'])
+            py_raw, _ = python(data)
+            rs_raw, rs = rust(data)
+            self.assertEqual(rs, c['rust'], c['name'])
+            if 'stricter' in c:
+                self.assertIsNone(rs_raw, c['name'])
+            else:
+                self.assertEqual(rs_raw, py_raw, c['name'])
 
 
 if __name__ == '__main__':
