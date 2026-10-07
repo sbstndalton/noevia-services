@@ -14,6 +14,8 @@ from . import discover, gguf_meta
 from .config import settings
 
 BACKUPS_TO_KEEP = 10
+# #1021: noevia-backup-<revision> copies kept (MODEL_FILES_IMPL=rust decides which).
+REVISION_BACKUPS_TO_KEEP = 10
 
 # One process-wide lock for every models.ini read-modify-write. FastAPI runs sync handlers in a
 # threadpool, so callers hold it around their revision check and write; the write helpers take it
@@ -842,17 +844,63 @@ def _fsync_dir(directory) -> None:
         os.close(fd)
 
 
-def _replace_file(path, text: str, *, base_revision: str | None = None) -> None:
+def _rotating_name(path):
+    """The next free `.bak-<ts>[-n]` name (the one `_backup_current` would use)."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_suffix(path.suffix + f".bak-{ts}")
+    n = 1
+    while backup.exists():
+        backup = path.with_suffix(path.suffix + f".bak-{ts}-{n}")
+        n += 1
+    return backup
+
+
+def _rust_backups(path, base_revision: str | None, backup: bool):
+    """#1021 (MODEL_FILES_IMPL=rust): make the copies `model-files backups` decides on; return
+    the names to remove once the new file is in place. Fails closed: any failure raises before
+    models.ini is touched (OSError, so the API says nothing was changed)."""
+    from . import model_files
+    existing = []
+    try:
+        for entry in os.scandir(path.parent):
+            if entry.is_file(follow_symlinks=False):
+                existing.append({"name": entry.name, "mtimeNs": entry.stat(follow_symlinks=False).st_mtime_ns})
+    except OSError as e:
+        raise OSError(f"could not list {path.parent}") from e
+    request = {"file": path.name, "baseRevision": base_revision, "backup": backup,
+               "rotatingName": _rotating_name(path).name, "keepRevisions": REVISION_BACKUPS_TO_KEEP,
+               "existing": existing}
+    try:
+        plan = model_files.backup_plan_rust(request)
+    except model_files.ModelFilesError as e:
+        raise OSError(f"backup plan unavailable: {e}") from e
+    if plan["revision"] is not None:
+        _immutable_backup(path, base_revision)
+    if plan["rotating"] is not None:
+        shutil.copy(path, path.with_name(plan["rotating"]))
+    return [path.with_name(n) for n in plan["prune"]]
+
+
+def _replace_file(path, text: str, *, base_revision: str | None = None, backup: bool = True) -> None:
     """Back up, write a fsynced temp file with the current mode, rename it over models.ini and
     fsync the directory, so the llama router always sees a whole file and the rename survives a
-    crash. Any backup failure raises before the file is touched."""
+    crash. Any backup failure raises before the file is touched.
+
+    `backup=False` is noevia-core's hint (#1003: auto-tune keeps one copy per run): no copies.
+    With MODEL_FILES_IMPL=rust the copies and their retention are `model-files backups`'
+    decision (#1021); otherwise the behaviour before #1021, less the hinted copies."""
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = 0o644
+    prune = []
     if path.exists():
         mode = path.stat().st_mode & 0o777
-        if base_revision is not None:
-            _immutable_backup(path, base_revision)
-        _backup_current(path)
+        from .model_files import impl_choice
+        if impl_choice() == "rust":
+            prune = _rust_backups(path, base_revision, backup)
+        elif backup:
+            if base_revision is not None:
+                _immutable_backup(path, base_revision)
+            _backup_current(path)
     tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{time.monotonic_ns()}")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -866,6 +914,12 @@ def _replace_file(path, text: str, *, base_revision: str | None = None) -> None:
         try:
             tmp.unlink()
         except FileNotFoundError:
+            pass
+    # Old copies go only after the new file is in place; best effort, never fails the write.
+    for old in prune:
+        try:
+            old.unlink()
+        except OSError:
             pass
 
 
@@ -1059,12 +1113,12 @@ def _atomic_write(cp: configparser.ConfigParser) -> None:
         _replace_file(settings.models_ini_path, text)
 
 
-def write_raw_text(text: str, base_revision: str | None = None) -> None:
+def write_raw_text(text: str, base_revision: str | None = None, backup: bool = True) -> None:
     """Replace models.ini with caller-supplied text verbatim (comments and layout kept).
     With `base_revision`, an immutable `models.ini.noevia-backup-<base_revision>` is kept as well
     as the rotating `.bak-<ts>` copy."""
     with WRITE_LOCK:
-        _replace_file(settings.models_ini_path, text, base_revision=base_revision)
+        _replace_file(settings.models_ini_path, text, base_revision=base_revision, backup=backup)
 
 
 def _prune_backups() -> None:

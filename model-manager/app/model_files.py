@@ -173,6 +173,51 @@ def files_from_tree_rust(entries: list[Any]) -> list[dict[str, Any]]:
     return files
 
 
+BACKUPS_STDOUT_CAP = 4 * 1024 * 1024
+
+
+def backup_plan_rust(request: dict[str, Any]) -> dict[str, Any]:
+    """#1021: `model-files backups` - which recovery copies of models.ini a write makes and which
+    old ones it removes (see noevia-rs crates/model-files/src/backups.rs). Used by ini.py when
+    MODEL_FILES_IMPL=rust. Fails closed: any failure raises ModelFilesError and the write is not
+    made. A refused base revision raises ValueError, as the Python path does."""
+    binary = _rust_binary()
+    if binary is None:
+        raise _fail("missing_binary", "model-files not found or not executable")
+    payload = json.dumps(request, ensure_ascii=True).encode()
+    try:
+        proc = subprocess.run([binary, "backups"], input=payload, capture_output=True,
+                              timeout=MODEL_FILES_TIMEOUT_S, check=False,
+                              env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
+    except subprocess.TimeoutExpired:
+        raise _fail("timeout", f"no result within {MODEL_FILES_TIMEOUT_S:g} s") from None
+    except OSError as e:
+        raise _fail("spawn", type(e).__name__) from None
+    if proc.returncode != 0:
+        if proc.stderr.strip() == b"model-files: refused: base_revision":
+            raise ValueError("baseRevision must be a sha256 hex digest")
+        raise _fail("rejected", f"exit {proc.returncode}: {proc.stderr[:300].decode('utf-8', 'replace').strip()}")
+    if len(proc.stdout) > BACKUPS_STDOUT_CAP:
+        raise _fail("output_too_large", f"more than {BACKUPS_STDOUT_CAP} bytes")
+    try:
+        out = json.loads(proc.stdout)
+    except ValueError:
+        raise _fail("malformed_output", "not JSON") from None
+    listed = {e["name"] for e in request.get("existing", [])}
+    ok = (isinstance(out, dict) and set(out) == {"rotating", "revision", "prune"}
+          and out["rotating"] in (None, request.get("rotatingName"))
+          and (out["revision"] is None or (isinstance(out["revision"], str)
+               and out["revision"] == f"{request['file']}.noevia-backup-{request.get('baseRevision')}"))
+          and isinstance(out["prune"], list)
+          # Never anything that was not listed, and never this write's own copies.
+          and all(isinstance(n, str) and n in listed and n not in (out["rotating"], out["revision"])
+                  and (n.startswith(request["file"] + ".bak-") or n.startswith(request["file"] + ".noevia-backup-"))
+                  for n in out["prune"]))
+    if not ok:
+        raise _fail("malformed_output", "unexpected shape")
+    return out
+
+
 def files_from_tree(entries: list[Any]) -> list[dict[str, Any]]:
     """The file list of a tree listing, by the configured implementation."""
     if impl_choice() == "rust":
