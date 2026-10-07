@@ -36,6 +36,9 @@ jobs:
           repository: sbstndalton/noevia-core
           path: sib/noevia-core
       - name: Lay out the noevia-shaped workspace
+        # The job default (ws/apps/web or ws/services/...) only exists after this step: since the
+        # cutover noevia main has no apps/web or services/ (noevia #952).
+        working-directory: .
         env:
           SELF: noevia-services
         run: |
@@ -97,6 +100,9 @@ jobs:
           repository: sbstndalton/noevia-core
           path: sib/noevia-core
       - name: Lay out the noevia-shaped workspace
+        # The job default (ws/apps/web or ws/services/...) only exists after this step: since the
+        # cutover noevia main has no apps/web or services/ (noevia #952).
+        working-directory: .
         env:
           SELF: noevia-services
         run: |
@@ -151,6 +157,9 @@ jobs:
           repository: sbstndalton/noevia-core
           path: sib/noevia-core
       - name: Lay out the noevia-shaped workspace
+        # The job default (ws/apps/web or ws/services/...) only exists after this step: since the
+        # cutover noevia main has no apps/web or services/ (noevia #952).
+        working-directory: .
         env:
           SELF: noevia-services
         run: |
@@ -209,6 +218,9 @@ jobs:
           repository: sbstndalton/noevia-core
           path: sib/noevia-core
       - name: Lay out the noevia-shaped workspace
+        # The job default (ws/apps/web or ws/services/...) only exists after this step: since the
+        # cutover noevia main has no apps/web or services/ (noevia #952).
+        working-directory: .
         env:
           SELF: noevia-services
         run: |
@@ -263,6 +275,9 @@ jobs:
           repository: sbstndalton/noevia-core
           path: sib/noevia-core
       - name: Lay out the noevia-shaped workspace
+        # The job default (ws/apps/web or ws/services/...) only exists after this step: since the
+        # cutover noevia main has no apps/web or services/ (noevia #952).
+        working-directory: .
         env:
           SELF: noevia-services
         run: |
