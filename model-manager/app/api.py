@@ -249,10 +249,12 @@ def replace_models_ini(body: dict = Body(...)) -> dict:
     except Exception:
         raise HTTPException(400, "models.ini text does not parse")
     base = body.get("baseRevision")
+    # #1003/#1021: advisory hint from noevia-core; only an explicit false skips the copies.
+    backup = body.get("backup") is not False
     with ini.WRITE_LOCK:
         _require_revision(base)
         try:
-            ini.write_raw_text(text, base_revision=base)
+            ini.write_raw_text(text, base_revision=base, backup=backup)
         except OSError:
             log.exception("models.ini write failed")
             raise HTTPException(500, "models.ini could not be written safely; nothing was changed")
