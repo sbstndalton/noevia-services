@@ -190,6 +190,47 @@ jobs:
           sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu ghostscript poppler-utils
       - run: pip install pytest==9.1.1
       - run: python -m pytest -q -rs
+      # docx-text (#981, sbstndalton/noevia-rs) at the Dockerfile's pinned ref, checksum-verified.
+      # The model-manager image pins the same ref and checksum (release/versions.lock's
+      # NOEVIA_RS_REF); the shared fixture table must be byte-identical in both repos, and the
+      # binary must agree with the live Python reference on it.
+      - name: OCR and model-manager pin the same noevia-rs
+        run: |
+          set -euo pipefail
+          for k in NOEVIA_RS_REF NOEVIA_RS_SHA256; do
+            a=$(sed -n "s/^ARG $k=//p" Dockerfile); b=$(sed -n "s/^ARG $k=//p" ../model-manager/Dockerfile)
+            [ -n "$a" ] && [ "$a" = "$b" ] || { echo "::error::ocr/Dockerfile $k ($a) != model-manager/Dockerfile ($b)"; exit 1; }
+          done
+      - name: Fetch noevia-rs at the pinned ref
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ARG NOEVIA_RS_REF=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG NOEVIA_RS_SHA256=//p' Dockerfile)
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "Dockerfile NOEVIA_RS_REF is not a 40-char SHA"; exit 1; }
+          curl -fsSL -o /tmp/noevia-rs.tar.gz "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
+          echo "$sum  /tmp/noevia-rs.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/noevia-rs"
+          tar -xzf /tmp/noevia-rs.tar.gz -C "$RUNNER_TEMP/noevia-rs" --strip-components=1
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ runner.temp }}/noevia-rs
+      - name: Build docx-text
+        working-directory: ${{ runner.temp }}/noevia-rs
+        run: cargo build --release --locked -p docx-text-cli
+      - name: Differential test (docx-text vs Python reference)
+        env:
+          DOCX_TEXT_BIN: ${{ runner.temp }}/noevia-rs/target/release/docx-text
+        run: |
+          cmp tests/fixtures/docx-text.v1.json "$RUNNER_TEMP/noevia-rs/crates/docx-text/tests/fixtures/docx-text.v1.json"
+          python -m pytest -q -rs -s test_docx_text_differential.py test_docx_text_switch.py
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: ws/services/ocr
+          push: false
+          cache-from: type=gha,scope=ocr
+          cache-to: type=gha,mode=max,scope=ocr
 
   laya:
     name: Laya service tests
