@@ -1,3 +1,4 @@
+import os
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +8,19 @@ from pdf_reduce import reduce_pdf
 import synthetic_pdfs
 
 ENGINES = synthetic_pdfs.skip_reason()
+
+
+def _core_file(rel):
+    """A noevia-core file, or None. Looks in the services CI workspace layout (core's server/ is
+    overlaid at <ws>/apps/web/server/, this file at <ws>/services/ocr/), then a sibling noevia-core
+    clone; NOEVIA_CORE_DIR overrides. The OCR image ships neither, so callers skip on None."""
+    here = Path(__file__).resolve()
+    roots = []
+    if os.environ.get('NOEVIA_CORE_DIR'):
+        roots.append(Path(os.environ['NOEVIA_CORE_DIR']))
+    if len(here.parents) > 2:  # a shallow path (the image) has no grandparent to search
+        roots += [here.parents[2] / 'apps/web', here.parents[2] / 'noevia-core']
+    return next((r / rel for r in roots if (r / rel).is_file()), None)
 
 class ReductionTests(unittest.TestCase):
     def test_invalid_pdf_is_rejected(self):
@@ -85,9 +99,12 @@ class ReductionDeadlineTests(unittest.TestCase):
     def test_budget_is_below_the_web_abort(self):
         import re
         from pdf_reduce import REDUCE_DEADLINE_SECONDS
-        web = (Path(__file__).resolve().parents[2] / 'apps/web/server/pdf-reduce.cjs').read_text()
+        web_path = _core_file('server/pdf-reduce.cjs')
+        if web_path is None:
+            self.skipTest('noevia-core server/pdf-reduce.cjs not present (OCR image, or no noevia workspace layout)')
+        web = web_path.read_text()
         if 'AbortSignal.timeout' not in web:
-            self.skipTest('web source not present')
+            self.skipTest('AbortSignal.timeout not found in noevia-core server/pdf-reduce.cjs')
         abort = int(re.search(r'AbortSignal\.timeout\((\d+)\)', web)[1]) / 1000
         self.assertLess(REDUCE_DEADLINE_SECONDS, abort)
 

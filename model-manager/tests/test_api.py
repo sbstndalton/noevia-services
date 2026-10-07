@@ -53,8 +53,9 @@ def test_web_field_id_fixture_matches_the_schema():
     import json
     from pathlib import Path
     from app import ini
-    fixture = Path(__file__).resolve().parents[3] / "apps/web/tests/fixtures/model-manager-field-ids.json"
-    if not fixture.exists():  # the model-manager image ships without the web app
+    parents = Path(__file__).resolve().parents
+    fixture = parents[3] / "apps/web/tests/fixtures/model-manager-field-ids.json" if len(parents) > 3 else None
+    if fixture is None or not fixture.exists():  # the model-manager image ships without the web app
         import pytest
         pytest.skip("apps/web not present")
     assert json.loads(fixture.read_text()) == [f.key for f in ini.ALL_FIELDS]
@@ -67,9 +68,9 @@ def test_web_backend_notes_fixture_matches_the_service_strings():
     import re
     from pathlib import Path
     from app import services
-    root = Path(__file__).resolve().parents[3]
-    fixture = root / "apps/web/tests/fixtures/model-manager-backend-notes.json"
-    if not fixture.exists():  # the model-manager image ships without the web app
+    parents = Path(__file__).resolve().parents
+    fixture = parents[3] / "apps/web/tests/fixtures/model-manager-backend-notes.json" if len(parents) > 3 else None
+    if fixture is None or not fixture.exists():  # the model-manager image ships without the web app
         import pytest
         pytest.skip("apps/web not present")
     data = json.loads(fixture.read_text())
