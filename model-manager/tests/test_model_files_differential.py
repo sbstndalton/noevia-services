@@ -107,3 +107,32 @@ def test_binary_agrees_on_a_seeded_random_corpus():
     disagreements = [t for t in texts if not _agree(_python(t), _rust(t))]
     assert disagreements == [], disagreements[:3]
     print(f"model-files random corpus: {len(texts)}/{len(texts)} agree")
+
+
+# #964 F3: inputs past the Rust caps are refused on purpose (fail closed) while Python accepts
+# them. Kept out of the shared table, which holds only inputs both sides must agree on.
+_OVER_CAP = {
+    "lone_surrogate_path": [{"type": "file", "path": "m-\ud800-Q4_0.gguf", "size": 1}],
+    "path_over_4096_chars": [{"type": "file", "path": "a" * 4097 + "-Q4_0.gguf", "size": 1}],
+}
+
+
+@pytest.mark.parametrize("name", sorted(_OVER_CAP))
+def test_python_accepts_inputs_past_the_rust_caps(name):
+    files = files_from_tree_py(_OVER_CAP[name])
+    assert len(files) == 1 and files[0]["quant"] == "Q4_0"
+
+
+@needs_bin
+@pytest.mark.parametrize("name", sorted(_OVER_CAP))
+def test_rust_refuses_inputs_past_its_caps_and_the_switch_fails_closed(name, monkeypatch):
+    from app import config, model_files
+    proc = subprocess.run([BIN, "tree"], input=json.dumps(_OVER_CAP[name]).encode(),
+                          capture_output=True, timeout=30, check=False)
+    assert proc.returncode == 1 and proc.stdout == b""
+    monkeypatch.setattr(config.settings, "model_files_impl", "rust")
+    monkeypatch.setattr(config.settings, "model_files_bin", BIN)
+    with pytest.raises(model_files.ModelFilesError, match="rejected"):
+        model_files.files_from_tree(_OVER_CAP[name])
+    monkeypatch.setattr(config.settings, "model_files_impl", "python")
+    assert model_files.files_from_tree(_OVER_CAP[name]) == files_from_tree_py(_OVER_CAP[name])

@@ -9,8 +9,8 @@
 # Built on bookworm (glibc 2.36); the runtime base below is Debian bookworm or newer, and glibc
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm AS gguf-meta
-ARG NOEVIA_RS_REF=306bd9a7264be815cfaae9f0430596206ba3adcb
-ARG NOEVIA_RS_SHA256=f3f2aa98dcacd6f8961162da420ef4ef57c5e1aaa6e310e32b81106cee896a34
+ARG NOEVIA_RS_REF=472e83421bcfe039c2081595999abdbe7975d808
+ARG NOEVIA_RS_SHA256=b1e9e03305ef7daea4e49d86cd9c6f33367a3597bdf35b21fb57f69def3054ba
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never

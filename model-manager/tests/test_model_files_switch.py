@@ -205,3 +205,40 @@ def test_api_answers_502_when_rust_refuses(tmp_path, monkeypatch):
     assert r.status_code == 502
     assert "could not be checked" in r.json()["detail"]
     assert queued == []
+
+
+def test_child_gets_a_minimal_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODEL_LOADER_TOKEN", "synthetic-secret-not-for-children")
+    monkeypatch.setenv("HF_TOKEN", "hf_synthetic")
+    out = tmp_path / "env.json"
+    _use_rust(monkeypatch, _fake_bin(tmp_path, f"""
+        import os
+        open({str(out)!r}, "w").write(json.dumps(dict(os.environ)))
+        print(json.dumps({{"files": []}}))
+    """))
+    model_files.files_from_tree([])
+    env = json.loads(out.read_text())
+    assert "PATH" in env
+    assert "MODEL_LOADER_TOKEN" not in env and "HF_TOKEN" not in env
+    # Whatever the OS, sh or interpreter adds itself, nothing of the service's environment leaks.
+    assert not set(env) - {"PATH", "__CF_USER_TEXT_ENCODING", "LC_CTYPE", "PWD", "SHLVL", "_"}
+
+
+@pytest.mark.asyncio
+async def test_a_slow_binary_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    import asyncio
+    import time
+    from app import db
+    db.init()
+    health = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    _hub(monkeypatch, LISTING)
+    _use_rust(monkeypatch, _fake_bin(tmp_path, "time.sleep(2)\n" + textwrap.dedent(_ECHO_PYTHON)))
+    slow = asyncio.create_task(hf.repo_detail("synthetic/repo-GGUF"))
+    await asyncio.sleep(0.2)  # the listing is now waiting on the binary
+    t0 = time.monotonic()
+    r = await health.get("/api/v1/health")
+    assert r.status_code == 200 and time.monotonic() - t0 < 2.0
+    assert not slow.done()
+    detail = await slow
+    assert {f.quant for f in detail.files} == {"FROM-RUST"}
+    await health.aclose()

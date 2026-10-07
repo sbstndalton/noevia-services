@@ -193,8 +193,9 @@ async def repo_detail(repo_id: str, revision: str = "main") -> HfRepoDetail:
             pass
 
     # #964: listing -> file entries, by MODEL_FILES_IMPL (python by default; rust fails closed
-    # with model_files.ModelFilesError, which the app answers with a 502).
-    files = [HfFile(**f) for f in model_files.files_from_tree(entries)]
+    # with model_files.ModelFilesError, which the app answers with a 502). Off the event loop:
+    # the rust path runs a subprocess with a 10 s timeout.
+    files = [HfFile(**f) for f in await asyncio.to_thread(model_files.files_from_tree, entries)]
     files.sort(key=lambda f: (not f.path.lower().endswith(".gguf"), f.path.lower()))
     return HfRepoDetail(id=repo_id, files=files, readme_snippet=None)
 

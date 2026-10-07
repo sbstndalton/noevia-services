@@ -150,7 +150,10 @@ def files_from_tree_rust(entries: list[Any]) -> list[dict[str, Any]]:
         raise _fail("input_too_large", f"{len(payload)} bytes")
     try:
         proc = subprocess.run([binary, "tree"], input=payload, capture_output=True,
-                              timeout=MODEL_FILES_TIMEOUT_S, check=False)
+                              timeout=MODEL_FILES_TIMEOUT_S, check=False,
+                              # A minimal environment: the child needs nothing of ours (tokens,
+                              # settings), only a PATH.
+                              env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
     except subprocess.TimeoutExpired:
         raise _fail("timeout", f"no result within {MODEL_FILES_TIMEOUT_S:g} s") from None
     except OSError as e:
