@@ -176,6 +176,11 @@ def files_from_tree_rust(entries: list[Any]) -> list[dict[str, Any]]:
 BACKUPS_STDOUT_CAP = 4 * 1024 * 1024
 
 
+def _copy_of(file: str, infix: str, name: str, rest: str) -> bool:
+    prefix = file + infix
+    return name.startswith(prefix) and re.fullmatch(rest, name[len(prefix):], re.DOTALL) is not None
+
+
 def backup_plan_rust(request: dict[str, Any]) -> dict[str, Any]:
     """#1021: `model-files backups` - which recovery copies of models.ini a write makes and which
     old ones it removes (see noevia-rs crates/model-files/src/backups.rs). Used by ini.py when
@@ -211,7 +216,8 @@ def backup_plan_rust(request: dict[str, Any]) -> dict[str, Any]:
           and isinstance(out["prune"], list)
           # Never anything that was not listed, and never this write's own copies.
           and all(isinstance(n, str) and n in listed and n not in (out["rotating"], out["revision"])
-                  and (n.startswith(request["file"] + ".bak-") or n.startswith(request["file"] + ".noevia-backup-"))
+                  and (_copy_of(request["file"], ".bak-", n, r".+")
+                       or _copy_of(request["file"], ".noevia-backup-", n, r"[0-9a-f]{64}"))
                   for n in out["prune"]))
     if not ok:
         raise _fail("malformed_output", "unexpected shape")
