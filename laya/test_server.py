@@ -7,7 +7,7 @@ import queue
 import socket
 import threading
 import time
-from server import Runtime, decision_timeout_from_env, serve, validate
+from server import Busy, Pool, Runtime, decision_timeout_from_env, max_concurrency_from_env, queue_timeout_from_env, serve, validate
 
 
 def fake_worker(pipe):
@@ -176,5 +176,141 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(self.fatal, [])
         finally:
             os.environ.pop('LAYA_FAKE_STARTUP_FAIL', None)
+
+
+DELAY = 0.4
+
+
+def delay_worker(pipe):
+    """Fake model: state 'sleep:<n>' answers after n seconds, echoing its own state back."""
+    pipe.send({'ready': True})
+    while True:
+        body = pipe.recv()
+        time.sleep(float(body['state'].split(':')[1].split()[0]) if body['state'].startswith('sleep:') else 0)
+        pipe.send({'selected': body['state'], 'scores': {'continue': 1, 'verify': 0},
+                   'model': 'fake', 'calibrated': False})
+
+
+class ConcurrencyEnvTests(unittest.TestCase):
+    def parse(self, **env):
+        logs = []
+        return max_concurrency_from_env(env, logs.append), logs
+
+    def test_default_one_and_valid(self):
+        self.assertEqual(self.parse(), (1, []))
+        self.assertEqual(self.parse(LAYA_MAX_CONCURRENCY=' '), (1, []))
+        self.assertEqual(self.parse(LAYA_MAX_CONCURRENCY='3'), (3, []))
+
+    def test_garbage_falls_back_with_log(self):
+        for raw in ['0', '-1', '5', 'two', '1.5', '']:
+            value, logs = self.parse(LAYA_MAX_CONCURRENCY=raw)
+            self.assertEqual(value, 1, raw)
+            self.assertEqual(len(logs), 0 if raw == '' else 1, raw)
+
+
+class QueueTimeoutEnvTests(unittest.TestCase):
+    def test_parse(self):
+        logs = []
+        self.assertEqual(queue_timeout_from_env({}, logs.append), 2.0)
+        self.assertEqual(queue_timeout_from_env({'LAYA_QUEUE_TIMEOUT_MS': '500'}, logs.append), 0.5)
+        self.assertEqual(logs, [])
+        for raw in ['-1', 'x', '10001', '1.5']:
+            self.assertEqual(queue_timeout_from_env({'LAYA_QUEUE_TIMEOUT_MS': raw}, logs.append), 2.0)
+        self.assertEqual(len(logs), 4)
+
+
+class PoolHttpTests(unittest.TestCase):
+    def start(self, size, queue_timeout=5):
+        self.pool = Pool.start(size, queue_timeout, ctx=mp.get_context('spawn'), worker_target=delay_worker,
+                               startup_timeout=10, decision_timeout=2.0)
+        published = queue.Queue()
+        self.thread = threading.Thread(target=serve, args=(self.pool, ('127.0.0.1', 0), published.put), daemon=True)
+        self.thread.start()
+        self.server = published.get(timeout=2)
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join(2)
+        self.pool.stop()
+
+    def request(self, method, path, body=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+        conn.request(method, path, body=json.dumps(body) if body else None,
+                     headers={'Content-Type': 'application/json'})
+        response = conn.getresponse()
+        out = (response.status, json.loads(response.read()), response.getheader('Retry-After'))
+        conn.close()
+        return out
+
+    def burst(self, n, state=lambda i: f'sleep:{DELAY}'):
+        results = [None] * n
+
+        def run(i):
+            results[i] = self.request('POST', '/v1/decisions', {**BODY, 'state': state(i)})
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+        start = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return results, time.monotonic() - start
+
+    def test_k1_overlapping_requests_queue_instead_of_503(self):
+        self.start(1, queue_timeout=2.0)
+        results, took = self.burst(2, lambda i: 'sleep:0.5')
+        self.assertEqual([r[0] for r in results], [200, 200])
+        self.assertGreaterEqual(took, 1.0)
+
+    def test_default_one_serialises(self):
+        self.start(1)
+        results, took = self.burst(3)
+        self.assertEqual([r[0] for r in results], [200] * 3)
+        self.assertGreaterEqual(took, 3 * DELAY)
+
+    def test_concurrency_k_finishes_in_ceil_n_over_k_delays(self):
+        self.start(2)
+        results, took = self.burst(4)
+        self.assertEqual([r[0] for r in results], [200] * 4)
+        self.assertGreaterEqual(took, 2 * DELAY)
+        self.assertLess(took, 3.5 * DELAY)  # serial would be 4 * DELAY
+
+    def test_no_cross_request_state_leakage(self):
+        self.start(3)
+        results, _ = self.burst(9, lambda i: f'sleep:0.05 req{i}')
+        self.assertEqual([r[1]['selected'] for r in results], [f'sleep:0.05 req{i}' for i in range(9)])
+
+    def test_health_answers_while_inference_busy(self):
+        self.start(1)
+        busy = threading.Thread(target=self.burst, args=(1,))
+        busy.start()
+        time.sleep(0.1)
+        start = time.monotonic()
+        self.assertEqual(self.request('GET', '/health')[:2], (200, {'ready': True}))
+        self.assertLess(time.monotonic() - start, DELAY * 0.9)
+        busy.join()
+
+    def test_over_capacity_gets_fast_503_with_retry_after(self):
+        self.start(1, queue_timeout=0.1)
+        out = {}
+        busy = threading.Thread(target=lambda: out.update(first=self.request('POST', '/v1/decisions', {**BODY, 'state': 'sleep:0.6'})))
+        busy.start()
+        time.sleep(0.15)
+        start = time.monotonic()
+        status, payload, retry = self.request('POST', '/v1/decisions', BODY)
+        self.assertEqual((status, retry), (503, '1'))
+        self.assertLess(time.monotonic() - start, 0.5)
+        busy.join()
+        self.assertEqual(out['first'][0], 200)
+        self.assertEqual(self.request('POST', '/v1/decisions', BODY)[0], 200)  # recovers
+
+    def test_pool_raises_busy(self):
+        self.start(1, queue_timeout=0.05)
+        t = threading.Thread(target=self.burst, args=(1, lambda i: 'sleep:0.4'))
+        t.start()
+        time.sleep(0.1)
+        with self.assertRaises(Busy):
+            self.pool.decide(BODY)
+        t.join()
 
 if __name__ == '__main__': unittest.main()

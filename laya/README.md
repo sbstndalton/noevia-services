@@ -58,3 +58,24 @@ As of 2026-09-22, Settings → Server → Experimental provides shared endpoint 
 Both System-One routing and Step supervision can use Laya. Saving configuration there
 overrides the initial COWORK_DECISION_URL default without a restart. The legacy
 option-logit endpoint remains a compatibility fallback when no shared endpoint is set.
+
+## Concurrency (`LAYA_MAX_CONCURRENCY`, issue #780)
+
+The HTTP server is threaded (daemon threads); `/health` never waits on inference.
+`LAYA_MAX_CONCURRENCY` (integer 1 to 4, default 1, garbage refused with a log line)
+sets the number of inference slots. Each slot is its own worker process with its own
+model copy and pipe, so a request holds one slot exclusively and nothing mutable is
+shared. Requests beyond the bound queue for `LAYA_QUEUE_TIMEOUT_MS` (0 to 10000,
+default 2000, the web deadline maximum, so queueing matches the old single-threaded
+server), then get `503` with `Retry-After: 1` (web already fails closed).
+
+Thread safety: the model is deliberately not shared across threads. Laya 0.3.5
+`Agent.system_one` is `@torch.no_grad()` over an `eval()` model and its router notes
+that concurrent predictions may share a checkpoint, but `Agent` mutates `self.device`
+and `self.dtype` in its GPU out-of-memory fallback (not reachable on CPU), the
+HuggingFace tokenizer is called from the same object, and `torch.set_num_threads(2)`
+is process-wide. Per-process slots avoid all of that.
+
+Cost: every extra slot loads another model copy (RSS not yet measured; the container
+limit is 6 GiB and 2 CPUs, which also caps real speedup). Raising the bound, and
+`NOEVIA_ROUTER_CHUNKS`, needs a measured, owner-approved run.

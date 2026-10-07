@@ -4,7 +4,7 @@ import multiprocessing as mp
 import os
 import re
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def validate(body):
@@ -201,6 +201,116 @@ class Runtime:
         return result
 
 
+DEFAULT_MAX_CONCURRENCY, MAX_MAX_CONCURRENCY = 1, 4
+# Web's decision deadline is at most 2000 ms, so a request queued longer would have been
+# abandoned by its caller anyway; this matches the old single-threaded queueing.
+DEFAULT_QUEUE_TIMEOUT_S = 2.0
+MAX_QUEUE_TIMEOUT_MS = 10000
+
+
+def queue_timeout_from_env(env=None, log=None):
+    """Queue wait in seconds from LAYA_QUEUE_TIMEOUT_MS (0-10000). Default 2000."""
+    env = os.environ if env is None else env
+    log = log or (lambda msg: print(msg, flush=True))
+    raw = env.get('LAYA_QUEUE_TIMEOUT_MS')
+    if raw is None or not raw.strip():
+        return DEFAULT_QUEUE_TIMEOUT_S
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = -1
+    if not 0 <= value <= MAX_QUEUE_TIMEOUT_MS:
+        log(f'laya: ignoring LAYA_QUEUE_TIMEOUT_MS={raw.strip()[:32]!r}; it must be an integer '
+            f'from 0 to {MAX_QUEUE_TIMEOUT_MS}. Using {int(DEFAULT_QUEUE_TIMEOUT_S * 1000)}.')
+        return DEFAULT_QUEUE_TIMEOUT_S
+    return value / 1000
+
+
+def max_concurrency_from_env(env=None, log=None):
+    """Inference slots from LAYA_MAX_CONCURRENCY (integer 1-4). Default 1 keeps one model.
+
+    Each slot is a separate worker process holding its own model copy, so raising it
+    multiplies model memory. Garbage or out-of-range values are refused with a log line.
+    """
+    env = os.environ if env is None else env
+    log = log or (lambda msg: print(msg, flush=True))
+    raw = env.get('LAYA_MAX_CONCURRENCY')
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CONCURRENCY
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if not 1 <= value <= MAX_MAX_CONCURRENCY:
+        log(f'laya: ignoring LAYA_MAX_CONCURRENCY={raw.strip()[:32]!r}; it must be an integer '
+            f'from 1 to {MAX_MAX_CONCURRENCY}. Using {DEFAULT_MAX_CONCURRENCY}.')
+        return DEFAULT_MAX_CONCURRENCY
+    return value
+
+
+class Busy(RuntimeError):
+    """All inference slots stayed occupied for the whole queue timeout."""
+
+
+class Pool:
+    """Bounded concurrent decisions over len(runtimes) single-worker Runtimes.
+
+    A semaphore admits at most len(runtimes) in-flight decisions; each holds one idle
+    Runtime exclusively, so no worker or pipe is ever shared between requests. Excess
+    requests wait up to queue_timeout, then raise Busy. ready() never takes the semaphore.
+    """
+
+    def __init__(self, runtimes, queue_timeout=DEFAULT_QUEUE_TIMEOUT_S):
+        self.runtimes = list(runtimes)
+        self.queue_timeout = queue_timeout
+        self.slots = threading.Semaphore(len(self.runtimes))
+        self.lock = threading.Lock()
+        self.idle = list(self.runtimes)
+
+    @classmethod
+    def start(cls, size, queue_timeout=DEFAULT_QUEUE_TIMEOUT_S, **runtime_args):
+        runtimes, errors = [], []
+
+        def boot():
+            try:
+                runtimes.append(Runtime(**runtime_args))
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=boot) for _ in range(size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            for r in runtimes:
+                r.stop()
+            raise errors[0]
+        return cls(runtimes, queue_timeout)
+
+    def ready(self):
+        # Ready while any worker can serve; a recovering slot just fails its own request.
+        return any([r.ready() for r in self.runtimes])
+
+    def decide(self, body):
+        if not self.slots.acquire(timeout=self.queue_timeout):
+            raise Busy('Decision service busy')
+        try:
+            with self.lock:
+                runtime = next((r for r in self.idle if r.ready()), self.idle[0])
+                self.idle.remove(runtime)
+            try:
+                return runtime.decide(body)
+            finally:
+                with self.lock:
+                    self.idle.append(runtime)
+        finally:
+            self.slots.release()
+
+    def stop(self):
+        for r in self.runtimes:
+            r.stop()
+
+
 def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -210,12 +320,14 @@ def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
             super().setup()
             self.connection.settimeout(3)
 
-        def reply(self, status, value):
+        def reply(self, status, value, headers=None):
             data = json.dumps(value).encode()
             try:
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(data)))
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
@@ -236,11 +348,16 @@ def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
                     return self.reply(413, {'error': 'Request too large'})
                 body = validate(json.loads(self.rfile.read(length)))
                 self.reply(200, runtime.decide(body))
+            except Busy:
+                self.reply(503, {'error': 'Decision service busy'}, {'Retry-After': '1'})
             except (ValueError, TypeError):
                 self.reply(422, {'error': 'Invalid or over-budget decision request'})
             except Exception:
                 self.reply(503, {'error': 'Decision unavailable'})
-    server = HTTPServer(address, Handler)
+    class Server(ThreadingHTTPServer):
+        request_queue_size = 64  # default 5 drops bursts before a thread accepts
+        daemon_threads = True
+    server = Server(address, Handler)
     try:
         if on_server is not None:
             on_server(server)
@@ -250,7 +367,7 @@ def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
 
 
 if __name__ == '__main__':
-    runtime = Runtime(decision_timeout=decision_timeout_from_env())
+    runtime = Pool.start(max_concurrency_from_env(), queue_timeout_from_env(), decision_timeout=decision_timeout_from_env())
     try:
         serve(runtime)
     finally:
