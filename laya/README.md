@@ -33,7 +33,13 @@ request deadline of 1.3 seconds by default. Set `LAYA_DECISION_TIMEOUT_S`
 (seconds, 0.5 to 2.0; unset keeps 1.3) to change it. A garbage or out-of-range value is
 refused with a startup log line and the default is used. The web decision deadline
 (Settings, at most 2000 ms) must stay at or above this value so web receives Laya's
-answer; the recommended pair is Laya 1.8 s with web 2000 ms. A timed-out, crashed, or failed worker is terminated,
+answer; the recommended pair is Laya 1.8 s with web 2000 ms. A request that misses the deadline gets a 503, but the
+worker is kept for 15 seconds so the late answer (discarded, never returned) can finish; at
+most two such answers may be outstanding, then the worker counts as hung (noevia#1070: killing
+it cost a ~17 s reload and left a cold replacement). While idle, the worker reads its weights
+every `LAYA_KEEP_WARM_S` seconds (0 to 3600, 0 off, default 30; no inference, no request data)
+so the host does not swap them out and make the first decision after a quiet spell miss its
+deadline. A crashed, failed or hung worker is terminated,
 and one replacement loads in the background. Health reports unready during loading;
 the failed decision is never replayed. Replacement startup uses the same 90-second
 deadline with at most three attempts and short backoff. If all attempts fail, the

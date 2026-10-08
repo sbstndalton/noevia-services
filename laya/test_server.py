@@ -7,7 +7,7 @@ import queue
 import socket
 import threading
 import time
-from server import Busy, Pool, Runtime, decision_timeout_from_env, max_concurrency_from_env, queue_timeout_from_env, serve, validate
+from server import Busy, Late, Pool, Runtime, decision_timeout_from_env, keep_warm_from_env, touch_weights, max_concurrency_from_env, queue_timeout_from_env, serve, validate
 
 
 def fake_worker(pipe):
@@ -18,6 +18,11 @@ def fake_worker(pipe):
         body = pipe.recv()
         if body['state'] == 'hang':
             time.sleep(5)
+        elif body['state'] == 'slow':
+            # A late answer that differs from the normal one, so a leaked stale reply shows.
+            time.sleep(0.3)
+            pipe.send({'selected': 'verify', 'scores': {'continue': 0, 'verify': 1},
+                       'model': 'fake', 'calibrated': False})
         elif body['state'] == 'crash':
             os._exit(2)
         elif body['state'] == 'error':
@@ -67,12 +72,117 @@ class TimeoutEnvTests(unittest.TestCase):
             self.assertEqual(len(logs), 1, raw)
 
 
+class KeepWarmTests(unittest.TestCase):
+    def test_env_parsing(self):
+        logs = []
+        self.assertEqual(keep_warm_from_env({}, logs.append), 30.0)
+        self.assertEqual(keep_warm_from_env({'LAYA_KEEP_WARM_S': ' '}, logs.append), 30.0)
+        self.assertEqual(keep_warm_from_env({'LAYA_KEEP_WARM_S': '0'}, logs.append), 0.0)
+        self.assertEqual(keep_warm_from_env({'LAYA_KEEP_WARM_S': '3600'}, logs.append), 3600.0)
+        self.assertEqual(logs, [])
+        for raw in ['-1', 'x', 'nan', 'inf', '3601']:
+            self.assertEqual(keep_warm_from_env({'LAYA_KEEP_WARM_S': raw}, logs.append), 30.0)
+        self.assertEqual(len(logs), 5)
+        self.assertIn('LAYA_KEEP_WARM_S', logs[0])
+
+    def test_touch_weights_reads_every_module_tensor_only(self):
+        touched = []
+
+        class Tensor:
+            def __init__(self, name): self.name = name
+            def detach(self): return self
+            def sum(self): touched.append(self.name)
+
+        class Module:
+            def __init__(self, params, buffers): self.p, self.b = params, buffers
+            def parameters(self): return iter(self.p)
+            def buffers(self): return iter(self.b)
+
+        class NoGrad:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class Nn: pass
+        Nn.Module = Module
+
+        class Torch:
+            nn = Nn
+            no_grad = NoGrad
+
+        class Agent: pass
+        agent = Agent()
+        agent.model = Module([Tensor('w1'), Tensor('w2')], [Tensor('b')])
+        agent.tok = object()
+        agent.cfg = {'max_len': 1}
+        self.assertEqual(touch_weights(agent, Torch), 3)
+        self.assertEqual(touched, ['w1', 'w2', 'b'])
+
+
+class LateAnswerTests(unittest.TestCase):
+    """noevia#1070: a missed deadline keeps the worker and drops its stale answer."""
+
+    def setUp(self):
+        self.fatal = []
+        self.runtime = Runtime(ctx=mp.get_context('spawn'), worker_target=fake_worker,
+                               startup_timeout=2, decision_timeout=0.12,
+                               retry_delays=(0, 0.02, 0.04), fatal=self.fatal.append, late_grace=1.0)
+
+    def tearDown(self):
+        self.runtime.stop()
+
+    def test_late_answer_is_dropped_and_worker_kept(self):
+        first = self.runtime.process.pid
+        with self.assertRaises(Late):
+            self.runtime.decide({**BODY, 'state': 'slow'})
+        self.assertTrue(self.runtime.ready())
+        time.sleep(0.4)  # the stale 'verify' answer is now waiting in the pipe
+        self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
+        self.assertEqual(self.runtime.late, 0)
+        self.assertEqual(first, self.runtime.process.pid)
+        self.assertEqual(self.fatal, [])
+
+    def test_request_behind_a_late_one_waits_within_its_deadline(self):
+        self.runtime.decision_timeout = 0.25
+        with self.assertRaises(Late):
+            self.runtime.decide({**BODY, 'state': 'slow'})  # 0.25 s passed; 0.05 s left
+        self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
+        self.assertEqual(self.runtime.late, 0)
+
+    def test_hung_worker_is_replaced_after_grace(self):
+        first = self.runtime.process.pid
+        with self.assertRaises(Late):
+            self.runtime.decide({**BODY, 'state': 'hang'})
+        time.sleep(1.1)
+        with self.assertRaises(RuntimeError) as caught:
+            self.runtime.decide(BODY)
+        self.assertNotIsInstance(caught.exception, Late)
+        end = time.monotonic() + 3
+        while not self.runtime.ready() and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertNotEqual(first, self.runtime.process.pid)
+        self.assertEqual(self.runtime.late, 0)
+        self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
+
+    def test_too_many_late_requests_replace_the_worker(self):
+        first = self.runtime.process.pid
+        for _ in range(2):
+            with self.assertRaises(Late):
+                self.runtime.decide({**BODY, 'state': 'hang'})
+        with self.assertRaises(RuntimeError) as caught:
+            self.runtime.decide(BODY)
+        self.assertNotIsInstance(caught.exception, Late)
+        end = time.monotonic() + 3
+        while not self.runtime.ready() and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertNotEqual(first, self.runtime.process.pid)
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.fatal = []
         self.runtime = Runtime(ctx=mp.get_context('spawn'), worker_target=fake_worker,
                                startup_timeout=2, decision_timeout=0.12,
-                               retry_delays=(0, 0.02, 0.04), fatal=self.fatal.append)
+                               retry_delays=(0, 0.02, 0.04), fatal=self.fatal.append, late_grace=0)
 
     def tearDown(self):
         self.runtime.stop()
