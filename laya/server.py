@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -25,6 +26,47 @@ def validate(body):
     return body
 
 
+DEFAULT_KEEP_WARM_S, MAX_KEEP_WARM_S = 30.0, 3600.0
+
+
+def keep_warm_from_env(env=None, log=None):
+    """Idle interval in seconds between weight touches from LAYA_KEEP_WARM_S (0-3600, 0 off).
+
+    noevia#1070: while idle the host swapped part of the worker's weights out, so the first
+    decision after a quiet night paid the swap-in and missed its deadline. Unset/blank uses 30.
+    """
+    env = os.environ if env is None else env
+    log = log or (lambda msg: print(msg, flush=True))
+    raw = env.get('LAYA_KEEP_WARM_S')
+    if raw is None or not raw.strip():
+        return DEFAULT_KEEP_WARM_S
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        value = float('nan')
+    if not 0 <= value <= MAX_KEEP_WARM_S:  # also rejects nan/inf
+        log(f'laya: ignoring LAYA_KEEP_WARM_S={raw.strip()[:32]!r}; it must be a number of seconds '
+            f'from 0 (off) to {MAX_KEEP_WARM_S:g}. Using {DEFAULT_KEEP_WARM_S:g}.')
+        return DEFAULT_KEEP_WARM_S
+    return value
+
+
+def touch_weights(agent, torch, stop=lambda: False):
+    """Read every parameter and buffer of the agent's torch modules so the kernel keeps them
+    resident. No inference, no request data. Checks `stop()` between tensors so a waiting
+    request is picked up promptly; returns the number of tensors touched."""
+    count = 0
+    with torch.no_grad():
+        for value in vars(agent).values():
+            if isinstance(value, torch.nn.Module):
+                for tensor in list(value.parameters()) + list(value.buffers()):
+                    if stop():
+                        return count
+                    tensor.detach().sum()
+                    count += 1
+    return count
+
+
 def worker(pipe):
     try:
         import torch
@@ -32,8 +74,15 @@ def worker(pipe):
         torch.set_num_threads(2)
         torch.set_num_interop_threads(1)
         agent = laya.load('/model', device='cpu')
+        keep_warm = keep_warm_from_env()
+        warned = False
         pipe.send({'ready': True})
         while True:
+            if keep_warm and not pipe.poll(keep_warm):
+                if not touch_weights(agent, torch, stop=lambda: pipe.poll(0)) and not warned and not pipe.poll(0):
+                    warned = True
+                    print('laya: keep-warm found no model tensors to touch; LAYA_KEEP_WARM_S has no effect.', flush=True)
+                continue
             body = pipe.recv()
             # Reject over-budget inputs rather than let the SDK silently truncate evidence.
             state_budget = agent.cfg['max_len'] - agent.cfg['head_max_len'] - 16
@@ -78,15 +127,30 @@ def decision_timeout_from_env(env=None, log=None):
     return value
 
 
+class Late(RuntimeError):
+    """The worker missed this request's deadline but is kept: its answer will be discarded."""
+
+
+# A request that missed its deadline usually finishes a moment later (noevia#1070: a cold
+# first decision after idle). Killing the worker for it cost a ~17 s reload and left a cold
+# replacement, so the worker is kept for this long and its stale answer is dropped. At most one
+# abandoned request is ever outstanding: nothing new is sent while it is still running.
+DEFAULT_LATE_GRACE_S = 15.0
+
+
 class Runtime:
     def __init__(self, ctx=None, worker_target=worker, startup_timeout=90,
-                 decision_timeout=1.3, retry_delays=(0, 2, 8), fatal=os._exit):
+                 decision_timeout=1.3, retry_delays=(0, 2, 8), fatal=os._exit,
+                 late_grace=DEFAULT_LATE_GRACE_S):
         self.ctx = ctx or mp.get_context('spawn')
         self.worker_target = worker_target
         self.startup_timeout = startup_timeout
         self.decision_timeout = decision_timeout
         self.retry_delays = retry_delays
         self.fatal = fatal
+        self.late_grace = late_grace
+        self.late = 0  # requests sent to the current worker whose answers are still due
+        self.late_since = 0.0
         self.lock = threading.Lock()
         self.stopping = threading.Event()
         self.process = None
@@ -143,6 +207,7 @@ class Runtime:
                 return
             pipe = self.pipe
             self.process = self.pipe = None
+            self.late = 0
             self.recovery = threading.Thread(target=self._recover, args=(process, pipe), daemon=True)
             self.recovery.start()
 
@@ -186,10 +251,32 @@ class Runtime:
             self._replace(process)
             raise RuntimeError('Worker unavailable')
         try:
+            deadline = time.monotonic() + self.decision_timeout
+            # Drop stale answers that already arrived, so a worker that finished its late work
+            # long ago is never mistaken for a hung one.
+            while self.late and pipe.poll(0):
+                pipe.recv()
+                self.late = max(0, self.late - 1)
+            if self.late:
+                if time.monotonic() - self.late_since > self.late_grace:
+                    raise RuntimeError('Worker stuck on an abandoned decision')
+                # Never queue behind unfinished abandoned work: wait for it within this request's
+                # own deadline, and if it is still running answer 503 without sending anything.
+                if not pipe.poll(max(0.0, deadline - time.monotonic())):
+                    raise Late('Worker still finishing an abandoned decision')
+                pipe.recv()
+                self.late = max(0, self.late - 1)
             pipe.send(body)
-            if not pipe.poll(self.decision_timeout):
-                raise RuntimeError('Decision deadline exceeded')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not pipe.poll(remaining):
+                if self.late_grace <= 0:
+                    raise RuntimeError('Decision deadline exceeded')
+                self.late_since = time.monotonic()
+                self.late = 1
+                raise Late('Decision deadline exceeded')
             result = pipe.recv()
+        except Late:
+            raise
         except (BrokenPipeError, EOFError, OSError, RuntimeError):
             self._replace(process)
             raise RuntimeError('Decision unavailable') from None
@@ -296,7 +383,9 @@ class Pool:
             raise Busy('Decision service busy')
         try:
             with self.lock:
-                runtime = next((r for r in self.idle if r.ready()), self.idle[0])
+                # Prefer a worker with no answers still due (#1070), then any ready one.
+                runtime = next((r for r in self.idle if r.ready() and not r.late),
+                               next((r for r in self.idle if r.ready()), self.idle[0]))
                 self.idle.remove(runtime)
             try:
                 return runtime.decide(body)
