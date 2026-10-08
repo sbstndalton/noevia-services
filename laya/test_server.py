@@ -116,6 +116,10 @@ class KeepWarmTests(unittest.TestCase):
         agent.cfg = {'max_len': 1}
         self.assertEqual(touch_weights(agent, Torch), 3)
         self.assertEqual(touched, ['w1', 'w2', 'b'])
+        touched.clear()
+        self.assertEqual(touch_weights(agent, Torch, stop=lambda: len(touched) >= 1), 1)
+        self.assertEqual(touched, ['w1'])
+        self.assertEqual(touch_weights(Agent(), Torch), 0)
 
 
 class LateAnswerTests(unittest.TestCase):
@@ -163,18 +167,27 @@ class LateAnswerTests(unittest.TestCase):
         self.assertEqual(self.runtime.late, 0)
         self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
 
-    def test_too_many_late_requests_replace_the_worker(self):
+    def test_arrived_late_answer_after_grace_keeps_the_worker(self):
         first = self.runtime.process.pid
-        for _ in range(2):
+        with self.assertRaises(Late):
+            self.runtime.decide({**BODY, 'state': 'slow'})
+        time.sleep(1.1)  # past late_grace, but the stale answer arrived long ago
+        self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
+        self.assertEqual(first, self.runtime.process.pid)
+        self.assertEqual(self.runtime.late, 0)
+
+    def test_nothing_is_sent_behind_unfinished_abandoned_work(self):
+        first = self.runtime.process.pid
+        with self.assertRaises(Late):
+            self.runtime.decide({**BODY, 'state': 'slow'})
+        for _ in range(2):  # still running: 503 without queueing more work
             with self.assertRaises(Late):
-                self.runtime.decide({**BODY, 'state': 'hang'})
-        with self.assertRaises(RuntimeError) as caught:
-            self.runtime.decide(BODY)
-        self.assertNotIsInstance(caught.exception, Late)
-        end = time.monotonic() + 3
-        while not self.runtime.ready() and time.monotonic() < end:
-            time.sleep(0.01)
-        self.assertNotEqual(first, self.runtime.process.pid)
+                self.runtime.decide({**BODY, 'state': 'slow'})
+            self.assertEqual(self.runtime.late, 1)
+        time.sleep(0.4)
+        self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
+        self.assertEqual(first, self.runtime.process.pid)
+        self.assertEqual(self.runtime.late, 0)
 
 
 class RecoveryTests(unittest.TestCase):

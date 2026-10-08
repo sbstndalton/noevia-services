@@ -51,14 +51,17 @@ def keep_warm_from_env(env=None, log=None):
     return value
 
 
-def touch_weights(agent, torch):
+def touch_weights(agent, torch, stop=lambda: False):
     """Read every parameter and buffer of the agent's torch modules so the kernel keeps them
-    resident. No inference, no request data; returns the number of tensors touched."""
+    resident. No inference, no request data. Checks `stop()` between tensors so a waiting
+    request is picked up promptly; returns the number of tensors touched."""
     count = 0
     with torch.no_grad():
         for value in vars(agent).values():
             if isinstance(value, torch.nn.Module):
                 for tensor in list(value.parameters()) + list(value.buffers()):
+                    if stop():
+                        return count
                     tensor.detach().sum()
                     count += 1
     return count
@@ -72,10 +75,13 @@ def worker(pipe):
         torch.set_num_interop_threads(1)
         agent = laya.load('/model', device='cpu')
         keep_warm = keep_warm_from_env()
+        warned = False
         pipe.send({'ready': True})
         while True:
             if keep_warm and not pipe.poll(keep_warm):
-                touch_weights(agent, torch)
+                if not touch_weights(agent, torch, stop=lambda: pipe.poll(0)) and not warned and not pipe.poll(0):
+                    warned = True
+                    print('laya: keep-warm found no model tensors to touch; LAYA_KEEP_WARM_S has no effect.', flush=True)
                 continue
             body = pipe.recv()
             # Reject over-budget inputs rather than let the SDK silently truncate evidence.
@@ -127,9 +133,9 @@ class Late(RuntimeError):
 
 # A request that missed its deadline usually finishes a moment later (noevia#1070: a cold
 # first decision after idle). Killing the worker for it cost a ~17 s reload and left a cold
-# replacement, so the worker is kept for this long and its stale answers are dropped in order.
+# replacement, so the worker is kept for this long and its stale answer is dropped. At most one
+# abandoned request is ever outstanding: nothing new is sent while it is still running.
 DEFAULT_LATE_GRACE_S = 15.0
-MAX_LATE_REQUESTS = 2
 
 
 class Runtime:
@@ -245,25 +251,30 @@ class Runtime:
             self._replace(process)
             raise RuntimeError('Worker unavailable')
         try:
-            if self.late and (self.late >= MAX_LATE_REQUESTS or
-                              time.monotonic() - self.late_since > self.late_grace):
-                raise RuntimeError('Worker stuck on abandoned decisions')
-            pipe.send(body)
             deadline = time.monotonic() + self.decision_timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not pipe.poll(remaining):
-                    if self.late_grace <= 0:
-                        raise RuntimeError('Decision deadline exceeded')
-                    if not self.late:
-                        self.late_since = time.monotonic()
-                    self.late += 1
-                    raise Late('Decision deadline exceeded')
-                result = pipe.recv()
-                if not self.late:
-                    break
-                # The worker answers in order: this is a stale answer to an abandoned request.
-                self.late -= 1
+            # Drop stale answers that already arrived, so a worker that finished its late work
+            # long ago is never mistaken for a hung one.
+            while self.late and pipe.poll(0):
+                pipe.recv()
+                self.late = max(0, self.late - 1)
+            if self.late:
+                if time.monotonic() - self.late_since > self.late_grace:
+                    raise RuntimeError('Worker stuck on an abandoned decision')
+                # Never queue behind unfinished abandoned work: wait for it within this request's
+                # own deadline, and if it is still running answer 503 without sending anything.
+                if not pipe.poll(max(0.0, deadline - time.monotonic())):
+                    raise Late('Worker still finishing an abandoned decision')
+                pipe.recv()
+                self.late = max(0, self.late - 1)
+            pipe.send(body)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not pipe.poll(remaining):
+                if self.late_grace <= 0:
+                    raise RuntimeError('Decision deadline exceeded')
+                self.late_since = time.monotonic()
+                self.late = 1
+                raise Late('Decision deadline exceeded')
+            result = pipe.recv()
         except Late:
             raise
         except (BrokenPipeError, EOFError, OSError, RuntimeError):
