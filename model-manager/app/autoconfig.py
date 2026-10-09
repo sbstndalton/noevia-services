@@ -9,38 +9,31 @@ import re
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from . import gguf_meta, ini
+from . import autoconfig_core, gguf_meta, ini
+from .autoconfig_core import (  # noqa: F401 - the sizing core, re-exported under its old names
+    _CACHE_BYTES_PER_ELEM, _CACHE_DEFAULT, _CACHE_RAM_CONVOS, _CACHE_RAM_DEFAULT_MIB,
+    _CACHE_RAM_HEADROOM_GB, _CPU_LAYER_PENALTY, _CTX_CANDIDATES, _MODEL_OVERHEAD_SINGLE,
+    _MODEL_OVERHEAD_SPLIT, _RESERVE_PER_GPU, _SSM_STATE_BYTES, UNMEASURED_CTX_CAP, FitRow,
+    PresetOption, _cache_dtype_bytes, _dense_frontier, _find_fit, _frontier_options,
+    _layer_costs, _moe_ratio, _pareto_frontier, _pattern_sample, _period_of,
+    _presets_from_dense_frontier, _presets_from_frontier, _split_feasible, cap_context,
+    cap_reason_text, kv_cache_bytes, kv_shape, kv_shape_bytes,
+)
 from .config import settings
 
-# candidate contexts to try, smallest → largest
-_CTX_CANDIDATES = (
-    4096, 8192, 12288, 16384, 24576, 32768, 40960, 49152, 57344, 65536,
-    73728, 81920, 90112, 98304, 106496, 114688, 122880, 131072, 139264,
-    147456, 151552, 155648, 159744, 163840, 172032, 180224, 188416,
-    196608, 204800, 212992, 221184, 229376, 237568, 245760, 253952, 262144,
-    294912, 327680, 360448, 393216, 425984, 458752, 491520, 524288,
-    589824, 655360, 720896, 786432, 851968, 917504, 983040, 1048576,
-)
-# Every value above is a multiple of 4096 (most are multiples of 8192), which keeps them on
-# llama.cpp's internal block-alignment boundaries — the reason arbitrary values like 160000
-# behave badly. The upper range used to step by 16384, which was too coarse: a model that
-# already fits near its ceiling had only one or two reachable steps left, so the offload
-# frontier collapsed to two points and "Balanced" came out identical to "Fast".
 
-_CACHE_BYTES_PER_ELEM = {
-    "": 2.0, "f16": 2.0, "bf16": 2.0, "f32": 4.0,
-    "q8_0": 1.0625, "q5_0": 0.75, "q5_1": 0.8125, "q4_0": 0.6250, "q4_1": 0.6875,
-    "iq4_nl": 0.6250,
-}
+_PRESET_KEYS = ("fast", "balanced", "long-ctx")
 
-_RESERVE_PER_GPU = 1.0   # CUDA runtime + driver context + scratch/cuBLAS workspace.
-                         # Bumped from 0.5 -> 1.0 for llama.cpp 0.3.0-dev (commit d222767+) which
-                         # recognizes MTP nextn tensors and allocates larger cuBLAS workspaces on
-                         # inference. Empirical: Qwen3.8-27B at ctx=159744 loaded fine but OOM'd
-                         # on first inference (cuBLAS workspace on device 1). At ctx=131072 fits
-                         # cleanly. If you pin an older image and want more ctx, drop this back to 0.5.
+
+def _card_gb(c: Any) -> float:
+    """One card's VRAM as the fit maths uses it (`c - reserve`): a number, else TypeError as
+    that subtraction raised before the size core existed."""
+    if isinstance(c, (int, float)):
+        return float(c)
+    raise TypeError(f"card_vram_gb entry {type(c).__name__!r} is not a number")
+
 # Every key autoconfig has an opinion about. For each one it either SETS a value or wants the
 # key GONE — nothing here may survive a Fill untouched. The list is what makes "Fill form" honest:
 # Fill writes the keys present in `values` and clears the rest of this set, so a recommendation
@@ -81,24 +74,6 @@ def _domain_gaps(values: dict[str, str]) -> list[str]:
     return sorted(set(values) - AUTOCONFIG_DOMAIN - _NEVER_CLEAR)
 
 
-# --- prompt cache (--cache-ram) sizing. See the block that consumes these for the measurements.
-_CACHE_RAM_DEFAULT_MIB = 8192   # llama-server's own default; never suggest worse without cause
-_CACHE_RAM_CONVOS = 4           # conversations to keep warm at the recommended context
-_CACHE_RAM_HEADROOM_GB = 8.0    # left for the OS, the other containers and page cache churn
-
-_MODEL_OVERHEAD_SINGLE = 1.00  # Q_K_M loads at ~file size when everything's on one card
-_MODEL_OVERHEAD_SPLIT = 1.08   # +8% for cross-GPU handoffs, duplicated activation buffers, layer-imbalance.
-_CACHE_DEFAULT = "q8_0"  # symmetric K/V; K stays q8, V could drop to q4 for +20% ctx (future preset)
-_SSM_STATE_BYTES = 4 * 1024 * 1024  # ~4 MB per SSM layer, derived from typical state_size×inner_size
-_CPU_LAYER_PENALTY = 20.0  # how much slower one CPU-resident DENSE layer is than a GPU one.
-                           # Used only to rank presets, not to decide fit. Dense offload is
-                           # brutal compared to MoE expert offload: every token traverses every
-                           # CPU layer, whereas MoE only touches a few active experts.
-                           # VERIFIED on Qwen3.8-27B-OBLITERATED (65 layers, 2x RTX 5070):
-                           #   ngl=999 (all GPU)  -> 34.2 tok/s   (predicted 100%)
-                           #   ngl=56  (9 on CPU) ->  9.7 tok/s   (predicted 28%, measured 28.4%)
-                           # Still hardware-dependent (RAM bandwidth, PCIe width), so treat the
-                           # speed % as a well-calibrated estimate rather than a guarantee.
 _MMPROJ_VRAM_MULT = 1.0  # projector weights land in VRAM at ~their file size.
                          # Verified on Qwen3-VL-4B: mmproj-F32.gguf is 1.55 GB on disk and
                          # llama-server allocates 1584.43 MiB for it. (An earlier 2.0 here was
@@ -116,9 +91,6 @@ _MMPROJ_COMPUTE_GB = 0.5  # modality-encoder scratch beyond the projector weight
                           # both cards' CUDA contexts included, is ~1.67 GiB. _RESERVE_PER_GPU
                           # already covers most of that.
 
-
-def _cache_dtype_bytes(k: str) -> float:
-    return _CACHE_BYTES_PER_ELEM.get((k or "").lower(), 2.0)
 
 
 def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
@@ -140,134 +112,6 @@ def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
         return int(kv_heads[0])
     return default
 
-
-def _pattern_sample(val: Any, layers: int) -> list:
-    """Per-layer GGUF arrays arrive as {_array, count, sample} holding only a PREFIX of the
-    array. Returns the prefix when it describes this model's layer stack, else []."""
-    if isinstance(val, dict) and val.get("_array"):
-        if int(val.get("count") or 0) == layers:
-            return list(val.get("sample") or [])
-        return []
-    if isinstance(val, (list, tuple)):
-        return list(val)
-    return []
-
-
-def _period_of(seq: list) -> int:
-    """Shortest p with seq[i] == seq[i % p] for all i. These per-layer patterns repeat, and the
-    sample is only a prefix, so the period is what lets one cycle stand for the whole stack."""
-    for p in range(1, len(seq) + 1):
-        if all(seq[i] == seq[i % p] for i in range(len(seq))):
-            return p
-    return len(seq)
-
-
-def kv_cache_bytes(arch: str, ctx: int, layers: int, kv_heads: int,
-                   head_dim: int, bytes_per_elem: float,
-                   key_length: int | None = None, value_length: int | None = None,
-                   full_attention_interval: int | None = None,
-                   ssm_state_size: int | None = None,
-                   v_bytes_per_elem: float | None = None,
-                   sliding_window: int | None = None,
-                   sliding_window_pattern: Any = None,
-                   key_length_swa: int | None = None,
-                   value_length_swa: int | None = None,
-                   shared_kv_layers: int | None = None,
-                   kv_heads_pattern: Any = None) -> int:
-    """Compute KV cache bytes. Handles:
-       - explicit key/value_length overrides (Qwen3.x, Yi, etc.)
-       - hybrid attention+SSM (Qwen3.5, Zamba) via full_attention_interval + ssm_state_size
-       - Gemma sliding-window carve-out
-       - asymmetric K/V quantization (bytes_per_elem is K; v_bytes_per_elem defaults to it)
-    """
-    if not (ctx > 0 and layers > 0 and kv_heads > 0):
-        return 0
-    # Use explicit key/value lengths when the model declares them; else fall back to head_dim
-    k_dim = int(key_length) if key_length else head_dim
-    v_dim = int(value_length) if value_length else head_dim
-    if k_dim <= 0 or v_dim <= 0:
-        return 0
-    v_bytes = bytes_per_elem if v_bytes_per_elem is None else v_bytes_per_elem
-    per_layer_per_token = kv_heads * (k_dim * bytes_per_elem + v_dim * v_bytes)
-    arch_l = (arch or "").lower()
-
-    # Hybrid attention + SSM (Mamba-2 style) — only every Nth layer holds a real KV cache
-    is_hybrid = bool(ssm_state_size) or (full_attention_interval and full_attention_interval > 1)
-    if is_hybrid and full_attention_interval and full_attention_interval > 1:
-        full_layers = max(1, (layers + full_attention_interval - 1) // full_attention_interval)
-        ssm_layers = layers - full_layers
-        kv_full = full_layers * per_layer_per_token * ctx
-        return int(kv_full + ssm_layers * _SSM_STATE_BYTES)
-
-    # ---- Sliding-window attention, from what the model DECLARES ----
-    #
-    # Earlier this was guessed: 1-in-6 layers global, a 4096-token window, and the same head
-    # dim for every layer. Gemma-4 declares all of it and none of the guesses match — window
-    # 512 not 4096, a 42-entry per-layer pattern rather than a ratio, SWA head dims of 256
-    # against 512 for global layers, and 18 layers that share another layer's KV and so
-    # allocate none of their own. Guessing over-estimated this model's cache by roughly an
-    # order of magnitude, which shows up as far less offered context than it can really do.
-    if sliding_window and sliding_window > 0:
-        # Read every per-layer quantity off the SAME repeating period.
-        #
-        # Gemma declares both the local/global pattern and the KV head count as per-layer
-        # arrays, and they are aligned: on gemma-4-12b the global layer (pattern False) carries
-        # 1 KV head against 8 on the local ones, and on 26B-A4B it is 2 against 8. Collapsing
-        # that array to one representative value charged every global layer 8x too much, and
-        # since the global term is the only one that scales with ctx, it dominated the entire
-        # estimate - 14.5 GB predicted against llama.cpp's own 2.0 GB at 208K.
-        pattern = _pattern_sample(sliding_window_pattern, layers)
-        heads_seq = _pattern_sample(kv_heads_pattern, layers)
-
-        # Layers that reuse another layer's KV allocate none of their own. They are spread
-        # through the stack rather than clustered at one end, so the saving lands on local and
-        # global layers alike; charging it entirely to the local layers (the cheap ones) made
-        # it nearly worthless and left gemma-4-E4B 70% high.
-        shared = max(0, min(int(shared_kv_layers or 0), layers))
-        alloc_frac = (layers - shared) / layers if layers else 1.0
-
-        k_swa = int(key_length_swa) if key_length_swa else k_dim
-        v_swa = int(value_length_swa) if value_length_swa else v_dim
-        per_local_elem = k_swa * bytes_per_elem + v_swa * v_bytes
-        per_global_elem = k_dim * bytes_per_elem + v_dim * v_bytes
-        window = min(int(sliding_window), ctx)
-
-        if pattern:
-            period = _period_of(pattern)
-            reps = (layers / period) * alloc_frac
-            total = 0.0
-            for i in range(period):
-                # Fall back to the scalar head count for any position the sample does not
-                # reach; models that declare a scalar (gemma-4-E4B) take this path throughout.
-                h = kv_heads
-                if i < len(heads_seq):
-                    try:
-                        h = max(1, int(heads_seq[i]))
-                    except (TypeError, ValueError):
-                        h = kv_heads
-                if pattern[i]:
-                    total += reps * h * per_local_elem * window
-                else:
-                    total += reps * h * per_global_elem * ctx
-            return int(total)
-
-        # No usable pattern: fall back to gemma's 5-local-to-1-global ratio at one head count.
-        local_layers = max(0, min(layers, layers - max(1, layers // 6)))
-        global_layers = layers - local_layers
-        return int(alloc_frac * (global_layers * kv_heads * per_global_elem * ctx
-                                 + local_layers * kv_heads * per_local_elem * window))
-
-    if arch_l.startswith("gemma") and layers >= 6:
-        # Older gemma with no declared window: fall back to the 1-in-6 / 4096 approximation.
-        full_layers = max(1, layers // 6)
-        swa_layers = layers - full_layers
-        kv_full = full_layers * per_layer_per_token * ctx
-        kv_swa = swa_layers * per_layer_per_token * 4096
-        return int(kv_full + kv_swa)
-
-    # No sliding window declared, but layers may still share KV.
-    effective_layers = max(1, layers - max(0, min(int(shared_kv_layers or 0), layers - 1)))
-    return int(effective_layers * per_layer_per_token * ctx)
 
 
 # ---- baseline parsing (compose command → ini keys) ----
@@ -307,22 +151,6 @@ def parse_baseline(cmd_args: list[str]) -> dict[str, str]:
 
 # ---- recommendation ----
 
-@dataclass
-class FitRow:
-    ctx: int                 # per-session ctx (what each user sees)
-    total_ctx: int           # ctx * n_sessions — what llama-server allocates as --ctx-size
-    model_gb: float          # GPU-resident weight VRAM (accounts for MoE offload)
-    kv_gb: float
-    total_gb: float          # model_gb + kv_gb
-    fits: bool
-    free_gb: float
-    offload_kind: str = ""   # "" | "cpu-moe" | "n-cpu-moe"
-    n_cpu_moe: int = 0       # populated when offload_kind == "n-cpu-moe"
-    gpu_pct: int = 100       # share of the model's WEIGHTS resident on the GPU, 0-100.
-                             # Measured in bytes rather than layers because for a MoE the
-                             # layer count says little: attention stays resident while only
-                             # experts move, so "layers on GPU" overstates what is really there.
-
 
 @dataclass
 class BackendPlan:
@@ -334,21 +162,6 @@ class BackendPlan:
     fits_at_all: bool
 
 
-@dataclass
-class PresetOption:
-    key: str                # "fast" | "balanced" | "long-ctx"
-    label: str
-    icon: str               # lucide name
-    backend: str
-    ctx: int
-    n_cpu_moe: int          # 0 = no offload; layers = all offloaded (cpu-moe=true)
-    offload_kind: str       # "" | "cpu-moe" | "n-cpu-moe" | "ngl"
-    gpu_layers: int         # layers kept on GPU (for MoE: layers whose experts stay on GPU)
-    total_layers: int
-    gpu_gb: float           # weights VRAM
-    kv_gb: float
-    speed_score: float      # 0..1 relative (1.0 = no offload)
-    ngl: int = -1           # dense offload only: value to write as `ngl`. -1 = leave at 999 (all)
 
 
 @dataclass(frozen=True)
@@ -513,68 +326,6 @@ def _fmt_ctx(n: int) -> str:
     return f"{n:,}"
 
 
-def _moe_ratio(expert_count: Any) -> float:
-    """Approximate share of a GGUF's weights that live in MoE experts.
-    Heuristic: more experts → more of the weights are experts.
-      - 8 experts → ~0.75 in experts
-      - 16 experts → ~0.85
-      - 32-128 experts → ~0.9-0.92
-    Clamped to [0.6, 0.92]. Used for sizing cpu-moe / n-cpu-moe recommendations."""
-    if not isinstance(expert_count, int) or expert_count < 2:
-        return 0.0
-    if expert_count >= 64:
-        return 0.92
-    if expert_count >= 32:
-        return 0.90
-    if expert_count >= 16:
-        return 0.85
-    if expert_count >= 8:
-        return 0.78
-    return 0.65
-
-
-def _layer_costs(layers: int, n_cpu_moe: int, attention_gb: float,
-                 expert_per_layer_gb: float, kv_gb: float) -> list[float]:
-    """Per-layer GPU cost: attention + KV share, plus experts above the n-cpu-moe threshold."""
-    if layers <= 0:
-        return []
-    att = attention_gb / layers
-    kv = kv_gb / layers
-    return [att + kv + (expert_per_layer_gb if i >= n_cpu_moe else 0.0) for i in range(layers)]
-
-
-def _split_feasible(layers: int, n_cpu_moe: int, attention_gb: float,
-                    expert_per_layer_gb: float, kv_gb: float, gpu_count: int,
-                    pinned_gb: float, caps: list[float]) -> bool:
-    """Does ANY contiguous per-card partition fit? One greedy pass.
-
-    The fit search asks only whether a configuration is placeable, never how to place it
-    best. Answering that with _partition_min_max ran a 64-step binary search per call, and
-    the search makes thousands of calls per page load — measured at 2239 for one model,
-    around nine million inner steps, which turned a snappy preset click into a visible wait.
-
-    Filling each card to capacity in order is optimal for CONTIGUOUS feasibility: taking
-    less on an earlier card can only leave more for a later one, never less.
-    """
-    if gpu_count <= 1 or not caps:
-        return True
-    costs = _layer_costs(layers, n_cpu_moe, attention_gb, expert_per_layer_gb, kv_gb)
-    if not costs:
-        return True
-    idx, n = 0, len(costs)
-    for card in range(gpu_count):
-        budget = caps[card] - (pinned_gb if card == 0 else 0.0)
-        took = 0
-        while idx < n and costs[idx] <= budget:
-            budget -= costs[idx]
-            idx += 1
-            took += 1
-        if idx >= n:
-            return True
-        if took == 0:
-            return False          # this card cannot hold even one more layer
-    return idx >= n
-
 
 def _partition_min_max(costs: list[float], k: int, pinned_gb: float,
                        caps: list[float] | None = None) -> list[int]:
@@ -640,319 +391,6 @@ def _partition_min_max(costs: list[float], k: int, pinned_gb: float,
         best = [base + (1 if i < rem else 0) for i in range(k)]
     return best
 
-
-def _find_fit(model_gb_full: float, kv_gb: float, budget_gb: float,
-              layers: int, moe_ratio: float,
-              card_ok: "Callable[[float, str, int], bool] | None" = None) -> tuple[bool, float, str, int]:
-    """Return (fits, gpu_model_gb, offload_kind, n_layers) for a given (model, kv, budget).
-
-    Strategy: try no offload first; then offload.
-      * MoE  -> smallest n-cpu-moe (fewest expert layers moved) that fits; n=layers means cpu-moe
-      * dense -> smallest number of whole layers moved to CPU via `ngl`
-
-    For offload_kind == "ngl" the trailing int is the count of CPU-resident LAYERS, not experts.
-
-    The dense branch used to be missing entirely: anything whose weights+KV exceeded the budget
-    was reported as "doesn't fit on any backend", even though a dense model runs perfectly well
-    with some layers on the CPU — that is exactly what the Fast/Balanced/Long presets do. The
-    result was a red X and no options for, say, a 27 GB Q8 on 24 GB of VRAM, when the honest
-    answer is "yes, with N layers offloaded, and here is the speed cost".
-
-    `card_ok(gpu_gb, kind, n)` is an optional second test, used on multi-GPU backends to check
-    that the per-card split of that configuration actually fits each card. It has to be part
-    of the SEARCH, not a filter applied afterwards: the pooled budget and the per-card limit
-    are satisfied at different offload levels, so the first configuration that clears the pool
-    may still overflow one card while offloading one more layer clears both. Rejecting that
-    first candidate instead of continuing produced a band of contexts reported as impossible
-    while both smaller AND larger ones fitted — non-monotonic, and wrong.
-    """
-    def _ok(gpu: float, kind: str, n: int) -> bool:
-        if gpu + kv_gb > budget_gb:
-            return False
-        return card_ok is None or card_ok(gpu, kind, n)
-
-    if _ok(model_gb_full, "", 0):
-        return True, model_gb_full, "", 0
-    if layers <= 0:
-        return False, model_gb_full, "", 0
-
-    if moe_ratio <= 0:
-        # Dense: move whole layers to the CPU. Keep at least one on the GPU — a fully
-        # offloaded model is just CPU inference and the GPU backend has nothing to do.
-        per_layer_gb = model_gb_full / layers
-        for cpu_layers in range(1, layers):
-            gpu = per_layer_gb * (layers - cpu_layers)
-            if _ok(gpu, "ngl", cpu_layers):
-                return True, gpu, "ngl", cpu_layers
-        return False, model_gb_full, "", 0
-    attention_gb = model_gb_full * (1 - moe_ratio)
-    expert_per_layer_gb = model_gb_full * moe_ratio / layers
-    # smallest n where fits — n counts CPU-offloaded layers
-    for n in range(1, layers + 1):
-        gpu = attention_gb + max(0, layers - n) * expert_per_layer_gb
-        kind = "cpu-moe" if n >= layers else "n-cpu-moe"
-        if _ok(gpu, kind, n):
-            if n >= layers:
-                return True, attention_gb, "cpu-moe", 0
-            return True, gpu, "n-cpu-moe", n
-    return False, attention_gb, "cpu-moe", 0  # even full offload can't fit (attention too big for GPU)
-
-
-def _pareto_frontier(arch: str, layers: int, kv_heads: int, head_dim: int,
-                     bytes_per: float, model_gb: float, moe_ratio: float,
-                     budget_gb: float, ctx_candidates: list[int],
-                     n_sessions: int = 1,
-                     key_length: int | None = None, value_length: int | None = None,
-                     full_attention_interval: int | None = None,
-                     ssm_state_size: int | None = None,
-                     v_bytes_per_elem: float | None = None,
-                     card_ok: "Callable[[float, float, int], bool] | None" = None,
-                     swa: dict | None = None) -> list[tuple[int, int, float, float]]:
-    """For a MoE model on a given backend, sweep n-cpu-moe from 0..layers.
-
-    `card_ok(weight_gb, kv_gb, n_cpu_moe)` is the same per-card feasibility test the fit table
-    applies. Without it the frontier can propose a point that clears the pooled budget but
-    overflows one card, so a preset card recommends a configuration the table beside it marks
-    as not fitting.
-    Return list of (n_cpu_moe, max_per_session_ctx_fitting, gpu_weight_gb, kv_gb_at_max_ctx) — pareto frontier.
-    Higher n_cpu_moe → higher max_ctx (more offloaded = less VRAM for weights = more room for KV).
-
-    Candidates are interpreted as PER-SESSION ctx. KV is sized against total_ctx = ctx * n_sessions.
-    """
-
-    _swa = swa or {}
-    if moe_ratio <= 0 or layers <= 0:
-        return []
-    attention_gb = model_gb * (1 - moe_ratio)
-    per_layer_gb = model_gb * moe_ratio / layers
-    frontier: list[tuple[int, int, float, float]] = []
-    n = max(1, int(n_sessions))
-    for ncm in range(0, layers + 1):
-        gpu_layers = layers - ncm
-        weight_gb = attention_gb + gpu_layers * per_layer_gb
-        if weight_gb >= budget_gb:
-            continue  # can't fit even at ctx=0
-        # find max per-session ctx that fits with this weight footprint
-        best_ctx = 0
-        best_kv = 0.0
-        for ctx in ctx_candidates:
-            kv_gb = kv_cache_bytes(arch, ctx * n, layers, kv_heads, head_dim, bytes_per,
-                                   key_length=key_length, value_length=value_length,
-                                   full_attention_interval=full_attention_interval,
-                                   ssm_state_size=ssm_state_size, **_swa,
-                                   v_bytes_per_elem=v_bytes_per_elem) / (1024 ** 3)
-            if card_ok is not None and not card_ok(weight_gb, kv_gb, ncm):
-                continue
-            if weight_gb + kv_gb <= budget_gb:
-                if ctx > best_ctx:
-                    best_ctx = ctx
-                    best_kv = kv_gb
-        if best_ctx == 0:
-            continue
-        # only keep this point if it strictly improves ctx over prior (higher ncm) — pareto step
-        if frontier and best_ctx <= frontier[-1][1]:
-            continue
-        frontier.append((ncm, best_ctx, weight_gb, best_kv))
-    return frontier
-
-
-def _dense_frontier(arch: str, layers: int, kv_heads: int, head_dim: int,
-                    bytes_per: float, model_gb: float, budget_gb: float,
-                    ctx_candidates: list[int], n_sessions: int = 1,
-                    key_length: int | None = None, value_length: int | None = None,
-                    full_attention_interval: int | None = None,
-                    ssm_state_size: int | None = None,
-                    v_bytes_per_elem: float | None = None,
-                    card_ok: "Callable[[float, float], bool] | None" = None,
-                    swa: dict | None = None) -> list[tuple[int, int, float, float]]:
-    """Context-vs-speed frontier for a DENSE model, by moving whole layers off the GPU.
-
-    MoE models offload expert weights (`--cpu-moe` / `--n-cpu-moe`), which is cheap because
-    only a few experts are active per token. A dense model has no experts, so the only lever
-    is `--n-gpu-layers` below the total: layers past that stay in host RAM (mmap'd from the
-    GGUF) and every single token has to traverse them on the CPU. Freeing VRAM this way buys
-    context, but it is far more expensive per layer than MoE offload — see _CPU_LAYER_PENALTY.
-
-    Returns (cpu_layers, max_per_session_ctx, gpu_weight_gb, kv_gb_at_that_ctx), same tuple
-    shape as _pareto_frontier so the preset builder can consume either.
-
-    `card_ok(weight_gb, kv_gb)` applies the same per-card feasibility test the fit table uses.
-    Without it the frontier proposes points that clear the pooled budget but overflow one
-    card, so a preset card could recommend an ngl the table beside it marks as not fitting —
-    and, worse, that llama.cpp would OOM.
-    """
-    _swa = swa or {}
-    if layers <= 0 or model_gb <= 0:
-        return []
-    per_layer_gb = model_gb / layers
-    n = max(1, int(n_sessions))
-    frontier: list[tuple[int, int, float, float]] = []
-    for cpu_layers in range(0, layers):  # keep at least 1 layer on GPU
-        gpu_layers = layers - cpu_layers
-        weight_gb = per_layer_gb * gpu_layers
-        if weight_gb >= budget_gb:
-            continue
-        best_ctx, best_kv = 0, 0.0
-        for ctx in ctx_candidates:
-            kv_gb = kv_cache_bytes(arch, ctx * n, layers, kv_heads, head_dim, bytes_per,
-                                   key_length=key_length, value_length=value_length,
-                                   full_attention_interval=full_attention_interval,
-                                   ssm_state_size=ssm_state_size, **_swa,
-                                   v_bytes_per_elem=v_bytes_per_elem) / (1024 ** 3)
-            if weight_gb + kv_gb <= budget_gb and ctx > best_ctx:
-                if card_ok is not None and not card_ok(weight_gb, kv_gb):
-                    continue
-                best_ctx, best_kv = ctx, kv_gb
-        if best_ctx == 0:
-            continue
-        # pareto step: only keep points that strictly improve max ctx
-        if frontier and best_ctx <= frontier[-1][1]:
-            continue
-        frontier.append((cpu_layers, best_ctx, weight_gb, best_kv))
-    return frontier
-
-
-def _frontier_options(frontier: list[tuple[int, int, float, float]], backend: str,
-                      layers: int, dense: bool) -> list[PresetOption]:
-    """Turn EVERY frontier point into a PresetOption, ascending by ctx.
-
-    Feeds the custom slider, which lets any achievable point on the speed/context curve be
-    selected rather than only the three named samples.
-    """
-    out: list[PresetOption] = []
-    for off, ctx, gpu_gb, kv_gb in sorted(frontier, key=lambda f: f[1]):
-        if dense:
-            gpu_layers = layers - off
-            speed = round(layers / (gpu_layers + off * _CPU_LAYER_PENALTY), 3) if layers else 0.0
-            out.append(PresetOption(
-                key=f"pt{off}", label=f"{gpu_layers}/{layers} layers", icon="sliders",
-                backend=backend, ctx=ctx, n_cpu_moe=0,
-                offload_kind=("ngl" if off > 0 else ""),
-                gpu_layers=gpu_layers, total_layers=layers,
-                gpu_gb=round(gpu_gb, 2), kv_gb=round(kv_gb, 2),
-                speed_score=speed, ngl=(gpu_layers if off > 0 else 999),
-            ))
-        else:
-            speed = round((layers - off) / layers, 3) if layers else 0.0
-            out.append(PresetOption(
-                key=f"pt{off}", label=f"ncm {off}", icon="sliders",
-                backend=backend, ctx=ctx, n_cpu_moe=off,
-                offload_kind=("cpu-moe" if off >= layers else ("n-cpu-moe" if off > 0 else "")),
-                gpu_layers=layers - off, total_layers=layers,
-                gpu_gb=round(gpu_gb, 2), kv_gb=round(kv_gb, 2),
-                speed_score=speed,
-            ))
-    return out
-
-
-def _presets_from_dense_frontier(frontier: list[tuple[int, int, float, float]], backend: str,
-                                 layers: int) -> list[PresetOption]:
-    """Fast / Balanced / Long-context picks from a dense layer-offload frontier."""
-    if not frontier:
-        return []
-
-    def _speed(cpu_layers: int) -> float:
-        # Relative throughput estimate. GPU layer = 1 unit of time, CPU layer = _CPU_LAYER_PENALTY.
-        # Dense offload hurts far more than the MoE equivalent: with a 20x penalty, moving just
-        # 10% of layers off already costs roughly two thirds of your tokens/sec.
-        if layers <= 0:
-            return 0.0
-        gpu = layers - cpu_layers
-        return round(layers / (gpu + cpu_layers * _CPU_LAYER_PENALTY), 3)
-
-    def _make(key: str, label: str, icon: str, e: tuple[int, int, float, float]) -> PresetOption:
-        cpu_layers, ctx, gpu_gb, kv_gb = e
-        gpu_layers = layers - cpu_layers
-        return PresetOption(
-            key=key, label=label, icon=icon, backend=backend, ctx=ctx,
-            n_cpu_moe=0,
-            offload_kind=("ngl" if cpu_layers > 0 else ""),
-            gpu_layers=gpu_layers, total_layers=layers,
-            gpu_gb=round(gpu_gb, 2), kv_gb=round(kv_gb, 2),
-            speed_score=_speed(cpu_layers),
-            # 999 keeps llama-server's "everything on GPU" behaviour when nothing is offloaded.
-            ngl=(gpu_layers if cpu_layers > 0 else 999),
-        )
-
-    fast_entry = min(frontier, key=lambda f: f[0])                 # fewest layers offloaded
-    long_entry = max(frontier, key=lambda f: (f[1], -f[0]))        # most context
-    fi, li = frontier.index(fast_entry), frontier.index(long_entry)
-    if fi > li:
-        fi, li = li, fi
-    mi = (fi + li) // 2
-    # Never let Balanced collapse onto Fast/Long: when they are adjacent the midpoint
-    # rounds onto one of them and the chip disappears. Step inward instead.
-    if mi in (fi, li) and li - fi >= 2:
-        mi = fi + 1
-    balanced_entry = frontier[mi]
-
-    out: list[PresetOption] = []
-    seen: set[tuple[int, int]] = set()
-    for key, label, icon, entry in (
-        ("fast", "Fast", "gauge", fast_entry),
-        ("balanced", "Balanced", "cpu", balanced_entry),
-        ("long-ctx", "Long context", "layers-3", long_entry),
-    ):
-        sig = (entry[0], entry[1])
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(_make(key, label, icon, entry))
-    return out
-
-
-def _presets_from_frontier(frontier: list[tuple[int, int, float, float]], backend: str,
-                           layers: int, native_ctx: int) -> list[PresetOption]:
-    """Pick Fast / Balanced / Long-ctx from the frontier."""
-    if not frontier:
-        return []
-    fast_min_ctx = 8192
-
-    def _speed_score(ncm: int) -> float:
-        return (layers - ncm) / layers if layers > 0 else 0.0
-
-    def _make(key: str, label: str, icon: str, entry: tuple[int, int, float, float]) -> PresetOption:
-        ncm, ctx, gpu_gb, kv_gb = entry
-        return PresetOption(
-            key=key, label=label, icon=icon, backend=backend,
-            ctx=ctx, n_cpu_moe=ncm,
-            offload_kind=("cpu-moe" if ncm >= layers else ("n-cpu-moe" if ncm > 0 else "")),
-            gpu_layers=layers - ncm, total_layers=layers,
-            gpu_gb=round(gpu_gb, 2), kv_gb=round(kv_gb, 2),
-            speed_score=round(_speed_score(ncm), 3),
-        )
-
-    # Fast: highest speed (lowest ncm) where ctx meets a chat minimum
-    fast_candidates = [f for f in frontier if f[1] >= fast_min_ctx] or frontier
-    fast_entry = min(fast_candidates, key=lambda f: f[0])
-
-    # Long-ctx: max ctx (any ncm)
-    long_entry = max(frontier, key=lambda f: (f[1], -f[0]))
-
-    # Balanced: a point STRICTLY between fast and long, so it is never a duplicate of
-    # either. Plain midpoint rounding collapses onto fast when the two are adjacent
-    # (e.g. a 2-point frontier gives (0+1)//2 == 0), which is why Balanced used to vanish.
-    fi = frontier.index(fast_entry)
-    li = frontier.index(long_entry)
-    if fi > li: fi, li = li, fi
-    mi = (fi + li) // 2
-    if mi in (fi, li) and li - fi >= 2:
-        mi = fi + 1
-    balanced_entry = frontier[mi]
-
-    out: list[PresetOption] = []
-    seen: set[tuple[int, int]] = set()
-    for key, label, icon, entry in (
-        ("fast", "Fast", "gauge", fast_entry),
-        ("balanced", "Balanced", "cpu", balanced_entry),
-        ("long-ctx", "Long context", "layers-3", long_entry),
-    ):
-        sig = (entry[0], entry[1])
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(_make(key, label, icon, entry))
-    return out
 
 
 # Real draft/MTP heads are tens to a few hundred MB; anything larger with "mtp" in its name is a
@@ -1128,37 +566,6 @@ def quality_warnings(*, model_rel: str, params: float | int | None, recommended_
         out.append(f"{usable:,} tokens of context is little use once tool definitions and results are in the prompt; {MIN_USEFUL_CTX:,} is a sensible floor.")
     return out
 
-
-# Without a prompt-speed measurement, never propose more than this: the memory estimate alone
-# happily recommends a model's full 262K window on hardware that reads ~500 tokens/s (9 min).
-UNMEASURED_CTX_CAP = 32768
-
-
-def cap_context(memory_ctx: int, candidates: list[int], *, prompt_tps: float = 0.0,
-                prompt_budget_s: float = 120.0, verified_ctx: int = 0) -> tuple[int, str]:
-    """Largest candidate context that memory allows AND this machine can use.
-
-    Order of evidence: a calibration-verified context (measured load + full prompt) wins outright
-    as an upper bound; otherwise the measured prompt rate × the time budget; otherwise a
-    conservative default until something is measured. Returns (ctx, reason) with reason "" when
-    memory was the binding limit.
-    """
-    if memory_ctx <= 0:
-        return memory_ctx, ""
-    limit, reason = memory_ctx, ""
-    if verified_ctx and verified_ctx > 0:
-        if verified_ctx < limit:
-            limit, reason = verified_ctx, f"verified on this machine at {verified_ctx:,} tokens"
-    elif prompt_tps and prompt_tps > 0:
-        by_time = int(prompt_tps * max(prompt_budget_s, 1))
-        if by_time < limit:
-            limit, reason = by_time, f"a full prompt must finish in {int(prompt_budget_s)} s at the measured {prompt_tps:.0f} tokens/s"
-    elif UNMEASURED_CTX_CAP < limit:
-        limit, reason = UNMEASURED_CTX_CAP, "prompt speed not measured yet; measure context to go higher"
-    fitting = sorted(c for c in candidates if 0 < c <= limit)
-    if not reason:
-        return memory_ctx, ""
-    return (fitting[-1] if fitting else min(limit, memory_ctx)), reason
 
 
 # Deepest public LLMs have ~60-130 transformer blocks (Llama 3.1 405B: 126). Fit search loops
@@ -1384,115 +791,6 @@ def analyze(*,
             _extra_ub = max(0, 1024 - 512)
             mmproj_vram_gb += 7.0 * _extra_ub * layers * _hidden / 1e9
 
-    # Candidate ctx values: default cap is the model's native ctx. Linear RoPE extension
-    # to 2× is possible but (a) degrades quality noticeably, (b) inflates compute buffers
-    # unpredictably. Not worth the OOM risk as an autoconfig default — users who want
-    # extension can dial ctx-size up in the form manually.
-    cands = sorted(set(list(_CTX_CANDIDATES) + ([native_ctx] if native_ctx else [])))
-    if native_ctx:
-        cands = [c for c in cands if c <= native_ctx]
-
-    plans: list[BackendPlan] = []
-    # remember offload used at the recommended-ctx per backend, for the values dict
-    per_backend_offload: dict[str, tuple[str, int]] = {}
-
-    def _fit_all(v_bytes: float, weight_for: str = "",
-                 weight_gb: float | None = None) -> tuple[list[BackendPlan], dict[str, tuple[str, int]]]:
-        """Run the whole per-backend ctx sweep for a given V-cache element size.
-        K always stays at _CACHE_DEFAULT; only V is varied.
-
-        weight_for/weight_gb pin one backend's GPU-resident weight to an already-offloaded
-        figure, so the fit table can be recomputed to match a chosen preset instead of
-        always showing the everything-on-GPU case."""
-        _plans: list[BackendPlan] = []
-        _offload: dict[str, tuple[str, int]] = {}
-        for b in backends:
-            _w = weight_gb if (weight_gb is not None and b["name"] == weight_for) else None
-            rows, max_fit, max_fit_offload = _fit_backend(b, v_bytes, _w)
-            _plans.append(BackendPlan(
-                name=b["name"], vendor=b.get("vendor", ""),
-                vram_gb=float(b["vram_gb"]), rows=rows,
-                max_ctx=max_fit, fits_at_all=(max_fit > 0),
-            ))
-            if max_fit:
-                _offload[b["name"]] = max_fit_offload
-        return _plans, _offload
-
-    def _fit_backend(b: dict, v_bytes: float,
-                     weight_gb: float | None = None) -> tuple[list[FitRow], int, tuple[str, int]]:
-        rows: list[FitRow] = []
-        gpu_count = max(1, int(b.get("gpu_count", 1)))
-        # Reserve scales per GPU (each CUDA context takes ~500 MB just to be initialized).
-        # NOTE: compute buffer VRAM (prompt-eval scratch, ~1-2 GB at stock ub) is NOT
-        # subtracted from budget. Real-world calibration on this rig shows the 1.08
-        # split-overhead + 0.5 GB/GPU reserve already over-estimates enough to absorb
-        # the compute buffer for models we've tested. Explicitly subtracting compute_gb
-        # here over-corrects and drops working ctx picks. If we hit OOMs on models the
-        # picker approves, revisit this.
-        # The projector is pinned to the main GPU, not layer-split. Under an even layer
-        # split every GB pinned to one card costs gpu_count GB of usable POOLED capacity,
-        # because the matching share on the other cards cannot be used for it either.
-        # Measured: Qwen3-VL's 801 MB projector allocates ~1584 MiB on device 0, and its
-        # compute buffer (~1858 MiB) lands there too — so on 2 GPUs a naive pooled
-        # subtraction under-reserves by ~2x and the model OOMs on device 0 while the
-        # second card still shows free VRAM.
-        budget = float(b["vram_gb"]) - _RESERVE_PER_GPU * gpu_count - mmproj_vram_gb
-        # Per-card capacities for the single-device feasibility check below. Falls back to an
-        # even division of the pool when the sampler has not reported individual cards.
-        card_caps = [c - _RESERVE_PER_GPU for c in (b.get("card_vram_gb") or [])]
-        if gpu_count > 1 and not card_caps:
-            card_caps = [(float(b["vram_gb"]) / gpu_count) - _RESERVE_PER_GPU] * gpu_count
-        # The projector, compute buffer and cuBLAS workspace are not layer-split: they all
-        # land on the main GPU, so device 0 starts with less room than its siblings.
-        pinned_gb = mmproj_vram_gb
-        # Model overhead: single-GPU is basically file size; layer-split adds ~5% for cross-card handoffs
-        overhead_mul = _MODEL_OVERHEAD_SPLIT if gpu_count > 1 else _MODEL_OVERHEAD_SINGLE
-        # When weight_gb is supplied the offload is already baked into it, so pass moe_ratio=0
-        # below to stop _find_fit applying a second round of expert offload on top.
-        model_gb = model_gb_raw * overhead_mul if weight_gb is None else weight_gb
-        eff_moe = moe_ratio if weight_gb is None else 0.0
-        max_fit = 0
-        max_fit_offload: tuple[str, int] = ("", 0)
-        for per_session_ctx in cands:
-            # ctx-size llama-server sees = per_session * n_sessions.
-            # KV cache is sized against the TOTAL because each slot is allocated
-            # a contiguous chunk in the shared cache.
-            total_ctx = per_session_ctx * n_sessions
-            kv_gb = kv_cache_bytes(arch, total_ctx, layers, kv_heads, head_dim, bytes_per,
-                                   key_length=key_length, value_length=value_length,
-                                   full_attention_interval=full_attention_interval,
-                                   ssm_state_size=ssm_state_size, **_swa,
-                                   v_bytes_per_elem=v_bytes) / (1024 ** 3)
-            # The per-card test is handed to the search rather than applied to its answer, so
-            # it can keep offloading until BOTH the pool and every individual card are happy.
-            def _card_ok(gpu_gb: float, kind: str, n: int,
-                         _kv=kv_gb, _caps=card_caps, _pin=pinned_gb) -> bool:
-                if gpu_count <= 1 or not _caps:
-                    return True
-                if eff_moe > 0:
-                    att = model_gb * (1 - eff_moe)
-                    exp = (model_gb * eff_moe / layers) if layers else 0.0
-                    ncm = n if kind == "n-cpu-moe" else (layers if kind == "cpu-moe" else 0)
-                else:
-                    att, exp, ncm = gpu_gb, 0.0, 0
-                return _split_feasible(layers, ncm, att, exp, _kv, gpu_count, _pin, _caps)
-
-            fits, gpu_model_gb, offload_kind, n_cm = _find_fit(
-                model_gb, kv_gb, budget, layers, eff_moe, card_ok=_card_ok)
-            total = gpu_model_gb + kv_gb
-            rows.append(FitRow(
-                ctx=per_session_ctx, total_ctx=total_ctx,
-                model_gb=round(gpu_model_gb, 2), kv_gb=round(kv_gb, 2),
-                total_gb=round(total, 2), fits=fits,
-                free_gb=round(float(b["vram_gb"]) - total, 2),
-                offload_kind=offload_kind, n_cpu_moe=n_cm,
-                gpu_pct=(round(100.0 * gpu_model_gb / model_gb) if model_gb > 0 else 100),
-            ))
-            if fits:
-                max_fit = per_session_ctx
-                max_fit_offload = (offload_kind, n_cm)
-        return rows, max_fit, max_fit_offload
-
     # Symmetric q8_0 K/V, always.
     #
     # An earlier revision escalated V to q4_0 when the model could not reach its context
@@ -1511,36 +809,58 @@ def analyze(*,
     # it. Users who want asymmetric KV can set `cache-type-v` by hand and benchmark a
     # LONG prompt — short ones will not reveal the fallback.
     v_cache_type = _CACHE_DEFAULT
-    plans, per_backend_offload = _fit_all(bytes_per)
 
-    # pick recommendation:
-    #   Rule of thumb: pick the largest ctx we can, on the smallest GPU that hosts it,
-    #   BUT if MoE requires offload at that ctx, prefer the bigger GPU (less offload = faster).
-    recommended: BackendPlan | None = None
-    rec_ctx = 0
-    estimated_ctx = 0
-    capped_ctx = 0
-    ctx_cap_reason = ""
-    is_moe_now = isinstance(experts, int) and experts > 1
-    fitting = [p for p in plans if p.fits_at_all]
-    if fitting:
-        # Best ctx anyone can achieve
-        global_max_ctx = max(p.max_ctx for p in fitting)
-        top_plans = [p for p in fitting if p.max_ctx >= global_max_ctx]
-        # among those hitting the global max ctx, prefer smaller GPU (leaves the big card free)
-        # unless MoE + offload needed there → prefer bigger GPU (less offload)
-        def _needs_offload_at(p: BackendPlan, ctx: int) -> bool:
-            r = next((row for row in p.rows if row.ctx == ctx), None)
-            return bool(r and r.offload_kind)
-        if is_moe_now and any(_needs_offload_at(p, global_max_ctx) for p in top_plans):
-            recommended = sorted(top_plans, key=lambda p: p.vram_gb, reverse=True)[0]
-        else:
-            recommended = sorted(top_plans, key=lambda p: p.vram_gb)[0]
-        rec_ctx = recommended.max_ctx
-        estimated_ctx = rec_ctx
-        rec_ctx, ctx_cap_reason = cap_context(rec_ctx, [r.ctx for r in recommended.rows if r.ctx <= recommended.max_ctx],
-                                              prompt_tps=prompt_tps, prompt_budget_s=prompt_budget_s, verified_ctx=verified_ctx)
-        capped_ctx = rec_ctx
+    # The size core (autoconfig_core.size_plan): the per-backend fit sweep, the recommended
+    # backend and context, the usable-context cap, the offload presets and the prompt cache.
+    # Everything it needs that touches files or the GGUF's raw per-layer arrays is resolved
+    # here first; MODEL_AUTOCONFIG chooses who computes it, and Python stays authoritative.
+    _req = {
+        "shape": kv_shape(arch, layers, kv_heads, head_dim,
+                          key_length=key_length, value_length=value_length,
+                          full_attention_interval=full_attention_interval,
+                          ssm_state_size=ssm_state_size, **_swa),
+        "layers": layers,
+        "native_ctx": native_ctx,
+        "model_gb_raw": model_gb_raw,
+        "moe_ratio": moe_ratio,
+        "is_moe": isinstance(experts, int) and experts > 1,
+        "mmproj_vram_gb": mmproj_vram_gb,
+        "n_sessions": n_sessions,
+        "backends": [{
+            "vram_gb": float(b["vram_gb"]),
+            "gpu_count": max(1, int(b.get("gpu_count", 1))),
+            "cards": [_card_gb(c) for c in (b.get("card_vram_gb") or [])],
+            "host_ram_gb": float(b.get("host_ram_gb") or 0.0),
+            "same_as": next(j for j, o in enumerate(backends) if o["name"] == b["name"]),
+        } for b in backends],
+        # Anything that is not a preset key matches none, exactly as "" does: the dense branch
+        # then takes presets[0] (always "fast") and the MoE branch the middle one either way.
+        "preset": preset if preset in _PRESET_KEYS else "",
+        "prompt_tps": prompt_tps,
+        "prompt_budget_s": prompt_budget_s,
+        "verified_ctx": verified_ctx,
+        "cache_ram_cap_mib": settings.cache_ram_limits[0],
+    }
+    try:
+        _plan = autoconfig_core.plan_sizes(_req)
+    except autoconfig_core.AutoconfigCoreError as e:
+        return Recommendation(
+            plans=[], recommended_backend="", recommended_ctx=0,
+            error=(f"The Rust size check (MODEL_AUTOCONFIG=rust) could not confirm this "
+                   f"recommendation ({e}), so none is offered rather than one that might be "
+                   "larger than this machine can hold. Set MODEL_AUTOCONFIG=python to use the "
+                   "Python sizing alone, and report the model so the two can be reconciled."),
+        )
+    plans = [BackendPlan(name=b["name"], vendor=b.get("vendor", ""), vram_gb=float(b["vram_gb"]),
+                         rows=[FitRow(**r) for r in p["rows"]], max_ctx=p["max_ctx"],
+                         fits_at_all=(p["max_ctx"] > 0))
+             for b, p in zip(backends, _plan["plans"])]
+    recommended: BackendPlan | None = (plans[_plan["recommended"]]
+                                       if _plan["recommended"] is not None else None)
+    rec_ctx = _plan["initial_ctx"]
+    estimated_ctx = _plan["estimated_ctx"]
+    ctx_cap_reason = cap_reason_text(_plan["cap"], prompt_tps=prompt_tps,
+                                     prompt_budget_s=prompt_budget_s, verified_ctx=verified_ctx)
 
     # Resolved once, here, because three later blocks need it and each used to derive it for
     # itself inside its own conditional. That worked only while at least one of those branches
@@ -1669,203 +989,39 @@ def analyze(*,
 
     rope_type = m.get("rope_scaling_type")
 
-    # MoE offload for the recommended (backend, ctx)
-    active_preset = ""
-    presets: list[PresetOption] = []
-    frontier_opts: list[PresetOption] = []
-    # The rule: if the model fits entirely on the GPU AND reaches its native context that
-    # way, there is nothing to trade and one option is the whole truth. Offload can only
-    # buy context, and there is no context left to buy. Anything short of that — either it
-    # can't hold every layer, or it can but not at native ctx — means a real speed/context
-    # tradeoff exists and the user should get the choices.
-    _fits_full_gpu = False
-    if recommended and rec_ctx > 0 and native_ctx > 0:
-        _no_offload_ctx = max(
-            (r.ctx for r in recommended.rows if r.fits and not r.offload_kind),
-            default=0,
-        )
-        _fits_full_gpu = _no_offload_ctx >= native_ctx
-    if recommended and rec_ctx > 0:
-        off_kind, n_cm = per_backend_offload.get(recommended.name, ("", 0))
-        # If MoE + offload needed, compute the preset frontier on the recommended backend
-        # and let the requested preset override ctx / ncm.
-        is_moe_now2 = isinstance(experts, int) and experts > 1
-        # Not `and off_kind`. A MoE that needs no offload used to match neither this branch nor
-        # the dense one below, and fell out with no presets AND no frontier - which the template
-        # renders as a missing Priority section and no explanation for its absence, because the
-        # note that covers "too few tradeoffs to show" is itself guarded on having a frontier.
-        # The dense branch already states the rule this now follows: offer the tradeoff whenever
-        # the model fits at all, not only when it is forced, because choosing context over speed
-        # deliberately is the point. Nothing reached this state until a corrected KV estimate let
-        # gemma-4-26B-A4B fit without offload for the first time.
-        if is_moe_now2 and layers > 0:
-            gpu_count = max(1, int((rec_backend or {}).get("gpu_count", 1)))
-            overhead_mul = _MODEL_OVERHEAD_SPLIT if gpu_count > 1 else _MODEL_OVERHEAD_SINGLE
-            model_gb_rec = model_gb_raw * overhead_mul
-            budget = float(recommended.vram_gb) - _RESERVE_PER_GPU * gpu_count - mmproj_vram_gb
-            # Same per-card test the fit table applies. For a MoE the split is attention
-            # (always resident) plus the experts of every layer at or above n-cpu-moe.
-            _mcaps = [c - _RESERVE_PER_GPU for c in ((rec_backend or {}).get("card_vram_gb") or [])]
-            if gpu_count > 1 and len(_mcaps) != gpu_count:
-                _mcaps = [(float(recommended.vram_gb) / gpu_count) - _RESERVE_PER_GPU] * gpu_count
-
-            def _moe_card_ok(weight_gb: float, kv_gb: float, ncm: int) -> bool:
-                if gpu_count <= 1 or not _mcaps:
-                    return True
-                att = model_gb_rec * (1 - moe_ratio)
-                exp = (model_gb_rec * moe_ratio / layers) if layers else 0.0
-                return _split_feasible(layers, ncm, att, exp, kv_gb,
-                                       gpu_count, mmproj_vram_gb, _mcaps)
-
-            frontier = _pareto_frontier(arch, layers, kv_heads, head_dim, bytes_per,
-                                        model_gb_rec, moe_ratio, budget, cands,
-                                        n_sessions=n_sessions,
-                                        key_length=key_length, value_length=value_length,
-                                        full_attention_interval=full_attention_interval,
-                                        ssm_state_size=ssm_state_size,
-                                        v_bytes_per_elem=_cache_dtype_bytes(v_cache_type),
-                                        card_ok=_moe_card_ok, swa=_swa)
-            presets = _presets_from_frontier(frontier, recommended.name, layers, native_ctx)
-            frontier_opts = _frontier_options(frontier, recommended.name, layers, dense=False)
-            if presets:
-                chosen = next((p for p in presets if p.key == preset), presets[len(presets) // 2])
-                active_preset = chosen.key
-                rec_ctx = chosen.ctx
-                off_kind = chosen.offload_kind
-                n_cm = chosen.n_cpu_moe
-                values["ctx-size"] = str(rec_ctx * n_sessions)
-                # The fit table is deliberately NOT recomputed against the chosen preset's
-                # weight. Doing so pinned every row to that one offload level, so the table
-                # reported the same GPU-resident weight at every context and claimed 100%
-                # resident everywhere — while the preset card above it said 43/65 layers.
-                # The per-context search already agrees with the frontier (verified: both
-                # pick 22 layers off at 262144), so leaving it alone is both correct and
-                # consistent, and each row answers what THAT context actually costs.
-        elif not is_moe_now2 and layers > 0:
-            # DENSE model: no experts to offload, so trade whole layers for context via
-            # `ngl`. Offered whenever the model fits at all, not only when forced — the
-            # whole point is letting you choose context over speed deliberately.
-            gpu_count = max(1, int((rec_backend or {}).get("gpu_count", 1)))
-            overhead_mul = _MODEL_OVERHEAD_SPLIT if gpu_count > 1 else _MODEL_OVERHEAD_SINGLE
-            model_gb_rec = model_gb_raw * overhead_mul
-            budget = float(recommended.vram_gb) - _RESERVE_PER_GPU * gpu_count - mmproj_vram_gb
-            # Same per-card test the fit table applies, so the presets cannot propose a
-            # point the table marks as not fitting.
-            _fcaps = [c - _RESERVE_PER_GPU for c in ((rec_backend or {}).get("card_vram_gb") or [])]
-            if gpu_count > 1 and len(_fcaps) != gpu_count:
-                _fcaps = [(float(recommended.vram_gb) / gpu_count) - _RESERVE_PER_GPU] * gpu_count
-
-            def _front_card_ok(weight_gb: float, kv_gb: float) -> bool:
-                if gpu_count <= 1 or not _fcaps:
-                    return True
-                return _split_feasible(layers, 0, weight_gb, 0.0, kv_gb,
-                                       gpu_count, mmproj_vram_gb, _fcaps)
-
-            dfront = _dense_frontier(arch, layers, kv_heads, head_dim, bytes_per,
-                                     model_gb_rec, budget, cands, n_sessions=n_sessions,
-                                     key_length=key_length, value_length=value_length,
-                                     full_attention_interval=full_attention_interval,
-                                     ssm_state_size=ssm_state_size,
-                                     v_bytes_per_elem=_cache_dtype_bytes(v_cache_type),
-                                     card_ok=_front_card_ok, swa=_swa)
-            presets = _presets_from_dense_frontier(dfront, recommended.name, layers)
-            frontier_opts = _frontier_options(dfront, recommended.name, layers, dense=True)
-            if presets:
-                # Dense offload is OPT-IN. Unlike MoE — where offload is the only way to make
-                # the model fit — a dense model already fits with every layer on the GPU, and
-                # trading layers for context costs ~3x throughput (measured). So when the
-                # caller hasn't explicitly picked a preset, stay on "fast" (no offload) rather
-                # than silently spending speed the user never asked to spend.
-                want = preset or "fast"
-                chosen = next((p for p in presets if p.key == want), presets[0])
-                active_preset = chosen.key
-                rec_ctx = chosen.ctx
-                values["ctx-size"] = str(rec_ctx * n_sessions)
-                if chosen.ngl > 0:
-                    values["ngl"] = str(chosen.ngl)
-                # Same as the MoE branch: the table stays per-context rather than being
-                # recomputed at the chosen preset's offload level.
-        # The presets above pick from the memory frontier; the usable-context cap still binds.
-        if ctx_cap_reason and rec_ctx > capped_ctx:
-            rec_ctx = capped_ctx
-            values["ctx-size"] = str(rec_ctx * n_sessions)
-        if off_kind in ("cpu-moe", "n-cpu-moe"):
-            # Placement is handed to llama.cpp's own fitter rather than pinned here.
-            #
-            # Why: our estimate has to be exactly right or the model will not load, and on a
-            # model that massively overflows VRAM it is not. Measured on Qwen3.8-Flash-Next
-            # (177B, qwen4exp, 83.8 GiB of weights against 23.9 GiB of VRAM):
-            #
-            #   * we emitted tensor-split 40,8; llama.cpp's fitter computes 20,29 - close to
-            #     inverted. The load OOMed on device 0, the card we had loaded 5:1.
-            #   * compute buffers are not in our budget at all. The note above the fit table
-            #     assumed "~1-2 GB absorbed by the overhead multiplier" and asked to revisit
-            #     "if we hit OOMs on models the picker approves". Measured here: 3.6 GiB on a
-            #     single card. Worse, it scales with CONTEXT, which our 8*ub*layers*hidden
-            #     rule does not model - the same card wanted 672 MiB at 32K and 3608 MiB at
-            #     256K.
-            #
-            # `--fit` adjusts only arguments that are UNSET, so pinning ngl/tensor-split is
-            # what disabled it: the log says "n_gpu_layers already set by user to 999, abort".
-            # Leaving them unset lets llama-server size placement at load time, when it can
-            # see real free VRAM and knows its own allocator. Verified on Flash-Next: 19.86
-            # tok/s at the full 262144 ctx, versus a hard OOM from our pinned config, and the
-            # same speed our best hand-tuned n-cpu-moe reached at 1/8th the context.
-            #
-            # This is deliberately not architecture-specific. Qwen4 proper will land with
-            # another layout we have never seen, and llama.cpp will know how to size it before
-            # we do.
+    # The offload presets for the recommended backend, and what they change (computed by the
+    # size core above; the reasoning for each rule is kept beside it in autoconfig_core).
+    active_preset = _plan["active_preset"]
+    presets: list[PresetOption] = [PresetOption(backend=recommended.name, **p)
+                                   for p in _plan["presets"]] if recommended else []
+    frontier_opts: list[PresetOption] = [PresetOption(backend=recommended.name, **p)
+                                         for p in _plan["frontier"]] if recommended else []
+    # True when the model fits entirely on the GPU at its native context: nothing to trade.
+    _fits_full_gpu = _plan["fits_full_gpu"]
+    if _plan["sized"]:
+        rec_ctx = _plan["ctx"]
+        values["ctx-size"] = str(rec_ctx * n_sessions)
+        if _plan["ngl"] is not None:
+            # Dense layer offload chosen by the preset.
+            values["ngl"] = str(_plan["ngl"])
+        if _plan["fit"]:
+            # Expert offload: placement is handed to llama.cpp's own fitter rather than pinned
+            # here. Our estimate has to be exactly right or the model will not load, and on a
+            # model that massively overflows VRAM it is not (Qwen3.8-Flash-Next: we emitted
+            # tensor-split 40,8 where llama.cpp's fitter computes 20,29, and compute buffers
+            # reached 3.6 GiB on one card). `--fit` adjusts only arguments that are UNSET, so
+            # ngl / tensor-split / n-cpu-moe must stay unset for it to work. ctx-size stays
+            # pinned: --fit places around the context rather than silently shrinking it.
             values["fit"] = "on"
             values.pop("ngl", None)
             values.pop("cpu-moe", None)
             values.pop("n-cpu-moe", None)
             values.pop("tensor-split", None)
-            # ctx-size stays pinned: --fit adjusts placement around the context the user asked
-            # for rather than silently shrinking it. If it genuinely cannot fit, it falls back
-            # to more layers on CPU, which is slower but still runs.
-
-        # ---- cache-ram: host-RAM budget for the server-side prompt cache.
-        #
-        # llama-server defaults to 8192 MiB, which is sized for small contexts. Measured here on
-        # gemma-4-26B-A4B, re-asking a conversation after another had displaced it:
-        #
-        #   cache-ram 8192  ->    5 prompt tokens re-evaluated, 111 ms   (1179 cached)
-        #   cache-ram   64  -> 1177 prompt tokens re-evaluated, 283 ms   (7 cached)
-        #   cache-ram    0  -> 1177 prompt tokens re-evaluated, 285 ms   (7 cached)
-        #
-        # So the budget is load-bearing: undersize it and the 3.7x TTFT win vanishes entirely.
-        # It matters most for OpenWebUI-style clients, which resend the whole history each turn.
-        #
-        # Size it from what a conversation actually costs rather than from the model's size.
-        # kv_cache_bytes() already understands per-layer KV arrays and hybrid attention, which
-        # is what makes this correct for qwen4exp: only 12 of its 48 layers carry a growing KV
-        # cache, the other 36 hold a fixed-size recurrent state. Measured per conversation:
-        # Flash-Next 0.52 GiB at 32K, against 1.45 for gemma-4-26B and 1.25 for Qwen3.8-27B.
-        # A rule keyed on parameter count would size the 177B model ~3x too generously.
-        _kv_convo_gb = kv_cache_bytes(
-            arch, rec_ctx * n_sessions, layers, kv_heads, head_dim, bytes_per,
-            key_length=key_length, value_length=value_length,
-            full_attention_interval=full_attention_interval,
-            ssm_state_size=ssm_state_size, **_swa) / (1024 ** 3)
-        if _kv_convo_gb > 0:
-            _host_ram_gb = float((rec_backend or {}).get("host_ram_gb") or 0.0)
-            # Weights that will live in host RAM. For an offloaded MoE these are mmapped and
-            # want to stay in page cache — that is what makes the model fast — so the prompt
-            # cache must not crowd them out. Flash-Next needs ~84 GiB resident to hold 19.9
-            # tok/s; handing it a 48 GiB prompt cache on a 125 GiB box would thrash.
-            _cpu_weight_gb = (max(0.0, model_gb_raw - float(recommended.vram_gb))
-                              if off_kind in ("cpu-moe", "n-cpu-moe") else 0.0)
-            _upper_gb = _host_ram_gb - _cpu_weight_gb - _CACHE_RAM_HEADROOM_GB
-            _want_gb = _CACHE_RAM_CONVOS * _kv_convo_gb
-            _cache_gb = min(_want_gb, _upper_gb) if _upper_gb > 0 else 0.0
-            if _cache_gb > 0:
-                # Never suggest worse than llama.cpp's own default unless headroom forbids it.
-                _mib = int(round(_cache_gb * 1024))
-                if _upper_gb * 1024 >= _CACHE_RAM_DEFAULT_MIB:
-                    _mib = max(_mib, _CACHE_RAM_DEFAULT_MIB)
-                # #697: never above the configured cap (LLAMACPP_AUTOCONFIG_CACHE_RAM_MAX_MIB,
-                # default 1024). On a shared-memory GPU the prompt cache competes with the model.
-                values["cache-ram"] = str(min(_mib, settings.cache_ram_limits[0]))
+        if _plan["cache_ram"] is not None:
+            # --cache-ram: four conversations of KV at this context, within host RAM less the
+            # offloaded weights and 8 GB of headroom, never below llama.cpp's 8192 MiB default
+            # unless headroom forbids it, and never above the #697 cap.
+            values["cache-ram"] = str(_plan["cache_ram"])
 
     # Reasoning / thinking — infer from chat-template scanning
     features = summary.get("chat_template_features") or {}
@@ -2111,7 +1267,7 @@ def analyze(*,
     # MoE-specific quirk: reflect what offload is being applied
     if is_moe:
         if recommended:
-            off_kind, n_cm = per_backend_offload.get(recommended.name, ("", 0))
+            off_kind, n_cm = _plan["offload"]
             if off_kind in ("cpu-moe", "n-cpu-moe"):
                 est = (f"all {layers} layers'" if off_kind == "cpu-moe"
                        else f"roughly the first {n_cm} of {layers} layers'")

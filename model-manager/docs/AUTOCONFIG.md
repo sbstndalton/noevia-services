@@ -4,6 +4,25 @@ Autoconfig picks `models.ini` values that fit your live hardware without OOMing 
 
 Everything below is a *model* of llama.cpp's allocation behaviour, calibrated against measurements on real hardware. It is deliberately conservative. It is not a guarantee, and the doc says where it is least trustworthy.
 
+## Where the code lives, and `MODEL_AUTOCONFIG`
+
+`app/autoconfig.py` reads the GGUF summary, the backends and the saved section, and writes the
+values. The arithmetic that decides how much fits is in `app/autoconfig_core.py`: the KV cache
+estimate, the fit sweep, the recommended backend and context, the usable-context cap, the
+offload presets and the prompt cache. It is pure and imports only the stdlib, and `size_plan`
+is its single entry point.
+
+`MODEL_AUTOCONFIG=python|rust` (default `python`; any other value means python, with one
+warning) chooses who computes that plan. With `rust`, the `model-autoconfig` binary from
+sbstndalton/noevia-rs computes it as well, but the Python plan stays authoritative. It is used
+when the two agree exactly, or when Python's is the conservative one: the same backend and
+placement mode, and no larger context, GPU layer count or prompt cache. In every other case,
+including a missing binary, a timeout or a refusal, the recommendation is refused with an error
+naming `MODEL_AUTOCONFIG=rust`. A disagreement never buys a larger setting, because on DaServer
+the iGPU's memory is system RAM with no swap (#697). `MODEL_AUTOCONFIG_BIN` names the binary
+(default `model-autoconfig` on PATH). The shared fixtures are
+`tests/fixtures/model-autoconfig.v1.json`.
+
 ## The VRAM budget
 
 For a backend with `V` GB of pooled VRAM across `N` GPUs:
