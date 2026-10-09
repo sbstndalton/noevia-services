@@ -1,7 +1,8 @@
 """Differential test (MODEL_AUTOCONFIG): the model-autoconfig binary (sbstndalton/noevia-rs) and
 the Python reference must agree exactly - every int an int, every float the same float - on the
-shared fixture tables (tests/fixtures/model-autoconfig.v1.json for the size core `size_plan`, and
-model-autoconfig-check.v1.json for input prep and values assembly through `check_reference`;
+shared fixture tables (tests/fixtures/model-autoconfig.v1.json for the size core `size_plan`,
+model-autoconfig-check.v1.json for input prep and values assembly, model-autoconfig-present.v1.json
+for slices 3-6 - spec, files, present, baseline - through `check_reference`;
 the same files as noevia-rs's crates/model-autoconfig/tests/fixtures/) and on seeded random
 corpora generated here; where Python raises, the binary must name the same exception type.
 Fixture cases named "[stricter] ..." are inputs the port refuses on purpose: the binary must
@@ -39,6 +40,13 @@ CHECK_FIXTURES = FIXTURES.with_name("model-autoconfig-check.v1.json")
 
 def _check_cases() -> list[dict]:
     return json.loads(CHECK_FIXTURES.read_text())["cases"]
+
+
+PRESENT_FIXTURES = FIXTURES.with_name("model-autoconfig-present.v1.json")
+
+
+def _present_cases() -> list[dict]:
+    return json.loads(PRESENT_FIXTURES.read_text())["cases"]
 
 
 def _python_check(text: str) -> dict:
@@ -114,7 +122,60 @@ def test_binary_agrees_on_every_check_fixture():
     print(f"model-autoconfig check fixtures: {agreed} agree, {stricter} refused on purpose")
 
 
+def test_python_reference_still_produces_every_present_expectation():
+    """Slices 3-6 (spec, files, present, baseline): the committed table is what the Python
+    reference answers today."""
+    cases = _present_cases()
+    assert len(cases) >= 1600
+    assert sum("error" in c["expect"] for c in cases) >= 10
+    assert sum(c["name"].startswith("[stricter]") for c in cases) >= 8
+    for part in ("spec", "files", "present", "baseline"):
+        assert sum(json.loads(c["input"]).get(part) is not None for c in cases) > 300, part
+    for c in cases:
+        assert canonical(_python_check(c["input"])) == canonical(c["expect"]), c["name"]
+
+
+@needs_bin
+def test_binary_agrees_on_every_present_fixture():
+    agreed = stricter = 0
+    for c in _present_cases():
+        got = _rust_check(c["input"])
+        if c["name"].startswith("[stricter]"):
+            assert "error" in got and not got["python"], (c["name"], got)
+            stricter += 1
+            continue
+        got.pop("python", None)
+        assert canonical(got) == canonical(c["expect"]), c["name"]
+        agreed += 1
+    print(f"model-autoconfig present fixtures: {agreed} agree, {stricter} refused on purpose")
+
+
 # ---- a seeded random corpus of analyze() inputs, built here (not committed) ----
+
+_TREE: list[Path] = []
+_ARGS = ["-ngl", "999", "-c", "8192", "--ctx-size", "4096", "-fa", "on", "-np", "2", "--parallel", "-ctv", "q8_0",
+         "--jinja", "--models-dir", "/models", "-t", "8", "--port", "8080", "--cache-type-v", "Q8_0", "--unknown",
+         "--cont-batching", "-ncmoe", "4", "-ub", "2048", "--split-mode", "layer", "--", "-", "--keep", "--reasoning"]
+
+
+def _models_dir() -> Path:
+    """A synthetic models tree (sparse files): projectors and draft heads beside and apart from
+    the models, so analyze() exercises the companion-file rules."""
+    if not _TREE:
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="autoconfig-tree-"))
+        layout = {"s.gguf": 9 * 2**30, "s-mmproj-F16.gguf": 900 * 2**20, "s-mtp-Q8_0.gguf": 120 * 2**20,
+                  "s.draft.gguf": 60 * 2**20, "s-noMTP.gguf": 1, "x.Gguf": 3,
+                  "m/m-Q4_K_M.gguf": 5 * 2**30, "m/mmproj-BF16.gguf": 800 * 2**20, "m/mmproj-F32.gguf": 1600 * 2**20,
+                  "m/MTP/mtp-Q4_0.gguf": 60 * 2**20, "m/MTP/mtp-Q8_0.gguf": 100 * 2**20,
+                  "big/big-MTP-Q4.gguf": 3 * 2**30, "big/mtp-big.gguf": 3 * 2**30}
+        for rel, size in layout.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as f:
+                f.truncate(size)
+        _TREE.append(root)
+    return _TREE[0]
 
 def _summary(r: random.Random) -> dict:
     layers = r.choice([1, 2, 6, 12, 24, 32, 40, 48, 64, 80, r.randint(1, 160)])
@@ -152,9 +213,13 @@ def _backends(r: random.Random) -> list[dict]:
     out = []
     for i in range(r.choice([1, 1, 2, 3])):
         gc = r.choice([1, 1, 2, 3])
+        args = [r.choice(_ARGS) for _ in range(r.randint(0, 10))]
         b = {"name": r.choice(["a", "b", f"x{i}"]), "vendor": "cuda",
              "vram_gb": r.choice([4, 8, 12, 16, 23.9, 24, 32, 48, 80, round(r.uniform(1, 100), 3)]),
-             "gpu_count": gc, "host_ram_gb": r.choice([0, 16, 32, 64, 125.5]), "baseline": {}}
+             "gpu_count": gc, "host_ram_gb": r.choice([0, 16, 32, 64, 125.5]),
+             "baseline": autoconfig.parse_baseline(args)}
+        if r.random() < 0.7:
+            b["baseline_args"] = args       # as helpers._backend_list sends it
         if gc > 1 and r.random() < 0.7:
             b["card_vram_gb"] = [r.choice([8, 12, 11.6, 16, 24]) for _ in range(r.choice([gc, gc, gc - 1, gc + 1]))]
         out.append(b)
@@ -168,13 +233,23 @@ def _section(r: random.Random) -> dict | None:
         return None
     return {k: r.choice(v) for k, v in {
         "ubatch-size": ["", "512", "2048", " 4096 ", "1_024", "x"], "batch-size": ["", "256", "8192"],
-        "mmproj": ["", "/models/s/mmproj-F16.gguf"], "ngl": ["999", "30"], "n-cpu-moe": ["4"]}.items()
+        "mmproj": ["", "/models/s/mmproj-F16.gguf"], "ngl": ["999", "30"], "n-cpu-moe": ["4"],
+        "spec-type": ["", "draft-mtp", "ngram-simple", "none"], "spec-draft-n-max": ["", "4", "8"],
+        "spec-draft-p-min": ["0.25", "0.05"], "spec-draft-model": ["", "/models/m/MTP/mtp-Q4_0.gguf"],
+        "ctx-size": ["32768", "65536", "x"], "cpu-moe": ["on", ""], "keep": ["64", "it's"], "fit": ["off"],
+        "tensor-split": ["1,1"], "cache-ram": ["8192"]}.items()
         if r.random() < 0.4}
 
 
 def _analyze_kwargs(r: random.Random) -> dict:
-    return dict(summary=_summary(r), section_name=r.choice(["", "s"]), current_section=_section(r),
-                model_rel=r.choice(["", "/models/s/m.gguf"]), vision=r.random() < 0.9,
+    sub = r.choice(["", "", "m", "big", "missing"])
+    return dict(summary=_summary(r), section_name=r.choice(["", "s", "m-Q4_K_M", "big-MTP-Q4"]),
+                current_section=_section(r), model_subdir=sub,
+                models_dir=_models_dir() if r.random() < 0.6 else None,
+                spec_profile=r.choice(["", "", "off", "balanced", "coding", "writing", "ngram", "custom", "x"]),
+                mode=r.choice(["", "chat", "code", "agent", "writing"]),
+                model_rel=r.choice(["", "/models/s/m.gguf", "/models/m/m-Q2_K.gguf", "x-UD-IQ3_XXS.gguf"]),
+                vision=r.random() < 0.9,
                 file_size=int(r.choice([0.5, 2, 4.7, 9, 14, 20, 27, 40, 70, 90]) * 2**30) + r.randint(0, 2**20),
                 backends=_backends(r), preset=r.choice(["", "fast", "balanced", "long-ctx"]),
                 n_sessions=r.choice([1, 1, 2, 4, 8]), mmproj_gb_override=r.choice([None, None, 0.8]),
@@ -183,12 +258,14 @@ def _analyze_kwargs(r: random.Random) -> dict:
 
 
 def _parts(n: int, seed: int) -> list[dict]:
-    """The `check` requests analyze() builds for random inputs (captured, not re-derived): all
-    three parts for a recommendation, prep alone for an early refusal."""
+    """The `check` requests analyze() builds for random inputs (captured, not re-derived): every
+    part for a recommendation, prep alone for an early refusal."""
     seen: list[dict] = []
 
     def capture(**kw):
-        seen.append(json.loads(json.dumps({"prep": kw["prep_in"], "size": kw["size_req"], "values": kw["values_in"]})))
+        parts = {"prep": kw["prep_in"], "size": kw["size_req"], "values": kw["values_in"]}
+        parts.update({k: v for k, v in (kw.get("extra_in") or {}).items() if v is not None})
+        seen.append(json.loads(json.dumps(parts)))
 
     def capture_refusal(**kw):
         seen.append(json.loads(json.dumps({"prep": kw["prep_in"]})))
@@ -227,6 +304,9 @@ def test_binary_check_agrees_on_a_seeded_random_corpus():
     """Input prep, size plan and values for what analyze() really sends, part by part."""
     parts = _parts(800, seed=1137)
     assert sum("values" in p for p in parts) > 300 and sum("values" not in p for p in parts) > 20
+    for part in ("spec", "files", "present", "baseline"):
+        assert sum(part in p for p in parts) > 200, part
+    assert sum(any(c.get("rule") != "projector" for c in p.get("files", [])) for p in parts) > 100
     disagree = []
     for i, p in enumerate(parts):
         text = json.dumps(p)

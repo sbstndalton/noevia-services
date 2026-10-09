@@ -6,10 +6,9 @@ Everything below is a *model* of llama.cpp's allocation behaviour, calibrated ag
 
 ## Where the code lives, and `MODEL_AUTOCONFIG`
 
-`app/autoconfig.py` resolves what touches files (the projector and draft head beside the
-weights, the speculative-decoding profile) and turns the result into the panel: the diff against
-the saved section, the quirks, the warnings. Everything else is in `app/autoconfig_core.py`, which
-is pure and imports only the stdlib, in three steps:
+`app/autoconfig.py` does what touches files - it lists the model's directory and stats the
+projector and draft head it picks - and assembles the Recommendation. Every rule is in
+`app/autoconfig_core.py`, which is pure and imports only the stdlib:
 
 1. **Input prep** (`prepare`, then `main_gpu_reserve_gb` and `size_backends`): the GGUF
    summary's fields read with the conversions they always had (a hostile header's strings,
@@ -22,6 +21,16 @@ is pure and imports only the stdlib, in three steps:
 3. **Values assembly** (`assemble_values`): the settings written - context, slots, offload,
    caches, templating and reasoning flags, the projector with its batch/ubatch/image-token
    bounds, rope, split-mode.
+4. **Speculative decoding** (`resolve_spec`): which profile the saved section is, the profile in
+   effect, the draft head, the spec keys written.
+5. **Companion files** (`pick_file`): which projector and which draft head belong to the model,
+   from the directory listing autoconfig.py read, and which projector is budgeted.
+6. **Baseline** (`parse_baseline`): the container's llama-server command read into ini keys.
+7. **The report** (`present`): the values the baseline already covers and the ones it overrides,
+   the quirks, the knobs that do not apply, the preset the saved section matches, the diff
+   against it, the keys Fill must clear (`displaced`) and the quality warnings. The diff lists
+   the keys whose value changes in the order of `values`, then the keys it supersedes sorted by
+   key (#1152; it used to follow set order, which changed with `PYTHONHASHSEED`).
 
 `MODEL_AUTOCONFIG=python|rust` (default `python`; any other value means python, with one
 warning) chooses whether the `model-autoconfig` binary from sbstndalton/noevia-rs checks those
@@ -30,20 +39,28 @@ authoritative: what the panel shows is always Python's. Input prep must agree ex
 plan and the values are used when the two agree exactly, or when Python's are the conservative
 ones: the same backend, placement mode and every other value, and no larger context, GPU layer
 count, prompt cache, batch, ubatch or image-token bound (an unset batch counts as llama-server's
-2048, an unset ubatch as 512, anything else unset as unbounded). In every other case, including
-a missing binary, a timeout or a refusal, the recommendation is refused with an error naming
+2048, an unset ubatch as 512, anything else unset as unbounded). The speculative-decoding part
+likewise, with draft depth, draft minimum and the head's GPU layers as its only bounds (both
+plain numbers, Python's no larger). The companion files, the baseline parse and the report must
+agree exactly - every message, key and order. In every other case, including a missing binary,
+a timeout or a refusal, the recommendation is refused with an error naming
 `MODEL_AUTOCONFIG=rust`. An early refusal from Python's input prep is returned either way; a
 Rust disagreement there is only logged. A disagreement never buys a larger setting, because on
 DaServer the iGPU's memory is system RAM with no swap (#697). `MODEL_AUTOCONFIG_BIN` names the
 binary (default `/usr/local/bin/model-autoconfig`, where the image installs it). The shared
-fixtures are `tests/fixtures/model-autoconfig.v1.json` (size core) and
-`model-autoconfig-check.v1.json` (input prep and values).
+fixtures are `tests/fixtures/model-autoconfig.v1.json` (size core),
+`model-autoconfig-check.v1.json` (input prep and values) and `model-autoconfig-present.v1.json`
+(steps 4-7). The backend list carries the command each baseline was parsed from
+(`baseline_args`), so the baseline parse is checked with the rest.
 
 The Rust port refuses, rather than reproduces, a few inputs Python accepts: integer strings with
 non-ASCII characters (Python reads other scripts' digits and Unicode spaces), a string where a
 backend's VRAM, RAM or card size belongs, integers past 2^100 (file sizes past 2^53), a NaN or
-a list as a backend name, and a per-layer sample whose comparison would run past its work
-budget. Under `rust` such a model gets no recommendation; `python` is unaffected.
+a list as a backend name, a per-layer sample whose comparison would run past its work budget,
+a saved value whose `repr()` holds a character past U+024F (the diff quotes it), a non-string
+saved value, a non-ASCII model file name or section name, a case-insensitive comparison of two
+non-ASCII strings (baseline against value), and listings, argument lists or reports past their
+caps. Under `rust` such a model gets no recommendation; `python` is unaffected.
 
 ## The VRAM budget
 
