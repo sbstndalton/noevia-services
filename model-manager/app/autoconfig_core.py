@@ -989,16 +989,370 @@ def size_plan(req: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- input prep (slice 2): reading the GGUF summary and the backends, and the early refusals ----
+#
+# analyze()'s first steps, unchanged in behaviour: the hostile int() conversions of the GGUF
+# summary's model fields, _kv_first_int, kv_shape, _moe_ratio, the backend filter and the four
+# early refusals, then (once the projector files are resolved) the main-GPU reservation and the
+# backends as the size core reads them. `prepare_all` is the whole of it as one JSON request:
+#
+#   n_sessions       analyze()'s n_sessions (already clamped there; clamped again, idempotently)
+#   arch, model      summary["arch"] and summary["model"], raw
+#   file_size        the model's bytes
+#   backends         the backend dicts analyze() was given, raw
+#   projector        {has_mmproj, mmproj_gb, mtp_gb}: resolved from files by analyze()
+#
+# and answers either a refusal, {"refuse": kind, ...the numbers its message needs}, or
+# {"refuse": None, n_sessions, layers, native_ctx, hidden, is_moe, moe_ratio, model_gb_raw,
+#  shape, sized (indices of the backends that report VRAM), mmproj_vram_gb, backends (the size
+#  core's form)}. Python raises where it always raised (a corrupt summary still raises).
+
+# Deepest public LLMs have ~60-130 transformer blocks (Llama 3.1 405B: 126). Fit search loops
+# over layers x context candidates, and the block count can come from an untrusted remote GGUF
+# header, so an absurd value (0xFFFFFFFF) would spin for minutes on the event loop. 4096 is
+# ~30x the deepest real model: no legitimate file is refused, and the worst accepted input
+# costs a few hundred thousand iterations.
+MAX_BLOCK_COUNT = 4096
+
+_MMPROJ_VRAM_MULT = 1.0  # projector weights land in VRAM at ~their file size.
+                         # Verified on Qwen3-VL-4B: mmproj-F32.gguf is 1.55 GB on disk and
+                         # llama-server allocates 1584.43 MiB for it. (An earlier 2.0 here was
+                         # a mis-calibration: that same 1584 MiB was compared against the 0.78 GB
+                         # BF16 projector in the directory rather than the F32 one actually
+                         # referenced by the preset.)
+_MMPROJ_COMPUTE_GB = 0.5  # modality-encoder scratch beyond the projector weights.
+                          # This is deliberately small. An earlier 1.8 here was calibrated off a
+                          # FAILED allocation line in a log (an attempt at a much larger ctx, on a
+                          # different model) and then multiplied by gpu_count — which reserved
+                          # 5.34 GB for a 0.87 GB projector and made a working model report
+                          # "doesn't fit at any context". Ground truth from a loaded
+                          # Qwen3.8-27B-OBLITERATED at ctx=130768: 22.63 GiB used total, of which
+                          # model+KV+projector accounts for ~20.96 GiB — so ALL remaining overhead,
+                          # both cards' CUDA contexts included, is ~1.67 GiB. _RESERVE_PER_GPU
+                          # already covers most of that.
+
+
+def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
+    """kv_heads may be an int, or a per-layer array dict from GGUF; extract a representative int."""
+    if isinstance(kv_heads, int):
+        return kv_heads
+    if isinstance(kv_heads, dict) and kv_heads.get("_array"):
+        sample = kv_heads.get("sample") or []
+        # pick the most common value in the sample; for gemma it's usually 8 with a few 1s
+        if sample:
+            counts: dict[int, int] = {}
+            for v in sample:
+                if v is None:  # a non-finite float in the GGUF, nulled by summarize (#901)
+                    continue
+                counts[int(v)] = counts.get(int(v), 0) + 1
+            if counts:
+                return max(counts, key=lambda k: counts[k])
+    if isinstance(kv_heads, list) and kv_heads and kv_heads[0] is not None:
+        return int(kv_heads[0])
+    return default
+
+
+def _card_gb(c: Any) -> float:
+    """One card's VRAM as the fit maths uses it (`c - reserve`): a number, else TypeError as
+    that subtraction raised before the size core existed."""
+    if isinstance(c, (int, float)):
+        return float(c)
+    raise TypeError(f"card_vram_gb entry {type(c).__name__!r} is not a number")
+
+
+def prepare(inp: dict[str, Any]) -> dict[str, Any]:
+    """analyze()'s reading of the summary and backends, up to and including the early refusals."""
+    # Clamp n_sessions to a sensible range for a homelab. Above 8 the per-slot ctx
+    # shrinks below usability for real chat, and llama-server continuous batching
+    # overhead starts dominating.
+    n_sessions = max(1, min(int(inp["n_sessions"] or 1), 8))
+    arch = (inp["arch"] or "").lower()
+    m = inp["model"] or {}
+    layers = int(m.get("block_count") or 0)
+    if layers > MAX_BLOCK_COUNT or layers < 0:
+        return {"refuse": "block_count", "layers": layers}
+    heads = int(m.get("attention_head_count") or 1)
+    embed = int(m.get("embedding_length") or 0)
+    head_dim = embed // heads if heads > 0 else 0
+    kv_heads = _kv_first_int(m.get("attention_head_count_kv"), default=heads)
+    native_ctx = int(m.get("context_length") or 0)
+    experts = m.get("expert_count")
+    # explicit K/V lengths + hybrid markers (Qwen 3.5, Zamba, etc.)
+    key_length = int(m.get("key_length")) if isinstance(m.get("key_length"), int) else None
+    value_length = int(m.get("value_length")) if isinstance(m.get("value_length"), int) else None
+    full_attention_interval = int(m.get("full_attention_interval")) if isinstance(m.get("full_attention_interval"), int) else None
+    ssm_state_size = int(m.get("ssm_state_size")) if isinstance(m.get("ssm_state_size"), int) else None
+    # Sliding-window attention parameters travel together and are threaded through every
+    # kv_cache_bytes call as one bundle. Absent for models that declare none, in which case
+    # kv_cache_bytes falls back to its previous behaviour.
+    _swa = {
+        "sliding_window": m.get("sliding_window") if isinstance(m.get("sliding_window"), int) else None,
+        "sliding_window_pattern": m.get("sliding_window_pattern"),
+        "key_length_swa": m.get("key_length_swa") if isinstance(m.get("key_length_swa"), int) else None,
+        "value_length_swa": m.get("value_length_swa") if isinstance(m.get("value_length_swa"), int) else None,
+        "shared_kv_layers": m.get("shared_kv_layers") if isinstance(m.get("shared_kv_layers"), int) else None,
+        # Raw, not collapsed: which layers are global decides which head count applies.
+        "kv_heads_pattern": m.get("attention_head_count_kv"),
+    }
+    # Model VRAM depends on whether we'll be layer-splitting across multiple GPUs; the size core
+    # applies the split multiplier per backend.
+    model_gb_raw = inp["file_size"] / (1024 ** 3)
+    moe_ratio = _moe_ratio(experts)
+    # Plan around q8_0 KV cache: near-identical quality to f16 in practice,
+    # and lets us fit ~2× the context. Users can override in the form if they want f16.
+    bytes_per = _cache_dtype_bytes(_CACHE_DEFAULT)
+
+    # HARD STOP if we have nothing to fit against (see analyze() for the message and why).
+    backends = inp["backends"]
+    if not backends:
+        return {"refuse": "no_backends"}
+    # A model larger than VRAM + system RAM cannot run at ANY offload setting.
+    _ram = max((float(b.get("host_ram_gb") or 0) for b in backends), default=0.0)
+    _vram = max((float(b.get("vram_gb") or 0) for b in backends), default=0.0)
+    if _ram > 0 and model_gb_raw > (_vram + _ram):
+        return {"refuse": "ram", "model_gb": model_gb_raw, "vram_gb": _vram, "ram_gb": _ram}
+    # A backend that is discovered but reports 0 GB is a different failure from one that is
+    # genuinely too small, and must not be reported as the latter.
+    sized = [i for i, b in enumerate(backends) if float(b.get("vram_gb") or 0) > 0]
+    if not sized:
+        return {"refuse": "unsized_vram", "names": [str(b.get("name") or "?") for b in backends]}
+
+    # HARD STOP if the KV cache cannot be sized from this GGUF's metadata: zero KV silently means
+    # "the cache is free" and every candidate would fit.
+    shape = kv_shape(arch, layers, kv_heads, head_dim,
+                     key_length=key_length, value_length=value_length,
+                     full_attention_interval=full_attention_interval,
+                     ssm_state_size=ssm_state_size, **_swa)
+    if kv_shape_bytes(shape, 4096, bytes_per) <= 0:
+        missing = [k for k, v in (("block_count", layers),
+                                  ("attention_head_count_kv", kv_heads),
+                                  ("head_dim (embedding_length / attention_head_count)", head_dim))
+                   if not v]
+        return {"refuse": "kv", "missing": missing}
+    return {"refuse": None, "n_sessions": n_sessions, "layers": layers, "native_ctx": native_ctx,
+            "hidden": embed, "is_moe": isinstance(experts, int) and experts > 1,
+            "moe_ratio": moe_ratio, "model_gb_raw": model_gb_raw, "shape": shape, "sized": sized}
+
+
+def main_gpu_reserve_gb(has_mmproj: bool, mmproj_gb: float, mtp_gb: float, layers: int,
+                        hidden: int) -> float:
+    """VRAM pinned to the MAIN GPU: projector weights + encoder compute buffer, the draft head,
+    and the larger vision ubatch's compute buffer (see analyze())."""
+    mmproj_vram_gb = (mmproj_gb * _MMPROJ_VRAM_MULT + _MMPROJ_COMPUTE_GB) if has_mmproj else 0.0
+    # The draft head rides along in the same non-layer-split reservation. Its own KV is small
+    # (a handful of layers over the drafted window) and folded into this rather than modelled.
+    mmproj_vram_gb += mtp_gb * 1.15
+    # Raising ubatch for the vision encoder (see image-max-tokens) grows the compute buffer,
+    # which is not layer-split and lands on the main GPU with everything else here.
+    # Calibrated from a measured point: a 27B (64 layers, 5120 hidden) at ub=2048 allocated
+    # ~4.7 GB, i.e. ~7 bytes per (ub x layer x hidden). Scaled against the default ub of 512,
+    # only the INCREASE is charged.
+    if has_mmproj and layers > 0:
+        if hidden > 0:
+            _extra_ub = max(0, 1024 - 512)
+            mmproj_vram_gb += 7.0 * _extra_ub * layers * hidden / 1e9
+    return mmproj_vram_gb
+
+
+def size_backends(backends: list[dict]) -> list[dict[str, Any]]:
+    """The sized backends as the size core reads them. same_as is the first backend whose name
+    equals this one's (Python ==), which is how analyze() finds "the" backend of a name."""
+    return [{
+        "vram_gb": float(b["vram_gb"]),
+        "gpu_count": max(1, int(b.get("gpu_count", 1))),
+        "cards": [_card_gb(c) for c in (b.get("card_vram_gb") or [])],
+        "host_ram_gb": float(b.get("host_ram_gb") or 0.0),
+        "same_as": next(j for j, o in enumerate(backends) if o["name"] == b["name"]),
+    } for b in backends]
+
+
+def prepare_all(inp: dict[str, Any]) -> dict[str, Any]:
+    """The reference for the Rust port's `prep` part: prepare(), then (unless it refused) the
+    main-GPU reservation and the size core's backends, in analyze()'s order."""
+    p = prepare(inp)
+    if p["refuse"] is not None:
+        return p
+    pj = inp["projector"]
+    reserve = main_gpu_reserve_gb(pj["has_mmproj"], pj["mmproj_gb"], pj["mtp_gb"], p["layers"], p["hidden"])
+    return dict(p, mmproj_vram_gb=reserve,
+                backends=size_backends([inp["backends"][i] for i in p["sized"]]))
+
+
+# ---- values assembly (slice 2): the settings analyze() writes, before the diff and quirks ----
+#
+# One JSON request (`assemble_values`); the answer is the ordered values dict (key order is part
+# of it). The request:
+#
+#   model_rel        the model path ("" = none)
+#   n_sessions       1..8
+#   chat_template    whether summary["chat_template"] is set (a bool: only its truthiness counts)
+#   features         summary["chat_template_features"], raw
+#   section          the section name ("" for an estimate); vision: the vision switch
+#   current          the saved section's mmproj / ubatch-size / batch-size, where set (strings)
+#   mmproj_rel       the projector analyze() resolved ("" = none); has_mmproj: one is attached
+#   spec             [[key, value]...]: the speculative-decoding keys, in order (slice 3 ports them)
+#   plan             the size plan's {initial_ctx, sized, ctx, ngl, fit, cache_ram}
+#   rope             summary["model"] (arch, rope_scaling_type, rope_scaling_factor), raw
+#   native_ctx       context_length as prepare() read it
+#   rec_gpu_count    GPUs of the recommended backend (its first same-named one), or None
+
+# The GGUF already decides rope scaling for these architectures (llama.cpp derives per-layer
+# scaling itself); a preset value would override it (#568).
+_ROPE_FROM_GGUF_ARCHS = ("gemma3",)
+
+
+def rope_owned_by_gguf(model: dict[str, Any]) -> bool:
+    """True when the GGUF already decides rope scaling and a preset must not override it:
+    the metadata declares a scaling type or factor, or the architecture is one whose per-layer
+    scaling llama.cpp derives itself. `model` is the `summary["model"]` dict."""
+    arch = str(model.get("arch") or "").lower()
+    if any(arch.startswith(a) for a in _ROPE_FROM_GGUF_ARCHS):
+        return True
+    rtype = str(model.get("rope_scaling_type") or "").strip().lower()
+    if rtype not in ("", "none"):
+        return True
+    factor = model.get("rope_scaling_factor")
+    return isinstance(factor, (int, float)) and factor > 0
+
+
+def assemble_values(inp: dict[str, Any]) -> dict[str, str]:
+    """analyze()'s values, from "build values" through split-mode (see analyze() for the why of
+    each setting)."""
+    n_sessions = inp["n_sessions"]
+    current = inp["current"]
+    plan = inp["plan"]
+    rec_ctx = plan["initial_ctx"]
+    values: dict[str, str] = {}
+    if inp["model_rel"]:
+        values["model"] = inp["model_rel"]
+    if rec_ctx > 0:
+        # ctx-size llama-server allocates = per-session ctx × n_sessions.
+        values["ctx-size"] = str(rec_ctx * n_sessions)
+    # ALWAYS emit parallel: llama-server's own default is 4 slots, which quarters each slot.
+    values["parallel"] = str(n_sessions)
+    if n_sessions > 1:
+        values["cont-batching"] = "on"
+        values["context-shift"] = "on"
+        values["keep"] = "256"
+        values["batch-size"] = "4096"
+    values["ngl"] = "999"
+    values["flash-attn"] = "on"
+    values["cache-type-k"] = _CACHE_DEFAULT
+    values["cache-type-v"] = _CACHE_DEFAULT
+    values["cache-reuse"] = "1"
+    if inp["chat_template"]:
+        values["jinja"] = "true"
+
+    # Multimodal: the user's projector wins; otherwise the one analyze() resolved.
+    if inp["section"] and inp["vision"]:
+        current_mmproj = current.get("mmproj", "").strip()
+        if current_mmproj:
+            values["mmproj"] = current_mmproj
+        else:
+            if inp["mmproj_rel"]:
+                values["mmproj"] = inp["mmproj_rel"]
+
+    # Speculative decoding (resolved by analyze(); see SpecProfile there).
+    for k, v in inp["spec"]:
+        values[k] = v
+
+    if plan["sized"]:
+        rec_ctx = plan["ctx"]
+        values["ctx-size"] = str(rec_ctx * n_sessions)
+        if plan["ngl"] is not None:
+            values["ngl"] = str(plan["ngl"])
+        if plan["fit"]:
+            # Expert offload: placement handed to llama.cpp's fitter, which only adjusts UNSET args.
+            values["fit"] = "on"
+            values.pop("ngl", None)
+            values.pop("cpu-moe", None)
+            values.pop("n-cpu-moe", None)
+            values.pop("tensor-split", None)
+        if plan["cache_ram"] is not None:
+            values["cache-ram"] = str(plan["cache_ram"])
+
+    # Reasoning / thinking — inferred from chat-template scanning.
+    features = inp["features"] or {}
+    tpl_kwargs: dict[str, Any] = {}
+    if features.get("accepts_enable_thinking"):
+        values["reasoning"] = "on"
+    if features.get("accepts_reasoning_effort"):
+        tpl_kwargs["reasoning_effort"] = "medium"
+    if tpl_kwargs:
+        values["chat-template-kwargs"] = json.dumps(tpl_kwargs)
+    if features.get("uses_think_tags") or features.get("uses_channel_thought"):
+        values["reasoning-format"] = "deepseek"
+    if features.get("accepts_preserve_thinking"):
+        values["reasoning-preserve"] = "on"
+
+    # Multimodal extras — only meaningful when a projector is actually attached.
+    if inp["has_mmproj"]:
+        values["mmproj-offload"] = "on"
+        # Bound how many tokens a single image may consume (an unbounded decode buffer OOMs at
+        # inference time, long after the fit maths approved the load).
+        values["image-max-tokens"] = "1024"
+        # ubatch-size MUST be at least image-max-tokens, or the model aborts on the first image
+        # (non-causal attention: the whole image has to be in one micro-batch).
+        try:
+            _imt = int(values.get("image-max-tokens") or 0)
+        except ValueError:
+            _imt = 0
+        if _imt > 0:
+            try:
+                _cur_ub = int(current.get("ubatch-size") or 0)
+            except ValueError:
+                _cur_ub = 0
+            values["ubatch-size"] = str(max(_imt, _cur_ub))
+            # batch-size must be >= ubatch-size, but only RAISE it: an absent batch-size is
+            # llama-server's 2048, comfortably above a 1024 ubatch.
+            try:
+                _cur_b = int(values.get("batch-size") or current.get("batch-size") or 0)
+            except ValueError:
+                _cur_b = 0
+            if _cur_b and _cur_b < _imt:
+                values["batch-size"] = str(_imt)
+            elif not _cur_b and _imt > 2048:      # above llama-server's own default
+                values["batch-size"] = str(_imt)
+
+    # RoPE: only when the chosen ctx exceeds n_ctx_train on a model that declares no scaling.
+    native_ctx = inp["native_ctx"]
+    if not rope_owned_by_gguf(inp["rope"]) and rec_ctx > native_ctx and native_ctx > 0:
+        values["rope-scaling"] = "linear"
+        values["rope-scale"] = f"{round(rec_ctx / native_ctx, 1)}"
+
+    # Multi-GPU: be explicit about the split strategy.
+    if inp["rec_gpu_count"] is not None and inp["rec_gpu_count"] > 1:
+        values["split-mode"] = "layer"
+    return values
+
+
+def check_reference(parts: dict[str, Any]) -> dict[str, Any]:
+    """What `model-autoconfig check` answers for `parts` ({prep?, size?, values?}), from the
+    Python reference: prep as prepare_all, size as size_plan, values as ordered [key, value]."""
+    out: dict[str, Any] = {}
+    if parts.get("prep") is not None:
+        out["prep"] = prepare_all(parts["prep"])
+    if parts.get("size") is not None:
+        out["size"] = size_plan(parts["size"])
+    if parts.get("values") is not None:
+        out["values"] = [[k, v] for k, v in assemble_values(parts["values"]).items()]
+    return out
+
+
 # ---- MODEL_AUTOCONFIG: python (default) | rust ----
 #
-# rust runs the same size core in the bounded Rust leaf from sbstndalton/noevia-rs
-# (`model-autoconfig size`, baked into the image at the Dockerfile's NOEVIA_RS_REF) BESIDE the
-# Python, which stays authoritative: the plan used is always Python's, and only when the Rust
-# answer agrees with it exactly. On a mismatch the Python plan is still used if it is the
-# conservative one (never a larger context, prompt cache or GPU layer count, and the same
-# backend and placement mode); otherwise, and on any Rust fault (missing binary, timeout,
-# refusal, malformed output), the recommendation is refused with AutoconfigCoreError. DaServer's
-# iGPU memory is system RAM with no swap (#697), so a disagreement never buys a bigger setting.
+# rust runs the same three steps - input prep, the size core and values assembly - in the
+# bounded Rust leaf from sbstndalton/noevia-rs (`model-autoconfig check`, one process per
+# analyze(), baked into the image at the Dockerfile's NOEVIA_RS_REF) BESIDE the Python, which
+# stays authoritative: what analyze() returns is always Python's, and only when the Rust answer
+# confirms it. Input prep must agree exactly. The size plan and the values must agree exactly,
+# or Python's must be the conservative one: the same backend, placement mode and every other
+# value, and no larger context, GPU layer count, prompt cache, batch, ubatch or image-token
+# bound. Anything else, and every Rust fault (missing binary, timeout, refusal, malformed
+# output), refuses the recommendation with AutoconfigCoreError. When Python's own input prep
+# refuses (an implausible block count, no backend, ...), that refusal is returned either way and
+# a Rust disagreement is only logged. DaServer's iGPU memory is system RAM with no swap (#697),
+# so a disagreement never buys a bigger setting.
 
 IMPLS = ("python", "rust")
 # Where the model-manager image installs the binary; MODEL_AUTOCONFIG_BIN overrides it (tests).
@@ -1139,18 +1493,19 @@ def _run_bounded(proc: "subprocess.Popen[bytes]", payload: bytes) -> tuple[str, 
     return status, bytes(out), bytes(err)
 
 
-def size_plan_rust(req: dict[str, Any]) -> dict[str, Any]:
+def check_rust(parts: dict[str, Any]) -> dict[str, Any]:
+    """`model-autoconfig check` on `parts` ({prep?, size?, values?}): the Rust answer, unchecked."""
     binary = _rust_binary()
     if binary is None:
         raise _fail("missing_binary", "model-autoconfig not found or not executable")
     try:
-        payload = json.dumps(req, ensure_ascii=True).encode()
+        payload = json.dumps(parts, ensure_ascii=True).encode()
     except (TypeError, ValueError) as e:
         raise _fail("unencodable_input", type(e).__name__) from None
     if len(payload) > CORE_STDIN_CAP:
         raise _fail("input_too_large", f"{len(payload)} bytes")
     try:
-        proc = subprocess.Popen([binary, "size"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        proc = subprocess.Popen([binary, "check"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 # A minimal environment: the child needs nothing of ours.
                                 env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
@@ -1168,8 +1523,8 @@ def size_plan_rust(req: dict[str, Any]) -> dict[str, Any]:
         out = json.loads(stdout)
     except ValueError:
         raise _fail("malformed_output", "not JSON") from None
-    if not isinstance(out, dict):
-        raise _fail("malformed_output", "not an object")
+    if not isinstance(out, dict) or set(out) != {k for k, v in parts.items() if v is not None}:
+        raise _fail("malformed_output", "not an object with the parts asked for")
     return out
 
 
@@ -1207,20 +1562,102 @@ def python_is_conservative(py: dict[str, Any], rs: dict[str, Any], n_sessions: i
     return all(pv <= rv for pv, rv in zip(p[2:], r[2:]))
 
 
-def plan_sizes(req: dict[str, Any], model: str = "") -> dict[str, Any]:
-    """The size plan by the configured implementation; always Python's answer (see above).
-    `model` only labels the log lines; it is never part of the request."""
-    py = size_plan(req)
-    if impl_choice() != "rust":
-        return py
-    rs = size_plan_rust(req)
+# The values a recommendation writes that cost memory, and what their absence means: llama-server's
+# own default (batch 2048, ubatch 512) or, for the rest, no bound at all - counted as larger than
+# any value autoconfig writes.
+VALUE_LIMITS: dict[str, float] = {
+    "ctx-size": math.inf, "ngl": math.inf, "cache-ram": math.inf, "image-max-tokens": math.inf,
+    "batch-size": 2048, "ubatch-size": 512,
+}
+
+
+def _as_values(v: Any) -> dict[str, str] | None:
+    """The Rust values ([[key, value]...], keys unique, all strings) as a dict, else None."""
+    if not isinstance(v, list):
+        return None
+    out: dict[str, str] = {}
+    for pair in v:
+        if (not isinstance(pair, list) or len(pair) != 2 or not all(isinstance(x, str) for x in pair)
+                or pair[0] in out):
+            return None
+        out[pair[0]] = pair[1]
+    return out
+
+
+def _value_int(v: str | None, key: str) -> float | None:
+    """A written number as an int (its absence as VALUE_LIMITS says), or None if malformed."""
+    if v is None:
+        return VALUE_LIMITS[key]
+    if len(v) > 40 or not (v.isascii() and (v.isdigit() or (v[:1] == "-" and v[1:].isdigit()))):
+        return None
+    return int(v)
+
+
+def values_are_conservative(py: dict[str, str], rs: dict[str, str]) -> bool:
+    """True when Python's values write nothing larger than Rust's: every key outside VALUE_LIMITS
+    present in both or neither, with the same value and the shared keys in the same order, and
+    no VALUE_LIMITS key larger in Python's."""
+    for k in set(py) | set(rs):
+        if k in VALUE_LIMITS:
+            p, r = _value_int(py.get(k), k), _value_int(rs.get(k), k)
+            if p is None or r is None or p > r:
+                return False
+        elif py.get(k) != rs.get(k):
+            return False
+    return [k for k in py if k in rs] == [k for k in rs if k in py]
+
+
+def size_plan_accepted(py: dict[str, Any], rs: Any, n_sessions: int) -> str:
+    """"same", "conservative" or "" (refuse) for a Rust size plan against Python's."""
+    if not isinstance(rs, dict):
+        return ""
     if canonical(rs) == canonical(py):
-        return py
-    shape = _shape_key(req)
-    if python_is_conservative(py, rs, req["n_sessions"]):
+        return "same"
+    return "conservative" if python_is_conservative(py, rs, n_sessions) else ""
+
+
+def confirm(*, prep_in: dict[str, Any], prep: dict[str, Any], size_req: dict[str, Any],
+            plan: dict[str, Any], values_in: dict[str, Any], values: dict[str, str],
+            model: str = "") -> None:
+    """Under MODEL_AUTOCONFIG=rust, confirm Python's prep, size plan and values with the Rust
+    port (one process); raise AutoconfigCoreError unless every part is confirmed (see above).
+    `model` only labels the log lines; it is never part of the request."""
+    if impl_choice() != "rust":
+        return
+    out = check_rust({"prep": prep_in, "size": size_req, "values": values_in})
+    shape = _shape_key(size_req)
+    if canonical(out["prep"]) != canonical(prep):
+        raise _fail("mismatch", "the Rust input prep disagrees", shape=shape, model=model)
+    verdict = size_plan_accepted(plan, out["size"], size_req["n_sessions"])
+    if not verdict:
+        raise _fail("mismatch", "the Rust plan disagrees and the Python plan is not the smaller one",
+                    shape=shape, model=model)
+    rs_values = _as_values(out["values"])
+    if rs_values is None:
+        raise _fail("malformed_output", "values are not [[key, value]...]", shape=shape, model=model)
+    if list(rs_values.items()) != list(values.items()):
+        if not values_are_conservative(values, rs_values):
+            raise _fail("mismatch", "the Rust values disagree and Python's are not the smaller ones",
+                        shape=shape, model=model)
+        verdict = "conservative"
+    if verdict == "conservative":
         _log_once(f"mismatch:conservative:{shape}",
-                  f"model-autoconfig disagreed with the Python size core for model {model[:200]!r} "
-                  f"(request {shape}); using the Python plan, which is the more conservative one")
-        return py
-    raise _fail("mismatch", "the Rust plan disagrees and the Python plan is not the smaller one",
-                shape=shape, model=model)
+                  f"model-autoconfig disagreed with the Python autoconfig for model {model[:200]!r} "
+                  f"(request {shape}); using the Python recommendation, which is the more conservative one")
+
+
+def confirm_refusal(*, prep_in: dict[str, Any], prep: dict[str, Any], model: str = "") -> None:
+    """Under MODEL_AUTOCONFIG=rust, compare a Python input-prep refusal with the Rust one. The
+    Python refusal stands either way (no recommendation is the most conservative answer), so a
+    disagreement or a Rust fault is only logged; this never raises."""
+    if impl_choice() != "rust":
+        return
+    shape = _shape_key(prep_in)
+    try:
+        out = check_rust({"prep": prep_in})
+    except AutoconfigCoreError:
+        return    # _fail logged it
+    if canonical(out["prep"]) != canonical(prep):
+        _log_once(f"mismatch:refusal:{shape}",
+                  f"model-autoconfig disagreed with the Python input prep for model {model[:200]!r} "
+                  f"(request {shape}), which refused ({prep.get('refuse')}); the refusal stands")

@@ -1,10 +1,12 @@
 """MODEL_AUTOCONFIG switch: python stays the default and never spawns anything; rust runs the
-model-autoconfig binary BESIDE the Python size core, which stays authoritative. The Python plan
-is used when Rust agrees exactly, or when Python's is the conservative one (same backend and
-placement mode, no larger context, GPU layer count or prompt cache); any other disagreement and
-every Rust fault refuses the recommendation. A fake binary (a small script) stands in for
-model-autoconfig; the real one is covered by test_autoconfig_core_differential.py. Synthetic
-models only - nothing loads a model or starts llama.cpp."""
+model-autoconfig binary (`check`, once per analyze()) BESIDE the Python input prep, size core and
+values assembly, which stay authoritative. Prep must agree exactly; the plan and the values are
+used when Rust agrees exactly, or when Python's are the conservative ones (same backend, placement
+mode and other values; no larger context, GPU layer count, prompt cache, batch, ubatch or image
+tokens); any other disagreement and every Rust fault refuses the recommendation. A Python prep
+refusal stands either way. A fake binary (a small script) stands in for model-autoconfig; the
+real one is covered by test_autoconfig_core_differential.py. Synthetic models only - nothing
+loads a model or starts llama.cpp."""
 from __future__ import annotations
 
 import dataclasses
@@ -53,16 +55,18 @@ def _fresh_switch_state(monkeypatch):
 
 def _fake_bin(tmp_path, body: str) -> str:
     """An executable standing in for model-autoconfig: records argv, stdin and environment, then
-    runs `body` with `req` = the parsed request and `plan` = the Python plan for it."""
+    runs `body` with `parts` = the parsed request, `out` = the Python reference's answer to it,
+    `plan` = out["size"], `values` = out["values"] and `prep` = out["prep"] (same objects)."""
     body_file = tmp_path / "fake_model_autoconfig.py"
     body_file.write_text(textwrap.dedent(f"""\
         import json, os, sys, time
         sys.path.insert(0, {str(MM)!r})
-        from app.autoconfig_core import size_plan
+        from app.autoconfig_core import check_reference
         raw = sys.stdin.read()
         open({str(tmp_path / "calls.log")!r}, "a").write(json.dumps([sys.argv[1:], sorted(os.environ)]) + "\\n")
-        req = json.loads(raw)
-        plan = size_plan(req)
+        parts = json.loads(raw)
+        out = check_reference(parts)
+        plan, values, prep = out.get("size"), out.get("values"), out.get("prep")
     """) + textwrap.dedent(body))
     script = tmp_path / "fake-model-autoconfig"
     script.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{body_file}" "$@"\n')
@@ -80,7 +84,7 @@ def _use_rust(monkeypatch, binary: str) -> None:
     monkeypatch.setattr(config.settings, "model_autoconfig_bin", binary)
 
 
-ECHO = "print(json.dumps(plan))\n"
+ECHO = "print(json.dumps(out))\n"
 
 
 def test_default_is_python_and_never_spawns(tmp_path, monkeypatch):
@@ -115,7 +119,7 @@ def test_rust_agreeing_gives_exactly_the_python_recommendation(tmp_path, monkeyp
     rs = dataclasses.asdict(_analyze(summary=_summary(experts=64), file_size=60 * 2**30))
     assert rs == py
     (argv, env), = _calls(tmp_path)
-    assert argv == ["size"]
+    assert argv == ["check"]
     # The child gets a minimal environment: nothing of the service's (tokens, settings).
     # (conftest sets MODELS_DIR etc. in this process; the shell and interpreter add their own.)
     assert "PATH" in env and not {"MODELS_DIR", "DATA_DIR", "MODELS_INI_PATH"} & set(env)
@@ -124,7 +128,9 @@ def test_rust_agreeing_gives_exactly_the_python_recommendation(tmp_path, monkeyp
 @pytest.mark.parametrize("body,reason", [
     ("sys.exit(3)\n", "rejected"),
     ("print('not json')\n", "malformed_output"),
-    ("print(json.dumps([plan]))\n", "malformed_output"),
+    ("print(json.dumps([out]))\n", "malformed_output"),
+    ("del out['values']; print(json.dumps(out))\n", "malformed_output"),
+    ("out['values'] = [['parallel', '1'], ['parallel', '1']]; print(json.dumps(out))\n", "malformed_output"),
     ("time.sleep(30)\n", "timeout"),
     ("sys.stdout.write(' ' * (17 * 1024 * 1024))\n", "output_too_large"),
 ])
@@ -199,25 +205,55 @@ def test_python_unset_cache_ram_is_not_conservative():
     assert autoconfig_core.python_is_conservative(rs, py, 1)
 
 
-def test_never_larger_than_rust_property(monkeypatch):
-    """Whatever the Rust side answers, plan_sizes returns Python's plan or raises, and when it
-    returns, no written setting is larger than Rust's (seeded random perturbations)."""
-    r = random.Random(1133)
-    reqs = []
-    real = autoconfig_core.plan_sizes
-    monkeypatch.setattr(autoconfig_core, "plan_sizes", lambda req, model="": reqs.append(req) or real(req, model))
+def _captured_parts(monkeypatch, calls) -> list[dict]:
+    """The confirm() arguments analyze() builds for `calls` (python mode: nothing is spawned)."""
+    seen: list[dict] = []
+    real = autoconfig_core.confirm
+    monkeypatch.setattr(autoconfig_core, "confirm",
+                        lambda **kw: seen.append(json.loads(json.dumps(kw))) or real(**kw))
+    for kw in calls:
+        _analyze(**kw)
+    monkeypatch.setattr(autoconfig_core, "confirm", real)
+    return seen
+
+
+def _confirm_with(monkeypatch, parts: dict, rust_answer: dict) -> bool:
+    """confirm() under rust with `rust_answer` as the binary's output: True if it accepts."""
+    monkeypatch.setattr(autoconfig_core, "check_rust", lambda _parts, _a=rust_answer: _a)
+    try:
+        autoconfig_core.confirm(**parts)
+    except autoconfig_core.AutoconfigCoreError:
+        return False
+    return True
+
+
+def _answer(parts: dict) -> dict:
+    return json.loads(json.dumps(autoconfig_core.check_reference(
+        {"prep": parts["prep_in"], "size": parts["size_req"], "values": parts["values_in"]})))
+
+
+def _calls_for_property() -> list[dict]:
+    out = []
     for experts in (None, 8, 64):
         for vram in (8.0, 24.0, 48.0):
             for preset in ("", "fast", "long-ctx"):
-                _analyze(summary=_summary(experts=experts), file_size=int(20 * 2**30),
-                         backends=_backends(vram=vram), preset=preset)
-    monkeypatch.setattr(autoconfig_core, "plan_sizes", real)
+                for extra in ({}, {"n_sessions": 3}, {"mmproj_gb_override": 0.9, "section_name": "s"}):
+                    out.append(dict(summary=_summary(experts=experts), file_size=int(20 * 2**30),
+                                    backends=_backends(vram=vram), preset=preset, **extra))
+    return out
+
+
+def test_never_larger_than_rust_property(monkeypatch):
+    """Whatever the Rust side answers for the size plan, confirm() accepts only Python's plan
+    when no written setting is larger than Rust's (seeded random perturbations)."""
+    r = random.Random(1133)
+    all_parts = _captured_parts(monkeypatch, _calls_for_property())
     monkeypatch.setattr(config.settings, "model_autoconfig", "rust")
     used = refused = 0
     for _ in range(600):
-        req = r.choice(reqs)
-        py = autoconfig_core.size_plan(req)
-        rs = json.loads(json.dumps(py))
+        parts = r.choice(all_parts)
+        ans = _answer(parts)
+        py, rs = parts["plan"], ans["size"]
         for key in r.sample(["ctx", "initial_ctx", "cache_ram", "ngl", "fit", "recommended"], r.randint(1, 3)):
             if key == "fit":
                 rs[key] = r.random() < 0.5
@@ -225,17 +261,163 @@ def test_never_larger_than_rust_property(monkeypatch):
                 rs[key] = r.choice([None, 0, 1])
             else:
                 rs[key] = r.choice([None, 0, 1, 512, 999, 4096, 8192, 131072, 10**6, (rs.get(key) or 0) + r.randint(-5, 5)])
-        monkeypatch.setattr(autoconfig_core, "size_plan_rust", lambda _req, _rs=rs: _rs)
-        try:
-            got = autoconfig_core.plan_sizes(req)
-        except autoconfig_core.AutoconfigCoreError:
+        if not _confirm_with(monkeypatch, parts, ans):
             refused += 1
             continue
         used += 1
-        assert got == py
-        p, q = autoconfig_core._written(py, req["n_sessions"]), autoconfig_core._written(rs, req["n_sessions"])
+        n = parts["size_req"]["n_sessions"]
+        p, q = autoconfig_core._written(py, n), autoconfig_core._written(rs, n)
         assert p[:2] == q[:2] and all(a <= b for a, b in zip(p[2:], q[2:]))
     assert used and refused
+
+
+# ---- input prep and values (slice 2) ----
+
+def test_values_never_larger_than_rust_property(monkeypatch):
+    """Whatever the Rust side answers for the values, confirm() accepts Python's only when every
+    value outside VALUE_LIMITS is identical (same keys, same order) and no batch, ubatch, image
+    tokens, context, ngl or prompt cache of Python's is larger than Rust's."""
+    r = random.Random(1137)
+    all_parts = _captured_parts(monkeypatch, _calls_for_property())
+    monkeypatch.setattr(config.settings, "model_autoconfig", "rust")
+    keys = sorted(autoconfig_core.VALUE_LIMITS) + ["parallel", "jinja", "mmproj-offload", "fit", "split-mode",
+                                                    "reasoning", "rope-scale", "flash-attn"]
+    used = refused = 0
+    for _ in range(1500):
+        parts = r.choice(all_parts)
+        ans = _answer(parts)
+        rs = dict(ans["values"])
+        for key in r.sample(keys, r.randint(1, 3)):
+            choice = r.random()
+            if choice < 0.2:
+                rs.pop(key, None)
+            elif choice < 0.3:
+                rs[key] = r.choice(["on", "x", "1.5", "", "-1"])
+            else:
+                cur = rs.get(key)
+                base = int(cur) if cur and cur.lstrip("-").isdigit() else 1024
+                rs[key] = str(max(0, base + r.choice([-4096, -1, 0, 1, 512, 10**6])))
+        items = list(rs.items())
+        if r.random() < 0.1 and len(items) > 2:
+            i = r.randrange(len(items) - 1)
+            items[i], items[i + 1] = items[i + 1], items[i]
+        ans["values"] = [[k, v] for k, v in items]
+        if not _confirm_with(monkeypatch, parts, ans):
+            refused += 1
+            continue
+        used += 1
+        py = parts["values"]
+        got = dict(items)
+        for k in set(py) | set(got):
+            if k in autoconfig_core.VALUE_LIMITS:
+                lim = autoconfig_core.VALUE_LIMITS[k]
+                assert (int(py[k]) if k in py else lim) <= (int(got[k]) if k in got else lim), (k, py, got)
+            else:
+                assert py.get(k) == got.get(k), (k, py, got)
+        assert [k for k in py if k in got] == [k for k in got if k in py]
+    assert used > 50 and refused > 50, (used, refused)
+
+
+VALUE_MUTATIONS = {
+    # Rust larger (or unbounded) than Python: Python is conservative, so its values are used.
+    "rust batch larger": ("values[:] = [[k, '8192' if k == 'batch-size' else v] for k, v in values]", True),
+    "rust image tokens unset": ("values[:] = [p for p in values if p[0] != 'image-max-tokens']", True),
+    "rust ubatch larger": ("values[:] = [[k, '4096' if k == 'ubatch-size' else v] for k, v in values]", True),
+    # Rust smaller, or any other value different: refuse.
+    "rust ubatch smaller": ("values[:] = [[k, '512' if k == 'ubatch-size' else v] for k, v in values]", False),
+    "rust batch unset (2048 < 4096)": ("values[:] = [p for p in values if p[0] != 'batch-size']", False),
+    "rust reasoning differs": ("values.append(['reasoning', 'on'])", False),
+    "rust split-mode differs": ("values.append(['split-mode', 'row'])", False),
+    "rust order differs": ("values[0], values[1] = values[1], values[0]", False),
+    "rust number malformed": ("values[:] = [[k, 'big' if k == 'ubatch-size' else v] for k, v in values]", False),
+}
+
+
+@pytest.mark.parametrize("name", sorted(VALUE_MUTATIONS))
+def test_values_mismatch_policy(tmp_path, monkeypatch, name, caplog):
+    mutation, python_used = VALUE_MUTATIONS[name]
+    kw = dict(n_sessions=2, section_name="s", mmproj_gb_override=0.9, model_rel="/models/s/m.gguf")
+    py = dataclasses.asdict(_analyze(**kw))
+    assert py["values"]["ubatch-size"] == "1024" and py["values"]["batch-size"] == "4096"
+    _use_rust(monkeypatch, _fake_bin(tmp_path, mutation + "\n" + ECHO))
+    with caplog.at_level(logging.WARNING, logger="app.autoconfig_core"):
+        rs = dataclasses.asdict(_analyze(**kw))
+    if python_used:
+        assert rs == py
+        assert any("more conservative" in r.getMessage() for r in caplog.records)
+    else:
+        assert rs["recommended_ctx"] == 0 and rs["values"] == {}
+        assert "mismatch" in rs["error"]
+
+
+@pytest.mark.parametrize("mutation", [
+    "prep['layers'] += 1",
+    "prep['shape']['kv_heads'] = 1",
+    "prep['model_gb_raw'] *= 0.5",
+    "prep['backends'][0]['gpu_count'] = 2",
+    "prep['refuse'] = 'kv'",
+])
+def test_prep_must_agree_exactly(tmp_path, monkeypatch, mutation):
+    """Input prep feeds everything after it, so any difference refuses (even a smaller model)."""
+    _use_rust(monkeypatch, _fake_bin(tmp_path, mutation + "\n" + ECHO))
+    rec = _analyze()
+    assert rec.recommended_ctx == 0 and rec.values == {} and "mismatch" in rec.error
+
+
+REFUSALS = {
+    "block_count": dict(summary=_summary(layers=5000)),
+    "no_backends": dict(backends=[]),
+    "ram": dict(file_size=500 * 2**30),
+    "unsized_vram": dict(backends=_backends(vram=0)),
+    "kv": dict(summary={"arch": "llama", "model": {"block_count": 32}, "chat_template": "x"}),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(REFUSALS))
+@pytest.mark.parametrize("body", [ECHO, "prep.clear(); prep['refuse'] = None\n" + ECHO, "sys.exit(3)\n"])
+def test_a_python_prep_refusal_stands_under_rust(tmp_path, monkeypatch, caplog, kind, body):
+    """Python's early refusal is returned unchanged whatever the Rust side says (agreeing,
+    disagreeing or failing); a disagreement is logged, and only prep is sent."""
+    py = dataclasses.asdict(_analyze(**REFUSALS[kind]))
+    assert py["error"] and py["recommended_ctx"] == 0
+    _use_rust(monkeypatch, _fake_bin(tmp_path, body))
+    with caplog.at_level(logging.WARNING, logger="app.autoconfig_core"):
+        rs = dataclasses.asdict(_analyze(**REFUSALS[kind]))
+    assert rs == py
+    (argv, _env), = _calls(tmp_path)
+    assert argv == ["check"]
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    if body == ECHO:
+        assert "model-autoconfig" not in msgs
+    elif "exit" in body:
+        assert "rejected" in msgs
+    else:
+        assert "the refusal stands" in msgs
+
+
+def test_refusal_path_sends_only_prep(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(config.settings, "model_autoconfig", "rust")
+    monkeypatch.setattr(autoconfig_core, "check_rust",
+                        lambda parts: seen.append(parts) or autoconfig_core.check_reference(parts))
+    _analyze(backends=[])
+    assert len(seen) == 1 and set(seen[0]) == {"prep"}
+    seen.clear()
+    _analyze()
+    assert len(seen) == 1 and set(seen[0]) == {"prep", "size", "values"}
+
+
+def test_values_are_conservative_edges():
+    c = autoconfig_core.values_are_conservative
+    assert c({"batch-size": "1024"}, {})              # absent = llama-server's 2048
+    assert not c({"batch-size": "4096"}, {})
+    assert c({"ubatch-size": "512"}, {})
+    assert not c({"ubatch-size": "1024"}, {})
+    assert c({"ctx-size": "8192"}, {})                # absent = unbounded
+    assert not c({}, {"ctx-size": "8192"})
+    assert not c({"ubatch-size": "1" * 50}, {"ubatch-size": "1" * 50})   # malformed: too long
+    assert not c({"a": "1", "b": "2"}, {"b": "2", "a": "1"})            # order counts
+    assert c({"a": "1", "ngl": "10", "b": "2"}, {"a": "1", "b": "2"})
 
 
 # ---- bounded output, default binary path, per-shape mismatch logging (noevia#1138, #1139) ----

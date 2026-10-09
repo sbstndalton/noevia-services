@@ -48,9 +48,9 @@ class Settings(BaseSettings):
     model_files_impl: str = "python"
     # The model-files binary: a name looked up on PATH, or an absolute path.
     model_files_bin: str = "model-files"
-    # Autoconfig's size core (fit sweep, pick, context cap, presets, prompt cache): "python"
-    # (default) or "rust" (the model-autoconfig binary checks the Python plan, which stays
-    # authoritative; a disagreement that is not in Python's favour refuses the recommendation).
+    # Autoconfig's input prep, size core and values assembly: "python" (default) or "rust" (the
+    # model-autoconfig binary checks the Python answer, which stays authoritative; a disagreement
+    # that is not in Python's favour refuses the recommendation).
     # Invalid values mean python, with one warning.
     model_autoconfig: str = "python"
     # The model-autoconfig binary: a name looked up on PATH, or an absolute path.

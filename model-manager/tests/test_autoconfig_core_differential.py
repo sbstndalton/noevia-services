@@ -1,8 +1,11 @@
 """Differential test (MODEL_AUTOCONFIG): the model-autoconfig binary (sbstndalton/noevia-rs) and
-the Python size core `autoconfig_core.size_plan` must agree exactly - every int an int, every
-float the same float - on the shared fixture table (tests/fixtures/model-autoconfig.v1.json, the
-same file as noevia-rs's crates/model-autoconfig/tests/fixtures/) and on a seeded random corpus
-generated here; where Python raises, the binary must name the same exception type.
+the Python reference must agree exactly - every int an int, every float the same float - on the
+shared fixture tables (tests/fixtures/model-autoconfig.v1.json for the size core `size_plan`, and
+model-autoconfig-check.v1.json for input prep and values assembly through `check_reference`;
+the same files as noevia-rs's crates/model-autoconfig/tests/fixtures/) and on seeded random
+corpora generated here; where Python raises, the binary must name the same exception type.
+Fixture cases named "[stricter] ..." are inputs the port refuses on purpose: the binary must
+refuse them (never answer differently).
 
 The Python half (the reference still produces every committed expectation) always runs. The
 binary half runs only when MODEL_AUTOCONFIG_BIN points at a built model-autoconfig (CI builds it
@@ -29,6 +32,29 @@ needs_bin = pytest.mark.skipif(not BIN, reason="MODEL_AUTOCONFIG_BIN not set: no
 
 def _cases() -> list[dict]:
     return json.loads(FIXTURES.read_text())["cases"]
+
+
+CHECK_FIXTURES = FIXTURES.with_name("model-autoconfig-check.v1.json")
+
+
+def _check_cases() -> list[dict]:
+    return json.loads(CHECK_FIXTURES.read_text())["cases"]
+
+
+def _python_check(text: str) -> dict:
+    try:
+        return autoconfig_core.check_reference(json.loads(text))
+    except Exception as e:  # noqa: BLE001 - any exception is the reference refusing the input
+        return {"error": type(e).__name__}
+
+
+def _rust_check(text: str) -> dict:
+    proc = subprocess.run([BIN, "check"], input=text.encode(), capture_output=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        assert proc.stdout == b"", "an error must leave stdout empty"
+        code = proc.stderr.decode(errors="replace").split(": ", 2)[1]
+        return {"error": code.removeprefix("python:"), "python": code.startswith("python:")}
+    return json.loads(proc.stdout)
 
 
 def _python(text: str) -> dict:
@@ -64,6 +90,30 @@ def test_binary_agrees_on_every_fixture():
     print(f"model-autoconfig fixtures: {agreed}/{len(cases)} agree")
 
 
+def test_python_reference_still_produces_every_check_expectation():
+    cases = _check_cases()
+    assert len(cases) >= 400
+    assert any("error" in c["expect"] for c in cases)
+    assert sum(c["name"].startswith("[stricter]") for c in cases) >= 5
+    for c in cases:
+        assert canonical(_python_check(c["input"])) == canonical(c["expect"]), c["name"]
+
+
+@needs_bin
+def test_binary_agrees_on_every_check_fixture():
+    agreed = stricter = 0
+    for c in _check_cases():
+        got = _rust_check(c["input"])
+        if c["name"].startswith("[stricter]"):
+            assert "error" in got and not got["python"], (c["name"], got)
+            stricter += 1
+            continue
+        got.pop("python", None)
+        assert canonical(got) == canonical(c["expect"]), c["name"]
+        agreed += 1
+    print(f"model-autoconfig check fixtures: {agreed} agree, {stricter} refused on purpose")
+
+
 # ---- a seeded random corpus of analyze() inputs, built here (not committed) ----
 
 def _summary(r: random.Random) -> dict:
@@ -86,8 +136,16 @@ def _summary(r: random.Random) -> dict:
         m.update(sliding_window=r.choice([512, 1024, 4096]),
                  sliding_window_pattern=r.choice([{"_array": True, "count": layers, "sample": pat}, pat, None]),
                  key_length_swa=r.choice([None, 128, 256]), shared_kv_layers=r.choice([None, 0, 4, 18]))
+    if r.random() < 0.3:
+        m.update(arch=r.choice(["gemma3", "llama", ""]), rope_scaling_type=r.choice([None, "none", "linear", " NONE "]),
+                 rope_scaling_factor=r.choice([None, 0.0, 4.0]))
+    if r.random() < 0.03:
+        m["block_count"] = r.choice([5000, -1])          # an early refusal
+    feats = r.choice([None, {}, {k: r.random() < 0.5 for k in (
+        "accepts_enable_thinking", "accepts_reasoning_effort", "uses_think_tags", "uses_channel_thought",
+        "accepts_preserve_thinking")}])
     return {"arch": r.choice(["llama", "qwen3", "gemma3", "gemma4", ""]), "model": m,
-            "chat_template": r.choice(["", "x"])}
+            "chat_template": r.choice(["", "x"]), "chat_template_features": feats}
 
 
 def _backends(r: random.Random) -> list[dict]:
@@ -100,11 +158,23 @@ def _backends(r: random.Random) -> list[dict]:
         if gc > 1 and r.random() < 0.7:
             b["card_vram_gb"] = [r.choice([8, 12, 11.6, 16, 24]) for _ in range(r.choice([gc, gc, gc - 1, gc + 1]))]
         out.append(b)
+    if r.random() < 0.03:
+        out = r.choice([[], [dict(out[0], vram_gb=0)]])  # an early refusal
     return out
 
 
+def _section(r: random.Random) -> dict | None:
+    if r.random() < 0.5:
+        return None
+    return {k: r.choice(v) for k, v in {
+        "ubatch-size": ["", "512", "2048", " 4096 ", "1_024", "x"], "batch-size": ["", "256", "8192"],
+        "mmproj": ["", "/models/s/mmproj-F16.gguf"], "ngl": ["999", "30"], "n-cpu-moe": ["4"]}.items()
+        if r.random() < 0.4}
+
+
 def _analyze_kwargs(r: random.Random) -> dict:
-    return dict(summary=_summary(r),
+    return dict(summary=_summary(r), section_name=r.choice(["", "s"]), current_section=_section(r),
+                model_rel=r.choice(["", "/models/s/m.gguf"]), vision=r.random() < 0.9,
                 file_size=int(r.choice([0.5, 2, 4.7, 9, 14, 20, 27, 40, 70, 90]) * 2**30) + r.randint(0, 2**20),
                 backends=_backends(r), preset=r.choice(["", "fast", "balanced", "long-ctx"]),
                 n_sessions=r.choice([1, 1, 2, 4, 8]), mmproj_gb_override=r.choice([None, None, 0.8]),
@@ -112,16 +182,19 @@ def _analyze_kwargs(r: random.Random) -> dict:
                 verified_ctx=r.choice([0, 0, 16384, 50000]))
 
 
-def _requests(n: int, seed: int) -> list[dict]:
-    """The size requests analyze() builds for random inputs (captured, not re-derived)."""
+def _parts(n: int, seed: int) -> list[dict]:
+    """The `check` requests analyze() builds for random inputs (captured, not re-derived): all
+    three parts for a recommendation, prep alone for an early refusal."""
     seen: list[dict] = []
-    real = autoconfig_core.plan_sizes
 
-    def capture(req, model=""):
-        seen.append(json.loads(json.dumps(req)))
-        return real(req, model)
+    def capture(**kw):
+        seen.append(json.loads(json.dumps({"prep": kw["prep_in"], "size": kw["size_req"], "values": kw["values_in"]})))
+
+    def capture_refusal(**kw):
+        seen.append(json.loads(json.dumps({"prep": kw["prep_in"]})))
     r = random.Random(seed)
-    autoconfig_core.plan_sizes, orig = capture, autoconfig_core.plan_sizes
+    orig = autoconfig_core.confirm, autoconfig_core.confirm_refusal
+    autoconfig_core.confirm, autoconfig_core.confirm_refusal = capture, capture_refusal
     try:
         while len(seen) < n:
             try:
@@ -129,8 +202,13 @@ def _requests(n: int, seed: int) -> list[dict]:
             except Exception:  # noqa: BLE001 - raising inputs simply produce no request
                 pass
     finally:
-        autoconfig_core.plan_sizes = orig
+        autoconfig_core.confirm, autoconfig_core.confirm_refusal = orig
     return seen
+
+
+def _requests(n: int, seed: int) -> list[dict]:
+    """The size requests analyze() builds for random inputs."""
+    return [p["size"] for p in _parts(10 * n, seed) if "size" in p][:n]
 
 
 @needs_bin
@@ -142,6 +220,19 @@ def test_binary_agrees_on_a_seeded_random_corpus():
         if canonical(_rust(text)) != canonical(_python(text)):
             disagree.append(i)
     assert disagree == [], f"{len(disagree)} of {len(reqs)} disagree, first {disagree[:5]}"
+
+
+@needs_bin
+def test_binary_check_agrees_on_a_seeded_random_corpus():
+    """Input prep, size plan and values for what analyze() really sends, part by part."""
+    parts = _parts(800, seed=1137)
+    assert sum("values" in p for p in parts) > 300 and sum("values" not in p for p in parts) > 20
+    disagree = []
+    for i, p in enumerate(parts):
+        text = json.dumps(p)
+        if canonical(_rust_check(text)) != canonical(_python_check(text)):
+            disagree.append(i)
+    assert disagree == [], f"{len(disagree)} of {len(parts)} disagree, first {disagree[:5]}"
 
 
 @needs_bin

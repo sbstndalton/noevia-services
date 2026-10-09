@@ -20,19 +20,14 @@ from .autoconfig_core import (  # noqa: F401 - the sizing core, re-exported unde
     _layer_costs, _moe_ratio, _pareto_frontier, _pattern_sample, _period_of,
     _presets_from_dense_frontier, _presets_from_frontier, _split_feasible, cap_context,
     cap_reason_text, kv_cache_bytes, kv_shape, kv_shape_bytes,
+    # input prep (slice 2), re-exported under their old names
+    _MMPROJ_COMPUTE_GB, _MMPROJ_VRAM_MULT, MAX_BLOCK_COUNT, _card_gb, _kv_first_int,
 )
 from .config import settings
 
 
 _PRESET_KEYS = ("fast", "balanced", "long-ctx")
 
-
-def _card_gb(c: Any) -> float:
-    """One card's VRAM as the fit maths uses it (`c - reserve`): a number, else TypeError as
-    that subtraction raised before the size core existed."""
-    if isinstance(c, (int, float)):
-        return float(c)
-    raise TypeError(f"card_vram_gb entry {type(c).__name__!r} is not a number")
 
 # Every key autoconfig has an opinion about. For each one it either SETS a value or wants the
 # key GONE — nothing here may survive a Fill untouched. The list is what makes "Fill form" honest:
@@ -72,46 +67,6 @@ def _domain_gaps(values: dict[str, str]) -> list[str]:
     is trying to read. Surfaced as a quirk so it gets noticed and fixed.
     """
     return sorted(set(values) - AUTOCONFIG_DOMAIN - _NEVER_CLEAR)
-
-
-_MMPROJ_VRAM_MULT = 1.0  # projector weights land in VRAM at ~their file size.
-                         # Verified on Qwen3-VL-4B: mmproj-F32.gguf is 1.55 GB on disk and
-                         # llama-server allocates 1584.43 MiB for it. (An earlier 2.0 here was
-                         # a mis-calibration: that same 1584 MiB was compared against the 0.78 GB
-                         # BF16 projector in the directory rather than the F32 one actually
-                         # referenced by the preset.)
-_MMPROJ_COMPUTE_GB = 0.5  # modality-encoder scratch beyond the projector weights.
-                          # This is deliberately small. An earlier 1.8 here was calibrated off a
-                          # FAILED allocation line in a log (an attempt at a much larger ctx, on a
-                          # different model) and then multiplied by gpu_count — which reserved
-                          # 5.34 GB for a 0.87 GB projector and made a working model report
-                          # "doesn't fit at any context". Ground truth from a loaded
-                          # Qwen3.8-27B-OBLITERATED at ctx=130768: 22.63 GiB used total, of which
-                          # model+KV+projector accounts for ~20.96 GiB — so ALL remaining overhead,
-                          # both cards' CUDA contexts included, is ~1.67 GiB. _RESERVE_PER_GPU
-                          # already covers most of that.
-
-
-
-def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
-    """kv_heads may be an int, or a per-layer array dict from GGUF; extract a representative int."""
-    if isinstance(kv_heads, int):
-        return kv_heads
-    if isinstance(kv_heads, dict) and kv_heads.get("_array"):
-        sample = kv_heads.get("sample") or []
-        # pick the most common value in the sample; for gemma it's usually 8 with a few 1s
-        if sample:
-            counts: dict[int, int] = {}
-            for v in sample:
-                if v is None:  # a non-finite float in the GGUF, nulled by summarize (#901)
-                    continue
-                counts[int(v)] = counts.get(int(v), 0) + 1
-            if counts:
-                return max(counts, key=lambda k: counts[k])
-    if isinstance(kv_heads, list) and kv_heads and kv_heads[0] is not None:
-        return int(kv_heads[0])
-    return default
-
 
 
 # ---- baseline parsing (compose command → ini keys) ----
@@ -568,12 +523,55 @@ def quality_warnings(*, model_rel: str, params: float | int | None, recommended_
 
 
 
-# Deepest public LLMs have ~60-130 transformer blocks (Llama 3.1 405B: 126). Fit search loops
-# over layers x context candidates, and the block count can come from an untrusted remote GGUF
-# header, so an absurd value (0xFFFFFFFF) would spin for minutes on the event loop. 4096 is
-# ~30x the deepest real model: no legitimate file is refused, and the worst accepted input
-# costs a few hundred thousand iterations.
-MAX_BLOCK_COUNT = 4096
+def _prep_refusal(prep: dict[str, Any]) -> Recommendation:
+    """The Recommendation for one of autoconfig_core.prepare()'s early refusals."""
+    kind = prep["refuse"]
+    if kind == "block_count":
+        error = (f"This model's metadata declares an implausible block_count ({prep['layers']}; "
+                 f"real models have well under {MAX_BLOCK_COUNT}). The file is corrupt or "
+                 "hostile, so no context size is recommended.")
+    elif kind == "no_backends":
+        # Callers drop backends whose VRAM probes as 0 (CPU-only containers, or a GPU probe that
+        # failed), so an empty list is ambiguous with "model too big" downstream - the panel would
+        # otherwise tell the user to try a smaller quant when the real problem is that no GPU
+        # backend was discovered.
+        error = ("No GPU backend available to size against. Either no llama.cpp container was "
+                 "discovered, or its VRAM probe returned 0 (CPU-only build, or nvidia-smi / "
+                 "rocm-smi not usable inside the container). Check the Containers page: a backend "
+                 "must appear there with a non-zero VRAM total before Autoconfig can plan. "
+                 "This is not a statement about whether the model would fit.")
+    elif kind == "ram":
+        # CPU-resident layers live in system memory, so there is nowhere left to put them.
+        # Offering a context estimate at 2% speed is worse than saying nothing, because it reads
+        # as "slow but possible" when the honest answer is "not on this machine".
+        _vram, _ram = prep["vram_gb"], prep["ram_gb"]
+        error = (f"This model needs about {prep['model_gb']:.0f} GB, more than this machine's "
+                 f"{_vram:.0f} GB VRAM plus {_ram:.0f} GB RAM ({_vram + _ram:.0f} GB total). "
+                 "CPU offload moves layers into system memory, so there is no offload setting "
+                 "that makes it fit. A smaller quantisation of the same model is the option.")
+    elif kind == "unsized_vram":
+        # Sizing against zero produces a negative budget, so every context fails and the panel
+        # says "doesn't fit at any context" - a verdict on the model when it is really a missing
+        # probe. Vulkan images are the common case: they carry neither nvidia-smi nor rocm-smi.
+        _names = ", ".join(prep["names"])
+        error = (f"Backend(s) found ({_names}) but none report their VRAM, so there is nothing "
+                 "to size against. This is usually a Vulkan build: the image ships no vendor "
+                 "SMI tool, so VRAM cannot be probed. Declare it instead — set "
+                 "GPU_VRAM=<container>:<GB> on the model-loader service (e.g. "
+                 "GPU_VRAM=llama-vulkan:16) and restart it. Nothing here says the model "
+                 "does not fit; the size of the card is simply unknown.")
+    else:
+        # kv_cache_bytes() is 0 when block_count / attention_head_count_kv / head_dim are missing
+        # or zero (architectures whose keys we don't parse yet). Zero KV silently means "the cache
+        # is free", so every candidate fits and the picker returns the largest context in the
+        # table - a confident recommendation that OOMs the instant it loads.
+        missing = prep["missing"]
+        error = ("Cannot size the KV cache from this model's metadata"
+                 + (" — missing/zero: " + ", ".join(missing) if missing else "")
+                 + ". Autoconfig will not guess a context size, because an unsized KV cache "
+                   "would look free and produce a recommendation that OOMs on load. "
+                   "Set ctx-size manually in the form and verify it loads.")
+    return Recommendation(plans=[], recommended_backend="", recommended_ctx=0, error=error)
 
 
 def analyze(*,
@@ -594,127 +592,28 @@ def analyze(*,
             prompt_budget_s: float = 120.0,
             verified_ctx: int = 0,
             mode: str = "") -> Recommendation:
-    # Clamp n_sessions to a sensible range for a homelab. Above 8 the per-slot ctx
-    # shrinks below usability for real chat, and llama-server continuous batching
-    # overhead starts dominating.
+    # Clamp n_sessions to a sensible range for a homelab (prepare() clamps again, idempotently).
     n_sessions = max(1, min(int(n_sessions or 1), 8))
+    # Input prep and the early refusals (autoconfig_core.prepare): the GGUF summary's fields read
+    # with the conversions they always had, the backends filtered, and a refusal when there is
+    # nothing honest to recommend. MODEL_AUTOCONFIG=rust confirms it with the Rust port below.
+    _prep_in: dict[str, Any] = {"n_sessions": n_sessions, "arch": summary.get("arch"),
+                                "model": summary.get("model"), "file_size": file_size,
+                                "backends": backends}
+    _prep = autoconfig_core.prepare(_prep_in)
+    if _prep["refuse"] is not None:
+        refusal = _prep_refusal(_prep)
+        autoconfig_core.confirm_refusal(
+            prep_in=dict(_prep_in, projector={"has_mmproj": False, "mmproj_gb": 0.0, "mtp_gb": 0.0}),
+            prep=_prep, model=model_rel or section_name)
+        return refusal
     arch = (summary.get("arch") or "").lower()
     m = summary.get("model") or {}
-    layers = int(m.get("block_count") or 0)
-    if layers > MAX_BLOCK_COUNT or layers < 0:
-        return Recommendation(
-            plans=[], recommended_backend="", recommended_ctx=0,
-            error=(f"This model's metadata declares an implausible block_count ({layers}; "
-                   f"real models have well under {MAX_BLOCK_COUNT}). The file is corrupt or "
-                   "hostile, so no context size is recommended."),
-        )
-    heads = int(m.get("attention_head_count") or 1)
-    embed = int(m.get("embedding_length") or 0)
-    head_dim = embed // heads if heads > 0 else 0
-    kv_heads = _kv_first_int(m.get("attention_head_count_kv"), default=heads)
-    native_ctx = int(m.get("context_length") or 0)
+    layers = _prep["layers"]
+    native_ctx = _prep["native_ctx"]
     experts = m.get("expert_count")
-    # explicit K/V lengths + hybrid markers (Qwen 3.5, Zamba, etc.)
-    key_length = int(m.get("key_length")) if isinstance(m.get("key_length"), int) else None
-    value_length = int(m.get("value_length")) if isinstance(m.get("value_length"), int) else None
-    full_attention_interval = int(m.get("full_attention_interval")) if isinstance(m.get("full_attention_interval"), int) else None
-    ssm_state_size = int(m.get("ssm_state_size")) if isinstance(m.get("ssm_state_size"), int) else None
-    # Sliding-window attention parameters travel together and are threaded through every
-    # kv_cache_bytes call as one bundle. Absent for models that declare none, in which case
-    # kv_cache_bytes falls back to its previous behaviour.
-    _swa = {
-        "sliding_window": m.get("sliding_window") if isinstance(m.get("sliding_window"), int) else None,
-        "sliding_window_pattern": m.get("sliding_window_pattern"),
-        "key_length_swa": m.get("key_length_swa") if isinstance(m.get("key_length_swa"), int) else None,
-        "value_length_swa": m.get("value_length_swa") if isinstance(m.get("value_length_swa"), int) else None,
-        "shared_kv_layers": m.get("shared_kv_layers") if isinstance(m.get("shared_kv_layers"), int) else None,
-        # Raw, not collapsed: which layers are global decides which head count applies.
-        "kv_heads_pattern": m.get("attention_head_count_kv"),
-    }
-
-    # Model VRAM depends on whether we'll be layer-splitting across multiple GPUs.
-    # We check per-backend below; use single-GPU overhead as the base and apply the split
-    # multiplier inside the per-backend loop when that backend hosts >1 GPU.
-    model_gb_raw = file_size / (1024 ** 3)
-    moe_ratio = _moe_ratio(experts)
-
-    # Plan around q8_0 KV cache: near-identical quality to f16 in practice,
-    # and lets us fit ~2× the context. Users can override in the form if they want f16.
-    bytes_per = _cache_dtype_bytes(_CACHE_DEFAULT)
-
-    # HARD STOP if we have nothing to fit against. Callers drop backends whose VRAM probes
-    # as 0 (CPU-only containers, or a GPU probe that failed), so an empty list here is
-    # ambiguous with "model too big" downstream — the panel would otherwise tell the user
-    # to try a smaller quant when the real problem is that no GPU backend was discovered.
-    if not backends:
-        return Recommendation(
-            plans=[], recommended_backend="", recommended_ctx=0,
-            error="No GPU backend available to size against. Either no llama.cpp container was "
-                  "discovered, or its VRAM probe returned 0 (CPU-only build, or nvidia-smi / "
-                  "rocm-smi not usable inside the container). Check the Containers page: a backend "
-                  "must appear there with a non-zero VRAM total before Autoconfig can plan. "
-                  "This is not a statement about whether the model would fit.",
-        )
-
-    # A backend that is discovered but reports 0 GB is a DIFFERENT failure from one that is
-    # genuinely too small, and it must not be reported as the latter. Sizing against zero
-    # produces a negative budget, so every context fails and the panel says "doesn't fit at
-    # any context" — which reads as a verdict on the model when it is really a missing probe.
-    # Vulkan images are the common case: they carry neither nvidia-smi nor rocm-smi, so there
-    # is nothing to read and GPU_VRAM has to supply the number.
-    # A model larger than VRAM + system RAM cannot run at ANY offload setting: CPU-resident
-    # layers live in system memory, so there is nowhere left to put them. Offering it a
-    # context estimate at 2% speed is worse than saying nothing, because it reads as "slow
-    # but possible" when the honest answer is "not on this machine".
-    _ram = max((float(b.get("host_ram_gb") or 0) for b in backends), default=0.0)
-    _vram = max((float(b.get("vram_gb") or 0) for b in backends), default=0.0)
-    if _ram > 0 and model_gb_raw > (_vram + _ram):
-        return Recommendation(
-            plans=[], recommended_backend="", recommended_ctx=0,
-            error=f"This model needs about {model_gb_raw:.0f} GB, more than this machine's "
-                  f"{_vram:.0f} GB VRAM plus {_ram:.0f} GB RAM ({_vram + _ram:.0f} GB total). "
-                  "CPU offload moves layers into system memory, so there is no offload setting "
-                  "that makes it fit. A smaller quantisation of the same model is the option.",
-        )
-
-    _sized = [b for b in backends if float(b.get("vram_gb") or 0) > 0]
-    if not _sized:
-        _names = ", ".join(str(b.get("name") or "?") for b in backends)
-        return Recommendation(
-            plans=[], recommended_backend="", recommended_ctx=0,
-            error=f"Backend(s) found ({_names}) but none report their VRAM, so there is nothing "
-                  "to size against. This is usually a Vulkan build: the image ships no vendor "
-                  "SMI tool, so VRAM cannot be probed. Declare it instead — set "
-                  "GPU_VRAM=<container>:<GB> on the model-loader service (e.g. "
-                  "GPU_VRAM=llama-vulkan:16) and restart it. Nothing here says the model "
-                  "does not fit; the size of the card is simply unknown.",
-        )
-    backends = _sized
-
-    # HARD STOP if the KV cache cannot be sized from this GGUF's metadata.
-    #
-    # kv_cache_bytes() returns 0 when block_count / attention_head_count_kv / head_dim are
-    # missing or zero — which happens on architectures whose keys we don't parse yet. Zero
-    # KV silently means "the cache is free", so every candidate fits and the picker happily
-    # returns the largest context in the table. That is the worst possible failure: a
-    # confident recommendation of e.g. 1048576 for a model that will OOM the instant it
-    # loads. Refuse to guess instead — an honest error beats a plausible wrong number.
-    if kv_cache_bytes(arch, 4096, layers, kv_heads, head_dim, bytes_per,
-                      key_length=key_length, value_length=value_length,
-                      full_attention_interval=full_attention_interval,
-                      ssm_state_size=ssm_state_size, **_swa) <= 0:
-        missing = [k for k, v in (("block_count", layers),
-                                  ("attention_head_count_kv", kv_heads),
-                                  ("head_dim (embedding_length / attention_head_count)", head_dim))
-                   if not v]
-        return Recommendation(
-            plans=[], recommended_backend="", recommended_ctx=0,
-            error=("Cannot size the KV cache from this model's metadata"
-                   + (" — missing/zero: " + ", ".join(missing) if missing else "")
-                   + ". Autoconfig will not guess a context size, because an unsized KV cache "
-                     "would look free and produce a recommendation that OOMs on load. "
-                     "Set ctx-size manually in the form and verify it loads."),
-        )
+    model_gb_raw = _prep["model_gb_raw"]
+    backends = [backends[i] for i in _prep["sized"]]
 
     # NOTE: Autoconfig DOES wire speculative decoding now, but only from a head that shipped
     # beside these weights - see SpecProfile. The rule this replaced came from pairing an
@@ -775,21 +674,10 @@ def analyze(*,
     # Built-in MTP layers count as a head for profile purposes; there is no file to place.
     builtin_mtp = int(m.get("nextn_predict_layers") or 0) > 0
     has_mmproj = bool(mmproj_rel)
-    # VRAM pinned to the MAIN GPU for multimodal: projector weights + encoder compute buffer.
-    mmproj_vram_gb = (mmproj_gb * _MMPROJ_VRAM_MULT + _MMPROJ_COMPUTE_GB) if has_mmproj else 0.0
-    # The draft head rides along in the same non-layer-split reservation. Its own KV is small
-    # (a handful of layers over the drafted window) and folded into this rather than modelled.
-    mmproj_vram_gb += mtp_gb * 1.15
-    # Raising ubatch for the vision encoder (see image-max-tokens below) grows the compute
-    # buffer, which is not layer-split and lands on the main GPU with everything else here.
-    # Calibrated from a measured point: a 27B (64 layers, 5120 hidden) at ub=2048 allocated
-    # ~4.7 GB, i.e. ~7 bytes per (ub x layer x hidden). Scaled against the default ub of 512,
-    # only the INCREASE is charged.
-    if has_mmproj and layers > 0:
-        _hidden = int(m.get("embedding_length") or 0)
-        if _hidden > 0:
-            _extra_ub = max(0, 1024 - 512)
-            mmproj_vram_gb += 7.0 * _extra_ub * layers * _hidden / 1e9
+    # VRAM pinned to the MAIN GPU: projector weights + encoder scratch, the draft head, and the
+    # vision ubatch's larger compute buffer (autoconfig_core.main_gpu_reserve_gb).
+    mmproj_vram_gb = autoconfig_core.main_gpu_reserve_gb(has_mmproj, mmproj_gb, mtp_gb, layers,
+                                                         _prep["hidden"])
 
     # Symmetric q8_0 K/V, always.
     #
@@ -807,32 +695,22 @@ def analyze(*,
     # kernel is not something we can determine from GGUF metadata, so do not guess:
     # trading a predictable slice of context for an unpredictable 15x cliff is not worth
     # it. Users who want asymmetric KV can set `cache-type-v` by hand and benchmark a
-    # LONG prompt — short ones will not reveal the fallback.
-    v_cache_type = _CACHE_DEFAULT
+    # LONG prompt — short ones will not reveal the fallback. (autoconfig_core writes both.)
 
     # The size core (autoconfig_core.size_plan): the per-backend fit sweep, the recommended
     # backend and context, the usable-context cap, the offload presets and the prompt cache.
     # Everything it needs that touches files or the GGUF's raw per-layer arrays is resolved
-    # here first; MODEL_AUTOCONFIG chooses who computes it, and Python stays authoritative.
+    # above first.
     _req = {
-        "shape": kv_shape(arch, layers, kv_heads, head_dim,
-                          key_length=key_length, value_length=value_length,
-                          full_attention_interval=full_attention_interval,
-                          ssm_state_size=ssm_state_size, **_swa),
+        "shape": _prep["shape"],
         "layers": layers,
         "native_ctx": native_ctx,
         "model_gb_raw": model_gb_raw,
-        "moe_ratio": moe_ratio,
-        "is_moe": isinstance(experts, int) and experts > 1,
+        "moe_ratio": _prep["moe_ratio"],
+        "is_moe": _prep["is_moe"],
         "mmproj_vram_gb": mmproj_vram_gb,
         "n_sessions": n_sessions,
-        "backends": [{
-            "vram_gb": float(b["vram_gb"]),
-            "gpu_count": max(1, int(b.get("gpu_count", 1))),
-            "cards": [_card_gb(c) for c in (b.get("card_vram_gb") or [])],
-            "host_ram_gb": float(b.get("host_ram_gb") or 0.0),
-            "same_as": next(j for j, o in enumerate(backends) if o["name"] == b["name"]),
-        } for b in backends],
+        "backends": autoconfig_core.size_backends(backends),
         # Anything that is not a preset key matches none, exactly as "" does: the dense branch
         # then takes presets[0] (always "fast") and the MoE branch the middle one either way.
         "preset": preset if preset in _PRESET_KEYS else "",
@@ -841,23 +719,13 @@ def analyze(*,
         "verified_ctx": verified_ctx,
         "cache_ram_cap_mib": settings.cache_ram_limits[0],
     }
-    try:
-        _plan = autoconfig_core.plan_sizes(_req, model_rel or section_name)
-    except autoconfig_core.AutoconfigCoreError as e:
-        return Recommendation(
-            plans=[], recommended_backend="", recommended_ctx=0,
-            error=(f"The Rust size check (MODEL_AUTOCONFIG=rust) could not confirm this "
-                   f"recommendation ({e}), so none is offered rather than one that might be "
-                   "larger than this machine can hold. Set MODEL_AUTOCONFIG=python to use the "
-                   "Python sizing alone, and report the model so the two can be reconciled."),
-        )
+    _plan = autoconfig_core.size_plan(_req)
     plans = [BackendPlan(name=b["name"], vendor=b.get("vendor", ""), vram_gb=float(b["vram_gb"]),
                          rows=[FitRow(**r) for r in p["rows"]], max_ctx=p["max_ctx"],
                          fits_at_all=(p["max_ctx"] > 0))
              for b, p in zip(backends, _plan["plans"])]
     recommended: BackendPlan | None = (plans[_plan["recommended"]]
                                        if _plan["recommended"] is not None else None)
-    rec_ctx = _plan["initial_ctx"]
     estimated_ctx = _plan["estimated_ctx"]
     ctx_cap_reason = cap_reason_text(_plan["cap"], prompt_tps=prompt_tps,
                                      prompt_budget_s=prompt_budget_s, verified_ctx=verified_ctx)
@@ -868,61 +736,6 @@ def analyze(*,
     # expert offload, the branch that happened to bind it was skipped and the one that read it
     # was not, raising UnboundLocalError on a model that had rendered fine the day before.
     rec_backend = next((b for b in backends if b["name"] == recommended.name), None) if recommended else None
-
-    # build values
-    values: dict[str, str] = {}
-    if model_rel:
-        values["model"] = model_rel
-    if rec_ctx > 0:
-        # ctx-size llama-server allocates = per-session ctx × n_sessions.
-        values["ctx-size"] = str(rec_ctx * n_sessions)
-    # ALWAYS emit parallel, even for a single session. llama-server's own default is
-    # n_slots = 4, not 1 — leaving this unset silently quarters each slot's context
-    # (ctx-size is the shared total, divided across slots).
-    values["parallel"] = str(n_sessions)
-    if n_sessions > 1:
-        # Continuous batching is on by default in recent llama-server, but be explicit
-        # so anyone reading the ini can tell we planned for multi-slot serving.
-        values["cont-batching"] = "on"
-        # When a slot hits its per-session ctx cap, slide oldest tokens out instead
-        # of erroring. keep=256 pins roughly one system-prompt's worth of tokens
-        # at the start so instructions survive the shift; user tunes this to their
-        # actual system-prompt length in the form.
-        values["context-shift"] = "on"
-        values["keep"] = "256"
-        # batch-size is a scheduling knob — 4096 costs negligible VRAM and helps
-        # continuous-batching pack incoming prompts. Safe on any hardware that fit
-        # the model in the first place.
-        values["batch-size"] = "4096"
-        # Deliberately NOT bumping ubatch-size. On layer-split multi-GPU running a
-        # dense large model, the compute buffer scales as roughly 8 × ub × layers ×
-        # hidden bytes. Empirically: 27B (64L, 5120H) at ub=2048 allocates ~4.7 GB
-        # of compute buffers across cards. Bumping ub is the actual TTFT lever, but
-        # it needs 2+ GB of VRAM headroom which most tight fits don't have. See the
-        # quirk below for manual tuning.
-    values["ngl"] = "999"
-    values["flash-attn"] = "on"
-    values["cache-type-k"] = _CACHE_DEFAULT
-    # V may have been dropped to q4_0 by the fit search to buy context (see pass 2 above).
-    values["cache-type-v"] = v_cache_type
-    # Prefix cache reuse — llama-server reuses KV from a previous request when
-    # the new prompt shares a prefix. Huge TTFT win for chat continuations and
-    # OpenWebUI-style clients that resend the whole history each turn. Costs
-    # nothing, no downside, always safe. Off by default in llama-server, which
-    # is a footgun for chat use.
-    values["cache-reuse"] = "1"
-    if summary.get("chat_template"):
-        values["jinja"] = "true"
-
-    # Multimodal: look for an adjacent mmproj file the user hasn't already set
-    if section_name and vision:
-        current_mmproj = (current_section or {}).get("mmproj", "").strip()
-        if current_mmproj:
-            # Respect user's existing choice — echo it so Fill preserves it
-            values["mmproj"] = current_mmproj
-        else:
-            if mmproj_rel:  # already resolved above, when sizing the VRAM reservation
-                values["mmproj"] = mmproj_rel
 
     # Speculative decoding, driven by the selected workload profile (see SpecProfile).
     #
@@ -958,6 +771,8 @@ def analyze(*,
         _prof = SPEC_PROFILE_BY_KEY["off"]
         _spec_key = "off"
 
+    # The speculative keys, in the order analyze() always wrote them; assemble_values places them.
+    spec_values: dict[str, str] = {}
     if section_name:
         if _spec_key == "custom":
             # Hand-tuned. Echo every spec key verbatim: Fill writes exactly `values`, so a
@@ -965,27 +780,27 @@ def analyze(*,
             for _k in ("spec-type", "spec-draft-model", "spec-draft-ngl", *SPEC_PROFILE_KEYS):
                 _v = (current_section or {}).get(_k, "").strip()
                 if _v:
-                    values[_k] = _v
+                    spec_values[_k] = _v
         elif _prof is not None:
             # Every owned key is written even when empty, so switching profiles CLEARS what
             # the previous one set. Without this, Coding -> Writing would leave n-min = 1
             # behind and the result would match neither profile.
-            values["spec-type"] = _prof.spec_type
+            spec_values["spec-type"] = _prof.spec_type
             for _k in SPEC_PROFILE_KEYS:
-                values[_k] = _prof.knobs.get(_k, "")
+                spec_values[_k] = _prof.knobs.get(_k, "")
             if _prof.spec_type and _prof.needs_head and not _resolved_head:
                 # Built-in nextn layers: the engine drafts from the model itself.
-                values["spec-draft-model"] = ""
-                values["spec-draft-ngl"] = ""
+                spec_values["spec-draft-model"] = ""
+                spec_values["spec-draft-ngl"] = ""
             elif _prof.spec_type and _prof.needs_head:
-                values["spec-draft-model"] = _resolved_head
+                spec_values["spec-draft-model"] = _resolved_head
                 # Without this the head lands on the CPU, and a draft evaluated on the CPU is
                 # slower than the main model it is meant to be racing ahead of.
-                values["spec-draft-ngl"] = (current_section or {}).get("spec-draft-ngl", "").strip() or "999"
+                spec_values["spec-draft-ngl"] = (current_section or {}).get("spec-draft-ngl", "").strip() or "999"
             else:
                 # n-gram strategies have no model to place, and Off has nothing at all.
-                values["spec-draft-model"] = ""
-                values["spec-draft-ngl"] = ""
+                spec_values["spec-draft-model"] = ""
+                spec_values["spec-draft-ngl"] = ""
 
     rope_type = m.get("rope_scaling_type")
 
@@ -998,128 +813,44 @@ def analyze(*,
                                          for p in _plan["frontier"]] if recommended else []
     # True when the model fits entirely on the GPU at its native context: nothing to trade.
     _fits_full_gpu = _plan["fits_full_gpu"]
-    if _plan["sized"]:
-        rec_ctx = _plan["ctx"]
-        values["ctx-size"] = str(rec_ctx * n_sessions)
-        if _plan["ngl"] is not None:
-            # Dense layer offload chosen by the preset.
-            values["ngl"] = str(_plan["ngl"])
-        if _plan["fit"]:
-            # Expert offload: placement is handed to llama.cpp's own fitter rather than pinned
-            # here. Our estimate has to be exactly right or the model will not load, and on a
-            # model that massively overflows VRAM it is not (Qwen3.8-Flash-Next: we emitted
-            # tensor-split 40,8 where llama.cpp's fitter computes 20,29, and compute buffers
-            # reached 3.6 GiB on one card). `--fit` adjusts only arguments that are UNSET, so
-            # ngl / tensor-split / n-cpu-moe must stay unset for it to work. ctx-size stays
-            # pinned: --fit places around the context rather than silently shrinking it.
-            values["fit"] = "on"
-            values.pop("ngl", None)
-            values.pop("cpu-moe", None)
-            values.pop("n-cpu-moe", None)
-            values.pop("tensor-split", None)
-        if _plan["cache_ram"] is not None:
-            # --cache-ram: four conversations of KV at this context, within host RAM less the
-            # offloaded weights and 8 GB of headroom, never below llama.cpp's 8192 MiB default
-            # unless headroom forbids it, and never above the #697 cap.
-            values["cache-ram"] = str(_plan["cache_ram"])
+    rec_ctx = _plan["ctx"] if _plan["sized"] else _plan["initial_ctx"]
 
-    # Reasoning / thinking — infer from chat-template scanning
+    # The values (autoconfig_core.assemble_values; the reasoning for each setting is kept beside
+    # it there): context, slots, offload, cache, prompt cache, templating and reasoning flags,
+    # the projector and its batch/ubatch/image-token bounds, rope, split-mode.
+    _cs = current_section or {}
     features = summary.get("chat_template_features") or {}
-    tpl_kwargs: dict[str, Any] = {}
-    if features.get("accepts_enable_thinking"):
-        # Use the dedicated --reasoning flag; setting enable_thinking via
-        # chat-template-kwargs is deprecated in recent llama.cpp builds.
-        values["reasoning"] = "on"
-    if features.get("accepts_reasoning_effort"):
-        tpl_kwargs["reasoning_effort"] = "medium"
-    if tpl_kwargs:
-        import json as _json
-        values["chat-template-kwargs"] = _json.dumps(tpl_kwargs)
-    if features.get("uses_think_tags") or features.get("uses_channel_thought"):
-        # Ensures OpenAI-compatible clients (OpenWebUI) put thoughts in message.reasoning_content
-        # so they render as a collapsible instead of noise in the answer.
-        values["reasoning-format"] = "deepseek"
-    if features.get("accepts_preserve_thinking"):
-        # Carries reasoning across turns instead of discarding it each message. llama-server
-        # itself suggests this at load time for templates that support it ("chat template
-        # supports preserving reasoning, consider enabling it via --reasoning-preserve").
-        values["reasoning-preserve"] = "on"
-
-    # Multimodal extras — only meaningful when a projector is actually attached.
-    if has_mmproj:
-        # Keep the projector on GPU. It is small and CPU-side image encoding is slow.
-        values["mmproj-offload"] = "on"
-        # Bound how many tokens a single image may consume.
-        #
-        # Vision models with dynamic resolution size their decode buffer from the image,
-        # so a big photo allocates far more VRAM than a small one — and that allocation
-        # happens at INFERENCE time, long after the fit math approved the load. The model
-        # therefore loads fine, serves text fine, and then dies the moment an image
-        # arrives, inside mtmd_helper_decode_image_chunk.
-        #
-        # Measured on Qwen3.8-27B-OBLITERATED (ctx 262144, ngl 43, ~400 MB free on the main
-        # GPU): 1536x1536 decoded fine, 2048x2048 hard-OOM'd and killed the instance. With
-        # image-max-tokens=1024 both 2048x2048 and 3072x2048 decode correctly and peak VRAM
-        # stops moving with resolution — the cap converts an unbounded, input-dependent
-        # spike into a fixed cost the fit math can actually live with.
-        #
-        # 1024 is also the floor llama-server asks for on Qwen-VL ("require at minimum 1024
-        # image tokens to function correctly on grounding tasks"), so this pins images to
-        # that value rather than trading away accuracy. Raise it if you have spare VRAM and
-        # want finer detail on large images.
-        values["image-max-tokens"] = "1024"
-
-        # ubatch-size MUST be at least image-max-tokens, or the model aborts on the first
-        # image. The vision encoder runs non-causal attention, and llama.cpp asserts
-        #     causal_attn || n_ubatch >= n_tokens_all
-        # because a non-causal batch cannot be split — the whole image has to be in one
-        # micro-batch. Default ubatch is 512, so a 1024-token image trips
-        #     GGML_ASSERT(... "non-causal attention requires n_ubatch >= n_tokens") failed
-        # and llama-server dies rather than degrading. Text generation is unaffected, so the
-        # model loads, chats happily, and then dies the moment a picture arrives.
-        #
-        # These two settings were previously chosen independently: image-max-tokens was
-        # raised to 1024 to bound the decode buffer, and ubatch was deliberately left alone
-        # because it costs VRAM. Each was right on its own and the pair was fatal.
-        try:
-            _imt = int(values.get("image-max-tokens") or 0)
-        except ValueError:
-            _imt = 0
-        if _imt > 0:
-            try:
-                _cur_ub = int((current_section or {}).get("ubatch-size") or 0)
-            except ValueError:
-                _cur_ub = 0
-            values["ubatch-size"] = str(max(_imt, _cur_ub))
-            # batch-size must be >= ubatch-size, but only RAISE it. An absent batch-size is
-            # not a small one: llama-server defaults to 2048, comfortably above a 1024 ubatch.
-            # Writing _imt unconditionally dropped a multi-session model from 4096 to 1024.
-            try:
-                _cur_b = int(values.get("batch-size") or (current_section or {}).get("batch-size") or 0)
-            except ValueError:
-                _cur_b = 0
-            if _cur_b and _cur_b < _imt:
-                values["batch-size"] = str(_imt)
-            elif not _cur_b and _imt > 2048:      # above llama-server's own default
-                values["batch-size"] = str(_imt)
-
-    # RoPE handling. When the GGUF already declares rope scaling (or the architecture, like
-    # Gemma 3, gets per-layer scaling from llama.cpp itself) write NO rope keys: a global
-    # --rope-scale would override the per-layer values for every layer (#568). The one case
-    # where auto-config sets scaling is a chosen ctx beyond n_ctx_train on a model that
-    # declares none. Candidates are capped at native_ctx above, so this is a guard for
-    # callers that raise ctx, not a normal path.
+    _values_in: dict[str, Any] = {
+        "model_rel": model_rel, "n_sessions": n_sessions,
+        # Only its truthiness is read; templates run past the Rust reader's 4096-char strings.
+        "chat_template": bool(summary.get("chat_template")),
+        "features": summary.get("chat_template_features"),
+        "section": section_name, "vision": vision,
+        "current": {k: _cs[k] for k in ("mmproj", "ubatch-size", "batch-size") if k in _cs},
+        "mmproj_rel": mmproj_rel, "has_mmproj": has_mmproj,
+        "spec": [[k, v] for k, v in spec_values.items()],
+        "plan": {k: _plan[k] for k in ("initial_ctx", "sized", "ctx", "ngl", "fit", "cache_ram")},
+        "rope": m, "native_ctx": native_ctx,
+        "rec_gpu_count": (_req["backends"][_req["backends"][_plan["recommended"]]["same_as"]]["gpu_count"]
+                          if recommended else None),
+    }
+    values = autoconfig_core.assemble_values(_values_in)
     rope_owned = gguf_meta.rope_owned_by_gguf(m)
-    if not rope_owned and rec_ctx > native_ctx and native_ctx > 0:
-        values["rope-scaling"] = "linear"
-        values["rope-scale"] = f"{round(rec_ctx / native_ctx, 1)}"
-
-    # Multi-GPU: be explicit about the split strategy rather than relying on the
-    # container's CLI baseline to supply it.
-    if recommended:
-        _rb = next((b for b in backends if b["name"] == recommended.name), None)
-        if int((_rb or {}).get("gpu_count", 1)) > 1:
-            values["split-mode"] = "layer"
+    try:
+        autoconfig_core.confirm(
+            prep_in=dict(_prep_in, projector={"has_mmproj": has_mmproj, "mmproj_gb": mmproj_gb,
+                                              "mtp_gb": mtp_gb}),
+            prep=dict(_prep, mmproj_vram_gb=mmproj_vram_gb, backends=_req["backends"]),
+            size_req=_req, plan=_plan, values_in=_values_in, values=values,
+            model=model_rel or section_name)
+    except autoconfig_core.AutoconfigCoreError as e:
+        return Recommendation(
+            plans=[], recommended_backend="", recommended_ctx=0,
+            error=(f"The Rust autoconfig check (MODEL_AUTOCONFIG=rust) could not confirm this "
+                   f"recommendation ({e}), so none is offered rather than one that might be "
+                   "larger than this machine can hold. Set MODEL_AUTOCONFIG=python to use the "
+                   "Python autoconfig alone, and report the model so the two can be reconciled."),
+        )
 
     # baseline-redundant: any key that matches the recommended backend's baseline
     baseline_redundant: dict[str, str] = {}

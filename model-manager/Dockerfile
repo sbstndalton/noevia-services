@@ -6,12 +6,12 @@
 # pinned to release/versions.lock's NOEVIA_RS_REF and fetched as an anonymous tarball whose
 # sha256 is checked before anything is built. gguf-meta is used only when GGUF_PARSER=rust,
 # model-files only when MODEL_FILES_IMPL=rust (both default python; since #1021 also models.ini backups),
-# model-autoconfig only when MODEL_AUTOCONFIG=rust (default python; it only ever confirms the Python plan).
+# model-autoconfig only when MODEL_AUTOCONFIG=rust (default python; it only ever confirms the Python answer).
 # Built on bookworm (glibc 2.36); the runtime base below is Debian bookworm or newer, and glibc
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
-ARG NOEVIA_RS_REF=c2964151cdd882f8d705947922d33f437a4d4385
-ARG NOEVIA_RS_SHA256=e3e9f6969cf69c8911bffee6a3c17565699454dc553fe67f6025c0a5533c2fd2
+ARG NOEVIA_RS_REF=b7788837b7a3a13b0481520a446c5c90d9a88fe4
+ARG NOEVIA_RS_SHA256=0157324497079243434a4cff3a2f732f5ccae473192d9ccf78d86cd5d02d6591
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
