@@ -1050,6 +1050,11 @@ def analyze(*,
     # diff vs current section — only report on keys autoconfig actually opinions on.
     # Anything the user set that we don't touch (mmproj, chat-template-file, lora, override-*, etc.)
     # is left alone: not reported as a diff, and Fill/Fill minimal doesn't overwrite it.
+    #
+    # Order (#1152): first every key the recommendation sets whose value differs, in the order of
+    # `values`; then every key it supersedes, sorted by key (code point order, as `displaced`).
+    # The removals used to follow set iteration order, which changes with PYTHONHASHSEED, so the
+    # same request listed them differently from one process to the next.
     current_diff: list[str] = []
     # Everything autoconfig opinions on, minus what this recommendation actually set: that is
     # exactly the set it wants gone. Declared once in AUTOCONFIG_DOMAIN rather than remembered
@@ -1064,7 +1069,7 @@ def analyze(*,
                 else:
                     current_diff.append(f"{k}: unset → {v!r}")
         # Only report removals for keys we actively displace
-        for k in _displaces:
+        for k in sorted(_displaces):
             if k in cur and cur[k] and k not in values:
                 current_diff.append(f"{k}: {cur[k]!r} → unset (superseded)")
 
