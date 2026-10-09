@@ -657,3 +657,48 @@ def test_concurrent_models_ini_writers_serialise(client, monkeypatch):
     a.join(5); b.join(5)
     assert isinstance(results["replace"], dict) and results["delete"] == 409
     assert (ROOT / "models" / "models.ini").read_text().endswith("; first\n")
+
+
+def test_preset_estimates_say_why_they_are_empty_once_per_reason(monkeypatch, caplog):
+    """noevia#1159: every Discover file said "No context estimate" with nothing logged. The empty
+    answer is unchanged; the reason is now in the log, once, so a live repro can name the cause."""
+    import logging
+    from app import helpers, services
+    helpers._estimate_reasons_logged.clear()
+    summary = {"model": {"context_length": 32768}}
+    monkeypatch.setattr(services, "_fit_backends", lambda: {})
+    monkeypatch.setattr(services, "_cpu_backends", lambda: ["llama-cpu"])
+    with caplog.at_level(logging.WARNING, logger="app.helpers"):
+        assert helpers._preset_estimates(summary, 2 * 1024 ** 3) == []
+        assert helpers._preset_estimates(summary, 2 * 1024 ** 3) == []
+    lines = [r.getMessage() for r in caplog.records if "context estimate is empty" in r.getMessage()]
+    assert len(lines) == 1 and "no llama backend reports GPU VRAM" in lines[0] and "cpu_backends=1" in lines[0]
+    # No summary is not worth a line: that is a repo whose header could not be read, reported elsewhere.
+    caplog.clear(); helpers._estimate_reasons_logged.clear()
+    with caplog.at_level(logging.WARNING, logger="app.helpers"):
+        assert helpers._preset_estimates({}, 1) == []
+    assert not caplog.records
+    # An autoconfig that raises still returns [] and names the exception type, not its text.
+    monkeypatch.setattr(services, "_fit_backends", lambda: {"engine": 14.0})
+    from app import hw, autoconfig
+    monkeypatch.setattr(hw, "gpu_count_for", lambda n: 1)
+    monkeypatch.setattr(hw, "card_vram_gb_for", lambda n: [14.0])
+    monkeypatch.setattr(hw, "host_ram_gb", lambda: 29.0)
+    def boom(**kw): raise ValueError("secret detail")
+    monkeypatch.setattr(autoconfig, "analyze", boom)
+    with caplog.at_level(logging.WARNING, logger="app.helpers"):
+        assert helpers._preset_estimates(summary, 1) == []
+    assert any("autoconfig raised" in r.getMessage() and "ValueError" in r.getMessage() and "secret detail" not in r.getMessage() for r in caplog.records)
+
+
+def test_autoconfig_for_the_laya_section_explains_instead_of_saying_no_file(client):
+    """noevia#1163: the Laya routing model is its own service's file, so 'No model file found' read
+    as a fault. It is named for what it is; other sections are untouched."""
+    ini_path = ROOT / "models" / "models.ini"
+    ini_path.write_text(INI + "\n[laya_multilingual_f16]\nmodel = /models/laya_multilingual_f16/laya.gguf\n\n"
+                              "[routing]\nmodel = /models/laya-small/laya.gguf\n")
+    for name in ("laya_multilingual_f16", "routing"):
+        r = client.get(f"/api/v1/sections/{name}/autoconfig").json()
+        assert r["code"] == "laya_section" and "Laya" in r["error"] and "No model file" not in r["error"], name
+    assert client.get("/api/v1/sections/missing/autoconfig").json()["error"].startswith("No model file")
+    assert client.get("/api/v1/sections/tiny/autoconfig?vision=false").json()["arch"] == "llama"
