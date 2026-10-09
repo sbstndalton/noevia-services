@@ -294,6 +294,7 @@ def test_endless_stdout_with_a_stalled_reader_times_out_and_kills(tmp_path, monk
 
 
 def test_default_binary_is_the_installed_path_and_the_env_override_still_works(monkeypatch):
+    monkeypatch.delenv("MODEL_AUTOCONFIG_BIN", raising=False)
     assert config.Settings().model_autoconfig_bin == "/usr/local/bin/model-autoconfig"
     assert autoconfig_core.DEFAULT_BINARY == "/usr/local/bin/model-autoconfig"
     monkeypatch.setattr(config.settings, "model_autoconfig_bin", "")
