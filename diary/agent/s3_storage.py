@@ -26,6 +26,7 @@ from xml.etree import ElementTree
 
 import httpx
 
+from .storage_backoff import gate_for
 from .util import ensure_not_redirect, make_client
 
 log = logging.getLogger(__name__)
@@ -69,7 +70,8 @@ class S3CorpusBackend:
         self.secret_key = secret_key
         self.session_token = session_token
         self.timeout_s = timeout_s
-        self._client = make_client(base_url=self.base, timeout_s=timeout_s)
+        self.storage_gate = gate_for("s3", self.base, access_key, secret_key, session_token)
+        self._client = make_client(base_url=self.base, timeout_s=timeout_s, gate=self.storage_gate)
         self._conditions_checked = False
         self._condition_lock = threading.Lock()
 

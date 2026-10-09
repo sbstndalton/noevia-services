@@ -5,6 +5,8 @@ from contextlib import contextmanager
 import httpx
 from fastapi import HTTPException
 
+from .storage_backoff import StorageBackoff, StorageThrottled, StorageUpstreamError, as_response_error  # noqa: F401
+
 MAX_FILE = 512 * 1024
 MAX_TOTAL = 12 * 1024 * 1024
 MAX_FILES = 500
@@ -19,15 +21,18 @@ class StorageLoginRejected(Exception):
 
 @contextmanager
 def storage_login_guard():
-    """Turn a WebDAV 401/403 raised while READING storage into StorageLoginRejected, which the app
-    answers with a 4xx instead of an unhandled 500. Wrap reads only: a write that fails keeps
-    whatever handling it has today, and the journal is never touched here."""
+    """Turn a storage failure raised on a storage-only route into a typed error the app answers
+    cleanly (never an unhandled 500): 401/403 -> StorageLoginRejected (424), 429 or a back-off ->
+    StorageThrottled (503 + Retry-After), other HTTP/transport failures -> StorageUpstreamError
+    (502). Errors that are not the storage server's pass through untouched. The journal is never
+    touched here."""
     try:
         yield
-    except httpx.HTTPStatusError as exc:
-        if exc.response is not None and exc.response.status_code in (401, 403):
-            raise StorageLoginRejected() from exc
-        raise
+    except (httpx.HTTPError, StorageBackoff) as exc:
+        mapped = as_response_error(exc, StorageLoginRejected)
+        if mapped is None:
+            raise
+        raise mapped from exc
 
 
 def safe_path(path, directory=False):
