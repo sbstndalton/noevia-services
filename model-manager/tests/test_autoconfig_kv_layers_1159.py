@@ -204,3 +204,45 @@ def test_rust_mode_gives_the_same_hybrid_plan_and_refusal(monkeypatch, preset):
         monkeypatch.setattr(config.settings, "model_autoconfig_bin", _BIN)
         rs = dataclasses.asdict(autoconfig.analyze(**kw))
         assert rs == py
+
+
+def _llama_cpp_mamba2(state, inner, conv, groups):
+    """llama.cpp's per-sequence f32 state of one Mamba-2 layer: conv + SSM."""
+    return 4 * (state * inner + (conv - 1) * (inner + 2 * groups * state))
+
+
+@pytest.mark.parametrize("name,layers,embed,state,inner,conv,groups,attn_every,sessions", [
+    ("granite-4.0-h-small", 40, 4096, 128, 8192, 4, 1, 10, 2),   # ~4.10 MiB a layer
+    ("nemotron-h-large", 52, 8192, 256, 16384, 4, 8, 13, 1),      # ~16.2 MiB a layer
+])
+def test_mamba_state_is_at_least_llama_cpp(name, layers, embed, state, inner, conv, groups, attn_every, sessions):
+    heads = ([0] * (attn_every - 1) + [8]) * (layers // attn_every)
+    model = dict(BASE, block_count=layers, embedding_length=embed, attention_head_count=32, ssm_state_size=state,
+                 ssm_inner_size=inner, ssm_conv_kernel=conv, ssm_group_count=groups, attention_head_count_kv=heads)
+    p = autoconfig_core.prepare({"n_sessions": sessions, "arch": name, "model": model,
+                                 "file_size": 1_600_000_000, "backends": BACKENDS})
+    ssm_layers = layers - layers // attn_every
+    need = _llama_cpp_mamba2(state, inner, conv, groups)
+    assert p["shape"]["recurrent_bytes"] >= ssm_layers * need * sessions
+    assert p["shape"]["recurrent_bytes"] >= ssm_layers * autoconfig_core._SSM_STATE_BYTES * sessions
+
+
+def test_missing_ssm_keys_fall_back_above_llama_cpp():
+    # Without conv_kernel / group_count the defaults (4, 8) and +10% on the SSM term apply.
+    got = autoconfig_core._ssm_layer_bytes(256, 16384, None, None, 8192)
+    assert got >= _llama_cpp_mamba2(256, 16384, 4, 8)
+    # Not Mamba at all (LFM2 short-conv): the flat rate.
+    assert autoconfig_core._ssm_layer_bytes(None, None, None, None, 2048) == autoconfig_core._SSM_STATE_BYTES
+
+
+def test_interleaved_hybrid_only_ever_goes_up():
+    base = dict(BASE, block_count=32, embedding_length=4096, attention_head_count_kv=8, full_attention_interval=4,
+                ssm_state_size=128)
+    for extra in ({}, {"ssm_inner_size": 8192, "ssm_conv_kernel": 4, "ssm_group_count": 1}):
+        for sessions in (1, 3):
+            p = autoconfig_core.prepare({"n_sessions": sessions, "arch": "qwen35", "model": dict(base, **extra),
+                                         "file_size": 1_600_000_000, "backends": BACKENDS})
+            old = {k: v for k, v in p["shape"].items() if k != "recurrent_bytes"}
+            for ctx in (4096, 131072):
+                assert autoconfig_core.kv_shape_bytes(p["shape"], ctx, 1.0625) >= \
+                    autoconfig_core.kv_shape_bytes(old, ctx, 1.0625)

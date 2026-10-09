@@ -1094,6 +1094,33 @@ def _attention_layers(kv_raw: Any, layers: int) -> tuple | None:
     return ("partial", len(seq), count)
 
 
+def _ssm_layer_bytes(state: int | None, inner: int | None, conv: int | None, groups: int | None,
+                    embed: int) -> int:
+    """Recurrent state bytes one non-attention layer holds per sequence (#1159), never less than
+    llama.cpp allocates.
+
+    llama.cpp's Mamba-2 layer keeps an f32 conv state of (d_conv - 1) x (d_inner + 2 x n_group x
+    d_state) and an f32 SSM state of d_state x d_inner, per sequence. With all four keys
+    declared that is charged exactly; with some missing on an SSM model, the SSM term gets 10%
+    headroom and the conv term the common defaults (d_conv 4, n_group 8; d_state 128 and d_inner
+    2 x embedding_length when those are the missing ones). A model declaring neither state nor
+    inner size is not Mamba (LFM2's short-conv state is ~16 KB a layer) and pays the flat
+    _SSM_STATE_BYTES. Never below _SSM_STATE_BYTES, so no estimate drops."""
+    def ok(v: int | None) -> bool:
+        return v is not None and v > 0
+    if not ok(state) and not ok(inner):
+        return _SSM_STATE_BYTES
+    if ok(state) and ok(inner) and ok(conv) and ok(groups):
+        need = 4 * (state * inner + (conv - 1) * (inner + 2 * groups * state))
+    else:
+        st = state if ok(state) else 128
+        inn = inner if ok(inner) else 2 * embed
+        cv = conv if ok(conv) else 4
+        g = groups if ok(groups) else 8
+        need = (4 * st * inn * 11 + 9) // 10 + 4 * (cv - 1) * (inn + 2 * g * st)
+    return max(_SSM_STATE_BYTES, need)
+
+
 def _card_gb(c: Any) -> float:
     """One card's VRAM as the fit maths uses it (`c - reserve`): a number, else TypeError as
     that subtraction raised before the size core existed."""
@@ -1181,11 +1208,24 @@ def prepare(inp: dict[str, Any]) -> dict[str, Any]:
                      key_length=key_length, value_length=value_length,
                      full_attention_interval=full_attention_interval,
                      ssm_state_size=ssm_state_size, **_swa)
-    if shape is not None and shape_layers != layers:
+    if shape is not None and (shape_layers != layers or shape["hybrid_interval"] is not None):
         # The layers that hold no KV still hold a recurrent state (Mamba SSM, LFM2 short-conv)
-        # per sequence. Charged like the interleaved hybrid branch, _SSM_STATE_BYTES per layer -
-        # far above LFM2's ~16 KB conv state, an over-estimate on the safe side - per session.
-        shape["recurrent_bytes"] = (layers - shape_layers) * _SSM_STATE_BYTES * n_sessions
+        # per sequence: _ssm_layer_bytes each, per session.
+        def _opt(k: str) -> int | None:
+            v = m.get(k)
+            return int(v) if isinstance(v, int) else None
+        per = _ssm_layer_bytes(ssm_state_size, _opt("ssm_inner_size"), _opt("ssm_conv_kernel"),
+                               _opt("ssm_group_count"), embed)
+        if shape["hybrid_interval"] is None:
+            shape["recurrent_bytes"] = (layers - shape_layers) * per * n_sessions
+        else:
+            # The interleaved branch already charges _SSM_STATE_BYTES per SSM layer, once; only
+            # the excess is added, so no existing estimate goes down.
+            interval = shape["hybrid_interval"]
+            ssm_layers = layers - max(1, (layers + interval - 1) // interval)
+            extra = ssm_layers * (per * n_sessions - _SSM_STATE_BYTES)
+            if extra > 0:
+                shape["recurrent_bytes"] = extra
     if kv_shape_bytes(shape, 4096, bytes_per) <= 0:
         missing = [k for k, v in (("block_count", layers),
                                   ("attention_head_count_kv", shape_heads),

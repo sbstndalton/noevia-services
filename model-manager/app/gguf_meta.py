@@ -386,6 +386,10 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
             "sliding_window_pattern": a("attention.sliding_window_pattern"),
             "ssm_state_size": _scalar_int(a("ssm.state_size")),
             "ssm_inner_size": _scalar_int(a("ssm.inner_size")),
+            # Mamba conv window and B/C group count: with state and inner size they give the
+            # per-sequence recurrent state llama.cpp allocates for an SSM layer (#1159).
+            "ssm_conv_kernel": _scalar_int(a("ssm.conv_kernel")),
+            "ssm_group_count": _scalar_int(a("ssm.group_count")),
         },
         "tokenizer": {
             "model": raw.get("tokenizer.ggml.model"),

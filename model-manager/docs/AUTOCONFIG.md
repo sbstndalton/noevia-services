@@ -179,9 +179,15 @@ layers, Jamba's Mamba layers; llama.cpp makes them recurrent). Such hybrid model
 their attention layers only, at the largest declared head count (noevia#1159). The GGUF summary
 keeps only the first 8 entries of a longer array; when a 0 is among them, which later layers
 attend is unknown and autoconfig refuses (`kv_layers`) rather than guess. Discover shows that
-reason as the file's `estimatesReason`. The non-attention layers' recurrent state (Mamba SSM, LFM2
-short-conv) is charged at the hybrid rate, `_SSM_STATE_BYTES` per layer per session, which is an
-over-estimate for LFM2's small conv state. A shared-KV declaration on top of such an array refuses.
+reason as the file's `estimatesReason`. A shared-KV declaration on top of such an array refuses.
+
+Each non-attention layer is charged its recurrent state per session (`_ssm_layer_bytes`): llama.cpp's
+Mamba-2 f32 state, 4 x (d_state x d_inner + (d_conv - 1) x (d_inner + 2 x n_group x d_state)), from
+`ssm.state_size`, `ssm.inner_size`, `ssm.conv_kernel` and `ssm.group_count`. If some are missing, the
+SSM term gets +10% and the defaults d_conv 4, n_group 8 (d_state 128, d_inner 2 x embedding) apply.
+A model with neither state nor inner size (LFM2 short-conv, ~16 KB a layer) pays the flat
+`_SSM_STATE_BYTES`, which is also the floor. The interleaved hybrid branch (`full_attention_interval`)
+gets only the excess over its existing 4 MiB per SSM layer, so no existing estimate goes down.
 
 `cache_bytes` per element: `f16` 2 bytes, `q8_0` ~1.06 (block-quantised, includes scale overhead), `q4_0` ~0.56.
 
