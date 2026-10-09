@@ -117,9 +117,9 @@ def _requests(n: int, seed: int) -> list[dict]:
     seen: list[dict] = []
     real = autoconfig_core.plan_sizes
 
-    def capture(req):
+    def capture(req, model=""):
         seen.append(json.loads(json.dumps(req)))
-        return real(req)
+        return real(req, model)
     r = random.Random(seed)
     autoconfig_core.plan_sizes, orig = capture, autoconfig_core.plan_sizes
     try:

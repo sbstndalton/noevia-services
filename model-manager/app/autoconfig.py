@@ -842,7 +842,7 @@ def analyze(*,
         "cache_ram_cap_mib": settings.cache_ram_limits[0],
     }
     try:
-        _plan = autoconfig_core.plan_sizes(_req)
+        _plan = autoconfig_core.plan_sizes(_req, model_rel or section_name)
     except autoconfig_core.AutoconfigCoreError as e:
         return Recommendation(
             plans=[], recommended_backend="", recommended_ctx=0,

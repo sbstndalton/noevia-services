@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # Invalid values mean python, with one warning.
     model_autoconfig: str = "python"
     # The model-autoconfig binary: a name looked up on PATH, or an absolute path.
-    model_autoconfig_bin: str = "model-autoconfig"
+    model_autoconfig_bin: str = "/usr/local/bin/model-autoconfig"
 
     @property
     def cache_ram_limits(self) -> tuple[int, int]:

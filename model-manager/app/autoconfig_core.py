@@ -7,6 +7,7 @@ load time, so noevia-rs's fixture generator can import it without the service's 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -14,6 +15,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
@@ -999,6 +1001,8 @@ def size_plan(req: dict[str, Any]) -> dict[str, Any]:
 # iGPU memory is system RAM with no swap (#697), so a disagreement never buys a bigger setting.
 
 IMPLS = ("python", "rust")
+# Where the model-manager image installs the binary; MODEL_AUTOCONFIG_BIN overrides it (tests).
+DEFAULT_BINARY = "/usr/local/bin/model-autoconfig"
 CORE_TIMEOUT_S = 10.0
 CORE_STDIN_CAP = 4 * 1024 * 1024
 CORE_STDOUT_CAP = 16 * 1024 * 1024
@@ -1012,10 +1016,15 @@ class AutoconfigCoreError(RuntimeError):
     """MODEL_AUTOCONFIG=rust could not confirm the Python plan (fails closed)."""
 
 
+_LOGGED_MAX = 1024
+
+
 def _log_once(reason: str, message: str) -> None:
     with _LOGGED_LOCK:
         if reason in _LOGGED:
             return
+        if len(_LOGGED) >= _LOGGED_MAX:   # bounded: a long-lived service sees many request shapes
+            _LOGGED.clear()
         _LOGGED.add(reason)
     _log.warning(message)
 
@@ -1039,16 +1048,95 @@ def impl_choice() -> str:
 
 
 def _rust_binary() -> str | None:
-    configured = (_setting("model_autoconfig_bin", "MODEL_AUTOCONFIG_BIN", "model-autoconfig").strip()
-                  or "model-autoconfig")
+    configured = (_setting("model_autoconfig_bin", "MODEL_AUTOCONFIG_BIN", DEFAULT_BINARY).strip()
+                  or DEFAULT_BINARY)
     if os.sep in configured:
         return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
     return shutil.which(configured)
 
 
-def _fail(reason: str, detail: str) -> AutoconfigCoreError:
-    _log_once(f"rust:{reason}", f"model-autoconfig failed ({reason}: {detail}); refusing the recommendation")
+def _shape_key(req: dict[str, Any]) -> str:
+    """A short hash of the request: one log line per request shape, not per request."""
+    try:
+        return hashlib.sha256(canonical(req).encode()).hexdigest()[:12]
+    except (TypeError, ValueError):
+        return "unhashable"
+
+
+def _fail(reason: str, detail: str, *, shape: str = "", model: str = "") -> AutoconfigCoreError:
+    which = f" [model {model[:200]!r}, request {shape}]" if shape else ""
+    _log_once(f"rust:{reason}:{shape}" if shape else f"rust:{reason}",
+              f"model-autoconfig failed ({reason}: {detail}){which}; refusing the recommendation")
     return AutoconfigCoreError(f"model-autoconfig {reason}")
+
+
+def _run_bounded(proc: "subprocess.Popen[bytes]", payload: bytes) -> tuple[str, bytes, bytes]:
+    """Feed `payload`, read stdout up to CORE_STDOUT_CAP + 1 bytes and stderr's first 4 KiB, all
+    within CORE_TIMEOUT_S; the child is killed (and reaped) the moment the cap is passed or the
+    time is up, so a runaway binary can never fill memory or outlive the request.
+    Returns ("ok" | "too_large" | "timeout", stdout, stderr)."""
+    out, err = bytearray(), bytearray()
+    over = threading.Event()
+
+    def feed() -> None:
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass   # the child went away early; its exit status says why
+
+    def read_out() -> None:
+        fd = proc.stdout.fileno()
+        while len(out) <= CORE_STDOUT_CAP:
+            try:
+                chunk = os.read(fd, min(65536, CORE_STDOUT_CAP + 1 - len(out)))
+            except OSError:
+                return
+            if not chunk:
+                return
+            out.extend(chunk)
+        over.set()
+
+    def read_err() -> None:
+        fd = proc.stderr.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            if len(err) < 4096:
+                err.extend(chunk[:4096 - len(err)])
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (feed, read_out, read_err)]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + CORE_TIMEOUT_S
+    status = "ok"
+    try:
+        while True:
+            if over.is_set():
+                status = "too_large"
+                break
+            if not any(t.is_alive() for t in threads[1:]) and proc.poll() is not None:
+                break
+            if time.monotonic() >= deadline:
+                status = "timeout"
+                break
+            over.wait(0.01)
+    finally:
+        if status != "ok" or proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        for t in threads:
+            t.join(1.0)
+        for f in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
+    return status, bytes(out), bytes(err)
 
 
 def size_plan_rust(req: dict[str, Any]) -> dict[str, Any]:
@@ -1062,21 +1150,22 @@ def size_plan_rust(req: dict[str, Any]) -> dict[str, Any]:
     if len(payload) > CORE_STDIN_CAP:
         raise _fail("input_too_large", f"{len(payload)} bytes")
     try:
-        proc = subprocess.run([binary, "size"], input=payload, capture_output=True,
-                              timeout=CORE_TIMEOUT_S, check=False,
-                              # A minimal environment: the child needs nothing of ours.
-                              env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
-    except subprocess.TimeoutExpired:
-        raise _fail("timeout", f"no result within {CORE_TIMEOUT_S:g} s") from None
+        proc = subprocess.Popen([binary, "size"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                # A minimal environment: the child needs nothing of ours.
+                                env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
     except OSError as e:
         raise _fail("spawn", type(e).__name__) from None
-    if proc.returncode != 0:
-        detail = proc.stderr[:300].decode("utf-8", "replace").strip()
-        raise _fail("rejected", f"exit {proc.returncode}: {detail}")
-    if len(proc.stdout) > CORE_STDOUT_CAP:
+    status, stdout, stderr = _run_bounded(proc, payload)
+    if status == "timeout":
+        raise _fail("timeout", f"no result within {CORE_TIMEOUT_S:g} s") from None
+    if status == "too_large":
         raise _fail("output_too_large", f"more than {CORE_STDOUT_CAP} bytes")
+    if proc.returncode != 0:
+        detail = stderr[:300].decode("utf-8", "replace").strip()
+        raise _fail("rejected", f"exit {proc.returncode}: {detail}")
     try:
-        out = json.loads(proc.stdout)
+        out = json.loads(stdout)
     except ValueError:
         raise _fail("malformed_output", "not JSON") from None
     if not isinstance(out, dict):
@@ -1118,17 +1207,20 @@ def python_is_conservative(py: dict[str, Any], rs: dict[str, Any], n_sessions: i
     return all(pv <= rv for pv, rv in zip(p[2:], r[2:]))
 
 
-def plan_sizes(req: dict[str, Any]) -> dict[str, Any]:
-    """The size plan by the configured implementation; always Python's answer (see above)."""
+def plan_sizes(req: dict[str, Any], model: str = "") -> dict[str, Any]:
+    """The size plan by the configured implementation; always Python's answer (see above).
+    `model` only labels the log lines; it is never part of the request."""
     py = size_plan(req)
     if impl_choice() != "rust":
         return py
     rs = size_plan_rust(req)
     if canonical(rs) == canonical(py):
         return py
+    shape = _shape_key(req)
     if python_is_conservative(py, rs, req["n_sessions"]):
-        _log_once("mismatch:conservative",
-                  "model-autoconfig disagreed with the Python size core; using the Python plan, "
-                  "which is the more conservative one")
+        _log_once(f"mismatch:conservative:{shape}",
+                  f"model-autoconfig disagreed with the Python size core for model {model[:200]!r} "
+                  f"(request {shape}); using the Python plan, which is the more conservative one")
         return py
-    raise _fail("mismatch", "the Rust plan disagrees and the Python plan is not the smaller one")
+    raise _fail("mismatch", "the Rust plan disagrees and the Python plan is not the smaller one",
+                shape=shape, model=model)

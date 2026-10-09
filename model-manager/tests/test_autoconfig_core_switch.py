@@ -205,7 +205,7 @@ def test_never_larger_than_rust_property(monkeypatch):
     r = random.Random(1133)
     reqs = []
     real = autoconfig_core.plan_sizes
-    monkeypatch.setattr(autoconfig_core, "plan_sizes", lambda req: reqs.append(req) or real(req))
+    monkeypatch.setattr(autoconfig_core, "plan_sizes", lambda req, model="": reqs.append(req) or real(req, model))
     for experts in (None, 8, 64):
         for vram in (8.0, 24.0, 48.0):
             for preset in ("", "fast", "long-ctx"):
@@ -236,3 +236,88 @@ def test_never_larger_than_rust_property(monkeypatch):
         p, q = autoconfig_core._written(py, req["n_sessions"]), autoconfig_core._written(rs, req["n_sessions"])
         assert p[:2] == q[:2] and all(a <= b for a, b in zip(p[2:], q[2:]))
     assert used and refused
+
+
+# ---- bounded output, default binary path, per-shape mismatch logging (noevia#1138, #1139) ----
+
+def _pid_alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    # A zombie still answers signal 0; treat it as gone.
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+def test_endless_stdout_is_cut_at_the_cap_and_the_child_killed(tmp_path, monkeypatch, caplog):
+    import time
+    monkeypatch.setattr(autoconfig_core, "CORE_STDOUT_CAP", 256 * 1024)
+    monkeypatch.setattr(autoconfig_core, "CORE_TIMEOUT_S", 30.0)
+    pidfile = tmp_path / "pid"
+    body = (f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            "chunk = b' ' * 65536\n"
+            "while True:\n"
+            "    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()\n")
+    _use_rust(monkeypatch, _fake_bin(tmp_path, body))
+    t0 = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="app.autoconfig_core"):
+        rec = _analyze()
+    assert time.monotonic() - t0 < 10          # cut by the cap, not the 30 s timeout
+    assert rec.recommended_ctx == 0 and "output_too_large" in "".join(r.getMessage() for r in caplog.records)
+    pid = int(pidfile.read_text())
+    for _ in range(100):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.05)
+    assert not _pid_alive(pid)
+
+
+def test_endless_stdout_with_a_stalled_reader_times_out_and_kills(tmp_path, monkeypatch):
+    import time
+    monkeypatch.setattr(autoconfig_core, "CORE_TIMEOUT_S", 1.0)
+    pidfile = tmp_path / "pid"
+    body = f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n"
+    _use_rust(monkeypatch, _fake_bin(tmp_path, body))
+    t0 = time.monotonic()
+    rec = _analyze()
+    assert time.monotonic() - t0 < 8 and rec.recommended_ctx == 0
+    pid = int(pidfile.read_text())
+    for _ in range(100):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.05)
+    assert not _pid_alive(pid)
+
+
+def test_default_binary_is_the_installed_path_and_the_env_override_still_works(monkeypatch):
+    assert config.Settings().model_autoconfig_bin == "/usr/local/bin/model-autoconfig"
+    assert autoconfig_core.DEFAULT_BINARY == "/usr/local/bin/model-autoconfig"
+    monkeypatch.setattr(config.settings, "model_autoconfig_bin", "")
+    monkeypatch.setattr(autoconfig_core.os.path, "isfile", lambda p: p == autoconfig_core.DEFAULT_BINARY)
+    monkeypatch.setattr(autoconfig_core.os, "access", lambda p, m: True)
+    assert autoconfig_core._rust_binary() == "/usr/local/bin/model-autoconfig"
+
+
+def test_mismatch_logs_once_per_request_shape_with_the_model_name(tmp_path, monkeypatch, caplog):
+    _use_rust(monkeypatch, _fake_bin(tmp_path, "plan['ctx'] *= 2; plan['initial_ctx'] *= 2\n" + ECHO))
+    with caplog.at_level(logging.WARNING, logger="app.autoconfig_core"):
+        for _ in range(3):
+            _analyze(model_rel="alpha/model-a.gguf")
+        _analyze(model_rel="beta/model-b.gguf", file_size=9 * 2**30)   # a different shape
+        _analyze(model_rel="beta/model-b.gguf", file_size=9 * 2**30)
+    msgs = [r.getMessage() for r in caplog.records if "more conservative" in r.getMessage()]
+    assert len(msgs) == 2
+    assert "alpha/model-a.gguf" in msgs[0] and "beta/model-b.gguf" in msgs[1]
+
+
+def test_refused_mismatch_logs_once_per_shape_with_the_model_name(tmp_path, monkeypatch, caplog):
+    _use_rust(monkeypatch, _fake_bin(tmp_path, "plan['ctx'] //= 2; plan['initial_ctx'] //= 2\n" + ECHO))
+    with caplog.at_level(logging.WARNING, logger="app.autoconfig_core"):
+        for _ in range(3):
+            _analyze(model_rel="alpha/model-a.gguf")
+    msgs = [r.getMessage() for r in caplog.records if "mismatch" in r.getMessage()]
+    assert len(msgs) == 1 and "alpha/model-a.gguf" in msgs[0]
