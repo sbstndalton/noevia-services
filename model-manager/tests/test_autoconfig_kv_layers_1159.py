@@ -147,3 +147,24 @@ def test_search_repo_returns_estimates_reason(monkeypatch):
         sample["value"] = LFM2_HEADS
         g = c.get("/api/v1/search/repo", params={"repo": "synthetic/d1-3B-GGUF"}).json()["groups"][0]
         assert g["estimates"] and "estimatesReason" not in g
+
+
+_BIN = __import__("os").environ.get("MODEL_AUTOCONFIG_BIN", "")
+
+
+@pytest.mark.skipif(not _BIN, reason="MODEL_AUTOCONFIG_BIN not set: no model-autoconfig binary to compare")
+@pytest.mark.parametrize("preset", ["fast", "balanced", "long-ctx"])
+def test_rust_mode_gives_the_same_hybrid_plan_and_refusal(monkeypatch, preset):
+    """MODEL_AUTOCONFIG=rust must keep agreeing: the attention-only KV shape (fewer shape layers
+    than the stack) is a valid size request, and the prefix refusal is the same refusal."""
+    import dataclasses
+    from app import config
+    for heads in (LFM2_HEADS, {"_array": True, "count": 30, "sample": LFM2_HEADS[:8]}):
+        kw = dict(summary={"arch": "lfm2", "model": dict(BASE, attention_head_count_kv=heads)},
+                  file_size=1_600_000_000, backends=BACKENDS, preset=preset)
+        monkeypatch.setattr(config.settings, "model_autoconfig", "python")
+        py = dataclasses.asdict(autoconfig.analyze(**kw))
+        monkeypatch.setattr(config.settings, "model_autoconfig", "rust")
+        monkeypatch.setattr(config.settings, "model_autoconfig_bin", _BIN)
+        rs = dataclasses.asdict(autoconfig.analyze(**kw))
+        assert rs == py
