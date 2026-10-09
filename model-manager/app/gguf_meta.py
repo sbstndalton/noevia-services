@@ -39,6 +39,18 @@ MAX_KV_COUNT = 100_000
 MAX_RETAINED_CHARS = 16_000_000
 # One array nested directly inside another is accepted; deeper is rejected.
 MAX_ARRAY_DEPTH = 1
+# A top-level numeric array whose length equals the header's own `<arch>.block_count` is a
+# per-layer value (hybrid models list attention.head_count_kv per layer, 0 on recurrent
+# layers) and is kept whole instead of as an 8-element sample, so autoconfig can see every
+# layer (sbstndalton/noevia#1186). Only when block_count is at most this; worst case is this
+# many numbers per such key.
+MAX_PER_LAYER_KEPT = 4096
+# Numbers kept in whole per-layer arrays across one header. Past it, a block_count-length array
+# falls back to sample + count: a hostile header of many such arrays stays cheap.
+MAX_PER_LAYER_VALUES = 64 * MAX_PER_LAYER_KEPT
+_NUMERIC_TYPES = frozenset(
+    (_UINT8, _INT8, _UINT16, _INT16, _UINT32, _INT32, _FLOAT32, _UINT64, _INT64, _FLOAT64)
+)
 
 # subset of llama.cpp LlamaFileType — enough to name every real-world GGUF quant
 FILE_TYPE_NAMES: dict[int, str] = {
@@ -81,6 +93,7 @@ class _Source:
         f.seek(start)
         self.retained = 0     # characters of string data kept so far, across the whole header
         self.ran_out = False  # an array declared more elements than the stream holds
+        self.per_layer_left = MAX_PER_LAYER_VALUES  # numbers still allowed in whole arrays
 
     def run_out(self) -> None:
         """An array's elements outrun the stream. Normal for a range-fetched header, whose big
@@ -129,7 +142,19 @@ def _skip_string(src: _Source) -> None:
     src.skip(n)
 
 
-def _read_value(src: _Source, vtype: int, depth: int = 0):
+def _per_layer_len(out: dict[str, Any]) -> int | None:
+    """The header's block_count when it was already read and is a plausible layer count:
+    an int (not a bool) under `<general.architecture>.block_count`, 1..MAX_PER_LAYER_KEPT."""
+    arch = out.get("general.architecture")
+    if not isinstance(arch, str):
+        return None
+    n = out.get(f"{arch}.block_count")
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= MAX_PER_LAYER_KEPT:
+        return None
+    return n
+
+
+def _read_value(src: _Source, vtype: int, depth: int = 0, per_layer: int | None = None):
     if vtype in _SCALAR_FMT:
         fmt, size = _SCALAR_FMT[vtype]
         return src.unpack(fmt, size)
@@ -144,7 +169,16 @@ def _read_value(src: _Source, vtype: int, depth: int = 0):
             raise GgufMetaError("arrays nested more than one level deep are not supported")
         if subtype not in _SCALAR_FMT and subtype not in (_STRING, _ARRAY):
             raise GgufMetaError(f"unknown array element type {subtype}")
-        if count > MAX_ARRAY_ELEMENTS_KEPT:
+        keep_whole = (
+            depth == 0 and per_layer is not None and count == per_layer
+            and subtype in _NUMERIC_TYPES
+            # A cut-off header keeps the old count + sample (and run_out) rather than failing.
+            and _SCALAR_FMT[subtype][1] * count <= src.remaining()
+            and count <= src.per_layer_left
+        )
+        if keep_whole:
+            src.per_layer_left -= count
+        if count > MAX_ARRAY_ELEMENTS_KEPT and not keep_whole:
             if subtype == _ARRAY:
                 raise GgufMetaError(f"unsupported nested array subtype {subtype}")
             sample = [_read_value(src, subtype, depth + 1) for _ in range(MAX_ARRAY_ELEMENTS_KEPT)]
@@ -195,7 +229,7 @@ def _read_raw_stream(f) -> dict[str, Any]:
         for _ in range(kv_count):
             key = _read_string(src, max_len=MAX_KEY_LEN)
             vtype = src.unpack("<I", 4)
-            out[key] = _read_value(src, vtype)
+            out[key] = _read_value(src, vtype, per_layer=_per_layer_len(out))
     except (GgufMetaError, struct.error, OSError, OverflowError, MemoryError, RecursionError) as e:
         out["_error"] = f"stopped at KV read: {e or type(e).__name__}"
     if src.ran_out and "_error" not in out:
@@ -237,8 +271,11 @@ def _scalar_int(v: Any) -> int | None:
         return v
     if isinstance(v, float):
         return int(v)
-    if isinstance(v, dict) and v.get("_array"):
-        sample = v.get("sample") or []
+    # A whole per-layer list (longer than any sample, #1186) is read like a summary: its most
+    # common value, the first seen winning a tie. Shorter lists keep their first element.
+    long_list = isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT
+    if long_list or (isinstance(v, dict) and v.get("_array")):
+        sample = v if long_list else (v.get("sample") or [])
         if sample:
             counts: dict[int, int] = {}
             for x in sample:
@@ -246,11 +283,33 @@ def _scalar_int(v: Any) -> int | None:
                     counts[int(x)] = counts.get(int(x), 0) + 1
             if counts:
                 return max(counts, key=lambda k: counts[k])
-    if isinstance(v, list) and v:
+    if isinstance(v, list) and v and not long_list:
         first = v[0]
         if isinstance(first, (int, float)):
             return int(first)
     return None
+
+
+def _kv_dim_int(v: Any) -> int | None:
+    """_scalar_int for a KV-cache dimension (key/value length): a whole per-layer list (#1186)
+    gives its largest nonzero value (0 if every entry is 0: "use head_dim"). A 0 entry is listed
+    in the summary's per_layer_zero_dims, and autoconfig then never takes less than head_dim.
+    Everything else reads as _scalar_int."""
+    if isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT:
+        known = [int(x) for x in v if isinstance(x, (int, float))]
+        nonzero = [k for k in known if k != 0]
+        return max(nonzero) if nonzero else (0 if known else None)
+    return _scalar_int(v)
+
+
+def _is_whole(v: Any) -> bool:
+    """A whole per-layer list: only these are longer than the 8-entry sample (#1186)."""
+    return isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT
+
+
+_KV_DIMS = (("key_length", "attention.key_length"), ("value_length", "attention.value_length"),
+            ("key_length_swa", "attention.key_length_swa"),
+            ("value_length_swa", "attention.value_length_swa"))
 
 
 def _scalar_float(v: Any) -> float | None:
@@ -319,7 +378,31 @@ def _finite(v: Any) -> Any:
 
 
 def summarize(raw: dict[str, Any]) -> dict[str, Any]:
+    """The summary. When the header kept a whole per-layer list (#1186), the model section also
+    carries per_layer_sample: each model field whose value the old 8-entry-sample reading of
+    those lists gives differently, at that old value, so autoconfig can size KV both ways and
+    keep the larger; and per_layer_zero_dims: the KV dimensions whose list has a 0 entry."""
     raw = _finite(raw)
+    out = _summarize(raw)
+    if not any(_is_whole(v) for v in raw.values()):
+        return out
+    sampled = {k: ({"_array": True, "count": len(v), "sample": v[:MAX_ARRAY_ELEMENTS_KEPT]}
+                   if _is_whole(v) else v) for k, v in raw.items()}
+    old, new = _summarize(sampled)["model"], out["model"]
+    diff = {k: v for k, v in old.items()
+            if json.dumps(v, sort_keys=True) != json.dumps(new.get(k), sort_keys=True)}
+    arch = raw.get("general.architecture", "") or ""
+    zero = [f for f, key in _KV_DIMS
+            if arch and _is_whole(v := raw.get(f"{arch}.{key}"))
+            and any(isinstance(x, (int, float)) and x == 0 for x in v)]
+    if diff:
+        new["per_layer_sample"] = diff
+    if zero:
+        new["per_layer_zero_dims"] = zero
+    return out
+
+
+def _summarize(raw: dict[str, Any]) -> dict[str, Any]:
     arch = raw.get("general.architecture", "") or ""
 
     def a(key: str, default: Any = None) -> Any:
@@ -371,16 +454,16 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
             # Built-in multi-token-prediction layers (llama.cpp "nextn"): draft-mtp needs no head file.
             "nextn_predict_layers": _scalar_int(a("nextn_predict_layers")),
             "expert_used_count": _scalar_int(a("expert_used_count")),
-            "key_length": _scalar_int(a("attention.key_length")),
-            "value_length": _scalar_int(a("attention.value_length")),
+            "key_length": _kv_dim_int(a("attention.key_length")),
+            "value_length": _kv_dim_int(a("attention.value_length")),
             "full_attention_interval": _scalar_int(a("full_attention_interval")),
             # Sliding-window attention, declared properly rather than guessed. Gemma-4 sets
             # all four: most layers attend over a short window and use a NARROWER head dim
             # than the global layers, and some layers share another layer's KV entirely.
             # Sizing without these over-estimates the cache by an order of magnitude.
             "sliding_window": _scalar_int(a("attention.sliding_window")),
-            "key_length_swa": _scalar_int(a("attention.key_length_swa")),
-            "value_length_swa": _scalar_int(a("attention.value_length_swa")),
+            "key_length_swa": _kv_dim_int(a("attention.key_length_swa")),
+            "value_length_swa": _kv_dim_int(a("attention.value_length_swa")),
             "shared_kv_layers": _scalar_int(a("attention.shared_kv_layers")),
             # kept raw: a per-layer array of which layers are local vs global
             "sliding_window_pattern": a("attention.sliding_window_pattern"),

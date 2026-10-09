@@ -166,7 +166,13 @@ def kv_shape_bytes(shape: dict | None, ctx: int, bytes_per_elem: float,
         return 0
     base = _kv_shape_bytes(shape, ctx, bytes_per_elem, v_bytes_per_elem)
     rec = shape.get("recurrent_bytes")
-    return base + rec if rec else base
+    total = base + rec if rec else base
+    alt = shape.get("alt")
+    if alt is not None:
+        # The same model read with the old 8-entry sample of its per-layer lists (#1186):
+        # whichever is larger, so a whole list never sizes the cache below what it was.
+        return max(total, kv_shape_bytes(alt, ctx, bytes_per_elem, v_bytes_per_elem))
+    return total
 
 
 def _kv_shape_bytes(shape: dict, ctx: int, bytes_per_elem: float,
@@ -1043,6 +1049,10 @@ _MMPROJ_COMPUTE_GB = 0.5  # modality-encoder scratch beyond the projector weight
                           # already covers most of that.
 
 
+# gguf_meta.MAX_ARRAY_ELEMENTS_KEPT: a list longer than this is a whole per-layer array (#1186).
+_SAMPLE_KEPT = 8
+
+
 def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
     """kv_heads may be an int, or a per-layer array dict from GGUF; extract a representative int."""
     if isinstance(kv_heads, int):
@@ -1058,6 +1068,11 @@ def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
                 counts[int(v)] = counts.get(int(v), 0) + 1
             if counts:
                 return max(counts, key=lambda k: counts[k])
+    if isinstance(kv_heads, list) and len(kv_heads) > _SAMPLE_KEPT:
+        # A whole per-layer list (#1186): the largest head count, so no layer's cache is
+        # under-sized (never below the sample's most common value it replaces).
+        known = [int(v) for v in kv_heads if v is not None]
+        return max(known) if known else default
     if isinstance(kv_heads, list) and kv_heads and kv_heads[0] is not None:
         return int(kv_heads[0])
     return default
@@ -1129,8 +1144,38 @@ def _card_gb(c: Any) -> float:
     raise TypeError(f"card_vram_gb entry {type(c).__name__!r} is not a number")
 
 
+_PER_LAYER_KEYS = ("per_layer_sample", "per_layer_zero_dims")
+
+
 def prepare(inp: dict[str, Any]) -> dict[str, Any]:
-    """analyze()'s reading of the summary and backends, up to and including the early refusals."""
+    """analyze()'s reading of the summary and backends, up to and including the early refusals.
+
+    A summary that kept whole per-layer lists (#1186) carries per_layer_sample, the model fields
+    as the old 8-entry sample read them. The model is then also prepared that way and, when that
+    plan stands, its shape rides along as shape["alt"]: kv_shape_bytes takes the larger."""
+    p = _prepare(inp)
+    m = inp["model"] or {}
+    sample = m.get("per_layer_sample")
+    if p["refuse"] is not None or not (isinstance(sample, dict) and sample):
+        return p
+    old = {k: v for k, v in m.items() if k not in _PER_LAYER_KEYS}
+    old.update(sample)
+    q = _prepare(dict(inp, model=old))
+    if q["refuse"] is None:
+        p["shape"]["alt"] = q["shape"]
+    return p
+
+
+def _zero_dim(m: dict, zero_dims: list, key: str, fallback: int) -> Any:
+    """An SWA K/V length; with a 0 per-layer entry (#1186) never below what 0 means, the
+    global layers' length (kv_shape's fallback)."""
+    v = m.get(key) if isinstance(m.get(key), int) else None
+    if v is not None and key in zero_dims:
+        return max(v, fallback)
+    return v
+
+
+def _prepare(inp: dict[str, Any]) -> dict[str, Any]:
     # Clamp n_sessions to a sensible range for a homelab. Above 8 the per-slot ctx
     # shrinks below usability for real chat, and llama-server continuous batching
     # overhead starts dominating.
@@ -1149,6 +1194,14 @@ def prepare(inp: dict[str, Any]) -> dict[str, Any]:
     # explicit K/V lengths + hybrid markers (Qwen 3.5, Zamba, etc.)
     key_length = int(m.get("key_length")) if isinstance(m.get("key_length"), int) else None
     value_length = int(m.get("value_length")) if isinstance(m.get("value_length"), int) else None
+    # A per-layer K/V length list with a 0 entry ("this layer uses head_dim", #1186): never
+    # less than head_dim. The summary lists those dimensions in per_layer_zero_dims.
+    zero_dims = m.get("per_layer_zero_dims")
+    zero_dims = zero_dims if isinstance(zero_dims, list) else []
+    if "key_length" in zero_dims and key_length is not None:
+        key_length = max(key_length, head_dim)
+    if "value_length" in zero_dims and value_length is not None:
+        value_length = max(value_length, head_dim)
     full_attention_interval = int(m.get("full_attention_interval")) if isinstance(m.get("full_attention_interval"), int) else None
     ssm_state_size = int(m.get("ssm_state_size")) if isinstance(m.get("ssm_state_size"), int) else None
     # Sliding-window attention parameters travel together and are threaded through every
@@ -1157,8 +1210,8 @@ def prepare(inp: dict[str, Any]) -> dict[str, Any]:
     _swa = {
         "sliding_window": m.get("sliding_window") if isinstance(m.get("sliding_window"), int) else None,
         "sliding_window_pattern": m.get("sliding_window_pattern"),
-        "key_length_swa": m.get("key_length_swa") if isinstance(m.get("key_length_swa"), int) else None,
-        "value_length_swa": m.get("value_length_swa") if isinstance(m.get("value_length_swa"), int) else None,
+        "key_length_swa": _zero_dim(m, zero_dims, "key_length_swa", key_length or head_dim),
+        "value_length_swa": _zero_dim(m, zero_dims, "value_length_swa", value_length or head_dim),
         "shared_kv_layers": m.get("shared_kv_layers") if isinstance(m.get("shared_kv_layers"), int) else None,
         # Raw, not collapsed: which layers are global decides which head count applies.
         "kv_heads_pattern": m.get("attention_head_count_kv"),
