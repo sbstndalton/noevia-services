@@ -301,10 +301,10 @@ def test_reset_outcomes_are_logged_with_hash_prefix_only(caplog):
         gate.record(401)
         now[0] += 5
         assert gate.reset_login() is False
-    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(messages) == 2, messages
     assert 'accepted' in messages[0] and 'ignored' in messages[1]
-    assert all(r.levelno == logging.INFO for r in caplog.records)
+    assert all(r.levelno == logging.WARNING for r in caplog.records)
     prefix = gate._label
     assert len(prefix) == 8 and all(prefix in m for m in messages)
     assert all(secret not in m and 'acct' not in m and 'dav.example' not in m for m in messages)
