@@ -39,6 +39,15 @@ MAX_KV_COUNT = 100_000
 MAX_RETAINED_CHARS = 16_000_000
 # One array nested directly inside another is accepted; deeper is rejected.
 MAX_ARRAY_DEPTH = 1
+# A top-level numeric array whose length equals the header's own `<arch>.block_count` is a
+# per-layer value (hybrid models list attention.head_count_kv per layer, 0 on recurrent
+# layers) and is kept whole instead of as an 8-element sample, so autoconfig can see every
+# layer (sbstndalton/noevia#1186). Only when block_count is at most this; worst case is this
+# many numbers per such key.
+MAX_PER_LAYER_KEPT = 4096
+_NUMERIC_TYPES = frozenset(
+    (_UINT8, _INT8, _UINT16, _INT16, _UINT32, _INT32, _FLOAT32, _UINT64, _INT64, _FLOAT64)
+)
 
 # subset of llama.cpp LlamaFileType — enough to name every real-world GGUF quant
 FILE_TYPE_NAMES: dict[int, str] = {
@@ -129,7 +138,19 @@ def _skip_string(src: _Source) -> None:
     src.skip(n)
 
 
-def _read_value(src: _Source, vtype: int, depth: int = 0):
+def _per_layer_len(out: dict[str, Any]) -> int | None:
+    """The header's block_count when it was already read and is a plausible layer count:
+    an int (not a bool) under `<general.architecture>.block_count`, 1..MAX_PER_LAYER_KEPT."""
+    arch = out.get("general.architecture")
+    if not isinstance(arch, str):
+        return None
+    n = out.get(f"{arch}.block_count")
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= MAX_PER_LAYER_KEPT:
+        return None
+    return n
+
+
+def _read_value(src: _Source, vtype: int, depth: int = 0, per_layer: int | None = None):
     if vtype in _SCALAR_FMT:
         fmt, size = _SCALAR_FMT[vtype]
         return src.unpack(fmt, size)
@@ -144,7 +165,13 @@ def _read_value(src: _Source, vtype: int, depth: int = 0):
             raise GgufMetaError("arrays nested more than one level deep are not supported")
         if subtype not in _SCALAR_FMT and subtype not in (_STRING, _ARRAY):
             raise GgufMetaError(f"unknown array element type {subtype}")
-        if count > MAX_ARRAY_ELEMENTS_KEPT:
+        keep_whole = (
+            depth == 0 and per_layer is not None and count == per_layer
+            and subtype in _NUMERIC_TYPES
+            # A cut-off header keeps the old count + sample (and run_out) rather than failing.
+            and _SCALAR_FMT[subtype][1] * count <= src.remaining()
+        )
+        if count > MAX_ARRAY_ELEMENTS_KEPT and not keep_whole:
             if subtype == _ARRAY:
                 raise GgufMetaError(f"unsupported nested array subtype {subtype}")
             sample = [_read_value(src, subtype, depth + 1) for _ in range(MAX_ARRAY_ELEMENTS_KEPT)]
@@ -195,7 +222,7 @@ def _read_raw_stream(f) -> dict[str, Any]:
         for _ in range(kv_count):
             key = _read_string(src, max_len=MAX_KEY_LEN)
             vtype = src.unpack("<I", 4)
-            out[key] = _read_value(src, vtype)
+            out[key] = _read_value(src, vtype, per_layer=_per_layer_len(out))
     except (GgufMetaError, struct.error, OSError, OverflowError, MemoryError, RecursionError) as e:
         out["_error"] = f"stopped at KV read: {e or type(e).__name__}"
     if src.ran_out and "_error" not in out:
