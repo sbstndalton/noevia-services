@@ -119,9 +119,9 @@ class StorageGate:
             if self._kind == "login" and self._until > now:
                 if now - self._last_reset >= RETRY_RESET_MIN_INTERVAL_S:
                     self._kind, self._until, self._last_reset = "", 0.0, now
-                    log.info("storage login cool-down reset accepted (gate %s)", self._label)
+                    log.warning("storage login cool-down reset accepted (gate %s)", self._label)
                     return True
-                log.info("storage login cool-down reset ignored: under %ds since the last reset (gate %s)",
+                log.warning("storage login cool-down reset ignored: under %ds since the last reset (gate %s)",
                          int(RETRY_RESET_MIN_INTERVAL_S), self._label)
             return False
 
