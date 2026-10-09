@@ -677,7 +677,7 @@ async def _repo_files_cached(repo: str) -> list[dict]:
 async def search_repo(repo: str = Query(...)) -> dict:
     import httpx
     from . import discover, hf
-    from .helpers import _preset_estimates
+    from .helpers import _preset_estimates_with_reason
     groups: list[dict] = []
     gated = ""
     try:
@@ -716,8 +716,12 @@ async def search_repo(repo: str = Query(...)) -> dict:
                     if g["files"][0]["path"].lower().endswith(".gguf") and not g["projector"]:
                         # Off the event loop: the fit search is CPU-bound and runs on header
                         # metadata from a remote repo, so it must never stall other requests.
-                        g["estimates"] = await asyncio.to_thread(
-                            _preset_estimates, summary, g["bytes"], (min(mm) / 1024 ** 3) if mm else 0.0)
+                        g["estimates"], reason = await asyncio.to_thread(
+                            _preset_estimates_with_reason, summary, g["bytes"],
+                            (min(mm) / 1024 ** 3) if mm else 0.0)
+                        if reason:
+                            # Why the list is empty (#1159), for Discover to show.
+                            g["estimatesReason"] = reason
                         g["nativeCtx"] = (summary.get("model") or {}).get("context_length") or 0
     except httpx.HTTPStatusError as e:
         return {"repo": repo, "error": f"Hugging Face returned HTTP {e.response.status_code}", "groups": []}

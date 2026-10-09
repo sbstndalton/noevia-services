@@ -1054,6 +1054,37 @@ def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
     return default
 
 
+def _attention_layers(kv_raw: Any, layers: int) -> tuple | None:
+    """Which layers hold a KV cache, read off a per-layer attention.head_count_kv (#1159).
+
+    llama.cpp reads head_count_kv per layer (an absent key means head_count, which prepare()
+    already does through _kv_first_int's default) and gives a layer whose entry is 0 no KV cache
+    at all: hybrid models declare their non-attention layers that way (LFM2's short-conv layers,
+    Jamba's Mamba layers; llama.cpp marks them recurrent). The representative value
+    _kv_first_int picks is then 0 whenever most layers are not attention, and the model was
+    refused although its cache is perfectly sizeable.
+
+    None when the value is not a per-layer array of plain ints with a 0 entry: sizing is then
+    exactly what it was. ("full", n_attn, max_heads) when every entry is known and there is one
+    per layer. ("partial", known, count) when some entry is 0 but the array is not fully known
+    (GGUF summaries keep only a prefix of long arrays) or does not have one entry per layer:
+    which layers attend cannot be told, so prepare() refuses rather than guess."""
+    if isinstance(kv_raw, list):
+        seq, count = kv_raw, len(kv_raw)
+    elif isinstance(kv_raw, dict) and kv_raw.get("_array") is True:
+        seq, count = kv_raw.get("sample"), kv_raw.get("count")
+        if not isinstance(seq, list) or type(count) is not int:
+            return None
+    else:
+        return None
+    if not all(type(v) is int for v in seq) or 0 not in seq:
+        return None
+    if len(seq) == count == layers:
+        nonzero = [v for v in seq if v != 0]
+        return ("full", len(nonzero), max(nonzero, default=0))
+    return ("partial", len(seq), count)
+
+
 def _card_gb(c: Any) -> float:
     """One card's VRAM as the fit maths uses it (`c - reserve`): a number, else TypeError as
     that subtraction raised before the size core existed."""
@@ -1121,13 +1152,23 @@ def prepare(inp: dict[str, Any]) -> dict[str, Any]:
 
     # HARD STOP if the KV cache cannot be sized from this GGUF's metadata: zero KV silently means
     # "the cache is free" and every candidate would fit.
-    shape = kv_shape(arch, layers, kv_heads, head_dim,
+    # A per-layer head count with 0 entries (hybrid attention + recurrent layers, #1159): only
+    # the attention layers hold KV, at their own head count. Left to the paths that already
+    # read per-layer data (interleaved full attention, sliding window) when those are declared.
+    shape_layers, shape_heads = layers, kv_heads
+    attn = _attention_layers(m.get("attention_head_count_kv"), layers)
+    if attn is not None and not (full_attention_interval and full_attention_interval > 1) \
+            and not (_swa["sliding_window"] and _swa["sliding_window"] > 0):
+        if attn[0] == "partial":
+            return {"refuse": "kv_layers", "known": attn[1], "count": attn[2], "layers": layers}
+        shape_layers, shape_heads = attn[1], attn[2]
+    shape = kv_shape(arch, shape_layers, shape_heads, head_dim,
                      key_length=key_length, value_length=value_length,
                      full_attention_interval=full_attention_interval,
                      ssm_state_size=ssm_state_size, **_swa)
     if kv_shape_bytes(shape, 4096, bytes_per) <= 0:
         missing = [k for k, v in (("block_count", layers),
-                                  ("attention_head_count_kv", kv_heads),
+                                  ("attention_head_count_kv", shape_heads),
                                   ("head_dim (embedding_length / attention_head_count)", head_dim))
                    if not v]
         return {"refuse": "kv", "missing": missing}

@@ -268,13 +268,13 @@ def test_search_repo_runs_estimates_off_the_event_loop_and_survives_a_hostile_he
     monkeypatch.setattr(hw, "gpu_count_for", lambda n: 1)
     monkeypatch.setattr(hw, "card_vram_gb_for", lambda n: [14.0])
     monkeypatch.setattr(hw, "host_ram_gb", lambda: 29.0)
-    real = helpers._preset_estimates
+    real = helpers._preset_estimates_with_reason
     threads = []
 
     def spy(*a, **kw):
         threads.append(threading.current_thread())
         return real(*a, **kw)
-    monkeypatch.setattr(helpers, "_preset_estimates", spy)
+    monkeypatch.setattr(helpers, "_preset_estimates_with_reason", spy)
     with TestClient(app) as c:
         t0 = time.monotonic()
         r = c.get("/api/v1/search/repo", params={"repo": "o/r-GGUF"})

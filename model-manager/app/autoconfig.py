@@ -329,6 +329,18 @@ def _prep_refusal(prep: dict[str, Any]) -> Recommendation:
                  "GPU_VRAM=<container>:<GB> on the model-loader service (e.g. "
                  "GPU_VRAM=llama-vulkan:16) and restart it. Nothing here says the model "
                  "does not fit; the size of the card is simply unknown.")
+    elif kind == "kv_layers":
+        # A hybrid model (#1159): attention.head_count_kv marks its non-attention layers with 0,
+        # and only those holding a KV cache may be counted. The GGUF summary keeps a prefix of a
+        # long array, so which later layers attend is unknown; any count would be a guess.
+        known, count, layers = prep["known"], prep["count"], prep["layers"]
+        where = (f"only the first {known} of its {count} entries are readable"
+                 if count == layers else
+                 f"it has {count} entries for {layers} layers")
+        error = ("Cannot size the KV cache from this model's metadata: it is a hybrid model whose "
+                 "attention_head_count_kv marks non-attention layers with 0, and "
+                 f"{where}, so the number of attention layers is unknown. Autoconfig will not "
+                 "guess a context size. Set ctx-size manually in the form and verify it loads.")
     else:
         # kv_cache_bytes() is 0 when block_count / attention_head_count_kv / head_dim are missing
         # or zero (architectures whose keys we don't parse yet). Zero KV silently means "the cache
