@@ -53,7 +53,8 @@ class WebDAVCorpusBackend:
         # One back-off gate per credential (server + account + secret): see storage_backoff.
         self.storage_gate = gate_for("webdav", self.base_url, username, password)
         self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, auth=self.auth,
-                                   gate=self.storage_gate, transport=transport)
+                                   gate=self.storage_gate, transport=transport,
+                                   root_paths=(self.base_path,))
 
     @staticmethod
     def _ensure_not_redirect(resp) -> None:

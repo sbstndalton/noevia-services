@@ -141,7 +141,7 @@ def test_changed_credentials_are_tried_immediately(volume, dav):
 
 
 def test_explicit_retry_resets_login_cooldown(volume, dav):
-    dav.status = 403
+    dav.status = 401
     c = client()
     c.get('/api/files', headers=headers())
     calls = dav.calls
@@ -227,3 +227,68 @@ def test_retry_after_parsing():
     assert parse_retry_after('0') == 1
     assert parse_retry_after('999999') == 3600
     assert 1 <= parse_retry_after('Wed, 21 Oct 2099 07:28:00 GMT') <= 3600
+
+
+# ---- review follow-ups: 403 scope, retry rate limit, gate table cap -----------
+
+class PathDav(httpx.BaseTransport):
+    def __init__(self, forbidden):
+        self.forbidden, self.calls = set(forbidden), []
+
+    def handle_request(self, request):
+        self.calls.append(request.url.path)
+        if request.url.path in self.forbidden:
+            return httpx.Response(403, request=request)
+        return httpx.Response(200, text='x', headers={'ETag': '"e"'}, request=request)
+
+
+def test_403_on_one_path_does_not_block_other_paths():
+    fake = PathDav({'/remote.php/dav/files/alice/Diary/secret.md'})
+    backend = WebDAVCorpusBackend(BASE, 'alice', 'p403', transport=fake)
+    with pytest.raises(httpx.HTTPStatusError):
+        backend.get_text('Diary/secret.md')
+    assert backend.get_text('Diary/ok.md')[0] == 'x'
+    assert len(fake.calls) == 2
+
+
+def test_403_on_the_account_root_closes_the_gate():
+    fake = PathDav({'/remote.php/dav/files/alice/'})
+    backend = WebDAVCorpusBackend(BASE, 'alice', 'proot', transport=fake)
+    with pytest.raises(httpx.HTTPStatusError):
+        backend.exists('')
+    with pytest.raises(StorageBackoff):
+        backend.get_text('Diary/ok.md')
+
+
+def test_s3_403_on_one_key_does_not_block_another():
+    from agent.s3_storage import S3CorpusBackend
+    fake = PathDav({'/bkt/missing.md'})
+    backend = S3CorpusBackend('https://s3.example.test', 'bkt', 'AK', 'SK', transport=fake) \
+        if 'transport' in S3CorpusBackend.__init__.__code__.co_varnames else None
+    if backend is None:
+        backend = S3CorpusBackend('https://s3.example.test', 'bkt', 'AK', 'SK')
+        backend._client = httpx.Client(base_url=backend.base, transport=storage_backoff.GatedTransport(fake, backend.storage_gate))
+    with pytest.raises(httpx.HTTPStatusError):
+        backend.get_text('missing.md')
+    assert backend.get_text('other.md')[0] == 'x'
+    assert fake.calls == ['/bkt/missing.md', '/bkt/other.md']
+
+
+def test_explicit_retry_reset_is_rate_limited():
+    now = [1000.0]
+    gate = StorageGate(clock=lambda: now[0])
+    gate.record(401)
+    assert gate.reset_login() is True
+    gate.record(401)
+    now[0] += 10
+    assert gate.reset_login() is False
+    with pytest.raises(StorageBackoff):
+        gate.check()
+    now[0] += 25
+    assert gate.reset_login() is True
+
+
+def test_gate_table_is_hard_capped():
+    for i in range(storage_backoff._MAX_GATES + 40):
+        storage_backoff.gate_for('cred', str(i)).record(401)  # every gate closed: none idle
+    assert len(storage_backoff._gates) <= storage_backoff._MAX_GATES

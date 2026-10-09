@@ -14,6 +14,7 @@ def make_client(
     follow_redirects: bool = False,
     gate=None,
     transport: Optional[httpx.BaseTransport] = None,
+    root_paths=(),
 ) -> httpx.Client:
     """Shared httpx.Client factory — connection pooling, explicit timeouts.
 
@@ -37,7 +38,7 @@ def make_client(
         # Storage back-off (#1166): refuse while the server is throttling / has rejected the login.
         from .storage_backoff import GatedTransport
 
-        extra["transport"] = GatedTransport(transport or httpx.HTTPTransport(), gate)
+        extra["transport"] = GatedTransport(transport or httpx.HTTPTransport(), gate, root_paths)
     elif transport is not None:
         extra["transport"] = transport
     return httpx.Client(

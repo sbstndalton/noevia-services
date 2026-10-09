@@ -25,6 +25,7 @@ LOGIN_COOLDOWN_S = 300.0
 DEFAULT_RETRY_AFTER_S = 60.0
 MAX_RETRY_AFTER_S = 3600.0
 _MAX_GATES = 256
+RETRY_RESET_MIN_INTERVAL_S = 30.0
 STORAGE_TAG = "noevia_storage"
 
 
@@ -82,6 +83,7 @@ class StorageGate:
         self._lock = threading.Lock()
         self._until = 0.0
         self._kind = ""
+        self._last_reset = -RETRY_RESET_MIN_INTERVAL_S
 
     def check(self) -> None:
         with self._lock:
@@ -89,10 +91,13 @@ class StorageGate:
             if remaining > 0:
                 raise StorageBackoff(self._kind, remaining)
 
-    def record(self, status: int, retry_after: Optional[str] = None) -> None:
+    def record(self, status: int, retry_after: Optional[str] = None, root: bool = False) -> None:
+        """A 401 always closes the gate. A 403 only does when it answers the account root (the auth
+        probe): elsewhere it is a per-path refusal (S3 without ListBucket, a forbidden folder) and
+        must not block other paths."""
         with self._lock:
             now = self._clock()
-            if status in (401, 403):
+            if status == 401 or (status == 403 and root):
                 self._kind, self._until = "login", now + LOGIN_COOLDOWN_S
             elif status == 429:
                 until = now + parse_retry_after(retry_after)
@@ -103,10 +108,13 @@ class StorageGate:
                 self._kind, self._until = "", 0.0  # an in-flight success after a rejection: the login works
 
     def reset_login(self) -> bool:
-        """Explicit retry: clear a login cool-down (a throttle still has to be waited out)."""
+        """Explicit retry: clear a login cool-down (a throttle still has to be waited out). At most
+        one reset per RETRY_RESET_MIN_INTERVAL_S, so a client loop cannot rebuild the brute-force
+        pattern the cool-down exists to stop."""
         with self._lock:
-            if self._kind == "login" and self._until > self._clock():
-                self._kind, self._until = "", 0.0
+            now = self._clock()
+            if self._kind == "login" and self._until > now and now - self._last_reset >= RETRY_RESET_MIN_INTERVAL_S:
+                self._kind, self._until, self._last_reset = "", 0.0, now
                 return True
             return False
 
@@ -130,6 +138,8 @@ def gate_for(*credential_parts: str) -> StorageGate:
                 idle = [k for k, g in _gates.items() if g.state()[0] == ""]
                 for key in idle[: _MAX_GATES // 2]:
                     del _gates[key]
+                if len(_gates) >= _MAX_GATES:  # hard cap: drop the gate closest to expiry
+                    del _gates[min(_gates, key=lambda k: _gates[k].state()[1])]
             gate = _gates[digest] = StorageGate()
         return gate
 
@@ -138,8 +148,9 @@ class GatedTransport(httpx.BaseTransport):
     """Wraps a real transport: refuse while the gate is closed, learn from each answer, and tag the
     responses/errors that came from storage so the app's handlers map only those."""
 
-    def __init__(self, inner: httpx.BaseTransport, gate: StorageGate):
+    def __init__(self, inner: httpx.BaseTransport, gate: StorageGate, root_paths=()):
         self._inner, self.gate = inner, gate
+        self._roots = {r.rstrip("/") for r in root_paths}
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         self.gate.check()
@@ -148,7 +159,8 @@ class GatedTransport(httpx.BaseTransport):
         except httpx.TransportError as exc:
             setattr(exc, STORAGE_TAG, True)
             raise
-        self.gate.record(response.status_code, response.headers.get("Retry-After"))
+        self.gate.record(response.status_code, response.headers.get("Retry-After"),
+                         root=request.url.path.rstrip("/") in self._roots)
         response.extensions[STORAGE_TAG] = True
         return response
 
