@@ -30,14 +30,28 @@ sidecar runs one uvicorn worker). When the cache is full of unexpired nonces a
 new request is refused (NonceCacheFull, answered 503) rather than evicting a
 live nonce, which would reopen replay. The key is read per call so an operator
 change takes effect on restart and tests can patch the environment.
+
+TENANT_ASSERTION_IMPL=rust additionally runs the same check in the bounded Rust leaf from
+sbstndalton/noevia-rs (`tenant-assertion check`, built into the image at the Dockerfile's pinned
+NOEVIA_RS_REF). It is AND-composed and FAILS CLOSED: a request is accepted only when Python
+accepts AND Rust accepts; a Rust refusal, a missing binary, a nonzero exit, a timeout or any
+unexpected output rejects it. The default is python (no subprocess); any other value is python
+with one warning. The key, the headers and the secret travel to the child on stdin only, with a
+minimal environment; reasons and logs carry codes only. The shared differential fixtures
+(tests/fixtures/tenant-assertion.v1.json, generated in noevia-rs from this module) are the
+contract between the two.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import hmac
+import json
+import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -52,6 +66,14 @@ _ASSERTION_RE = re.compile(r"v2\.(\d{1,12})\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})
 
 _seen: "OrderedDict[str, float]" = OrderedDict()
 _seen_lock = threading.Lock()
+
+
+IMPLS = ("python", "rust")
+RUST_TIMEOUT_S = 2.0
+_RUST_STDOUT_CAP = 256
+_log = logging.getLogger(__name__)
+_logged: set = set()
+_logged_lock = threading.Lock()
 
 
 class NonceCacheFull(Exception):
@@ -110,14 +132,65 @@ def _remember_nonce(nonce: str, now: float) -> bool:
         return True
 
 
-def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Optional[float] = None,
-           query: bytes = b"", body_hash: Optional[str] = None) -> Optional[str]:
-    """None when the request carries a valid assertion for its X-Cowork-User-ID, else a reason.
+def _log_once(key: str, message: str) -> None:
+    with _logged_lock:
+        if key in _logged:
+            return
+        _logged.add(key)
+    _log.warning(message)
 
-    `path` is the encoded wire path, `query` the raw query string, `body_hash`
-    sha256 hex of the body or STREAM (see module doc). Reasons are for logs
-    only; callers answer every failure the same way. Raises NonceCacheFull."""
-    now = time.time() if now is None else now
+
+def impl_choice() -> str:
+    """The configured implementation: "python" (default) or "rust". Anything else is python."""
+    value = (os.environ.get("TENANT_ASSERTION_IMPL") or "python").strip().lower() or "python"
+    if value not in IMPLS:
+        # The value is an operator setting, never a secret; still, log only its length-bounded repr.
+        _log_once("invalid_setting", f"TENANT_ASSERTION_IMPL={value[:32]!r} is not one of {', '.join(IMPLS)}; using python")
+        return "python"
+    return value
+
+
+def _rust_binary() -> Optional[str]:
+    configured = (os.environ.get("TENANT_ASSERTION_BIN") or "tenant-assertion").strip() or "tenant-assertion"
+    if os.sep in configured:
+        return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
+    return shutil.which(configured)
+
+
+def _rust_decision(payload: dict) -> Optional[str]:
+    """None when `tenant-assertion check` accepts `payload`, else a reason code. Fails closed:
+    every fault is a refusal. The payload (key included) goes to the child on stdin only."""
+    binary = _rust_binary()
+    if binary is None:
+        _log_once("rust:missing_binary", "tenant-assertion binary not found; refusing tenant requests (TENANT_ASSERTION_IMPL=rust)")
+        return "rust unavailable"
+    try:
+        data = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    except (TypeError, ValueError):
+        return "rust unavailable"
+    try:
+        proc = subprocess.run([binary, "check"], input=data, capture_output=True, timeout=RUST_TIMEOUT_S,
+                              close_fds=True, env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
+    except subprocess.TimeoutExpired:
+        _log_once("rust:timeout", "tenant-assertion timed out; refusing the request")
+        return "rust unavailable"
+    except OSError as e:
+        _log_once("rust:spawn", f"tenant-assertion could not start ({type(e).__name__}); refusing the request")
+        return "rust unavailable"
+    out = proc.stdout[:_RUST_STDOUT_CAP + 1]
+    if proc.returncode == 0 and out == b"accept\n":
+        return None
+    if proc.returncode == 1 and out.startswith(b"reject: ") and len(out) <= _RUST_STDOUT_CAP:
+        return "rust refused"
+    # Exit 2/3, a signal or unexpected output: a fault, never an acceptance. stderr is not logged
+    # (it is a fixed string anyway; nothing of the request is in it).
+    _log_once(f"rust:exit:{proc.returncode}", f"tenant-assertion failed (exit {proc.returncode}); refusing the request")
+    return "rust unavailable"
+
+
+def _check(key: str, headers: Mapping[str, str], method: str, path: str, now: float, query: bytes,
+           body_hash: Optional[str]) -> Optional[str]:
+    """Python's stateless decision: None when the assertion is valid, else a reason."""
     user_id = headers.get("X-Cowork-User-ID", "")
     raw = headers.get(HEADER, "")
     if not user_id:
@@ -131,6 +204,31 @@ def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Op
         return "bad signature"
     if abs(now - ts) > SKEW_S:
         return "outside clock window"
+    return None
+
+
+def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Optional[float] = None,
+           query: bytes = b"", body_hash: Optional[str] = None) -> Optional[str]:
+    """None when the request carries a valid assertion for its X-Cowork-User-ID, else a reason.
+
+    `path` is the encoded wire path, `query` the raw query string, `body_hash`
+    sha256 hex of the body or STREAM (see module doc). Reasons are for logs
+    only; callers answer every failure the same way. Raises NonceCacheFull.
+    Under TENANT_ASSERTION_IMPL=rust the Rust check must accept as well (module doc)."""
+    now = time.time() if now is None else now
+    reason = _check(key, headers, method, path, now, query, body_hash)
+    if reason:
+        return reason
+    if impl_choice() == "rust":
+        reason = _rust_decision({
+            "op": "verify", "key": key, "user_id": headers.get("X-Cowork-User-ID", ""),
+            "assertion": headers.get(HEADER, ""), "method": method, "path": path,
+            "query_hex": bytes(query).hex(), "body_hash": sha256_hex(b"") if body_hash is None else body_hash,
+            "storage": headers.get("X-Cowork-Storage", ""), "legacy_owner": headers.get("X-Cowork-Legacy-Owner", ""),
+            "blocked": headers.get("X-Cowork-Storage-Blocked", ""), "now": repr(float(now))})
+        if reason:
+            return reason
+    nonce = _ASSERTION_RE.fullmatch(headers.get(HEADER, "") or "").group(2)
     if not _remember_nonce(nonce, now):
         return "replayed"
     return None
@@ -148,6 +246,16 @@ def storage_secret_ref(key: str, user_id: str, secret: str) -> str:
     """Same derivation as web's storageSecretRef (diary-tenant-assertion.cjs)."""
     msg = f"{LABEL}:storage-secret\n{user_id.lower()}\n{secret}"
     return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def secret_ref_matches(key: str, user_id: str, secret: str, ref: str) -> bool:
+    """app.py's secretRef check: `ref` equals storage_secret_ref (constant time). Under
+    TENANT_ASSERTION_IMPL=rust the Rust check must agree as well; any fault is a mismatch."""
+    if not hmac.compare_digest(ref, storage_secret_ref(key, user_id, secret)):
+        return False
+    if impl_choice() == "rust":
+        return _rust_decision({"op": "secret_ref", "key": key, "user_id": user_id, "secret": secret, "ref": ref}) is None
+    return True
 
 
 def _reset_for_tests() -> None:

@@ -245,7 +245,7 @@ def _storage_credential(descriptor: Optional[dict], user_id: str):
         raise HTTPException(status_code=400, detail="invalid storage descriptor")
     secret = descriptor.get("secret") or ""
     key = tenant_assertion.tenant_key()
-    if secret and key and not secrets.compare_digest(ref, tenant_assertion.storage_secret_ref(key, user_id, secret)):
+    if secret and key and not tenant_assertion.secret_ref_matches(key, user_id, secret, ref):
         raise HTTPException(status_code=400, detail="invalid storage descriptor")
     keyed = {k: v for k, v in descriptor.items() if k != "secret"}
     return json.dumps(keyed, sort_keys=True), bool(ref) and not secret
