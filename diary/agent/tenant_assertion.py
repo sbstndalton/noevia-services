@@ -69,7 +69,8 @@ _seen_lock = threading.Lock()
 
 
 IMPLS = ("python", "rust")
-RUST_TIMEOUT_S = 2.0
+RUST_TIMEOUT_S = 0.5
+DEFAULT_BIN = "/usr/local/bin/tenant-assertion"
 _RUST_STDOUT_CAP = 256
 _log = logging.getLogger(__name__)
 _logged: set = set()
@@ -151,7 +152,8 @@ def impl_choice() -> str:
 
 
 def _rust_binary() -> Optional[str]:
-    configured = (os.environ.get("TENANT_ASSERTION_BIN") or "tenant-assertion").strip() or "tenant-assertion"
+    # A fixed absolute path by default (never a PATH lookup); TENANT_ASSERTION_BIN is for tests.
+    configured = (os.environ.get("TENANT_ASSERTION_BIN") or DEFAULT_BIN).strip() or DEFAULT_BIN
     if os.sep in configured:
         return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
     return shutil.which(configured)
@@ -169,22 +171,74 @@ def _rust_decision(payload: dict) -> Optional[str]:
     except (TypeError, ValueError):
         return "rust unavailable"
     try:
-        proc = subprocess.run([binary, "check"], input=data, capture_output=True, timeout=RUST_TIMEOUT_S,
-                              close_fds=True, env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
-    except subprocess.TimeoutExpired:
-        _log_once("rust:timeout", "tenant-assertion timed out; refusing the request")
-        return "rust unavailable"
+        proc = subprocess.Popen([binary, "check"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, close_fds=True,
+                                env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
     except OSError as e:
         _log_once("rust:spawn", f"tenant-assertion could not start ({type(e).__name__}); refusing the request")
         return "rust unavailable"
-    out = proc.stdout[:_RUST_STDOUT_CAP + 1]
-    if proc.returncode == 0 and out == b"accept\n":
+    out = bytearray()
+    overflow = threading.Event()
+
+    def feed():
+        try:
+            proc.stdin.write(data)
+        except (OSError, ValueError):
+            pass  # The child exited early; its exit status decides.
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def drain():
+        # Read at most cap+1 bytes, then stop; the child is killed on overflow.
+        try:
+            while len(out) <= _RUST_STDOUT_CAP:
+                chunk = proc.stdout.read1(_RUST_STDOUT_CAP + 1 - len(out))
+                if not chunk:
+                    return
+                out.extend(chunk)
+            overflow.set()
+        except (OSError, ValueError):
+            return
+
+    threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain, daemon=True)]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + RUST_TIMEOUT_S
+    fault = None
+    while True:
+        try:
+            code = proc.wait(timeout=0.01)
+            break
+        except subprocess.TimeoutExpired:
+            if overflow.is_set():
+                fault = "output_too_large"
+            elif time.monotonic() >= deadline:
+                fault = "timeout"
+            if fault:
+                proc.kill()
+                proc.wait()
+                break
+    for t in threads:
+        t.join(timeout=0.2)
+    try:
+        proc.stdout.close()
+    except OSError:
+        pass
+    if fault or overflow.is_set():
+        fault = fault or "output_too_large"
+        _log_once(f"rust:{fault}", f"tenant-assertion failed ({fault}); refusing the request")
+        return "rust unavailable"
+    out = bytes(out)
+    if code == 0 and out == b"accept\n":
         return None
-    if proc.returncode == 1 and out.startswith(b"reject: ") and len(out) <= _RUST_STDOUT_CAP:
+    if code == 1 and out.startswith(b"reject: ") and len(out) <= _RUST_STDOUT_CAP:
         return "rust refused"
     # Exit 2/3, a signal or unexpected output: a fault, never an acceptance. stderr is not logged
     # (it is a fixed string anyway; nothing of the request is in it).
-    _log_once(f"rust:exit:{proc.returncode}", f"tenant-assertion failed (exit {proc.returncode}); refusing the request")
+    _log_once(f"rust:exit:{code}", f"tenant-assertion failed (exit {code}); refusing the request")
     return "rust unavailable"
 
 

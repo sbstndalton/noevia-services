@@ -2,7 +2,7 @@
 # release/versions.lock's NOEVIA_RS_REF and fetched as an anonymous tarball whose sha256 is checked
 # before anything is built. Used only when DOCX_TEXT_IMPL=rust (default python). Built on bookworm
 # (glibc 2.36), the same Debian as the runtime base below.
-FROM rust:1.99-slim-bookworm AS docx-text
+FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS docx-text
 ARG NOEVIA_RS_REF=a6a50ad971339eea7534d9266d887e04a26af384
 ARG NOEVIA_RS_SHA256=056ade791458364563b7711ccb53bb604dffff046da96740d4aaa607e5acc676
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own

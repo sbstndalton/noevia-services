@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -57,6 +58,7 @@ def verify(h, path='/api/day', method='GET', **kw):
 
 def test_default_is_python_and_never_spawns(monkeypatch):
     monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('spawned under python'))
+    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned under python'))
     assert ta.impl_choice() == 'python'
     assert verify(signed(A, 'GET', '/api/day')) is None
     assert ta.secret_ref_matches(KEY, A, SECRET, ta.storage_secret_ref(KEY, A, SECRET))
@@ -64,7 +66,7 @@ def test_default_is_python_and_never_spawns(monkeypatch):
 
 def test_unknown_value_is_python_with_one_warning(monkeypatch, caplog):
     monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'fortran')
-    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('spawned for an unknown value'))
+    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned for an unknown value'))
     with caplog.at_level(logging.WARNING, logger=ta.__name__):
         for _ in range(3):
             assert ta.impl_choice() == 'python'
@@ -142,11 +144,87 @@ def test_missing_or_non_executable_binary_rejects(tmp_path, monkeypatch, caplog)
     assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'
 
 
-def test_timeout_rejects(tmp_path, monkeypatch):
-    path, _ = fake(tmp_path, 'import time; time.sleep(5); sys.stdout.write("accept\\n")\n')
+def test_default_binary_is_the_fixed_image_path(monkeypatch):
+    assert ta.RUST_TIMEOUT_S == 0.5
+    assert ta.DEFAULT_BIN == '/usr/local/bin/tenant-assertion'
+    seen = []
+    monkeypatch.setattr(ta.os.path, 'isfile', lambda p: seen.append(p) or False)
+    monkeypatch.setattr(ta.shutil, 'which', lambda *a: pytest.fail('PATH lookup for the default binary'))
+    assert ta._rust_binary() is None and seen == ['/usr/local/bin/tenant-assertion']
+
+
+def _pid_gone(pidfile):
+    """True once the child is dead AND reaped: an unreaped zombie still answers kill(pid, 0)."""
+    try:
+        os.kill(int(pidfile.read_text()), 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_timeout_kills_and_reaps_the_child_quickly(tmp_path, monkeypatch):
+    pidfile = tmp_path / 'pid'
+    path, _ = fake(tmp_path, f'open({str(pidfile)!r}, "w").write(str(os.getpid())); import time; time.sleep(30); sys.stdout.write("accept\\n")\n')
     use(monkeypatch, path)
-    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 0.3)
+    t0 = time.monotonic()
     assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'
+    assert time.monotonic() - t0 < 1.5
+    assert _pid_gone(pidfile)
+
+
+def test_endless_stdout_is_capped_and_the_child_killed(tmp_path, monkeypatch):
+    pidfile = tmp_path / 'pid'
+    path, _ = fake(tmp_path, f'open({str(pidfile)!r}, "w").write(str(os.getpid()))\n'
+                             'sys.stdout.write("accept\\n"); sys.stdout.flush()\n'
+                             'while True:\n    sys.stdout.write("x" * 65536); sys.stdout.flush()\n')
+    use(monkeypatch, path)
+    t0 = time.monotonic()
+    assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'
+    assert time.monotonic() - t0 < 1.5
+    assert _pid_gone(pidfile)
+
+
+def test_stderr_flood_is_discarded_without_blocking(tmp_path, monkeypatch):
+    path, _ = fake(tmp_path, 'sys.stderr.write("e" * (4 << 20)); sys.stderr.flush(); sys.stdout.write("accept\\n")\n')
+    use(monkeypatch, path)
+    assert verify(signed(A, 'GET', '/api/day')) is None
+
+
+def test_child_that_never_reads_stdin_cannot_block(tmp_path, monkeypatch):
+    path, _ = fake(tmp_path, 'sys.stdout.write("accept\\n")\n', name='noread')
+    # Replace the recording prologue (which reads stdin) with one that does not.
+    path.write_text(f'#!{sys.executable}\nimport sys, time\ntime.sleep(5)\n')
+    use(monkeypatch, path)
+    big = signed(A, 'GET', '/api/day', {'X-Cowork-Storage': 's' * 200000})
+    t0 = time.monotonic()
+    assert verify(big) == 'rust unavailable'
+    assert time.monotonic() - t0 < 1.5
+
+
+def test_slow_rust_check_does_not_block_the_event_loop(volume, tmp_path, monkeypatch):  # noqa: F811
+    import asyncio
+    import httpx
+    import agent.app as appmod
+    monkeypatch.setattr(appmod, '_reindex_dirty', lambda st: None)
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 3.0)
+    path, _ = fake(tmp_path, 'import time; time.sleep(1.5); sys.stdout.write("accept\\n")\n')
+    use(monkeypatch, path)
+
+    async def main():
+        transport = httpx.ASGITransport(app=appmod.app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://diary') as client:
+            # Timed from the slow request's launch: a blocked loop would also delay the sleep.
+            t0 = time.monotonic()
+            slow = asyncio.create_task(client.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')))
+            await asyncio.sleep(0.2)
+            health = await client.get('/api/health')
+            elapsed = time.monotonic() - t0
+            return health.status_code, elapsed, (await slow).status_code
+
+    code, elapsed, slow_code = asyncio.run(main())
+    assert code == 200 and elapsed < 1.0, elapsed
+    assert slow_code == 200
 
 
 def test_python_refusal_never_consults_rust(tmp_path, monkeypatch):

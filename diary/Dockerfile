@@ -4,7 +4,7 @@
 # bookworm (glibc 2.36); the runtime base is the same or newer Debian. The release's Diary overlay
 # (noevia deploy/examples/diary-overlay.sh) builds this same stage from these ARG defaults, so an
 # overlaid image carries the binary at the same path without a pip install.
-FROM rust:1.99-slim-bookworm AS tenant-assertion
+FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS tenant-assertion
 ARG NOEVIA_RS_REF=a6a50ad971339eea7534d9266d887e04a26af384
 ARG NOEVIA_RS_SHA256=056ade791458364563b7711ccb53bb604dffff046da96740d4aaa607e5acc676
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
