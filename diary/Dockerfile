@@ -5,8 +5,8 @@
 # (noevia deploy/examples/diary-overlay.sh) builds this same stage from these ARG defaults, so an
 # overlaid image carries the binary at the same path without a pip install.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS tenant-assertion
-ARG NOEVIA_RS_REF=be174b12559fd09c1f38a97ae155d353f3e8f77b
-ARG NOEVIA_RS_SHA256=561ee90ffcac741818584f4efa7659feafef3bc54ac8d1764694e729289fce0b
+ARG NOEVIA_RS_REF=6547293b7fa061f4fd7268fed9f43d5cae2fd9e4
+ARG NOEVIA_RS_SHA256=67bbe3fe93d705666251c297a3b24f0aa612b4400635115e07ba33c660b27c43
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
