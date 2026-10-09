@@ -153,3 +153,36 @@ def test_a_hostile_header_of_many_per_layer_arrays_stays_cheap():
     raw = gguf_meta.read_raw_bytes(data)
     assert time.monotonic() - t < 5
     assert sum(len(v) for v in raw.values() if isinstance(v, list)) == gguf_meta.MAX_PER_LAYER_VALUES
+
+
+def _plan_bytes(model: dict, ctx: int = 32768) -> int:
+    p = autoconfig_core.prepare({"n_sessions": 1, "arch": "llama", "model": model,
+                                 "file_size": 1_600_000_000, "backends": BACKENDS})
+    assert p["refuse"] is None
+    return autoconfig_core.kv_shape_bytes(p["shape"], ctx, 1.0625)
+
+
+def test_summary_carries_the_old_sample_reading_and_kv_takes_the_larger():
+    """Lead decision on #1186: KV from a whole list is never below the old 8-sample reading."""
+    raw = gguf_meta.read_raw_bytes(_lfm2(_arr("lfm2.attention.head_count", U32, [8] * 8 + [32] * 22),
+                                         _kv("lfm2.attention.head_count_kv", U32, 8)))
+    m = gguf_meta.summarize(raw)["model"]
+    # mode of the whole list is 32 (head_dim 64); the old sample's mode was 8 (head_dim 256)
+    assert m["attention_head_count"] == 32 and m["per_layer_sample"] == {"attention_head_count": 8}
+    old = dict({k: v for k, v in m.items() if not k.startswith("per_layer")}, attention_head_count=8)
+    new = {k: v for k, v in m.items() if not k.startswith("per_layer")}
+    assert _plan_bytes(m) == max(_plan_bytes(old), _plan_bytes(new)) > _plan_bytes(new)
+
+
+def test_a_zero_kv_dim_entry_never_goes_below_head_dim():
+    raw = gguf_meta.read_raw_bytes(_lfm2(_arr("lfm2.attention.key_length", U32, [0] * 20 + [8] * 10)))
+    m = gguf_meta.summarize(raw)["model"]
+    assert m["key_length"] == 8 and m["per_layer_zero_dims"] == ["key_length"]
+    p = autoconfig_core.prepare({"n_sessions": 1, "arch": "lfm2", "model": m,
+                                 "file_size": 1_600_000_000, "backends": BACKENDS})
+    assert p["shape"]["k_dim"] == 2048 // 32  # head_dim, not 8
+
+
+def test_summaries_without_whole_lists_are_unchanged():
+    m = gguf_meta.summarize(gguf_meta.read_raw_bytes(_lfm2(_arr("lfm2.x", U32, [1] * 29))))["model"]
+    assert not any(k.startswith("per_layer") for k in m)

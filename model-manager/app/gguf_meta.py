@@ -292,12 +292,24 @@ def _scalar_int(v: Any) -> int | None:
 
 def _kv_dim_int(v: Any) -> int | None:
     """_scalar_int for a KV-cache dimension (key/value length): a whole per-layer list (#1186)
-    gives its largest value, so the cache is never sized below what the 8-entry sample's most
-    common value gave. Everything else reads as _scalar_int."""
+    gives its largest nonzero value (0 if every entry is 0: "use head_dim"). A 0 entry is listed
+    in the summary's per_layer_zero_dims, and autoconfig then never takes less than head_dim.
+    Everything else reads as _scalar_int."""
     if isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT:
         known = [int(x) for x in v if isinstance(x, (int, float))]
-        return max(known) if known else None
+        nonzero = [k for k in known if k != 0]
+        return max(nonzero) if nonzero else (0 if known else None)
     return _scalar_int(v)
+
+
+def _is_whole(v: Any) -> bool:
+    """A whole per-layer list: only these are longer than the 8-entry sample (#1186)."""
+    return isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT
+
+
+_KV_DIMS = (("key_length", "attention.key_length"), ("value_length", "attention.value_length"),
+            ("key_length_swa", "attention.key_length_swa"),
+            ("value_length_swa", "attention.value_length_swa"))
 
 
 def _scalar_float(v: Any) -> float | None:
@@ -366,7 +378,31 @@ def _finite(v: Any) -> Any:
 
 
 def summarize(raw: dict[str, Any]) -> dict[str, Any]:
+    """The summary. When the header kept a whole per-layer list (#1186), the model section also
+    carries per_layer_sample: each model field whose value the old 8-entry-sample reading of
+    those lists gives differently, at that old value, so autoconfig can size KV both ways and
+    keep the larger; and per_layer_zero_dims: the KV dimensions whose list has a 0 entry."""
     raw = _finite(raw)
+    out = _summarize(raw)
+    if not any(_is_whole(v) for v in raw.values()):
+        return out
+    sampled = {k: ({"_array": True, "count": len(v), "sample": v[:MAX_ARRAY_ELEMENTS_KEPT]}
+                   if _is_whole(v) else v) for k, v in raw.items()}
+    old, new = _summarize(sampled)["model"], out["model"]
+    diff = {k: v for k, v in old.items()
+            if json.dumps(v, sort_keys=True) != json.dumps(new.get(k), sort_keys=True)}
+    arch = raw.get("general.architecture", "") or ""
+    zero = [f for f, key in _KV_DIMS
+            if arch and _is_whole(v := raw.get(f"{arch}.{key}"))
+            and any(isinstance(x, (int, float)) and x == 0 for x in v)]
+    if diff:
+        new["per_layer_sample"] = diff
+    if zero:
+        new["per_layer_zero_dims"] = zero
+    return out
+
+
+def _summarize(raw: dict[str, Any]) -> dict[str, Any]:
     arch = raw.get("general.architecture", "") or ""
 
     def a(key: str, default: Any = None) -> Any:
