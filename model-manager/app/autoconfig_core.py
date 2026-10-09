@@ -12,11 +12,13 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Callable
 
 # candidate contexts to try, smallest → largest
@@ -1326,9 +1328,727 @@ def assemble_values(inp: dict[str, Any]) -> dict[str, str]:
     return values
 
 
+# ---- speculative-decoding profiles (slice 3) ----
+
+
+@dataclass(frozen=True)
+class SpecProfile:
+    """A workload-shaped preset for speculative decoding.
+
+    Speculative decoding is a bet, not a free win: a cheap drafter proposes N tokens, the main
+    model verifies all N in a single forward pass, and everything from the first mismatch
+    onward is discarded. Whether the bet pays depends on how PREDICTABLE the text is — which
+    is a property of the workload, not of the model. The same weights drafting Python and
+    drafting prose accept at wildly different rates (measured here: 31% to 100% on one model),
+    so the knobs are grouped by what you intend to do with it rather than left as eleven
+    independent numbers nobody can reason about in isolation.
+
+    Two levers do the real work:
+      n-max  how deep to guess. Multiplies the win on predictable text and the waste on
+             unpredictable text. llama.cpp defaults to 3.
+      p-min  how confident the drafter must be before it bothers. Raising it declines the
+             marginal bets, which is what you want when acceptance is poor.
+
+    These are reasoned starting points, not measured optima — llama-server prints the real
+    acceptance rate per request and that is the number to tune against.
+    """
+    key: str
+    label: str
+    icon: str
+    blurb: str                  # one line under the chip
+    spec_type: str              # "" = speculation off
+    needs_head: bool            # requires a draft/MTP model to sit beside the weights
+    knobs: dict[str, str] = field(default_factory=dict)
+
+
+# The knobs each profile sets. Anything not listed is deliberately left unset so llama-server
+# applies its own default; writing out a value identical to the default only creates noise in
+# the diff and a second place to keep in sync when upstream changes it.
+SPEC_PROFILES: tuple[SpecProfile, ...] = (
+    SpecProfile(
+        key="off", label="Off", icon="x",
+        blurb="No speculation. Always correct, never slower than the model itself.",
+        spec_type="", needs_head=False),
+    SpecProfile(
+        key="balanced", label="Balanced", icon="gauge",
+        blurb="Mixed use. Barely above llama.cpp's own defaults, with a mild confidence gate.",
+        spec_type="draft-mtp", needs_head=True,
+        knobs={"spec-draft-n-max": "4", "spec-draft-p-min": "0.25"}),
+    SpecProfile(
+        key="coding", label="Coding", icon="terminal",
+        blurb="Deep drafts, loose gate. Code repeats itself, so guesses land and guessing further pays.",
+        spec_type="draft-mtp,ngram-simple", needs_head=True,
+        knobs={"spec-draft-n-max": "8", "spec-draft-n-min": "1", "spec-draft-p-min": "0.05"}),
+    SpecProfile(
+        key="writing", label="Creative writing", icon="pencil",
+        blurb="Shallow drafts, tight gate. Prose is unpredictable, so bad bets cost more than good ones pay.",
+        spec_type="draft-mtp", needs_head=True,
+        knobs={"spec-draft-n-max": "2", "spec-draft-p-min": "0.60"}),
+    SpecProfile(
+        key="ngram", label="N-gram only", icon="hash",
+        blurb="No draft head required. Replays literal repeats from the prompt: strong on edits and refactors, inert on new prose.",
+        spec_type="ngram-simple", needs_head=False),
+)
+
+# n-gram strategies read their draft length from --spec-ngram-*-size-m, not --spec-draft-n-max
+# (upstream's removal note for --draft-max spells the split out). Setting the draft-model knobs
+# for a head-free profile would write keys llama-server ignores.
+SPEC_PROFILE_BY_KEY: dict[str, SpecProfile] = {p.key: p for p in SPEC_PROFILES}
+
+# Default speculative profile per workload when a head (file or built-in) is available. Agent turns
+# are mostly tool JSON and short answers, which draft like code; chat is mixed.
+MODE_SPEC_PROFILE: dict[str, str] = {"chat": "balanced", "code": "coding", "agent": "coding", "writing": "writing"}
+
+# Keys a profile owns. Switching profiles must clear whatever the previous one set, or a move
+# from Coding to Writing would silently keep n-min = 1 from the profile that was abandoned.
+SPEC_PROFILE_KEYS: tuple[str, ...] = (
+    "spec-draft-n-max", "spec-draft-n-min", "spec-draft-p-min",
+)
+
+# The saved-section keys resolve_spec() reads (what analyze() sends of the section).
+SPEC_SECTION_KEYS: tuple[str, ...] = ("spec-type", "spec-draft-model", "spec-draft-ngl", *SPEC_PROFILE_KEYS)
+
+
+def match_spec_profile(section: dict[str, str] | None) -> str:
+    """Which profile an existing section corresponds to: a key, "custom", or "".
+
+    Returns "" for a section that does not exist yet (no opinion — the caller picks a default).
+    A saved section with no spec-type is "off": that is a deliberate opt-out, and re-proposing
+    speculation would make turning it off impossible to make stick.
+    """
+    if section is None:
+        return ""
+    stype = (section.get("spec-type") or "").strip()
+    if not stype or stype == "none":
+        return "off"
+    for prof in SPEC_PROFILES:
+        if prof.spec_type != stype:
+            continue
+        if all((section.get(k) or "").strip() == v for k, v in prof.knobs.items()):
+            # Any knob the profile does not set must also be absent, or a hand-tuned section
+            # that merely happens to share a spec-type would be mislabelled as this profile
+            # and get its edits overwritten on the next Fill.
+            extra = [k for k in SPEC_PROFILE_KEYS
+                     if k not in prof.knobs and (section.get(k) or "").strip()]
+            if not extra:
+                return prof.key
+    return "custom"
+
+
+# One JSON request (`resolve_spec`); the answer is {mtp_rel, saved, key, head, values}:
+#
+#   section       the section name ("" for an estimate)
+#   current       the saved section's SPEC_SECTION_KEYS where set (strings), or None for no section
+#   spec_profile  the profile picked in the UI (raw string); mode: the workload ("" = none)
+#   files         whether analyze() looked for files (a models_dir and a section name)
+#   found_mtp     the draft head _find_mtp found ("" when it found none or was not asked)
+#   nextn         summary["model"]["nextn_predict_layers"], raw (built-in MTP layers)
+#
+#   mtp_rel       the draft head analyze() budgets (the saved one wins over the found one)
+#   saved         match_spec_profile(current); key: the profile in effect ("custom" = hand-tuned)
+#   head          the draft head the profile uses; values: [[key, value]...], the spec keys in order
+
+
+def resolve_spec(inp: dict[str, Any]) -> dict[str, Any]:
+    """analyze()'s speculative-decoding resolution (see SpecProfile)."""
+    current = inp["current"]
+    cs = current or {}
+    mtp_rel = ""
+    if inp["files"]:
+        mtp_rel = cs.get("spec-draft-model", "").strip() or inp["found_mtp"]
+    builtin_mtp = int(inp["nextn"] or 0) > 0
+    saved = match_spec_profile(current)
+    key = (inp["spec_profile"] or "").strip()
+    if key not in SPEC_PROFILE_BY_KEY and key != "custom":
+        # No explicit pick. Fall back to what is saved; a new section gets Balanced when a
+        # head was found beside the weights and Off when there is nothing to draft with.
+        key = saved or (MODE_SPEC_PROFILE.get(inp["mode"], "balanced") if (mtp_rel or builtin_mtp) else "off")
+    # A profile that needs a head but has none cannot run — llama-server would start and then
+    # fail to load the draft. Fall back rather than offering a configuration that cannot work.
+    head = cs.get("spec-draft-model", "").strip() or mtp_rel
+    prof = SPEC_PROFILE_BY_KEY.get(key)
+    if prof and prof.needs_head and not head and not builtin_mtp:
+        prof = SPEC_PROFILE_BY_KEY["off"]
+        key = "off"
+
+    values: dict[str, str] = {}
+    if inp["section"]:
+        if key == "custom":
+            # Hand-tuned. Echo every spec key verbatim: Fill writes exactly `values`, so a
+            # setting that is not repeated here is silently erased on the next save.
+            for k in SPEC_SECTION_KEYS:
+                v = cs.get(k, "").strip()
+                if v:
+                    values[k] = v
+        elif prof is not None:
+            # Every owned key is written even when empty, so switching profiles CLEARS what
+            # the previous one set. Without this, Coding -> Writing would leave n-min = 1
+            # behind and the result would match neither profile.
+            values["spec-type"] = prof.spec_type
+            for k in SPEC_PROFILE_KEYS:
+                values[k] = prof.knobs.get(k, "")
+            if prof.spec_type and prof.needs_head and not head:
+                # Built-in nextn layers: the engine drafts from the model itself.
+                values["spec-draft-model"] = ""
+                values["spec-draft-ngl"] = ""
+            elif prof.spec_type and prof.needs_head:
+                values["spec-draft-model"] = head
+                # Without this the head lands on the CPU, and a draft evaluated on the CPU is
+                # slower than the main model it is meant to be racing ahead of.
+                values["spec-draft-ngl"] = cs.get("spec-draft-ngl", "").strip() or "999"
+            else:
+                # n-gram strategies have no model to place, and Off has nothing at all.
+                values["spec-draft-model"] = ""
+                values["spec-draft-ngl"] = ""
+    return {"mtp_rel": mtp_rel, "saved": saved, "key": key, "head": head,
+            "values": [[k, v] for k, v in values.items()]}
+
+
+# ---- companion files: the mmproj and draft-head name rules (slice 6) ----
+#
+# The directory listing and every stat stay in autoconfig.py; these rules only read a listing:
+# [[name, kind, size]...] in sorted order (kind "file" with its size, or None where stat failed;
+# "other" for anything that is not a regular file; "error" where is_file() itself raised), or
+# None when the directory could not be listed. One request per rule call (`pick_file`):
+#
+#   {"rule": "mmproj_subdir", "listing", "subdir"}    the smallest projector in the model's folder
+#   {"rule": "mmproj_flat", "listing", "section"}     the first top-level projector naming the model
+#   {"rule": "mtp_folder", "listing", "prefix", "section"}  the smallest head in a folder
+#   {"rule": "mtp_flat", "listing", "section"}        the smallest top-level head naming the model
+#   {"rule": "projector", "files", "current", "found", "stat_gb", "vision", "override"}
+#       which projector analyze() budgets: {mmproj_rel, mmproj_gb, available}
+
+# Real draft/MTP heads are tens to a few hundred MB; anything larger with "mtp" in its name is a
+# full model build that includes MTP layers (e.g. Unsloth's "-MTP-GGUF" repos), not a head.
+HEAD_MAX_BYTES = 2 * 1024 ** 3
+
+
+def _looks_like_draft(filename: str) -> bool:
+    """Heuristic: is this GGUF a speculative-decoding draft head?
+
+    Match on isolated tokens (`-draft-`, `-mtp-`, or the filename starting/ending with those)
+    so we don't false-match main models that have "noMTP" or "nodraft" in their name — those
+    are variants explicitly WITHOUT MTP support (e.g. `Qwen3.8-27B-Uncensored-noMTP-Q4_K_M.gguf`).
+    """
+    low = filename.lower()
+    # Explicit "no MTP" or "no draft" variants — these are main models, not drafts
+    for negation in ("nomtp", "no-mtp", "no_mtp", "nodraft", "no-draft", "no_draft"):
+        if negation in low:
+            return False
+    # Positive matches — token boundaries only
+    for token in ("-draft-", "-draft.", "_draft_", ".draft.", "-mtp-", "_mtp_", ".mtp."):
+        if token in low:
+            return True
+    # Also match "draft" or "mtp" as leading/trailing tokens
+    stem = low[:-5] if low.endswith(".gguf") else low
+    parts = stem.replace("_", "-").split("-")
+    return parts and (parts[0] in ("draft", "mtp") or parts[-1] in ("draft", "mtp"))
+
+
+def _is_mmproj(name: str) -> bool:
+    return name.lower().endswith(".gguf") and "mmproj" in name.lower()
+
+
+def _name_key(name: str) -> str:
+    return name.lower().replace("-", "").replace("_", "").replace(".", "")
+
+
+def _is_head(name: str, kind: str, size: int | None, section: str) -> bool:
+    """_find_mtp's per-folder filter: a .gguf head, not a projector, not the model itself,
+    head-sized."""
+    p = PurePosixPath(name)
+    if not (kind == "file" and p.suffix.lower() == ".gguf"):
+        return False
+    if "mmproj" in name.lower() or not _looks_like_draft(name):
+        return False
+    # The model itself is never its own head: "-MTP-" builds carry the name too.
+    return p.stem != section and size is not None and size <= HEAD_MAX_BYTES
+
+
+def pick_file(inp: dict[str, Any]) -> Any:
+    """One companion-file rule (see above)."""
+    rule = inp["rule"]
+    if rule == "projector":
+        return _resolve_projector(inp)
+    listing = inp["listing"]
+    if rule == "mmproj_subdir":
+        # A repo often ships several precisions of the same projector (BF16 / F16 / F32).
+        # Prefer the SMALLEST: it is pinned to the main GPU and competes with the KV cache.
+        if listing is None:
+            return ""
+        best: tuple[int, str] | None = None
+        for name, kind, size in listing:
+            if kind == "error":
+                break       # is_file() raised: the scan stops, keeping what it found
+            if kind == "file" and _is_mmproj(name):
+                if size is None:
+                    break   # stat raised: likewise
+                if best is None or size < best[0]:
+                    best = (size, name)
+        return f"/models/{inp['subdir']}/{best[1]}" if best else ""
+    if rule == "mmproj_flat":
+        # Flat layout: the projector filename must carry the model's full stem, so
+        # `foo-Q4_K_M.gguf` matches `foo-Q4_K_M-mmproj.gguf` but never a sibling model.
+        stem_key = _name_key(inp["section"])
+        if not stem_key or listing is None:
+            return ""
+        for name, kind, _size in listing:
+            if kind == "error":
+                return ""
+            if kind == "file" and _is_mmproj(name) and stem_key in _name_key(name):
+                return f"/models/{name}"
+        return ""
+    if rule == "mtp_folder":
+        if listing is None:
+            return ""
+        cands = []
+        for name, kind, size in listing:
+            if kind == "error":
+                return ""
+            if _is_head(name, kind, size, inp["section"]):
+                cands.append((name, size))
+        if not cands:
+            return ""
+        return f"{inp['prefix']}{min(cands, key=lambda c: c[1])[0]}"
+    if rule == "mtp_flat":
+        stem_key = _name_key(inp["section"])
+        if not stem_key or listing is None:
+            return ""
+        cands = []
+        for name, kind, size in listing:
+            if kind == "error":
+                return ""
+            if (kind == "file" and PurePosixPath(name).suffix.lower() == ".gguf" and _looks_like_draft(name)
+                    and "mmproj" not in name.lower() and stem_key in _name_key(name)):
+                cands.append((name, size))
+        if not cands:
+            return ""
+        if any(size is None for _, size in cands):
+            raise OSError("a draft head could not be sized")
+        return f"/models/{min(cands, key=lambda c: c[1])[0]}"
+    raise ValueError(f"unknown file rule {rule!r}")
+
+
+def _resolve_projector(inp: dict[str, Any]) -> dict[str, Any]:
+    """Size against the projector that will ACTUALLY be loaded: the saved one wins over the one
+    found beside the model. `stat_gb` is its size as analyze() read it (0.0 when unreadable).
+    Vision off drops it; a caller that knows a remote projector's size (the HF estimator)
+    passes it as `override`."""
+    mmproj_rel, mmproj_gb = "", 0.0
+    if inp["files"]:
+        mmproj_rel = inp["current"].strip() or inp["found"]
+        if mmproj_rel:
+            mmproj_gb = inp["stat_gb"]
+    available = mmproj_rel
+    if not inp["vision"]:
+        mmproj_rel, mmproj_gb = "", 0.0
+    override = inp["override"]
+    if inp["vision"] and override is not None and override > 0:
+        mmproj_gb = override
+        mmproj_rel = mmproj_rel or "(remote projector)"
+    return {"mmproj_rel": mmproj_rel, "mmproj_gb": mmproj_gb, "available": available}
+
+
+# ---- baseline parsing (slice 5): the container's llama-server command -> ini keys ----
+
+_SHORT_TO_KEY = {
+    "-ngl": "ngl", "-fa": "flash-attn", "-ctk": "cache-type-k",
+    "-ctv": "cache-type-v", "-np": "parallel", "-c": "ctx-size",
+    "-b": "batch-size", "-ub": "ubatch-size", "-t": "threads",
+    "-tb": "threads-batch", "-sm": "split-mode", "-mg": "main-gpu",
+    "-fit": "fit", "-fitt": "fit-target", "-fitc": "fit-ctx",
+    "-cmoe": "cpu-moe", "-ncmoe": "n-cpu-moe",
+    "-kvo": "kv-offload",
+}
+
+
+def parse_baseline(cmd_args: list[str], known: Any) -> dict[str, str]:
+    """Parse the container's llama-server command args into a {ini_key: value} dict. `known`
+    holds the long option names that are ini keys (ini.ALL_KNOWN_KEYS)."""
+    out: dict[str, str] = {}
+    n = len(cmd_args)
+    for i, a in enumerate(cmd_args):
+        key: str | None = None
+        if a in _SHORT_TO_KEY:
+            key = _SHORT_TO_KEY[a]
+        elif a.startswith("--"):
+            k = a[2:]
+            if k in known:
+                key = k
+        if not key:
+            continue
+        nxt = cmd_args[i + 1] if i + 1 < n else None
+        if nxt is not None and not nxt.startswith("-"):
+            out[key] = nxt
+        else:
+            out[key] = "true"
+    return out
+
+
+# ---- diff and presentation (slice 4): what analyze() reports beside the values ----
+
+# Every key autoconfig has an opinion about. For each one it either SETS a value or wants the
+# key GONE — nothing here may survive a Fill untouched. The list is what makes "Fill form" honest:
+# Fill writes the keys present in `values` and clears the rest of this set, so a recommendation
+# cannot leave a stale placement pin behind and report success.
+#
+# This replaces a hand-maintained set that held only {cpu-moe, n-cpu-moe}. Because ngl and
+# tensor-split were missing from it, the panel reported "n-cpu-moe -> unset" while Fill silently
+# left ngl=999 and tensor-split=17,13 in place — Save then wrote them straight back and the user
+# saw no change at all. _domain_gaps() below guards against that returning: any key assigned but
+# not declared here is surfaced as a quirk rather than silently escaping.
+#
+# The profile-owned keys are folded in by REFERENCE rather than restated, so the two can't drift.
+# They are written from a profile's `knobs` dict rather than by a literal `values[...] =`, which
+# is exactly why enumerating assignments by eye missed them — the _domain_gaps() guard caught all
+# three on its first run.
+AUTOCONFIG_DOMAIN: frozenset[str] = frozenset({
+    # placement / fit — the ones that decide whether the model loads
+    "ngl", "tensor-split", "split-mode", "cpu-moe", "n-cpu-moe", "fit",
+    # context and cache
+    "ctx-size", "parallel", "batch-size", "ubatch-size", "keep", "cache-reuse", "cache-ram",
+    "cache-type-k", "cache-type-v", "flash-attn", "cont-batching", "context-shift",
+    # rope
+    "rope-scaling", "rope-scale",
+    # speculative decoding
+    "spec-type", "spec-draft-model", "spec-draft-ngl",
+    # multimodal
+    "mmproj", "mmproj-offload", "image-max-tokens",
+    # templating / reasoning
+    "jinja", "chat-template-kwargs", "reasoning", "reasoning-format", "reasoning-preserve",
+}) | frozenset(SPEC_PROFILE_KEYS)
+
+# Clearing this would break the section outright — a section with no model file is not a model.
+# It stays out of the displaced list even when a recommendation happens not to set it.
+_NEVER_CLEAR: frozenset[str] = frozenset({"model"})
+
+
+def _domain_gaps(values: dict[str, str]) -> list[str]:
+    """Keys a recommendation set that AUTOCONFIG_DOMAIN does not declare.
+
+    Non-fatal on purpose: a missing declaration should be visible, not a 500 on a page the user
+    is trying to read. Surfaced as a quirk so it gets noticed and fixed.
+    """
+    return sorted(set(values) - AUTOCONFIG_DOMAIN - _NEVER_CLEAR)
+
+
+def _fmt_ctx(n: int) -> str:
+    if n >= 1024 and n % 1024 == 0:
+        k = n // 1024
+        return f"{k}K"
+    return f"{n:,}"
+
+
+# Operator policy (2026-09-17): a context this small leaves no room for tool definitions, results and
+# a conversation, and a quantisation below Q4 costs more quality than it saves memory on a model
+# this size. Both are warnings on the recommendation, never silent refusals.
+MIN_USEFUL_CTX = 16384
+SUB_Q4_PARAM_LIMIT = 100_000_000_000
+_SUB_Q4 = re.compile(r'(?:^|[-_.])(?:UD-)?(IQ[123]\w*|Q[123](?:_[\w]+)*)(?:[-_.]|$)', re.I)
+
+
+def quality_warnings(*, model_rel: str, params: float | int | None, recommended_ctx: int, native_ctx: int = 0) -> list[str]:
+    """Settings that will disappoint before they are measured: too little context, too few bits."""
+    out = []
+    name = (model_rel or "").rsplit("/", 1)[-1]
+    quant = (_SUB_Q4.search(name) or [None, None])[1] if name else None
+    if quant and (not params or float(params) < SUB_Q4_PARAM_LIMIT):
+        out.append(f"{quant.upper()} is below Q4; on a model this size that usually costs more quality than the memory it saves.")
+    usable = recommended_ctx or native_ctx
+    if usable and usable < MIN_USEFUL_CTX:
+        out.append(f"{usable:,} tokens of context is little use once tool definitions and results are in the prompt; {MIN_USEFUL_CTX:,} is a sensible floor.")
+    return out
+
+
+# Kept even when the baseline already covers them (see present()).
+_ESSENTIAL = ("model", "ctx-size", "jinja", "cpu-moe", "n-cpu-moe",
+              "parallel", "cont-batching", "context-shift", "keep",
+              "batch-size", "ubatch-size", "cache-reuse", "reasoning",
+              "reasoning-preserve", "mmproj", "mmproj-offload", "image-max-tokens",
+              # tensor-split is a correctness setting under expert offload, not a
+              # tuning nicety: dropping it restores the even layer split that OOMs.
+              "tensor-split", "split-mode")
+
+# One JSON request (`present`); the answer is {minimal, redundant, quirks, unavailable,
+# current_preset, current_diff, displaced, warnings} (minimal and redundant as [[key, value]...]):
+#
+#   values        Python's values, [[key, value]...] in order
+#   current       the saved section (strings), or None
+#   recommended   whether a backend was recommended; rec_name: its name, raw
+#   rec_backend   the first backend of that name: its "baseline" and "gpu_count" where present
+#   arch          summary["arch"], raw; chat_template: whether summary["chat_template"] is set
+#   features      summary["chat_template_features"], raw
+#   n_sessions    1..8; rec_ctx: the per-session context recommended
+#   has_mmproj, mmproj_vram_gb, mmproj_gb   the projector and its reservation
+#   rope          summary["model"], raw (rope ownership, the declared scaling type)
+#   native_ctx, layers   as prepare() read them; experts: summary["model"]["expert_count"], raw
+#   offload       the size plan's [kind, n_cpu_moe]; presets: [{key, ctx, offload_kind, ngl, n_cpu_moe}...]
+#   model_rel     the model path; general: summary["general"], raw (its params_raw)
+
+
+def _lower_eq(a: Any, b: Any) -> bool:
+    return str(a).lower() == str(b).lower()
+
+
+def present(inp: dict[str, Any]) -> dict[str, Any]:
+    """analyze()'s report beside the values, in analyze()'s order: baseline redundancy, the
+    quirks, the unavailable knobs, the saved preset, the diff, the displaced keys, the warnings."""
+    values = {k: v for k, v in inp["values"]}
+    current_section = inp["current"]
+    recommended = inp["recommended"]
+    rec_backend = inp["rec_backend"]
+    n_sessions = inp["n_sessions"]
+    rec_ctx = inp["rec_ctx"]
+    m = inp["rope"]
+    native_ctx = inp["native_ctx"]
+    layers = inp["layers"]
+    experts = inp["experts"]
+    features = inp["features"] or {}
+
+    # baseline-redundant: any key that matches the recommended backend's baseline
+    baseline_redundant: dict[str, str] = {}
+    minimal = dict(values)
+    if recommended:
+        base = (rec_backend or {}).get("baseline") or {}
+        for k, v in list(values.items()):
+            bv = base.get(k)
+            if bv is not None and _lower_eq(bv, v):
+                baseline_redundant[k] = v
+                minimal.pop(k, None)
+
+    # ensure minimal keeps the essential differentiators even if redundant on paper
+    for essential in _ESSENTIAL:
+        if essential in values and essential not in minimal:
+            minimal[essential] = values[essential]
+
+    quirks: list[str] = []
+
+    # Baseline CONFLICTS — the container's own CLI args win over anything in models.ini,
+    # so a preset value that disagrees with the compose command is silently discarded.
+    # This bit us hard: `-np 1` in the compose command overrode `parallel = 2` in the ini,
+    # so multi-session serving never actually ran, and `-ctv q8_0` overrode `cache-type-v`.
+    # Surface it loudly instead of letting the preset look like it took effect.
+    if recommended:
+        _base2 = (rec_backend or {}).get("baseline") or {}
+        conflicts = [
+            f"`{k}`: preset wants {v}, container forces {_base2[k]}"
+            for k, v in values.items()
+            if k in _base2 and not _lower_eq(_base2[k], v)
+        ]
+        if conflicts:
+            quirks.append(
+                "CONFLICT — the container's CLI args override models.ini, so these preset values "
+                "will NOT take effect: " + "; ".join(conflicts) + ". "
+                f"Fix by removing those flags from the `{inp['rec_name']}` command in your compose file "
+                "so per-model presets can control them. Keep only router-level args there "
+                "(--models-dir, --models-preset, --host, --port, --models-max)."
+            )
+
+    if (inp["arch"] or "").lower().startswith("gemma"):
+        quirks.append("Gemma sliding-window attention: the ctx→KV math above assumes swa-full=false (default). "
+                      "Enabling swa-full multiplies full-attn KV ~5× and will OOM.")
+    # (MoE hint is emitted later, tailored to whichever offload the recommendation actually applies)
+    if not inp["chat_template"]:
+        quirks.append("No embedded chat template — you'll need to set `chat-template` or `chat-template-file` "
+                      "manually to get correct multi-turn formatting.")
+
+    # Chat-template reasoning-capability hints (from template scanning)
+    detected: list[str] = []
+    if features.get("accepts_enable_thinking"):
+        detected.append("`enable_thinking` kwarg (set true/false)")
+    if features.get("accepts_reasoning_effort"):
+        detected.append("`reasoning_effort` kwarg (low/medium/high)")
+    if features.get("accepts_preserve_thinking"):
+        detected.append("`preserve_thinking` kwarg (keep reasoning across turns)")
+    if detected:
+        quirks.append(
+            "Chat template supports " + ", ".join(detected) + ". "
+            "Thinking is enabled via the dedicated `reasoning = on` flag (setting enable_thinking through "
+            "chat-template-kwargs is deprecated in current llama.cpp); anything without a dedicated flag, "
+            "such as reasoning_effort, is pre-filled into `chat-template-kwargs`. Override either in the form."
+        )
+    if features.get("uses_think_tags") or features.get("uses_channel_thought"):
+        quirks.append(
+            "Model emits <think> or channel-based thought tags. Set `reasoning-format = deepseek` so OpenAI-compatible "
+            "clients (OpenWebUI etc.) render thoughts as a collapsible instead of inline in the answer."
+        )
+
+    # Multi-session disclosure — makes the ctx-size vs per-session split visible
+    if n_sessions > 1 and rec_ctx > 0:
+        quirks.append(
+            f"Sizing for {n_sessions} concurrent sessions: each user gets {_fmt_ctx(rec_ctx)} of context, "
+            f"llama-server allocates ctx-size = {_fmt_ctx(rec_ctx * n_sessions)} total across the -np {n_sessions} slots. "
+            f"KV cache is sized against the total; per-session throughput drops roughly linearly with load."
+        )
+        quirks.append(
+            f"When a session hits its {_fmt_ctx(rec_ctx)} cap it will SLIDE: oldest tokens drop, "
+            f"generation continues. Set `context-shift = on` and `keep = 256` (tune to your system-prompt "
+            f"length in tokens so instructions survive the shift). To fail hard instead of forgetting old "
+            f"turns, set `context-shift = off` in the form."
+        )
+        quirks.append(
+            "TTFT tuning for multi-slot: set `batch-size = 4096` (safe, negligible VRAM). "
+            "To also improve prompt-eval when a second session arrives mid-generation, bump `ubatch-size` "
+            "in the form — this is the main lever, but it's costly. On layer-split multi-GPU, compute-buffer "
+            "VRAM grows as ~8 × ubatch × layers × hidden. A dense 27B (64L, 5120H) at ubatch=2048 costs ~4.7 GB "
+            "of compute buffers across cards. Don't bump ubatch above 512 unless you have 2+ GB of measured "
+            "free VRAM after boot. MoE with CPU offload has much more room to work with."
+        )
+
+    # Multi-GPU overhead disclosure — user should know the math accounted for split-mode costs
+    if recommended:
+        rec_gpu_count = int((rec_backend or {}).get("gpu_count", 1))
+        if rec_gpu_count > 1:
+            quirks.append(
+                f"Multi-GPU backend ({rec_gpu_count} cards, layer-split): reserved "
+                f"{_RESERVE_PER_GPU * rec_gpu_count:.1f} GB total for CUDA runtime "
+                f"(0.5 GB × {rec_gpu_count}) and applied a {int((_MODEL_OVERHEAD_SPLIT - 1) * 100)}% model-VRAM "
+                f"multiplier for cross-card handoffs. Real cap will be a bit lower than pure sum-of-VRAMs."
+            )
+
+    # Multimodal VRAM accounting
+    if inp["has_mmproj"]:
+        quirks.append(
+            f"Multimodal model (mmproj companion present — vision, audio, or other modality). "
+            f"Reserved {inp['mmproj_vram_gb']:.2f} GB for the projector ({inp['mmproj_gb']:.2f} GB weights + "
+            f"{_MMPROJ_COMPUTE_GB:g} GB encoder scratch). If several projector precisions ship in the "
+            "directory the smallest is chosen, since it competes directly with the KV cache.\n"
+            "TREAT THIS CTX AS OPTIMISTIC AND VERIFY IT LOADS. The projector and its encoder buffer are "
+            "NOT layer-split — both land entirely on the main GPU — so the real limit is that one card, "
+            "not the pooled total this estimate is based on. Worse, measured encoder scratch varies ~4x "
+            "between models (0.55 GB on a 27B with a 0.87 GB projector vs 2.3 GB on Qwen3-VL-4B with a "
+            "0.78 GB one) and is not derivable from GGUF metadata, so no single constant fits all. "
+            "If it OOMs on device 0 while the other card still shows free VRAM, that is exactly this "
+            "limitation — step ctx-size down until it loads."
+        )
+
+    # RoPE extension quirk (only when we set linear scaling ourselves)
+    rope_owned = rope_owned_by_gguf(m)
+    if values.get("rope-scaling") == "linear" and not rope_owned and native_ctx > 0:
+        scale = values.get("rope-scale", "?")
+        quirks.append(f"Extended ctx from native {_fmt_ctx(native_ctx)} to {_fmt_ctx(rec_ctx)} "
+                      f"via `rope-scaling=linear, rope-scale={scale}`. Linear scaling degrades quality gracefully up "
+                      f"to ~2× native; beyond that outputs get progressively worse. Drop ctx-size in the form to back off.")
+
+    # unavailable knobs
+    rope_type = m.get("rope_scaling_type")
+    unavailable: list[str] = []
+    is_moe = isinstance(experts, int) and experts > 1
+    if not is_moe:
+        unavailable.append("cpu-moe / n-cpu-moe (not MoE)")
+    if rope_owned:
+        unavailable.append("rope-scaling (the GGUF sets it per layer; a preset value would override it)")
+    elif not rope_type or str(rope_type).lower() == "none":
+        unavailable.append("rope-scaling (model doesn't declare one)")
+
+    # MoE-specific quirk: reflect what offload is being applied
+    if is_moe:
+        if recommended:
+            off_kind, n_cm = inp["offload"]
+            if off_kind in ("cpu-moe", "n-cpu-moe"):
+                est = (f"all {layers} layers'" if off_kind == "cpu-moe"
+                       else f"roughly the first {n_cm} of {layers} layers'")
+                quirks.append(
+                    f"MoE model ({experts} experts): needs expert weights on the CPU — estimated {est} worth. "
+                    "Placement is left to llama.cpp: `fit = on` with ngl, tensor-split and n-cpu-moe all unset, "
+                    "so llama-server sizes it at load time against real free VRAM. That estimate is advisory; "
+                    "the loader decides. Expect slower generation than a fully-GPU model."
+                )
+                quirks.append(
+                    "Pinning ngl or tensor-split here would DISABLE that fitting (`--fit` only adjusts unset "
+                    "arguments — the log says \"n_gpu_layers already set by user to 999, abort\"), and our own "
+                    "placement maths has no term for compute buffers, which reached 3.6 GiB on a single card "
+                    "on a 177B model at 256K ctx. Leave them unset unless you are tuning by measurement."
+                )
+            else:
+                quirks.append(f"MoE model ({experts} experts): fits fully on GPU at this ctx — no CPU offload needed.")
+        else:
+            quirks.append(f"MoE model ({experts} experts): does not fit even with all experts offloaded to CPU. "
+                          f"You need a bigger GPU, a smaller quant, or a shorter context.")
+
+    # Work out which preset the SAVED section currently matches, by comparing the knobs
+    # that presets actually set (total ctx plus the offload level). Used to badge the chip
+    # that is really running, so a previewed chip can't be mistaken for the live config.
+    presets = inp["presets"]
+    current_preset = ""
+    if current_section and presets:
+        _cur = {k: str(v) for k, v in current_section.items()}
+        try:
+            _cur_ctx = int(_cur.get("ctx-size") or 0)
+        except ValueError:
+            _cur_ctx = 0
+        _cur_ngl = (_cur.get("ngl") or "").strip()
+        _cur_ncm = (_cur.get("n-cpu-moe") or "").strip()
+        for _p in presets:
+            if _cur_ctx != _p["ctx"] * n_sessions:
+                continue
+            if _p["offload_kind"] == "ngl":
+                ok = _cur_ngl == str(_p["ngl"])
+            elif _p["offload_kind"] == "n-cpu-moe":
+                ok = _cur_ncm == str(_p["n_cpu_moe"])
+            elif _p["offload_kind"] == "cpu-moe":
+                ok = (_cur.get("cpu-moe") or "").lower() in ("true", "on", "1")
+            else:
+                ok = _cur_ngl in ("", "999") and not _cur_ncm
+            if ok:
+                current_preset = _p["key"]
+                break
+
+    # diff vs current section — only report on keys autoconfig actually opinions on.
+    # Anything the user set that we don't touch (mmproj, chat-template-file, lora, override-*, etc.)
+    # is left alone: not reported as a diff, and Fill/Fill minimal doesn't overwrite it.
+    #
+    # Order (#1152): first every key the recommendation sets whose value differs, in the order of
+    # `values`; then every key it supersedes, sorted by key (code point order, as `displaced`).
+    # The removals used to follow set iteration order, which changes with PYTHONHASHSEED, so the
+    # same request listed them differently from one process to the next.
+    current_diff: list[str] = []
+    # Everything autoconfig opinions on, minus what this recommendation actually set: that is
+    # exactly the set it wants gone. Declared once in AUTOCONFIG_DOMAIN rather than remembered
+    # per-branch, so a key can no longer be quietly left behind.
+    _displaces = sorted(AUTOCONFIG_DOMAIN - _NEVER_CLEAR)
+    if current_section:
+        cur = {k: str(v) for k, v in current_section.items()}
+        for k, v in values.items():
+            if cur.get(k, "") != v:
+                if k in cur:
+                    current_diff.append(f"{k}: {cur[k]!r} → {v!r}")
+                else:
+                    current_diff.append(f"{k}: unset → {v!r}")
+        # Only report removals for keys we actively displace
+        for k in _displaces:
+            if k in cur and cur[k] and k not in values:
+                current_diff.append(f"{k}: {cur[k]!r} → unset (superseded)")
+
+    # Keys the recommendation wants GONE. "Fill form" walks `values` and writes each key it
+    # finds, so a key we deliberately omit is simply left holding whatever the form already had
+    # — the current section — and Save writes it straight back. The diff would promise
+    # "n-cpu-moe: '6' -> unset" while nothing changed. Fill has to be told what to clear.
+    displaced = [k for k in _displaces if k not in values]
+
+    # A key we set but never declared would escape both the diff and Fill's clearing, which is
+    # how the "Save does nothing" bug worked. Make it visible instead of silent.
+    _gaps = _domain_gaps(values)
+    if _gaps:
+        quirks.append(
+            "Autoconfig set %s, which AUTOCONFIG_DOMAIN does not declare. Fill will not clear "
+            "%s on a later run, so a stale value could survive. Add them to the domain."
+            % (", ".join("`%s`" % g for g in _gaps), "them" if len(_gaps) > 1 else "it")
+        )
+
+    warnings = quality_warnings(model_rel=inp["model_rel"], params=(inp["general"] or {}).get("params_raw"),
+                                recommended_ctx=rec_ctx, native_ctx=native_ctx)
+    return {"minimal": [[k, v] for k, v in minimal.items()],
+            "redundant": [[k, v] for k, v in baseline_redundant.items()],
+            "quirks": quirks, "unavailable": unavailable, "current_preset": current_preset,
+            "current_diff": current_diff, "displaced": displaced, "warnings": warnings}
+
+
 def check_reference(parts: dict[str, Any]) -> dict[str, Any]:
-    """What `model-autoconfig check` answers for `parts` ({prep?, size?, values?}), from the
-    Python reference: prep as prepare_all, size as size_plan, values as ordered [key, value]."""
+    """What `model-autoconfig check` answers for `parts` ({prep?, size?, values?, spec?, files?,
+    present?, baseline?}), from the Python reference: prep as prepare_all, size as size_plan,
+    values as ordered [key, value], spec as resolve_spec, files as pick_file of each rule call,
+    present as present, baseline as parse_baseline of each {args, known} (ordered pairs)."""
     out: dict[str, Any] = {}
     if parts.get("prep") is not None:
         out["prep"] = prepare_all(parts["prep"])
@@ -1336,20 +2056,33 @@ def check_reference(parts: dict[str, Any]) -> dict[str, Any]:
         out["size"] = size_plan(parts["size"])
     if parts.get("values") is not None:
         out["values"] = [[k, v] for k, v in assemble_values(parts["values"]).items()]
+    if parts.get("spec") is not None:
+        out["spec"] = resolve_spec(parts["spec"])
+    if parts.get("files") is not None:
+        out["files"] = [pick_file(c) for c in parts["files"]]
+    if parts.get("present") is not None:
+        out["present"] = present(parts["present"])
+    if parts.get("baseline") is not None:
+        out["baseline"] = [[[k, v] for k, v in parse_baseline(c["args"], set(c["known"])).items()]
+                           for c in parts["baseline"]]
     return out
 
 
 # ---- MODEL_AUTOCONFIG: python (default) | rust ----
 #
-# rust runs the same three steps - input prep, the size core and values assembly - in the
-# bounded Rust leaf from sbstndalton/noevia-rs (`model-autoconfig check`, one process per
-# analyze(), baked into the image at the Dockerfile's NOEVIA_RS_REF) BESIDE the Python, which
-# stays authoritative: what analyze() returns is always Python's, and only when the Rust answer
-# confirms it. Input prep must agree exactly. The size plan and the values must agree exactly,
-# or Python's must be the conservative one: the same backend, placement mode and every other
-# value, and no larger context, GPU layer count, prompt cache, batch, ubatch or image-token
-# bound. Anything else, and every Rust fault (missing binary, timeout, refusal, malformed
-# output), refuses the recommendation with AutoconfigCoreError. When Python's own input prep
+# rust runs the same steps - input prep, the size core, values assembly, and (slices 3-6) the
+# speculative-decoding resolution, the companion-file rules, the report beside the values and
+# the baseline parse - in the bounded Rust leaf from sbstndalton/noevia-rs (`model-autoconfig
+# check`, one process per analyze(), baked into the image at the Dockerfile's NOEVIA_RS_REF)
+# BESIDE the Python, which stays authoritative: what analyze() returns is always Python's, and
+# only when the Rust answer confirms it. Input prep must agree exactly. The size plan and the
+# values must agree exactly, or Python's must be the conservative one: the same backend,
+# placement mode and every other value, and no larger context, GPU layer count, prompt cache,
+# batch, ubatch or image-token bound. The spec part likewise, with the draft limits
+# (SPEC_LIMITS: draft depth, draft minimum, the head's GPU layers) as its only bounds; the
+# files, present and baseline parts must agree exactly (every message, key and order). Anything
+# else, and every Rust fault (missing binary, timeout, refusal, malformed output), refuses the
+# recommendation with AutoconfigCoreError. When Python's own input prep
 # refuses (an implausible block count, no backend, ...), that refusal is returned either way and
 # a Rust disagreement is only logged. DaServer's iGPU memory is system RAM with no swap (#697),
 # so a disagreement never buys a bigger setting.
@@ -1616,15 +2349,54 @@ def size_plan_accepted(py: dict[str, Any], rs: Any, n_sessions: int) -> str:
     return "conservative" if python_is_conservative(py, rs, n_sessions) else ""
 
 
+# The speculative-decoding values that bound work or memory: how deep the drafter guesses and how
+# many of the head's layers go on the GPU. Python's may be smaller than Rust's; anything else in
+# the spec part must agree exactly.
+SPEC_LIMITS: tuple[str, ...] = ("spec-draft-n-max", "spec-draft-n-min", "spec-draft-ngl")
+
+
+def _digits(v: str) -> int | None:
+    return int(v) if len(v) <= 40 and v.isascii() and v.isdigit() else None
+
+
+def spec_is_conservative(py: dict[str, Any], rs: Any) -> bool:
+    """True when Python's spec answer writes nothing larger than Rust's: every field but the
+    values the same, the same value keys in the same order, every value the same except a
+    SPEC_LIMITS one that is a smaller (or equal) plain number in Python's."""
+    if not isinstance(rs, dict) or set(rs) != set(py):
+        return False
+    if any(canonical(rs[k]) != canonical(py[k]) for k in py if k != "values"):
+        return False
+    pv, rv = _as_values(py["values"]), _as_values(rs["values"])
+    if pv is None or rv is None or list(pv) != list(rv):
+        return False
+    for k, p in pv.items():
+        r = rv[k]
+        if p == r:
+            continue
+        a, b = _digits(p), _digits(r)
+        if k not in SPEC_LIMITS or a is None or b is None or a > b:
+            return False
+    return True
+
+
+# The parts added in slices 3-6, in the order they are checked.
+EXTRA_PARTS = ("spec", "files", "present", "baseline")
+
+
 def confirm(*, prep_in: dict[str, Any], prep: dict[str, Any], size_req: dict[str, Any],
             plan: dict[str, Any], values_in: dict[str, Any], values: dict[str, str],
+            extra_in: dict[str, Any] | None = None, extra: dict[str, Any] | None = None,
             model: str = "") -> None:
-    """Under MODEL_AUTOCONFIG=rust, confirm Python's prep, size plan and values with the Rust
-    port (one process); raise AutoconfigCoreError unless every part is confirmed (see above).
-    `model` only labels the log lines; it is never part of the request."""
+    """Under MODEL_AUTOCONFIG=rust, confirm Python's prep, size plan and values - and the parts
+    in `extra_in` (spec, files, present, baseline: requests, None to skip one), whose Python
+    answers are in `extra` - with the Rust port (one process); raise AutoconfigCoreError unless
+    every part is confirmed (see above). `model` only labels the log lines; it is never part of
+    the request."""
     if impl_choice() != "rust":
         return
-    out = check_rust({"prep": prep_in, "size": size_req, "values": values_in})
+    asked = {k: v for k, v in (extra_in or {}).items() if k in EXTRA_PARTS and v is not None}
+    out = check_rust({"prep": prep_in, "size": size_req, "values": values_in, **asked})
     shape = _shape_key(size_req)
     if canonical(out["prep"]) != canonical(prep):
         raise _fail("mismatch", "the Rust input prep disagrees", shape=shape, model=model)
@@ -1640,6 +2412,16 @@ def confirm(*, prep_in: dict[str, Any], prep: dict[str, Any], size_req: dict[str
             raise _fail("mismatch", "the Rust values disagree and Python's are not the smaller ones",
                         shape=shape, model=model)
         verdict = "conservative"
+    for part in EXTRA_PARTS:
+        if part not in asked:
+            continue
+        py, rs = (extra or {}).get(part), out[part]
+        if canonical(rs) == canonical(py):
+            continue
+        if part == "spec" and spec_is_conservative(py, rs):
+            verdict = "conservative"
+            continue
+        raise _fail("mismatch", f"the Rust {part} part disagrees", shape=shape, model=model)
     if verdict == "conservative":
         _log_once(f"mismatch:conservative:{shape}",
                   f"model-autoconfig disagreed with the Python autoconfig for model {model[:200]!r} "

@@ -227,9 +227,15 @@ def _confirm_with(monkeypatch, parts: dict, rust_answer: dict) -> bool:
     return True
 
 
+def _request(parts: dict) -> dict:
+    """The `check` request confirm() sends for its captured arguments."""
+    req = {"prep": parts["prep_in"], "size": parts["size_req"], "values": parts["values_in"]}
+    req.update({k: v for k, v in (parts.get("extra_in") or {}).items() if v is not None})
+    return req
+
+
 def _answer(parts: dict) -> dict:
-    return json.loads(json.dumps(autoconfig_core.check_reference(
-        {"prep": parts["prep_in"], "size": parts["size_req"], "values": parts["values_in"]})))
+    return json.loads(json.dumps(autoconfig_core.check_reference(_request(parts))))
 
 
 def _calls_for_property() -> list[dict]:
@@ -404,7 +410,9 @@ def test_refusal_path_sends_only_prep(tmp_path, monkeypatch):
     assert len(seen) == 1 and set(seen[0]) == {"prep"}
     seen.clear()
     _analyze()
-    assert len(seen) == 1 and set(seen[0]) == {"prep", "size", "values"}
+    # No backend carries its command, so the baseline part is not asked for; files always holds
+    # at least the projector resolution.
+    assert len(seen) == 1 and set(seen[0]) == {"prep", "size", "values", "spec", "files", "present"}
 
 
 def test_values_are_conservative_edges():
@@ -504,3 +512,169 @@ def test_refused_mismatch_logs_once_per_shape_with_the_model_name(tmp_path, monk
             _analyze(model_rel="alpha/model-a.gguf")
     msgs = [r.getMessage() for r in caplog.records if "mismatch" in r.getMessage()]
     assert len(msgs) == 1 and "alpha/model-a.gguf" in msgs[0]
+
+
+# ---- slices 3-6: speculative profiles, companion files, presentation, baseline ----
+
+def _head_kw(tmp_path) -> dict:
+    """A model folder with a draft head beside it and the Coding profile picked, so the spec part
+    writes every limit (n-max 8, n-min 1, head ngl 999)."""
+    models = tmp_path / "models"
+    (models / "s" / "MTP").mkdir(parents=True)
+    (models / "s" / "s.gguf").write_bytes(b"\0" * 16)
+    with open(models / "s" / "MTP" / "mtp-Q8_0.gguf", "wb") as f:
+        f.truncate(4096)
+    return dict(models_dir=models, section_name="s", model_subdir="s", spec_profile="coding")
+
+
+def _set_spec(key: str, value: str) -> str:
+    return (f"for pair in out['spec']['values']:\n"
+            f"    if pair[0] == {key!r}: pair[1] = {value!r}\n") + ECHO
+
+
+SPEC_MUTATIONS = {
+    # Rust's draft limits larger than Python's: Python is conservative, so its answer is used.
+    "rust deeper drafts": ("spec-draft-n-max", "16", True),
+    "rust larger draft minimum": ("spec-draft-n-min", "2", True),
+    "rust more head layers on the GPU": ("spec-draft-ngl", "1000", True),
+    # Smaller, unset, or any other spec value differing: refuse.
+    "rust shallower drafts": ("spec-draft-n-max", "4", False),
+    "rust fewer head layers": ("spec-draft-ngl", "12", False),
+    "rust unset draft depth": ("spec-draft-n-max", "", False),
+    "rust other confidence gate": ("spec-draft-p-min", "0.5", False),
+    "rust other spec type": ("spec-type", "draft-mtp", False),
+    "rust other head": ("spec-draft-model", "/models/x.gguf", False),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SPEC_MUTATIONS))
+def test_spec_mismatch_policy(tmp_path, monkeypatch, name, caplog):
+    key, value, python_used = SPEC_MUTATIONS[name]
+    kw = _head_kw(tmp_path)
+    py = dataclasses.asdict(_analyze(**kw))
+    assert dict(py["values"])["spec-draft-n-max"] == "8" and py["spec_head_rel"].endswith("mtp-Q8_0.gguf")
+    _use_rust(monkeypatch, _fake_bin(tmp_path, _set_spec(key, value)))
+    with caplog.at_level(logging.WARNING, logger="app.autoconfig_core"):
+        rs = dataclasses.asdict(_analyze(**kw))
+    if python_used:
+        assert rs == py
+        assert any("more conservative" in r.getMessage() for r in caplog.records)
+    else:
+        assert rs["recommended_ctx"] == 0 and rs["values"] == {} and "mismatch" in rs["error"]
+
+
+PART_MUTATIONS = {
+    "spec profile": "out['spec']['key'] = 'off'",
+    "spec saved profile": "out['spec']['saved'] = 'custom'",
+    "spec value order": "out['spec']['values'].reverse()",
+    "spec budgeted head": "out['spec']['mtp_rel'] = ''",
+    "files projector": "out['files'][-1] = {'mmproj_rel': '', 'mmproj_gb': 0.0, 'available': 'x'}",
+    "files head": "out['files'][0] = '/models/s/other-mtp-.gguf'",
+    "present diff": "out['present']['current_diff'].append('ngl: unset')",
+    "present quirk order": "out['present']['quirks'].reverse()",
+    "present displaced": "out['present']['displaced'] = out['present']['displaced'][1:]",
+    "present minimal": "out['present']['minimal'] = out['present']['minimal'][:-1]",
+    "present warning": "out['present']['warnings'] = []",
+    "present saved preset": "out['present']['current_preset'] = 'fast'",
+    "baseline": "out['baseline'][0].append(['keep', '1'])",
+    "a part missing": "del out['present']",
+}
+
+
+@pytest.mark.parametrize("name", sorted(PART_MUTATIONS))
+def test_any_other_part_disagreeing_refuses(tmp_path, monkeypatch, name):
+    kw = _head_kw(tmp_path)
+    b = _backends()
+    b[0]["baseline_args"] = ["--models-dir", "/models", "-np", "1"]
+    b[0]["baseline"] = autoconfig.parse_baseline(b[0]["baseline_args"])
+    kw.update(backends=b, n_sessions=2, current_section={"ngl": "30", "keep": "64"},
+              model_rel="/models/s/s-Q2_K.gguf")
+    py = dataclasses.asdict(_analyze(**kw))
+    assert py["error"] == "" and len(py["quirks"]) >= 2 and py["warnings"] and py["current_diff"]
+    _use_rust(monkeypatch, _fake_bin(tmp_path, PART_MUTATIONS[name] + "\n" + ECHO))
+    rs = dataclasses.asdict(_analyze(**kw))
+    assert rs["recommended_ctx"] == 0 and rs["values"] == {} and "MODEL_AUTOCONFIG=rust" in rs["error"]
+    assert ("mismatch" if name != "a part missing" else "malformed_output") in rs["error"]
+
+
+def test_every_part_is_sent_and_agreement_is_exact(tmp_path, monkeypatch):
+    kw = _head_kw(tmp_path)
+    b = _backends()
+    b[0]["baseline_args"] = ["-c", "8192", "--jinja"]
+    b[0]["baseline"] = autoconfig.parse_baseline(b[0]["baseline_args"])
+    kw["backends"] = b
+    py = dataclasses.asdict(_analyze(**kw))
+    seen = []
+    monkeypatch.setattr(config.settings, "model_autoconfig", "rust")
+    monkeypatch.setattr(autoconfig_core, "check_rust",
+                        lambda parts: seen.append(parts) or json.loads(json.dumps(autoconfig_core.check_reference(parts))))
+    assert dataclasses.asdict(_analyze(**kw)) == py
+    (parts,) = seen
+    assert set(parts) == {"prep", "size", "values", "spec", "files", "present", "baseline"}
+    assert [c["rule"] for c in parts["files"]] == ["mmproj_subdir", "projector", "mtp_folder"]
+    assert parts["baseline"][0]["args"] == ["-c", "8192", "--jinja"]
+    assert parts["baseline"][0]["known"] == sorted(autoconfig.ini.ALL_KNOWN_KEYS)
+
+
+def test_a_baseline_that_its_command_does_not_give_refuses(tmp_path, monkeypatch):
+    """The baseline analyze() used must be what parse_baseline makes of the command it carries."""
+    b = _backends()
+    b[0]["baseline_args"] = ["-np", "1"]
+    b[0]["baseline"] = {}                 # not what "-np 1" parses to
+    py = _analyze(backends=b)
+    assert py.error == ""                 # python mode never looks
+    _use_rust(monkeypatch, _fake_bin(tmp_path, ECHO))
+    rs = _analyze(backends=b)
+    assert rs.recommended_ctx == 0 and "mismatch" in rs.error
+
+
+def test_spec_never_larger_than_rust_property(monkeypatch):
+    """Whatever the Rust side answers for the spec part, confirm() accepts Python's only when every
+    field and value is identical (same keys, same order) except a draft limit (n-max, n-min, head
+    ngl) that is a plain number no larger in Python's."""
+    r = random.Random(1152)
+    calls = []
+    for profile in ("coding", "balanced", "writing", "ngram", "off", "custom", ""):
+        for cur in (None, {"spec-type": "draft-mtp", "spec-draft-n-max": "6", "spec-draft-ngl": "40",
+                           "spec-draft-model": "/models/s/h.gguf"}):
+            calls.append(dict(section_name="s", spec_profile=profile, current_section=cur,
+                              summary=dict(_summary(), model=dict(_summary()["model"], nextn_predict_layers=1))))
+    all_parts = _captured_parts(monkeypatch, calls)
+    monkeypatch.setattr(config.settings, "model_autoconfig", "rust")
+    used = refused = 0
+    for _ in range(1500):
+        parts = r.choice(all_parts)
+        ans = _answer(parts)
+        rs = ans["spec"]
+        for _ in range(r.randint(1, 2)):
+            if r.random() < 0.15 or not rs["values"]:
+                rs[r.choice(["key", "saved", "head", "mtp_rel"])] = r.choice(["", "off", "custom", "/models/x.gguf"])
+                continue
+            pair = r.choice(rs["values"])
+            pair[1] = r.choice(["", "0", "1", "2", "4", "8", "16", "999", "1000", "0.05", "x", "-1", " 8",
+                                str(int(pair[1]) + r.randint(-3, 3)) if pair[1].isdigit() else pair[1]])
+        if not _confirm_with(monkeypatch, parts, ans):
+            refused += 1
+            continue
+        used += 1
+        py = parts["extra"]["spec"]
+        assert all(py[k] == rs[k] for k in ("key", "saved", "head", "mtp_rel"))
+        assert [k for k, _ in py["values"]] == [k for k, _ in rs["values"]]
+        for (k, p), (_, q) in zip(py["values"], rs["values"]):
+            if p != q:
+                assert k in autoconfig_core.SPEC_LIMITS and int(p) <= int(q), (k, p, q)
+    assert used and refused
+
+
+def test_backend_list_carries_the_command_it_parsed(monkeypatch):
+    from app import helpers
+    monkeypatch.setattr(helpers.services, "_effective_container_names", lambda: ["llama-cuda"])
+    monkeypatch.setattr(helpers.services, "_docker_client", lambda: None)
+    monkeypatch.setattr(helpers.hw, "vram_gb_for", lambda name: 24.0)
+    monkeypatch.setattr(helpers.hw, "gpu_count_for", lambda name: 1)
+    monkeypatch.setattr(helpers.hw, "card_vram_gb_for", lambda name: [24.0])
+    monkeypatch.setattr(helpers.hw, "host_ram_gb", lambda: 64.0)
+    monkeypatch.setattr(helpers, "_container_baseline", lambda name: ["-np", "2", "--jinja"])
+    (b,) = helpers._backend_list()
+    assert b["baseline_args"] == ["-np", "2", "--jinja"]
+    assert b["baseline"] == {"parallel": "2", "jinja": "true"}

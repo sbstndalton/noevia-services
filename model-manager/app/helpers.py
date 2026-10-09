@@ -269,7 +269,9 @@ def _backend_list() -> list[dict]:
         out.append({"name": bn, "vendor": vendor, "vram_gb": float(vram),
                     "gpu_count": hw.gpu_count_for(bn), "card_vram_gb": hw.card_vram_gb_for(bn),
                     "host_ram_gb": hw.host_ram_gb(),
-                    "baseline": base})
+                    # The command the baseline was parsed from, so MODEL_AUTOCONFIG=rust can
+                    # confirm parse_baseline beside the rest of the recommendation.
+                    "baseline": base, "baseline_args": list(cmd)})
     return out
 
 
