@@ -363,9 +363,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
-      - name: Build gguf-meta and model-files
+      - name: Build gguf-meta, model-files and model-autoconfig
         working-directory: ${{ runner.temp }}/noevia-rs
-        run: cargo build --release --locked -p gguf-meta -p model-files-cli
+        run: cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli
       - name: Differential test (gguf-meta vs Python parser)
         env:
           GGUF_META_BIN: ${{ runner.temp }}/noevia-rs/target/release/gguf-meta
@@ -381,6 +381,15 @@ jobs:
           # #1021: model-files backups decides models.ini's recovery copies (MODEL_FILES_IMPL=rust).
           cmp tests/fixtures/model-backups.v1.json "$RUNNER_TEMP/noevia-rs/crates/model-files/tests/fixtures/model-backups.v1.json"
           python -m pytest -q -rs tests/test_model_files_differential.py tests/test_model_files_switch.py tests/test_model_backups.py
+      # MODEL_AUTOCONFIG: the shared size-core fixtures must be byte-identical in both repos, and
+      # the binary must agree with the Python size core on them, on a seeded random corpus, and
+      # through analyze() (never a plan other than Python's).
+      - name: Differential test (model-autoconfig vs Python size core)
+        env:
+          MODEL_AUTOCONFIG_BIN: ${{ runner.temp }}/noevia-rs/target/release/model-autoconfig
+        run: |
+          cmp tests/fixtures/model-autoconfig.v1.json "$RUNNER_TEMP/noevia-rs/crates/model-autoconfig/tests/fixtures/model-autoconfig.v1.json"
+          python -m pytest -q -rs tests/test_autoconfig_core_differential.py tests/test_autoconfig_core_switch.py
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:

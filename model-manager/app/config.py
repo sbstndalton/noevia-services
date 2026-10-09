@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     model_files_impl: str = "python"
     # The model-files binary: a name looked up on PATH, or an absolute path.
     model_files_bin: str = "model-files"
+    # Autoconfig's size core (fit sweep, pick, context cap, presets, prompt cache): "python"
+    # (default) or "rust" (the model-autoconfig binary checks the Python plan, which stays
+    # authoritative; a disagreement that is not in Python's favour refuses the recommendation).
+    # Invalid values mean python, with one warning.
+    model_autoconfig: str = "python"
+    # The model-autoconfig binary: a name looked up on PATH, or an absolute path.
+    model_autoconfig_bin: str = "/usr/local/bin/model-autoconfig"
 
     @property
     def cache_ram_limits(self) -> tuple[int, int]:

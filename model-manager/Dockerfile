@@ -5,12 +5,13 @@
 # gguf-meta (#909) and model-files (#964): bounded Rust leaves from sbstndalton/noevia-rs,
 # pinned to release/versions.lock's NOEVIA_RS_REF and fetched as an anonymous tarball whose
 # sha256 is checked before anything is built. gguf-meta is used only when GGUF_PARSER=rust,
-# model-files only when MODEL_FILES_IMPL=rust (both default python; since #1021 also models.ini backups).
+# model-files only when MODEL_FILES_IMPL=rust (both default python; since #1021 also models.ini backups),
+# model-autoconfig only when MODEL_AUTOCONFIG=rust (default python; it only ever confirms the Python plan).
 # Built on bookworm (glibc 2.36); the runtime base below is Debian bookworm or newer, and glibc
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm AS gguf-meta
-ARG NOEVIA_RS_REF=89dfbcb85e5a40ae58be21f9cca897b984845ce4
-ARG NOEVIA_RS_SHA256=8c42ad53eb1e23516d56f9cc98784e8f4c57502945b294670e84cdc6e2a3f889
+ARG NOEVIA_RS_REF=cd80eb27bfe99191d854756caaf372f40b262470
+ARG NOEVIA_RS_SHA256=e988192ad915b67ca6f728a3c46b0797914369b53c4937962eff64bfa3467782
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -19,9 +20,10 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
- && ./target/release/model-files --help 2>&1 | grep -q usage
+ && ./target/release/model-files --help 2>&1 | grep -q usage \
+ && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
 
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
@@ -30,6 +32,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY --from=gguf-meta /src/target/release/gguf-meta /usr/local/bin/gguf-meta
 COPY --from=gguf-meta /src/target/release/model-files /usr/local/bin/model-files
+COPY --from=gguf-meta /src/target/release/model-autoconfig /usr/local/bin/model-autoconfig
 COPY LICENSE ./
 COPY app ./app
 EXPOSE 8090
