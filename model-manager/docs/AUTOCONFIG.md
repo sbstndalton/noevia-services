@@ -6,22 +6,44 @@ Everything below is a *model* of llama.cpp's allocation behaviour, calibrated ag
 
 ## Where the code lives, and `MODEL_AUTOCONFIG`
 
-`app/autoconfig.py` reads the GGUF summary, the backends and the saved section, and writes the
-values. The arithmetic that decides how much fits is in `app/autoconfig_core.py`: the KV cache
-estimate, the fit sweep, the recommended backend and context, the usable-context cap, the
-offload presets and the prompt cache. It is pure and imports only the stdlib, and `size_plan`
-is its single entry point.
+`app/autoconfig.py` resolves what touches files (the projector and draft head beside the
+weights, the speculative-decoding profile) and turns the result into the panel: the diff against
+the saved section, the quirks, the warnings. Everything else is in `app/autoconfig_core.py`, which
+is pure and imports only the stdlib, in three steps:
+
+1. **Input prep** (`prepare`, then `main_gpu_reserve_gb` and `size_backends`): the GGUF
+   summary's fields read with the conversions they always had (a hostile header's strings,
+   floats and arrays go through Python's `int()`; per-layer arrays through `_kv_first_int` and
+   `kv_shape`), the backends filtered, and the four early refusals (an implausible block count,
+   no backend, a model larger than VRAM plus RAM, no backend reporting VRAM, a KV cache that
+   cannot be sized).
+2. **The size core** (`size_plan`): the KV cache estimate, the fit sweep, the recommended
+   backend and context, the usable-context cap, the offload presets and the prompt cache.
+3. **Values assembly** (`assemble_values`): the settings written - context, slots, offload,
+   caches, templating and reasoning flags, the projector with its batch/ubatch/image-token
+   bounds, rope, split-mode.
 
 `MODEL_AUTOCONFIG=python|rust` (default `python`; any other value means python, with one
-warning) chooses who computes that plan. With `rust`, the `model-autoconfig` binary from
-sbstndalton/noevia-rs computes it as well, but the Python plan stays authoritative. It is used
-when the two agree exactly, or when Python's is the conservative one: the same backend and
-placement mode, and no larger context, GPU layer count or prompt cache. In every other case,
-including a missing binary, a timeout or a refusal, the recommendation is refused with an error
-naming `MODEL_AUTOCONFIG=rust`. A disagreement never buys a larger setting, because on DaServer
-the iGPU's memory is system RAM with no swap (#697). `MODEL_AUTOCONFIG_BIN` names the binary
-(default `model-autoconfig` on PATH). The shared fixtures are
-`tests/fixtures/model-autoconfig.v1.json`.
+warning) chooses whether the `model-autoconfig` binary from sbstndalton/noevia-rs checks those
+steps as well (`model-autoconfig check`, one process per recommendation). Python stays
+authoritative: what the panel shows is always Python's. Input prep must agree exactly. The size
+plan and the values are used when the two agree exactly, or when Python's are the conservative
+ones: the same backend, placement mode and every other value, and no larger context, GPU layer
+count, prompt cache, batch, ubatch or image-token bound (an unset batch counts as llama-server's
+2048, an unset ubatch as 512, anything else unset as unbounded). In every other case, including
+a missing binary, a timeout or a refusal, the recommendation is refused with an error naming
+`MODEL_AUTOCONFIG=rust`. An early refusal from Python's input prep is returned either way; a
+Rust disagreement there is only logged. A disagreement never buys a larger setting, because on
+DaServer the iGPU's memory is system RAM with no swap (#697). `MODEL_AUTOCONFIG_BIN` names the
+binary (default `/usr/local/bin/model-autoconfig`, where the image installs it). The shared
+fixtures are `tests/fixtures/model-autoconfig.v1.json` (size core) and
+`model-autoconfig-check.v1.json` (input prep and values).
+
+The Rust port refuses, rather than reproduces, a few inputs Python accepts: integer strings with
+non-ASCII characters (Python reads other scripts' digits and Unicode spaces), a string where a
+backend's VRAM, RAM or card size belongs, integers past 2^100 (file sizes past 2^53), a NaN or
+a list as a backend name, and a per-layer sample whose comparison would run past its work
+budget. Under `rust` such a model gets no recommendation; `python` is unaffected.
 
 ## The VRAM budget
 

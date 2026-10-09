@@ -298,21 +298,9 @@ def _fmt_params(n: Any) -> str | None:
 # Architectures whose rope scaling llama.cpp applies per layer from the GGUF itself. A global
 # --rope-scale would also scale the layers that must stay unscaled (Gemma 3's sliding-window
 # local layers), so a preset must never carry rope keys for them, declared metadata or not.
-_ROPE_FROM_GGUF_ARCHS = ("gemma3",)
-
-
-def rope_owned_by_gguf(model: dict[str, Any]) -> bool:
-    """True when the GGUF already decides rope scaling and a preset must not override it:
-    the metadata declares a scaling type or factor, or the architecture is one whose per-layer
-    scaling llama.cpp derives itself. `model` is the `summary["model"]` dict."""
-    arch = str(model.get("arch") or "").lower()
-    if any(arch.startswith(a) for a in _ROPE_FROM_GGUF_ARCHS):
-        return True
-    rtype = str(model.get("rope_scaling_type") or "").strip().lower()
-    if rtype not in ("", "none"):
-        return True
-    factor = model.get("rope_scaling_factor")
-    return isinstance(factor, (int, float)) and factor > 0
+# rope_owned_by_gguf lives in autoconfig_core (pure, stdlib-only, so MODEL_AUTOCONFIG=rust's
+# values assembly can be checked against it); re-exported here under its old name.
+from .autoconfig_core import _ROPE_FROM_GGUF_ARCHS, rope_owned_by_gguf  # noqa: E402,F401
 
 
 def _finite(v: Any) -> Any:
