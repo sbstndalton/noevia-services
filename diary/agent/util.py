@@ -12,6 +12,8 @@ def make_client(
     auth: Optional[tuple] = None,
     headers: Optional[dict] = None,
     follow_redirects: bool = False,
+    gate=None,
+    transport: Optional[httpx.BaseTransport] = None,
 ) -> httpx.Client:
     """Shared httpx.Client factory — connection pooling, explicit timeouts.
 
@@ -24,10 +26,20 @@ def make_client(
     able to bounce a request inward (RFC1918, cloud metadata) and have us follow.
     Configure such a server by its final URL instead. Callers that talk to an
     operator-controlled endpoint (not user-supplied) may opt back in.
+
+    gate: a storage_backoff.StorageGate; wraps the transport so calls stop during a cool-down.
     """
     merged = {"Accept-Encoding": "identity"}
     if headers:
         merged.update(headers)
+    extra = {}
+    if gate is not None:
+        # Storage back-off (#1166): refuse while the server is throttling / has rejected the login.
+        from .storage_backoff import GatedTransport
+
+        extra["transport"] = GatedTransport(transport or httpx.HTTPTransport(), gate)
+    elif transport is not None:
+        extra["transport"] = transport
     return httpx.Client(
         base_url=base_url,
         timeout=httpx.Timeout(timeout_s),
@@ -35,6 +47,7 @@ def make_client(
         headers=merged,
         trust_env=False,
         follow_redirects=follow_redirects,
+        **extra,
     )
 
 

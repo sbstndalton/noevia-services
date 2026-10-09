@@ -223,8 +223,9 @@ def test_other_storage_failures_are_not_reported_as_a_rejected_login(volume, mon
         raise _status_error(500)
     monkeypatch.setattr(state.store.backend, 'list_dir', broken, raising=False)
     response = TestClient(appmod.app, raise_server_exceptions=False).get('/api/files', headers={'X-Cowork-User-ID': A})
-    assert response.status_code == 500
-    assert 'code' not in (response.json() if response.headers.get('content-type', '').startswith('application/json') else {})
+    # #1166: a storage 5xx is a 502, never an unhandled 500, and it is not worded as a rejected login.
+    assert response.status_code == 502
+    assert response.json()['code'] == 'storageUpstream'
 
 
 def test_the_guard_leaves_writes_alone(volume, monkeypatch):

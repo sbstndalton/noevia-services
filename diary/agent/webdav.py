@@ -14,6 +14,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
+from .storage_backoff import gate_for
 from .util import ensure_not_redirect, make_client
 
 log = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class WebDAVCorpusBackend:
     # httpx.Client is thread-safe; the corpus store may fetch a month's daily files together.
     concurrent_reads = 6
 
-    def __init__(self, base_url: str, username: str, password: str, timeout_s: float = 60.0):
+    def __init__(self, base_url: str, username: str, password: str, timeout_s: float = 60.0, transport=None):
         self.base_url = base_url.rstrip("/") + "/"
         self.base_path = unquote(urlparse(self.base_url).path).rstrip("/") + "/"
         self.auth = (username, password) if username else None
@@ -49,7 +50,10 @@ class WebDAVCorpusBackend:
         # must not bounce requests inward. httpx with redirects disabled returns
         # the 3xx response rather than raising, and raise_for_status() does not
         # treat 3xx as an error — so every call site checks explicitly below.
-        self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, auth=self.auth)
+        # One back-off gate per credential (server + account + secret): see storage_backoff.
+        self.storage_gate = gate_for("webdav", self.base_url, username, password)
+        self._client = make_client(base_url=self.base_url, timeout_s=timeout_s, auth=self.auth,
+                                   gate=self.storage_gate, transport=transport)
 
     @staticmethod
     def _ensure_not_redirect(resp) -> None:

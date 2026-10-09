@@ -40,6 +40,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Optional
 
+import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -438,6 +439,12 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
     for old_state in evicted:
         if old_state is not state:
             _close_state(old_state)
+    if request.headers.get("X-Cowork-Storage-Retry") == "1":
+        # The person pressed Retry on a rejected storage login (#1166): try storage again now
+        # instead of waiting out the cool-down. A 429 throttle is still waited out.
+        gate = getattr(state.backend, "storage_gate", None)
+        if gate is not None:
+            gate.reset_login()
     if recover:
         _recover_state(state)
     return state
@@ -1417,6 +1424,7 @@ if __name__ == "__main__":
 
 # Diary workspace routes share the same tenant resolution as the conversation.
 from .workspace_files import file_list, file_read, file_write, directory_create, MemoryBackend, reference_text, StorageLoginRejected, storage_login_guard
+from .storage_backoff import StorageBackoff, StorageThrottled, StorageUpstreamError, as_response_error, is_storage_error
 
 
 def entry_target(body):
@@ -1440,6 +1448,40 @@ async def storage_login_rejected(request: Request, exc: StorageLoginRejected):
     # 424, not 401/403: the caller is signed in to noevia, it is the storage server that refused the
     # saved login, and a 401 would make the browser think the noevia session ended (#849).
     return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=424)
+
+
+@app.exception_handler(StorageThrottled)
+async def storage_throttled(request: Request, exc: StorageThrottled):
+    # 503 + Retry-After (#1166): the storage server (Nextcloud brute-force protection) is throttling us.
+    # Same {detail, code} shape as the 424 so the web proxy and screens handle both alike.
+    return JSONResponse({"detail": str(exc), "code": "storageThrottled", "retryAfter": exc.retry_after},
+                        status_code=503, headers={"Retry-After": str(exc.retry_after)})
+
+
+@app.exception_handler(StorageUpstreamError)
+async def storage_upstream_error(request: Request, exc: StorageUpstreamError):
+    return JSONResponse({"detail": str(exc), "code": "storageUpstream"}, status_code=502)
+
+
+async def _storage_failure_response(request: Request, exc: Exception):
+    """Storage failures that reach the app unwrapped (writes, month listing, search, background
+    work): answer them like the guarded read routes do. Anything that is not the storage server's
+    keeps the default 500 and is logged."""
+    if isinstance(exc, StorageBackoff) or is_storage_error(exc):
+        mapped = as_response_error(exc, StorageLoginRejected)
+        if isinstance(mapped, StorageLoginRejected):
+            return await storage_login_rejected(request, mapped)
+        if isinstance(mapped, StorageThrottled):
+            return await storage_throttled(request, mapped)
+        if mapped is not None:
+            return await storage_upstream_error(request, mapped)
+    log.error("unhandled %s on %s", type(exc).__name__, request.url.path, exc_info=exc)
+    return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
+
+
+app.add_exception_handler(StorageBackoff, _storage_failure_response)
+app.add_exception_handler(httpx.HTTPStatusError, _storage_failure_response)
+app.add_exception_handler(httpx.TransportError, _storage_failure_response)
 
 
 @app.get("/api/files")
