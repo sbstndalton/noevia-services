@@ -160,9 +160,18 @@ def kv_shape(arch: str, layers: int, kv_heads: int, head_dim: int,
 
 def kv_shape_bytes(shape: dict | None, ctx: int, bytes_per_elem: float,
                    v_bytes_per_elem: float | None = None) -> int:
-    """KV cache bytes at `ctx` for a kv_shape(). The arithmetic of kv_cache_bytes, unchanged."""
+    """KV cache bytes at `ctx` for a kv_shape(), plus the fixed recurrent state prepare() puts
+    on a hybrid model's shape (recurrent_bytes, #1159) when it sizes only the attention layers."""
     if shape is None or not ctx > 0:
         return 0
+    base = _kv_shape_bytes(shape, ctx, bytes_per_elem, v_bytes_per_elem)
+    rec = shape.get("recurrent_bytes")
+    return base + rec if rec else base
+
+
+def _kv_shape_bytes(shape: dict, ctx: int, bytes_per_elem: float,
+                    v_bytes_per_elem: float | None = None) -> int:
+    """KV cache bytes at `ctx` for a kv_shape(). The arithmetic of kv_cache_bytes, unchanged."""
     layers, kv_heads = shape["layers"], shape["kv_heads"]
     k_dim, v_dim = shape["k_dim"], shape["v_dim"]
     v_bytes = bytes_per_elem if v_bytes_per_elem is None else v_bytes_per_elem
@@ -1054,6 +1063,64 @@ def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
     return default
 
 
+def _attention_layers(kv_raw: Any, layers: int) -> tuple | None:
+    """Which layers hold a KV cache, read off a per-layer attention.head_count_kv (#1159).
+
+    llama.cpp reads head_count_kv per layer (an absent key means head_count, which prepare()
+    already does through _kv_first_int's default) and gives a layer whose entry is 0 no KV cache
+    at all: hybrid models declare their non-attention layers that way (LFM2's short-conv layers,
+    Jamba's Mamba layers; llama.cpp marks them recurrent). The representative value
+    _kv_first_int picks is then 0 whenever most layers are not attention, and the model was
+    refused although its cache is perfectly sizeable.
+
+    None when the value is not a per-layer array of plain ints with a 0 entry: sizing is then
+    exactly what it was. ("full", n_attn, max_heads) when every entry is known and there is one
+    per layer. ("partial", known, count) when some entry is 0 but the array is not fully known
+    (GGUF summaries keep only a prefix of long arrays) or does not have one entry per layer:
+    which layers attend cannot be told, so prepare() refuses rather than guess."""
+    if isinstance(kv_raw, list):
+        seq, count = kv_raw, len(kv_raw)
+    elif isinstance(kv_raw, dict) and kv_raw.get("_array") is True:
+        seq, count = kv_raw.get("sample"), kv_raw.get("count")
+        if not isinstance(seq, list) or type(count) is not int:
+            return None
+    else:
+        return None
+    if not all(type(v) is int for v in seq) or 0 not in seq:
+        return None
+    if len(seq) == count == layers:
+        nonzero = [v for v in seq if v != 0]
+        return ("full", len(nonzero), max(nonzero, default=0))
+    return ("partial", len(seq), count)
+
+
+def _ssm_layer_bytes(state: int | None, inner: int | None, conv: int | None, groups: int | None,
+                    embed: int) -> int:
+    """Recurrent state bytes one non-attention layer holds per sequence (#1159), never less than
+    llama.cpp allocates.
+
+    llama.cpp's Mamba-2 layer keeps an f32 conv state of (d_conv - 1) x (d_inner + 2 x n_group x
+    d_state) and an f32 SSM state of d_state x d_inner, per sequence. With all four keys
+    declared that is charged exactly; with some missing on an SSM model, the SSM term gets 10%
+    headroom and the conv term the common defaults (d_conv 4, n_group 8; d_state 128 and d_inner
+    2 x embedding_length when those are the missing ones). A model declaring neither state nor
+    inner size is not Mamba (LFM2's short-conv state is ~16 KB a layer) and pays the flat
+    _SSM_STATE_BYTES. Never below _SSM_STATE_BYTES, so no estimate drops."""
+    def ok(v: int | None) -> bool:
+        return v is not None and v > 0
+    if not ok(state) and not ok(inner):
+        return _SSM_STATE_BYTES
+    if ok(state) and ok(inner) and ok(conv) and ok(groups):
+        need = 4 * (state * inner + (conv - 1) * (inner + 2 * groups * state))
+    else:
+        st = state if ok(state) else 128
+        inn = inner if ok(inner) else 2 * embed
+        cv = conv if ok(conv) else 4
+        g = groups if ok(groups) else 8
+        need = (4 * st * inn * 11 + 9) // 10 + 4 * (cv - 1) * (inn + 2 * g * st)
+    return max(_SSM_STATE_BYTES, need)
+
+
 def _card_gb(c: Any) -> float:
     """One card's VRAM as the fit maths uses it (`c - reserve`): a number, else TypeError as
     that subtraction raised before the size core existed."""
@@ -1121,13 +1188,47 @@ def prepare(inp: dict[str, Any]) -> dict[str, Any]:
 
     # HARD STOP if the KV cache cannot be sized from this GGUF's metadata: zero KV silently means
     # "the cache is free" and every candidate would fit.
-    shape = kv_shape(arch, layers, kv_heads, head_dim,
+    # A per-layer head count with 0 entries (hybrid attention + recurrent layers, #1159): only
+    # the attention layers hold KV, at their own head count. Left to the paths that already
+    # read per-layer data (interleaved full attention, sliding window) when those are declared.
+    shape_layers, shape_heads = layers, kv_heads
+    attn = _attention_layers(m.get("attention_head_count_kv"), layers)
+    if attn is not None and not (full_attention_interval and full_attention_interval > 1) \
+            and not (_swa["sliding_window"] and _swa["sliding_window"] > 0):
+        _shared = _swa["shared_kv_layers"]
+        if attn[0] == "partial":
+            return {"refuse": "kv_layers", "known": attn[1], "count": attn[2], "layers": layers, "shared": 0}
+        if _shared and _shared > 0:
+            # Which layers share KV is not declared against the attention layers; subtracting
+            # the shared count from the attention-only count could under-size the cache.
+            return {"refuse": "kv_layers", "known": layers, "count": layers, "layers": layers,
+                    "shared": int(_shared)}
+        shape_layers, shape_heads = attn[1], attn[2]
+    shape = kv_shape(arch, shape_layers, shape_heads, head_dim,
                      key_length=key_length, value_length=value_length,
                      full_attention_interval=full_attention_interval,
                      ssm_state_size=ssm_state_size, **_swa)
+    if shape is not None and (shape_layers != layers or shape["hybrid_interval"] is not None):
+        # The layers that hold no KV still hold a recurrent state (Mamba SSM, LFM2 short-conv)
+        # per sequence: _ssm_layer_bytes each, per session.
+        def _opt(k: str) -> int | None:
+            v = m.get(k)
+            return int(v) if isinstance(v, int) else None
+        per = _ssm_layer_bytes(ssm_state_size, _opt("ssm_inner_size"), _opt("ssm_conv_kernel"),
+                               _opt("ssm_group_count"), embed)
+        if shape["hybrid_interval"] is None:
+            shape["recurrent_bytes"] = (layers - shape_layers) * per * n_sessions
+        else:
+            # The interleaved branch already charges _SSM_STATE_BYTES per SSM layer, once; only
+            # the excess is added, so no existing estimate goes down.
+            interval = shape["hybrid_interval"]
+            ssm_layers = layers - max(1, (layers + interval - 1) // interval)
+            extra = ssm_layers * (per * n_sessions - _SSM_STATE_BYTES)
+            if extra > 0:
+                shape["recurrent_bytes"] = extra
     if kv_shape_bytes(shape, 4096, bytes_per) <= 0:
         missing = [k for k, v in (("block_count", layers),
-                                  ("attention_head_count_kv", kv_heads),
+                                  ("attention_head_count_kv", shape_heads),
                                   ("head_dim (embedding_length / attention_head_count)", head_dim))
                    if not v]
         return {"refuse": "kv", "missing": missing}

@@ -459,7 +459,8 @@ def test_search_repo_excludes_imatrix_from_groups_and_never_probes_it(client, mo
         probed.append(path)
         return {"model": {"context_length": 32768}}
     monkeypatch.setattr(hf, "gguf_header", fake_header)
-    monkeypatch.setattr(helpers, "_preset_estimates", lambda summary, size, mmproj_gb=0.0: [{"key": "fast", "label": "Fast", "ctx": 8192}])
+    monkeypatch.setattr(helpers, "_preset_estimates_with_reason",
+                        lambda summary, size, mmproj_gb=0.0: ([{"key": "fast", "label": "Fast", "ctx": 8192}], ""))
 
     r = client.get("/api/v1/search/repo", params={"repo": "bartowski/Qwen_Qwen3.5-4B-GGUF"})
     assert r.status_code == 200

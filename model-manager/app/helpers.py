@@ -123,7 +123,20 @@ def _why_no_estimate(reason: str, **detail: object) -> None:
 
 
 def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) -> list[dict]:
-    """Fast / Balanced / Long-ctx context estimates for a model we have NOT downloaded.
+    """_preset_estimates_with_reason's estimates alone."""
+    return _preset_estimates_with_reason(summary, size_bytes, mmproj_gb)[0]
+
+
+_REASON_MAX = 600
+
+
+def _preset_estimates_with_reason(summary: dict, size_bytes: int,
+                                  mmproj_gb: float = 0.0) -> tuple[list[dict], str]:
+    """(estimates, reason): reason says, for the Discover table (noevia#1159), why the
+    estimates are empty, and is "" when there are some or no reason is known. It is built from
+    the GGUF header's metadata and the backend list only, never from secrets or paths.
+
+    Fast / Balanced / Long-ctx context estimates for a model we have NOT downloaded.
 
     Runs the very same autoconfig fit math used on local models, so a search-page estimate
     and the eventual Config recommendation agree instead of being two different guesses.
@@ -139,12 +152,14 @@ def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) ->
             "baseline": {},
         })
     if not summary:
-        return []
+        return [], ""
     if not backends:
         _why_no_estimate("no llama backend reports GPU VRAM (CPU-only backends are not sized here)",
                          cpu_backends=len(services._cpu_backends()))
-        return []
+        return [], ("No GPU backend reports its VRAM, so there is nothing to size a context "
+                    "against. CPU-only backends are not sized here.")
     out: list[dict] = []
+    reason = ""
     for key, label in (("fast", "Fast"), ("balanced", "Balanced"), ("long-ctx", "Long ctx")):
         try:
             rec = autoconfig.analyze(
@@ -154,10 +169,11 @@ def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) ->
             )
         except Exception as e:  # noqa: BLE001 — an estimate must never break the search page
             _why_no_estimate("autoconfig raised", preset=key, error=type(e).__name__)
-            return []
+            return [], f"Autoconfig failed on this file's metadata ({type(e).__name__})."
         if rec.error or not rec.recommended_ctx:
             _why_no_estimate("autoconfig gave no context" if not rec.error else "autoconfig refused the plan",
                              preset=key, error=(rec.error or "")[:160])
+            reason = reason or (rec.error or "Autoconfig found no context size that fits.")[:_REASON_MAX]
             continue
         chosen = next((p for p in rec.presets if p.key == rec.active_preset), None)
         out.append({
@@ -174,7 +190,7 @@ def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) ->
         # three identical chips would imply choices that don't exist.
         if len(out) > 1 and out[-1]["ctx"] == out[0]["ctx"] and not out[-1]["offload"]:
             out.pop()
-    return out
+    return out, ("" if out else reason)
 
 
 def _model_stem(filename: str) -> str:
