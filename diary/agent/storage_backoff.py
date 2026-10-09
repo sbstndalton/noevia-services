@@ -14,6 +14,7 @@ from the person resets a login cool-down immediately.
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from email.utils import parsedate_to_datetime
@@ -27,6 +28,7 @@ MAX_RETRY_AFTER_S = 3600.0
 _MAX_GATES = 256
 RETRY_RESET_MIN_INTERVAL_S = 30.0
 STORAGE_TAG = "noevia_storage"
+log = logging.getLogger(__name__)
 
 
 class StorageBackoff(OSError):
@@ -78,8 +80,9 @@ def parse_retry_after(value: Optional[str], default: float = DEFAULT_RETRY_AFTER
 
 
 class StorageGate:
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, label: str = ""):
         self._clock = clock
+        self._label = label  # short credential-hash prefix for logs; never a secret
         self._lock = threading.Lock()
         self._until = 0.0
         self._kind = ""
@@ -113,9 +116,13 @@ class StorageGate:
         pattern the cool-down exists to stop."""
         with self._lock:
             now = self._clock()
-            if self._kind == "login" and self._until > now and now - self._last_reset >= RETRY_RESET_MIN_INTERVAL_S:
-                self._kind, self._until, self._last_reset = "", 0.0, now
-                return True
+            if self._kind == "login" and self._until > now:
+                if now - self._last_reset >= RETRY_RESET_MIN_INTERVAL_S:
+                    self._kind, self._until, self._last_reset = "", 0.0, now
+                    log.info("storage login cool-down reset accepted (gate %s)", self._label)
+                    return True
+                log.info("storage login cool-down reset ignored: under %ds since the last reset (gate %s)",
+                         int(RETRY_RESET_MIN_INTERVAL_S), self._label)
             return False
 
     def state(self):
@@ -140,7 +147,7 @@ def gate_for(*credential_parts: str) -> StorageGate:
                     del _gates[key]
                 if len(_gates) >= _MAX_GATES:  # hard cap: drop the gate closest to expiry
                     del _gates[min(_gates, key=lambda k: _gates[k].state()[1])]
-            gate = _gates[digest] = StorageGate()
+            gate = _gates[digest] = StorageGate(label=digest[:8])
         return gate
 
 

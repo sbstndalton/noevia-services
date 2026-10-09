@@ -288,6 +288,36 @@ def test_explicit_retry_reset_is_rate_limited():
     assert gate.reset_login() is True
 
 
+def test_reset_outcomes_are_logged_with_hash_prefix_only(caplog):
+    # #1185: live QA can see whether a Retry reset was accepted or ignored by the 30 s limit.
+    import logging
+    secret = 'synthetic-secret-value'
+    gate = storage_backoff.gate_for('https://dav.example', 'acct', secret)
+    now = [1000.0]
+    gate._clock = lambda: now[0]
+    gate.record(401)
+    with caplog.at_level(logging.INFO, logger='agent.storage_backoff'):
+        assert gate.reset_login() is True
+        gate.record(401)
+        now[0] += 5
+        assert gate.reset_login() is False
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert len(messages) == 2, messages
+    assert 'accepted' in messages[0] and 'ignored' in messages[1]
+    assert all(r.levelno == logging.INFO for r in caplog.records)
+    prefix = gate._label
+    assert len(prefix) == 8 and all(prefix in m for m in messages)
+    assert all(secret not in m and 'acct' not in m and 'dav.example' not in m for m in messages)
+
+
+def test_reset_with_no_cooldown_logs_nothing(caplog):
+    import logging
+    gate = StorageGate()
+    with caplog.at_level(logging.INFO, logger='agent.storage_backoff'):
+        assert gate.reset_login() is False
+    assert not caplog.records
+
+
 def test_gate_table_is_hard_capped():
     for i in range(storage_backoff._MAX_GATES + 40):
         storage_backoff.gate_for('cred', str(i)).record(401)  # every gate closed: none idle
