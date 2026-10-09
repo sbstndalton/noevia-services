@@ -5,6 +5,7 @@ These lived beside the server-rendered pages in main.py until those pages were r
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from . import autoconfig, db, gguf_meta, hw, ini, services
@@ -102,6 +103,25 @@ def _downloaded_and_still_present() -> dict[str, list[str]]:
     return out
 
 
+_log = logging.getLogger(__name__)
+_estimate_reasons_logged: set[str] = set()
+
+
+def _why_no_estimate(reason: str, **detail: object) -> None:
+    """Say once per distinct reason why a repo's context estimates came back empty (noevia#1159).
+
+    The search page used to show "No context estimate" for every file with nothing in the logs to
+    say whether the machine had no GPU backend with a measured VRAM, autoconfig raised, or its
+    check refused the plan. Once per reason keeps it from repeating for every file of every repo.
+    """
+    key = reason
+    if key in _estimate_reasons_logged:
+        return
+    _estimate_reasons_logged.add(key)
+    _log.warning("context estimate is empty for a repo file: %s%s", reason,
+                 "".join(f" {k}={v}" for k, v in detail.items()))
+
+
 def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) -> list[dict]:
     """Fast / Balanced / Long-ctx context estimates for a model we have NOT downloaded.
 
@@ -118,7 +138,11 @@ def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) ->
             "host_ram_gb": hw.host_ram_gb(),
             "baseline": {},
         })
-    if not backends or not summary:
+    if not summary:
+        return []
+    if not backends:
+        _why_no_estimate("no llama backend reports GPU VRAM (CPU-only backends are not sized here)",
+                         cpu_backends=len(services._cpu_backends()))
         return []
     out: list[dict] = []
     for key, label in (("fast", "Fast"), ("balanced", "Balanced"), ("long-ctx", "Long ctx")):
@@ -128,9 +152,12 @@ def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) ->
                 preset=key, models_dir=None, section_name="",
                 mmproj_gb_override=(mmproj_gb or None),
             )
-        except Exception:  # noqa: BLE001 — an estimate must never break the search page
+        except Exception as e:  # noqa: BLE001 — an estimate must never break the search page
+            _why_no_estimate("autoconfig raised", preset=key, error=type(e).__name__)
             return []
         if rec.error or not rec.recommended_ctx:
+            _why_no_estimate("autoconfig gave no context" if not rec.error else "autoconfig refused the plan",
+                             preset=key, error=(rec.error or "")[:160])
             continue
         chosen = next((p for p in rec.presets if p.key == rec.active_preset), None)
         out.append({

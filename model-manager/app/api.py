@@ -414,6 +414,10 @@ def section_autoconfig(name: str, preset: str = "", sessions: int = 1, spec: str
                        budget_gib: float = 0.0) -> dict:
     from .helpers import _backend_list
     sessions = max(1, min(int(sessions or 1), 8))
+    if ini.is_laya_section(name):
+        # Laya is its own service with its own model; there is no llama.cpp load to size (noevia#1163).
+        return {"error": f"'{name}' is the Laya routing model. Laya runs as its own service, so "
+                         "llama.cpp auto-configuration does not apply to it.", "code": "laya_section"}
     gguf_path, model_rel, rel = _resolve_section_gguf(name)
     if gguf_path is None or not gguf_path.is_file():
         return {"error": f"No model file found for '{name}'."}

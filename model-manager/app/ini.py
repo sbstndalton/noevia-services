@@ -700,14 +700,26 @@ def _is_non_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
     return bool(re.search(r"embed|rerank", name, re.I))
 
 
+def _is_laya_section(cp: configparser.ConfigParser, name: str) -> bool:
+    """A system routing (Laya) section: named laya*, or pointing at a laya* path. Laya runs as its
+    own service and loads its own model, so llama.cpp tuning does not apply to it (noevia#1163)."""
+    if name == "*" or not cp.has_section(name):
+        return False
+    model = cp.get(name, "model", fallback=cp.get(name, "m", fallback=""))
+    return any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
+
+
+def is_laya_section(name: str) -> bool:
+    return _is_laya_section(read_ini(), name)
+
+
 def _is_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
     """Embedding, reranking and system routing (Laya) sections are not chat models."""
     if name == "*":
         return False
     if _is_non_chat_section(cp, name):
         return False
-    model = cp.get(name, "model", fallback=cp.get(name, "m", fallback=""))
-    return not any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
+    return not _is_laya_section(cp, name)
 
 
 def migrate_cache_ram() -> list[str]:
