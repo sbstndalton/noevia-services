@@ -3,8 +3,8 @@
 # before anything is built. Used only when DOCX_TEXT_IMPL=rust (default python). Built on bookworm
 # (glibc 2.36), the same Debian as the runtime base below.
 FROM rust:1.99-slim-bookworm AS docx-text
-ARG NOEVIA_RS_REF=7c2a02cffa2fe8e7eeb052a959e6f6eb21cf906a
-ARG NOEVIA_RS_SHA256=8e3de750d3e25b6d5910e4170142a180b8f47118873569b9feecee30d20e8cfd
+ARG NOEVIA_RS_REF=cd80eb27bfe99191d854756caaf372f40b262470
+ARG NOEVIA_RS_SHA256=e988192ad915b67ca6f728a3c46b0797914369b53c4937962eff64bfa3467782
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
