@@ -105,3 +105,11 @@ the web server, bound to the tenant, method, path and storage headers, within a
 another tenant or delete one. With neither `DIARY_AUTH_TOKEN` nor
 `DIARY_TENANT_KEY` set the service refuses to start unless `DIARY_ALLOW_OPEN=1`.
 Keep the service internal regardless.
+
+`TENANT_ASSERTION_IMPL=rust` (default `python`; any other value is `python` with
+one warning) also runs the check in the bounded Rust leaf `tenant-assertion`
+(sbstndalton/noevia-rs, baked into the image at `/usr/local/bin`). It only adds
+refusals: a request is accepted when Python and Rust both accept, and a missing
+binary, crash, timeout or odd output refuses it (401). The key and headers reach
+the child on stdin only, with a `PATH`-only environment. `TENANT_ASSERTION_BIN`
+overrides the binary path (tests).

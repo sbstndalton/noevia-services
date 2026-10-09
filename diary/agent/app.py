@@ -245,7 +245,7 @@ def _storage_credential(descriptor: Optional[dict], user_id: str):
         raise HTTPException(status_code=400, detail="invalid storage descriptor")
     secret = descriptor.get("secret") or ""
     key = tenant_assertion.tenant_key()
-    if secret and key and not secrets.compare_digest(ref, tenant_assertion.storage_secret_ref(key, user_id, secret)):
+    if secret and key and not tenant_assertion.secret_ref_matches(key, user_id, secret, ref):
         raise HTTPException(status_code=400, detail="invalid storage descriptor")
     keyed = {k: v for k, v in descriptor.items() if k != "secret"}
     return json.dumps(keyed, sort_keys=True), bool(ref) and not secret
@@ -330,8 +330,13 @@ class TenantAssertionMiddleware:
                     else:
                         body_hash, downstream_receive = tenant_assertion.STREAM, receive
                     try:
-                        reason = tenant_assertion.verify(key, headers, scope.get("method", "GET"), tenant_assertion.wire_path(scope),
-                                                         query=scope.get("query_string", b""), body_hash=body_hash)
+                        args = (key, headers, scope.get("method", "GET"), tenant_assertion.wire_path(scope))
+                        kwargs = {"query": scope.get("query_string", b""), "body_hash": body_hash}
+                        if tenant_assertion.impl_choice() == "rust":
+                            # The Rust check spawns a child; keep the event loop free (#1144).
+                            reason = await run_in_threadpool(tenant_assertion.verify, *args, **kwargs)
+                        else:
+                            reason = tenant_assertion.verify(*args, **kwargs)
                     except tenant_assertion.NonceCacheFull:
                         if not _nonce_full_logged:
                             _nonce_full_logged = True

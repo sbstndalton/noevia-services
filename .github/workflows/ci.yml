@@ -65,6 +65,40 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest -q
+      # tenant-assertion (TENANT_ASSERTION_IMPL=rust) at the Dockerfile's pinned noevia-rs ref,
+      # which must equal the OCR and model-manager pins; the fixture table must be byte-identical
+      # to noevia-rs' copy, and the binary must agree with the live Python module through the switch.
+      - name: Diary pins the same noevia-rs as OCR and model-manager
+        run: |
+          set -euo pipefail
+          for k in NOEVIA_RS_REF NOEVIA_RS_SHA256; do
+            a=$(sed -n "s/^ARG $k=//p" Dockerfile); b=$(sed -n "s/^ARG $k=//p" ../ocr/Dockerfile)
+            [ -n "$a" ] && [ "$a" = "$b" ] || { echo "::error::diary/Dockerfile $k ($a) != ocr/Dockerfile ($b)"; exit 1; }
+          done
+      - name: Fetch noevia-rs at the pinned ref
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ARG NOEVIA_RS_REF=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG NOEVIA_RS_SHA256=//p' Dockerfile)
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "Dockerfile NOEVIA_RS_REF is not a 40-char SHA"; exit 1; }
+          curl -fsSL -o /tmp/noevia-rs.tar.gz "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
+          echo "$sum  /tmp/noevia-rs.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/noevia-rs"
+          tar -xzf /tmp/noevia-rs.tar.gz -C "$RUNNER_TEMP/noevia-rs" --strip-components=1
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ runner.temp }}/noevia-rs
+      - name: Build tenant-assertion
+        working-directory: ${{ runner.temp }}/noevia-rs
+        run: cargo build --release --locked -p tenant-assertion-cli
+      - name: Differential test (tenant-assertion vs Python reference)
+        env:
+          TENANT_ASSERTION_BIN: ${{ runner.temp }}/noevia-rs/target/release/tenant-assertion
+        run: |
+          cmp tests/fixtures/tenant-assertion.v1.json "$RUNNER_TEMP/noevia-rs/crates/tenant-assertion/tests/fixtures/tenant-assertion.v1.json"
+          python -m pytest -q -rs tests/test_tenant_assertion_differential.py tests/test_tenant_assertion_switch.py
+          TENANT_ASSERTION_IMPL=rust python -m pytest -q tests/test_tenant_assertion.py
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
