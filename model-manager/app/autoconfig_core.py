@@ -160,9 +160,18 @@ def kv_shape(arch: str, layers: int, kv_heads: int, head_dim: int,
 
 def kv_shape_bytes(shape: dict | None, ctx: int, bytes_per_elem: float,
                    v_bytes_per_elem: float | None = None) -> int:
-    """KV cache bytes at `ctx` for a kv_shape(). The arithmetic of kv_cache_bytes, unchanged."""
+    """KV cache bytes at `ctx` for a kv_shape(), plus the fixed recurrent state prepare() puts
+    on a hybrid model's shape (recurrent_bytes, #1159) when it sizes only the attention layers."""
     if shape is None or not ctx > 0:
         return 0
+    base = _kv_shape_bytes(shape, ctx, bytes_per_elem, v_bytes_per_elem)
+    rec = shape.get("recurrent_bytes")
+    return base + rec if rec else base
+
+
+def _kv_shape_bytes(shape: dict, ctx: int, bytes_per_elem: float,
+                    v_bytes_per_elem: float | None = None) -> int:
+    """KV cache bytes at `ctx` for a kv_shape(). The arithmetic of kv_cache_bytes, unchanged."""
     layers, kv_heads = shape["layers"], shape["kv_heads"]
     k_dim, v_dim = shape["k_dim"], shape["v_dim"]
     v_bytes = bytes_per_elem if v_bytes_per_elem is None else v_bytes_per_elem
@@ -1159,13 +1168,24 @@ def prepare(inp: dict[str, Any]) -> dict[str, Any]:
     attn = _attention_layers(m.get("attention_head_count_kv"), layers)
     if attn is not None and not (full_attention_interval and full_attention_interval > 1) \
             and not (_swa["sliding_window"] and _swa["sliding_window"] > 0):
+        _shared = _swa["shared_kv_layers"]
         if attn[0] == "partial":
-            return {"refuse": "kv_layers", "known": attn[1], "count": attn[2], "layers": layers}
+            return {"refuse": "kv_layers", "known": attn[1], "count": attn[2], "layers": layers, "shared": 0}
+        if _shared and _shared > 0:
+            # Which layers share KV is not declared against the attention layers; subtracting
+            # the shared count from the attention-only count could under-size the cache.
+            return {"refuse": "kv_layers", "known": layers, "count": layers, "layers": layers,
+                    "shared": int(_shared)}
         shape_layers, shape_heads = attn[1], attn[2]
     shape = kv_shape(arch, shape_layers, shape_heads, head_dim,
                      key_length=key_length, value_length=value_length,
                      full_attention_interval=full_attention_interval,
                      ssm_state_size=ssm_state_size, **_swa)
+    if shape is not None and shape_layers != layers:
+        # The layers that hold no KV still hold a recurrent state (Mamba SSM, LFM2 short-conv)
+        # per sequence. Charged like the interleaved hybrid branch, _SSM_STATE_BYTES per layer -
+        # far above LFM2's ~16 KB conv state, an over-estimate on the safe side - per session.
+        shape["recurrent_bytes"] = (layers - shape_layers) * _SSM_STATE_BYTES * n_sessions
     if kv_shape_bytes(shape, 4096, bytes_per) <= 0:
         missing = [k for k, v in (("block_count", layers),
                                   ("attention_head_count_kv", shape_heads),

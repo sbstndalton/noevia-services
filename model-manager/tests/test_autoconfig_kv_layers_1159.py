@@ -51,9 +51,45 @@ def test_hybrid_per_layer_heads_size_only_the_attention_layers():
     assert p["refuse"] is None
     assert p["layers"] == 30, "the model's own layer count (offload, split) is untouched"
     assert p["shape"]["layers"] == n_attn and p["shape"]["kv_heads"] == 8
-    # The same bytes as a dense stack of just those layers at 8 KV heads.
+    # A dense stack of just those layers at 8 KV heads, plus the non-attention layers' recurrent
+    # state at the SSM rate.
     dense = _prep(dict(BASE, block_count=n_attn, attention_head_count_kv=8), arch="llama")
-    assert _kv(p) == _kv(dense) > 0
+    rec = (30 - n_attn) * autoconfig_core._SSM_STATE_BYTES
+    assert p["shape"]["recurrent_bytes"] == rec
+    assert _kv(p) == _kv(dense) + rec > rec
+
+
+def test_recurrent_state_is_charged_per_session():
+    one = autoconfig_core.prepare({"n_sessions": 1, "arch": "lfm2", "model": dict(BASE, attention_head_count_kv=LFM2_HEADS),
+                                   "file_size": 1_600_000_000, "backends": BACKENDS})
+    four = autoconfig_core.prepare({"n_sessions": 4, "arch": "lfm2", "model": dict(BASE, attention_head_count_kv=LFM2_HEADS),
+                                    "file_size": 1_600_000_000, "backends": BACKENDS})
+    assert four["shape"]["recurrent_bytes"] == 4 * one["shape"]["recurrent_bytes"]
+
+
+def test_granite_h_shaped_header_is_not_cheaper_than_the_hybrid_branch():
+    """Granite-4.0-H: 40 layers, 4 of them attention, Mamba-2 elsewhere (ssm_state_size), and no
+    full_attention_interval. The per-layer path must charge at least what the interleaved hybrid
+    branch charges for the same stack (4 attention layers + 36 SSM states)."""
+    heads = [0] * 40
+    for i in (5, 15, 25, 35):
+        heads[i] = 8
+    model = dict(BASE, block_count=40, embedding_length=4096, attention_head_count=32,
+                 ssm_state_size=128, attention_head_count_kv=heads)
+    p = _prep(model, arch="granitehybrid")
+    assert p["refuse"] is None and p["shape"]["layers"] == 4
+    hybrid = autoconfig_core.kv_shape("granitehybrid", 40, 8, 128, full_attention_interval=10, ssm_state_size=128)
+    for ctx in (4096, 32768, 131072):
+        assert autoconfig_core.kv_shape_bytes(p["shape"], ctx, 1.0625) >= \
+            autoconfig_core.kv_shape_bytes(hybrid, ctx, 1.0625)
+
+
+def test_shared_kv_on_a_per_layer_hybrid_refuses():
+    p = _prep(dict(BASE, block_count=6, shared_kv_layers=2, attention_head_count_kv=[0, 0, 8, 0, 0, 8]))
+    assert p == {"refuse": "kv_layers", "known": 6, "count": 6, "layers": 6, "shared": 2}
+    assert "2 layers sharing KV" in autoconfig._prep_refusal(p).error
+    ok = _prep(dict(BASE, block_count=6, shared_kv_layers=0, attention_head_count_kv=[0, 0, 8, 0, 0, 8]))
+    assert ok["refuse"] is None
 
 
 def test_mixed_head_counts_take_the_largest():
@@ -66,7 +102,7 @@ def test_a_prefix_of_a_hybrid_array_refuses_with_its_reason():
     # What the live d1-3B summary looks like: count 30, the first 8 entries.
     model = dict(BASE, attention_head_count_kv={"_array": True, "count": 30, "sample": LFM2_HEADS[:8]})
     p = _prep(model)
-    assert p == {"refuse": "kv_layers", "known": 8, "count": 30, "layers": 30}
+    assert p == {"refuse": "kv_layers", "known": 8, "count": 30, "layers": 30, "shared": 0}
     rec = autoconfig.analyze(summary={"arch": "lfm2", "model": model}, file_size=1_600_000_000,
                              backends=BACKENDS, preset="fast")
     assert rec.recommended_ctx == 0

@@ -334,12 +334,16 @@ def _prep_refusal(prep: dict[str, Any]) -> Recommendation:
         # and only those holding a KV cache may be counted. The GGUF summary keeps a prefix of a
         # long array, so which later layers attend is unknown; any count would be a guess.
         known, count, layers = prep["known"], prep["count"], prep["layers"]
-        where = (f"only the first {known} of its {count} entries are readable"
-                 if count == layers else
-                 f"it has {count} entries for {layers} layers")
+        if prep.get("shared"):
+            where = (f"it also declares {prep['shared']} layers sharing KV, which cannot be "
+                     "matched to its attention layers")
+        elif count == layers:
+            where = f"only the first {known} of its {count} entries are readable"
+        else:
+            where = f"it has {count} entries for {layers} layers"
         error = ("Cannot size the KV cache from this model's metadata: it is a hybrid model whose "
                  "attention_head_count_kv marks non-attention layers with 0, and "
-                 f"{where}, so the number of attention layers is unknown. Autoconfig will not "
+                 f"{where}, so its KV cache cannot be sized safely. Autoconfig will not "
                  "guess a context size. Set ctx-size manually in the form and verify it loads.")
     else:
         # kv_cache_bytes() is 0 when block_count / attention_head_count_kv / head_dim are missing

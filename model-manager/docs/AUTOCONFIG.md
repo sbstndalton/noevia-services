@@ -179,7 +179,9 @@ layers, Jamba's Mamba layers; llama.cpp makes them recurrent). Such hybrid model
 their attention layers only, at the largest declared head count (noevia#1159). The GGUF summary
 keeps only the first 8 entries of a longer array; when a 0 is among them, which later layers
 attend is unknown and autoconfig refuses (`kv_layers`) rather than guess. Discover shows that
-reason as the file's `estimatesReason`. Their small fixed recurrent state is not charged.
+reason as the file's `estimatesReason`. The non-attention layers' recurrent state (Mamba SSM, LFM2
+short-conv) is charged at the hybrid rate, `_SSM_STATE_BYTES` per layer per session, which is an
+over-estimate for LFM2's small conv state. A shared-KV declaration on top of such an array refuses.
 
 `cache_bytes` per element: `f16` 2 bytes, `q8_0` ~1.06 (block-quantised, includes scale overhead), `q4_0` ~0.56.
 
