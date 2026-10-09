@@ -45,6 +45,9 @@ MAX_ARRAY_DEPTH = 1
 # layer (sbstndalton/noevia#1186). Only when block_count is at most this; worst case is this
 # many numbers per such key.
 MAX_PER_LAYER_KEPT = 4096
+# Numbers kept in whole per-layer arrays across one header. Past it, a block_count-length array
+# falls back to sample + count: a hostile header of many such arrays stays cheap.
+MAX_PER_LAYER_VALUES = 64 * MAX_PER_LAYER_KEPT
 _NUMERIC_TYPES = frozenset(
     (_UINT8, _INT8, _UINT16, _INT16, _UINT32, _INT32, _FLOAT32, _UINT64, _INT64, _FLOAT64)
 )
@@ -90,6 +93,7 @@ class _Source:
         f.seek(start)
         self.retained = 0     # characters of string data kept so far, across the whole header
         self.ran_out = False  # an array declared more elements than the stream holds
+        self.per_layer_left = MAX_PER_LAYER_VALUES  # numbers still allowed in whole arrays
 
     def run_out(self) -> None:
         """An array's elements outrun the stream. Normal for a range-fetched header, whose big
@@ -170,7 +174,10 @@ def _read_value(src: _Source, vtype: int, depth: int = 0, per_layer: int | None 
             and subtype in _NUMERIC_TYPES
             # A cut-off header keeps the old count + sample (and run_out) rather than failing.
             and _SCALAR_FMT[subtype][1] * count <= src.remaining()
+            and count <= src.per_layer_left
         )
+        if keep_whole:
+            src.per_layer_left -= count
         if count > MAX_ARRAY_ELEMENTS_KEPT and not keep_whole:
             if subtype == _ARRAY:
                 raise GgufMetaError(f"unsupported nested array subtype {subtype}")
@@ -264,8 +271,11 @@ def _scalar_int(v: Any) -> int | None:
         return v
     if isinstance(v, float):
         return int(v)
-    if isinstance(v, dict) and v.get("_array"):
-        sample = v.get("sample") or []
+    # A whole per-layer list (longer than any sample, #1186) is read like a summary: its most
+    # common value, the first seen winning a tie. Shorter lists keep their first element.
+    long_list = isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT
+    if long_list or (isinstance(v, dict) and v.get("_array")):
+        sample = v if long_list else (v.get("sample") or [])
         if sample:
             counts: dict[int, int] = {}
             for x in sample:
@@ -273,11 +283,21 @@ def _scalar_int(v: Any) -> int | None:
                     counts[int(x)] = counts.get(int(x), 0) + 1
             if counts:
                 return max(counts, key=lambda k: counts[k])
-    if isinstance(v, list) and v:
+    if isinstance(v, list) and v and not long_list:
         first = v[0]
         if isinstance(first, (int, float)):
             return int(first)
     return None
+
+
+def _kv_dim_int(v: Any) -> int | None:
+    """_scalar_int for a KV-cache dimension (key/value length): a whole per-layer list (#1186)
+    gives its largest value, so the cache is never sized below what the 8-entry sample's most
+    common value gave. Everything else reads as _scalar_int."""
+    if isinstance(v, list) and len(v) > MAX_ARRAY_ELEMENTS_KEPT:
+        known = [int(x) for x in v if isinstance(x, (int, float))]
+        return max(known) if known else None
+    return _scalar_int(v)
 
 
 def _scalar_float(v: Any) -> float | None:
@@ -398,16 +418,16 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
             # Built-in multi-token-prediction layers (llama.cpp "nextn"): draft-mtp needs no head file.
             "nextn_predict_layers": _scalar_int(a("nextn_predict_layers")),
             "expert_used_count": _scalar_int(a("expert_used_count")),
-            "key_length": _scalar_int(a("attention.key_length")),
-            "value_length": _scalar_int(a("attention.value_length")),
+            "key_length": _kv_dim_int(a("attention.key_length")),
+            "value_length": _kv_dim_int(a("attention.value_length")),
             "full_attention_interval": _scalar_int(a("full_attention_interval")),
             # Sliding-window attention, declared properly rather than guessed. Gemma-4 sets
             # all four: most layers attend over a short window and use a NARROWER head dim
             # than the global layers, and some layers share another layer's KV entirely.
             # Sizing without these over-estimates the cache by an order of magnitude.
             "sliding_window": _scalar_int(a("attention.sliding_window")),
-            "key_length_swa": _scalar_int(a("attention.key_length_swa")),
-            "value_length_swa": _scalar_int(a("attention.value_length_swa")),
+            "key_length_swa": _kv_dim_int(a("attention.key_length_swa")),
+            "value_length_swa": _kv_dim_int(a("attention.value_length_swa")),
             "shared_kv_layers": _scalar_int(a("attention.shared_kv_layers")),
             # kept raw: a per-layer array of which layers are local vs global
             "sliding_window_pattern": a("attention.sliding_window_pattern"),

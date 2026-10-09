@@ -1043,6 +1043,10 @@ _MMPROJ_COMPUTE_GB = 0.5  # modality-encoder scratch beyond the projector weight
                           # already covers most of that.
 
 
+# gguf_meta.MAX_ARRAY_ELEMENTS_KEPT: a list longer than this is a whole per-layer array (#1186).
+_SAMPLE_KEPT = 8
+
+
 def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
     """kv_heads may be an int, or a per-layer array dict from GGUF; extract a representative int."""
     if isinstance(kv_heads, int):
@@ -1058,6 +1062,11 @@ def _kv_first_int(kv_heads: Any, default: int = 8) -> int:
                 counts[int(v)] = counts.get(int(v), 0) + 1
             if counts:
                 return max(counts, key=lambda k: counts[k])
+    if isinstance(kv_heads, list) and len(kv_heads) > _SAMPLE_KEPT:
+        # A whole per-layer list (#1186): the largest head count, so no layer's cache is
+        # under-sized (never below the sample's most common value it replaces).
+        known = [int(v) for v in kv_heads if v is not None]
+        return max(known) if known else default
     if isinstance(kv_heads, list) and kv_heads and kv_heads[0] is not None:
         return int(kv_heads[0])
     return default

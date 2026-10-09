@@ -90,6 +90,17 @@ def _cases() -> dict[str, bytes]:
         "nonfinite_floats": _gguf(
             _kv("general.architecture", STRING, "llama"), _kv("llama.rope.freq_base", F32, math.nan),
             _kv("llama.rope.scaling.factor", F64, math.inf)),
+        # #1186: whole per-layer arrays share a per-header budget; past it head_count_kv keeps
+        # only the sample (in both parsers), and the summary shows which.
+        "per_layer_budget": _gguf(
+            _kv("general.architecture", STRING, "lfm2"), _kv("lfm2.block_count", U32, 4096),
+            *[_arr(f"lfm2.a{i:02d}", U8, [i % 7] * 4096) for i in range(66)],
+            _arr("lfm2.attention.head_count_kv", U8, [8] * 4096),
+            _arr("lfm2.feed_forward_length", U16, [3] * 4096)),
+        "per_layer_within_budget": _gguf(
+            _kv("general.architecture", STRING, "lfm2"), _kv("lfm2.block_count", U32, 4096),
+            *[_arr(f"lfm2.a{i:02d}", U8, [1] * 4096) for i in range(63)],
+            _arr("lfm2.attention.head_count_kv", U8, [1] + [8] * 4095)),
     }
     return c
 

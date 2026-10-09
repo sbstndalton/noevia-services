@@ -97,3 +97,59 @@ def test_a_cut_off_per_layer_array_keeps_count_and_sample():
     raw = gguf_meta.read_raw_bytes(_lfm2(_arr("lfm2.attention.head_count_kv", U32, HEADS[:12], count=30)))
     assert raw["lfm2.attention.head_count_kv"] == {"_array": True, "count": 30, "sample": HEADS[:8]}
     assert raw["_error"] == "stopped at KV read: array runs past the end of the data"
+
+
+def test_whole_lists_read_like_summaries_for_scalar_fields():
+    raw = gguf_meta.read_raw_bytes(_lfm2(
+        _arr("lfm2.attention.head_count", U32, [1] + [8] * 29),
+        _arr("lfm2.feed_forward_length", U32, [5] * 4 + [9] * 13 + [7] * 13),  # tie: first seen
+        _arr("lfm2.attention.key_length", I32, [64, 128] * 15)))
+    m = gguf_meta.summarize(raw)["model"]
+    assert m["attention_head_count"] == 8 and m["feed_forward_length"] == 9
+    # a KV dimension takes the largest entry: never below the sample's most common value
+    assert m["key_length"] == 128
+    # lists no longer than a sample keep their first element, as before
+    assert gguf_meta._scalar_int([1] + [8] * 7) == 1
+
+
+@pytest.mark.parametrize("heads", [
+    [1] + [8] * 29,                                       # one odd layer must not shrink KV
+    [2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 8] + [8] * 14,  # OpenELM-style increasing
+])
+def test_whole_kv_list_never_sizes_below_the_old_sample(heads):
+    old = autoconfig_core._kv_first_int({"_array": True, "count": len(heads), "sample": heads[:8]})
+    new = autoconfig_core._kv_first_int(heads)
+    assert new == max(heads) >= old
+    model = {"block_count": 30, "attention_head_count": 32, "embedding_length": 2048,
+             "context_length": 32768, "attention_head_count_kv": heads}
+    p = autoconfig_core.prepare({"n_sessions": 1, "arch": "llama", "model": model,
+                                 "file_size": 1_600_000_000, "backends": BACKENDS})
+    assert p["refuse"] is None and p["shape"]["kv_heads"] == max(heads) >= old
+
+
+def test_kv_list_nulls_and_short_lists():
+    assert autoconfig_core._kv_first_int([None, 2] * 5) == 2
+    assert autoconfig_core._kv_first_int([None] * 9, default=5) == 5
+    assert autoconfig_core._kv_first_int([1] + [8] * 7) == 1  # eight entries: unchanged
+
+
+def test_whole_arrays_share_a_per_header_budget():
+    n = gguf_meta.MAX_PER_LAYER_KEPT
+    whole = gguf_meta.MAX_PER_LAYER_VALUES // n
+    data = _lfm2(*[_arr(f"lfm2.a{i:02d}", U8, [1] * n) for i in range(whole + 2)],
+                 _arr("lfm2.attention.head_count_kv", U8, [8] * n), block_count=n)
+    raw = gguf_meta.read_raw_bytes(data)
+    assert all(raw[f"lfm2.a{i:02d}"] == [1] * n for i in range(whole))
+    for k in (f"lfm2.a{whole:02d}", "lfm2.attention.head_count_kv"):
+        assert raw[k] == {"_array": True, "count": n, "sample": raw[k]["sample"]} and len(raw[k]["sample"]) == 8
+    assert "_error" not in raw
+
+
+def test_a_hostile_header_of_many_per_layer_arrays_stays_cheap():
+    import time
+    n = gguf_meta.MAX_PER_LAYER_KEPT
+    data = _lfm2(*[_arr(f"k{i}", U8, [1] * n) for i in range(2000)], block_count=n)
+    t = time.monotonic()
+    raw = gguf_meta.read_raw_bytes(data)
+    assert time.monotonic() - t < 5
+    assert sum(len(v) for v in raw.values() if isinstance(v, list)) == gguf_meta.MAX_PER_LAYER_VALUES
