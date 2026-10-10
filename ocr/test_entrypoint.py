@@ -16,6 +16,8 @@ if [ "${{1-}}" = --features ]; then printf '%s\\n' '{features}'; exit {feature_s
 printf 'rust-selected\\n'
 ''')
             binary.chmod(0o755)
+            if features is None:
+                binary.unlink()
             python = root / 'python'
             python.write_text('#!/bin/sh\nprintf "python-selected\\n"\n')
             python.chmod(0o755)
@@ -43,6 +45,11 @@ printf 'rust-selected\\n'
                 result = self.run_selector('rust', feature, status)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, '')
+
+    def test_missing_native_binary_refuses_without_python_fallback(self):
+        result = self.run_selector('rust', None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
 
     def test_invalid_selector_refuses_without_fallback(self):
         for selector in ['', 'Rust', 'node', 'rust python']:
