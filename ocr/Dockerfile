@@ -3,7 +3,7 @@
 # before anything is built. Used only when DOCX_TEXT_IMPL=rust (default python). Built on bookworm
 # (glibc 2.36), the same Debian as the runtime base below.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS docx-text
-# Temporary rs#65 draft pin; merge blocked until repinned to its merged SHA.
+# Merged rs#67 runtime dependency; checksum verified below.
 ARG NOEVIA_RS_REF=b150831bdb1b00a6bc6f35315e50dad3e7c15e97
 ARG NOEVIA_RS_SHA256=b707258945f72cd9e2864fc0b1beed7a2264d117a9d2bd3a3f8d1eef8157344f
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
