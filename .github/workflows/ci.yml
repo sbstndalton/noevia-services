@@ -277,7 +277,7 @@ jobs:
         run: |
           set -eu
           for impl in python rust; do
-            docker run -d --name ocr-ci --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --tmpfs /tmp:rw,size=536870912,mode=1777 -e NOEVIA_OCR_IMPL="$impl" noevia-ocr:ci
+            docker run -d --name ocr-ci --network none --read-only --memory 1g --cpus 1 --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --tmpfs /tmp:rw,size=536870912,mode=1777 -e NOEVIA_OCR_IMPL="$impl" noevia-ocr:ci
             ready=0
             for attempt in $(seq 1 20); do
               if docker exec ocr-ci noevia-ocr --healthcheck; then ready=1; break; fi
