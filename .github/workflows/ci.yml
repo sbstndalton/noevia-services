@@ -249,9 +249,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
-      - name: Build docx-text
+      - name: Build docx-text and native OCR
         working-directory: ${{ runner.temp }}/noevia-rs
-        run: cargo build --release --locked -p docx-text-cli
+        run: cargo build --release --locked -p docx-text-cli -p noevia-ocr --features native-ocr
+      - name: Native OCR synthetic contract and engine tests
+        working-directory: ${{ runner.temp }}/noevia-rs
+        env:
+          NOEVIA_OCR_REFERENCE: ${{ github.workspace }}/ws/services/ocr
+          NOEVIA_OCR_REAL_ENGINES: "1"
+        run: cargo test --locked -p noevia-ocr --features native-ocr
       - name: Differential test (docx-text vs Python reference)
         env:
           DOCX_TEXT_BIN: ${{ runner.temp }}/noevia-rs/target/release/docx-text
@@ -265,8 +271,25 @@ jobs:
         with:
           context: ws/services/ocr
           push: false
+          load: true
+          tags: noevia-ocr:ci
           cache-from: type=gha,scope=ocr
           cache-to: type=gha,mode=max,scope=ocr
+
+      - name: Both OCR owners boot in the hardened image
+        run: |
+          set -eu
+          for impl in python rust; do
+            docker run -d --name ocr-ci --network none --read-only --memory 1g --cpus 1 --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --tmpfs /tmp:rw,size=536870912,mode=1777 -e NOEVIA_OCR_IMPL="$impl" noevia-ocr:ci
+            ready=0
+            for attempt in $(seq 1 20); do
+              if docker exec ocr-ci noevia-ocr --healthcheck; then ready=1; break; fi
+              sleep 1
+            done
+            docker rm -f ocr-ci
+            [ "$ready" = 1 ] || exit 1
+          done
+          if docker run --rm --network none -e NOEVIA_OCR_IMPL=invalid noevia-ocr:ci; then exit 1; fi
 
   laya:
     name: Laya service tests
