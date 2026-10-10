@@ -254,6 +254,9 @@ jobs:
         run: cargo build --release --locked -p docx-text-cli -p noevia-ocr --features native-ocr
       - name: Native OCR synthetic contract and engine tests
         working-directory: ${{ runner.temp }}/noevia-rs
+        env:
+          NOEVIA_OCR_REFERENCE: ${{ github.workspace }}/ws/services/ocr
+          NOEVIA_OCR_REAL_ENGINES: "1"
         run: cargo test --locked -p noevia-ocr --features native-ocr
       - name: Differential test (docx-text vs Python reference)
         env:
