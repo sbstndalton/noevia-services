@@ -11,6 +11,7 @@ import os
 import socket
 import threading
 import time
+from pathlib import Path
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -19,6 +20,47 @@ import extract as extractor
 import isolation
 import pytest
 import server
+
+
+@pytest.mark.parametrize("transport", ["stdout", "legacy"])
+def test_native_stdout_transport_uses_original_pipe_and_discards_library_prints(tmp_path, transport):
+    """Actual worker, including fd-level noise before readiness and conversion."""
+    import struct
+    import subprocess
+    import sys
+    module = tmp_path / "native_transport_fake.py"
+    module.write_text(
+        "import os\nprint('python import noise', flush=True)\nos.write(1,b'C import noise')\n"
+        "def extract(path,name):\n print('python conversion noise',flush=True)\n"
+        " os.write(1,b'C conversion noise')\n return {'value':'synthetic'}\n")
+    read_fd, write_fd = os.pipe() if transport == "legacy" else (None, None)
+    process = subprocess.Popen(
+        [sys.executable, str(Path(server.__file__).with_name("isolated_worker.py")),
+         str(write_fd) if transport == "legacy" else "--stdout-replies", "native_transport_fake:extract"],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE if transport == "stdout" else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, pass_fds=(write_fd,) if transport == "legacy" else ())
+    if write_fd is not None:
+        os.close(write_fd)
+    try:
+        output, _ = process.communicate(b'{"path":"unused","name":"synthetic.pdf"}\n', timeout=10)
+        if read_fd is not None:
+            output = os.read(read_fd, 4096)
+        frames = []
+        while output:
+            assert len(output) >= 4
+            size = struct.unpack(">I", output[:4])[0]
+            assert 0 < size <= 1024 and len(output) >= size + 4
+            frames.append(json.loads(output[4:4 + size]))
+            output = output[4 + size:]
+        assert process.returncode == 0
+        assert frames == [{"ready": True}, {"ok": {"value": "synthetic"}}]
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 @pytest.fixture()
