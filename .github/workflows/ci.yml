@@ -552,10 +552,43 @@ jobs:
           rustfmt --edition 2021 --check qualification/diagnosis.rs qualification/diagnosis-image.rs
           clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/diagnosis.rs -o "$RUNNER_TEMP/diagnosis-guard-probe"
           rustc --edition=2021 --test qualification/diagnosis.rs -o "$RUNNER_TEMP/diagnosis-guard-tests"
-          "$RUNNER_TEMP/diagnosis-guard-tests" tests::actual
+          umask 077
+          diagnosis_evidence="$RUNNER_TEMP/diagnosis-guard-evidence"
+          mkdir -m 700 "$diagnosis_evidence"
+          git -C "$GITHUB_WORKSPACE/self" rev-parse HEAD HEAD^{tree} > "$diagnosis_evidence/source.txt"
+          sha256sum qualification/diagnosis.rs qualification/prompts.rs "$RUNNER_TEMP/diagnosis-guard-tests" > "$diagnosis_evidence/bindings.txt"
+          run_diagnosis_exact() {
+            local diagnosis_name="$1" diagnosis_test_exit
+            printf '%s\n' "$RUNNER_TEMP/diagnosis-guard-tests" "$diagnosis_name" --exact > "$diagnosis_evidence/$diagnosis_name.argv"
+            if "$RUNNER_TEMP/diagnosis-guard-tests" "$diagnosis_name" --exact > "$diagnosis_evidence/$diagnosis_name.stdout" 2> "$diagnosis_evidence/$diagnosis_name.stderr"; then
+              diagnosis_test_exit=0
+            else
+              diagnosis_test_exit=$?
+            fi
+            printf '%s\n' "$diagnosis_test_exit" > "$diagnosis_evidence/$diagnosis_name.status"
+            [ "$diagnosis_test_exit" = 0 ] || { echo 'diagnosis exact test failed; raw evidence retained'; return 1; }
+            [ "$(grep -Fxc 'running 1 test' "$diagnosis_evidence/$diagnosis_name.stdout")" = 1 ]
+            [ "$(grep -Fxc "test $diagnosis_name ... ok" "$diagnosis_evidence/$diagnosis_name.stdout")" = 1 ]
+            [ "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' "$diagnosis_evidence/$diagnosis_name.stdout")" = 1 ]
+            if grep -Ev "^$|^running 1 test$|^test $diagnosis_name \.\.\. ok$|^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$" "$diagnosis_evidence/$diagnosis_name.stdout" > /dev/null; then
+              echo 'diagnosis exact test output grammar refused; raw evidence retained'; return 1
+            fi
+          }
+          run_diagnosis_exact tests::actual_exact_confirmation_preserves_default_errors_and_unknowns
+          run_diagnosis_exact tests::actual_token_precedes_method_and_path_ownership
+          run_diagnosis_exact tests::actual_diagnosis_composes_with_existing_guards
+          run_diagnosis_exact tests::actual_failed_fresh_create_preserves_preexisting_owned_sentinel
           clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/diagnosis-image.rs -o "$RUNNER_TEMP/diagnosis-image-probe"
           rustc --edition=2021 --test qualification/diagnosis-image.rs -o "$RUNNER_TEMP/diagnosis-image-tests"
           "$RUNNER_TEMP/diagnosis-image-tests" tests::confirmation_and_binding_are_exact --exact
+      - name: Retain exact diagnosis guard evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnosis-guard-exact-evidence
+          path: ${{ runner.temp }}/diagnosis-guard-evidence
+          retention-days: 7
+          if-no-files-found: warn
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
