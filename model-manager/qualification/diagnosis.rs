@@ -2,6 +2,15 @@
 #![forbid(unsafe_code)]
 #[path = "prompts.rs"]
 #[allow(dead_code)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 mod capture;
 use std::{
     error::Error,
@@ -36,6 +45,12 @@ for method,path,authorized in json.loads(sys.argv[1]):
  print(json.dumps([r.status_code,r.text,seen],separators=(',',':')))
 "#;
 struct Root(std::path::PathBuf);
+impl Root {
+    fn create(path: std::path::PathBuf) -> Result<Self> {
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
 impl Drop for Root {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -43,9 +58,9 @@ impl Drop for Root {
 }
 fn call(value: Option<&str>, composed: bool, cases: &str) -> Result<Vec<String>> {
     let tick = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let root =
-        Root(std::env::temp_dir().join(format!("diagnosis-guard-{}-{tick}", std::process::id())));
-    fs::DirBuilder::new().mode(0o700).create(&root.0)?;
+    let root = Root::create(
+        std::env::temp_dir().join(format!("diagnosis-guard-{}-{tick}", std::process::id())),
+    )?;
     let source = Path::new(file!()).canonicalize()?;
     let app = source
         .parent()
@@ -172,7 +187,31 @@ fn main() -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn actual_failed_fresh_create_preserves_preexisting_owned_sentinel() {
+        let tick = super::SystemTime::now()
+            .duration_since(super::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = super::Root::create(std::env::temp_dir().join(format!(
+            "diagnosis-create-control-{}-{tick}",
+            std::process::id()
+        )))
+        .unwrap();
+        let candidate = parent.0.join("preexisting");
+        super::fs::create_dir(&candidate).unwrap();
+        let sentinel = candidate.join("sentinel");
+        super::fs::write(&sentinel, b"owned synthetic sentinel").unwrap();
+        assert!(super::Root::create(candidate.clone()).is_err());
+        assert!(candidate.is_dir());
+        assert_eq!(
+            super::fs::read(sentinel).unwrap(),
+            b"owned synthetic sentinel"
+        );
+        // Only the successfully acquired test parent owns recursive cleanup.
+    }
     #[test]
     fn actual_exact_confirmation_preserves_default_errors_and_unknowns() {
         super::exact_confirmation().unwrap();

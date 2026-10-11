@@ -2,6 +2,15 @@
 #![forbid(unsafe_code)]
 #[path = "prompts.rs"]
 #[allow(dead_code)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 mod guards;
 use std::{
     error::Error,
@@ -163,25 +172,21 @@ fn bounded_text(path: &Path) -> Result<String> {
 }
 fn validate_marker(mode: &str, marker: &str) -> Result<()> {
     let confirmation = match mode {
-        "rust" => "\"diagnose\": \"1\"",
-        "off" => "\"diagnose\": \"0\"",
-        "python" => "\"diagnose\": null",
+        "rust" => "\"1\"",
+        "off" => "\"0\"",
+        "python" => "null",
         _ => return Err("unknown image mode".into()),
     };
-    require(
-        marker.contains(confirmation),
-        "exact child diagnosis confirmation",
-    )?;
-    require(marker.contains("\"tz\": \"UTC\""), "child exact UTC")?;
     let (host, port) = if mode == "python" {
         ("0.0.0.0", "8090")
     } else {
         ("127.0.0.1", "8091")
     };
-    require(
-        marker.contains(host) && marker.contains(port),
-        "exact child bind",
-    )?;
+    // SHIM's fixed insertion order and Python json.dumps default separators;
+    // actual launcher argv is app.main:app --host HOST --port PORT.
+    // Whole equality rejects duplicate/extra fields, extra args and unrelated spoofing.
+    let expected = format!("{{\"diagnose\": {confirmation}, \"tz\": \"UTC\", \"argv\": [\"app.main:app\", \"--host\", \"{host}\", \"--port\", \"{port}\"]}}");
+    require(marker == expected, "exact child marker")?;
     Ok(())
 }
 
@@ -406,9 +411,7 @@ fn docker_failure(args: &[&str], stderr: &[u8]) -> String {
         "image HTTP response cap",
         "image readiness deadline",
         "image marker cap",
-        "exact child diagnosis confirmation",
-        "child exact UTC",
-        "exact child bind",
+        "exact child marker",
         "compiled diagnosis omission preserves host",
         "exact selector refusal exit",
         "exact selector refusal diagnostic",
@@ -604,20 +607,34 @@ fn main() -> Result<()> {
 mod tests {
     #[test]
     fn confirmation_and_binding_are_exact() {
-        let selected = r#"{"diagnose": "1", "tz": "UTC", "argv": ["127.0.0.1", "8091"]}"#;
+        let selected = r#"{"diagnose": "1", "tz": "UTC", "argv": ["app.main:app", "--host", "127.0.0.1", "--port", "8091"]}"#;
         assert!(super::validate_marker("rust", selected).is_ok());
         for changed in [
             selected.replace("\"1\"", "\"true\""),
             selected.replace("UTC", "Etc/UTC"),
             selected.replace("8091", "8090"),
             selected.replace("127.0.0.1", "0.0.0.0"),
+            selected.replace("app.main:app", "wrong:app"),
+            selected.replace("--host", "--wrong"),
+            selected.replace("--port", "--wrong"),
+            selected.replace("\"8091\"]", "\"8091\", \"extra\"]"),
+            selected.replace("\"tz\": \"UTC\"", "\"tz\": \"UTC\", \"tz\": \"Etc/UTC\""),
+            selected.replace(
+                "\"diagnose\": \"1\"",
+                "\"diagnose\": \"1\", \"diagnose\": \"0\"",
+            ),
+            selected.replace("}", ", \"unrelated\": \"127.0.0.1 8091\"}"),
+            selected.replace(
+                "\"argv\":",
+                "\"unrelated\": [\"127.0.0.1\", \"8091\"], \"argv\":",
+            ),
         ] {
             assert!(super::validate_marker("rust", &changed).is_err());
         }
         assert!(super::validate_marker("off", &selected.replace("\"1\"", "\"0\"")).is_ok());
         assert!(super::validate_marker(
             "python",
-            r#"{"diagnose": null, "tz": "UTC", "argv": ["0.0.0.0", "8090"]}"#
+            r#"{"diagnose": null, "tz": "UTC", "argv": ["app.main:app", "--host", "0.0.0.0", "--port", "8090"]}"#
         )
         .is_ok());
     }
