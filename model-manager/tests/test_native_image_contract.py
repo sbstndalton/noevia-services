@@ -8,9 +8,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_native_image_build_copy_capability_and_default_entrypoint():
     source = (ROOT / "model-manager" / "Dockerfile").read_text()
-    assert "-p noevia-model-manager --features noevia-model-manager/native-host" in source
+    assert "-p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections" in source
     assert "native_features=$(./target/release/noevia-model-manager --features)" in source
-    for capability in ("native-logs", "native-host"):
+    for capability in ("native-logs", "native-host", "native-sections"):
         assert f"printf '%s\\n' \"$native_features\" | grep -Fx {capability} >/dev/null" in source
     assert "COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager" in source
     command = re.findall(r"^CMD (.+)$", source, re.M)
@@ -21,7 +21,7 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
 
 def test_services_share_a_verified_rust_source_pin():
     pins = []
-    for service in ("model-manager", "ocr", "diary"):
+    for service in ("model-manager", "ocr", "diary", "docling", "laya"):
         source = (ROOT / service / "Dockerfile").read_text()
         ref = re.findall(r"^ARG NOEVIA_RS_REF=([0-9a-f]{40})$", source, re.M)
         digest = re.findall(r"^ARG NOEVIA_RS_SHA256=([0-9a-f]{64})$", source, re.M)
