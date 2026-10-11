@@ -12,7 +12,7 @@ Protocol, deliberately tiny so it cannot be confused by anything Docling prints:
     conversion failed" (the document); the models themselves load lazily, on first use
   * stdout is the null device, so a stray print from a library cannot corrupt a reply.
 
-Usage: python isolated_worker.py <reply-fd> <module:function>
+Usage: python isolated_worker.py <reply-fd>|--stdout-replies <module:function>
 """
 import importlib
 import json
@@ -22,7 +22,16 @@ import sys
 
 
 def main(argv):
-    reply_fd, target = int(argv[1]), argv[2]
+    target = argv[2]
+    if argv[1] == "--stdout-replies":
+        # The native parent cannot pass arbitrary inherited descriptors without unsafe
+        # platform glue. Preserve the original stdout pipe for framing, then replace
+        # fd 1 itself before importing the engine: C and Python prints both go nowhere.
+        reply_fd = os.dup(1)
+        with open(os.devnull, "wb") as null:
+            os.dup2(null.fileno(), 1)
+    else:
+        reply_fd = int(argv[1])
     module_name, function_name = target.split(":", 1)
     function = getattr(importlib.import_module(module_name), function_name)
     # Buffered, and flushed after every frame: BufferedWriter loops until the whole frame is
