@@ -546,20 +546,21 @@ jobs:
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts
           native_features=$(./target/release/noevia-model-manager --features)
           printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-sections >/dev/null
+          printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
-      - name: Native sections actual-service oracle and Linux containment
+      - name: Native sections oracle and prompt startup, properties and Linux containment
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
           cargo run --locked -q -p noevia-model-manager --bin generate-sections-schema -- "$GITHUB_WORKSPACE/ws/services/model-manager/app" "$RUNNER_TEMP/sections-schema.json"
           cmp bins/noevia-model-manager/src/sections/schema.json "$RUNNER_TEMP/sections-schema.json"
           cargo run --locked -q -p noevia-model-manager --bin generate-sections-oracle -- "$GITHUB_WORKSPACE/ws/services/model-manager/app" "$RUNNER_TEMP/sections.json"
           cmp bins/noevia-model-manager/tests/fixtures/sections.json "$RUNNER_TEMP/sections.json"
-          cargo test --locked -p noevia-model-manager --features native-host,native-sections
+          cargo test --locked -p noevia-model-manager --features native-host,native-sections,native-prompts
       - name: Sections capability omission preserves native host
         working-directory: ${{ runner.temp }}/noevia-rs
         run: cargo test --locked -p noevia-model-manager --features native-host --test lifecycle
@@ -623,6 +624,10 @@ jobs:
           rustc --edition=2021 --test qualification/main.rs -o "$RUNNER_TEMP/sections-image-tests"
           "$RUNNER_TEMP/sections-image-tests"
           "$RUNNER_TEMP/sections-image-probe" images noevia-model-manager-qualification:ci
-      - name: Actual production image advertises sections
+      - name: Rust-owned actual image prompt writers, private child and default ownership
+        run: '"$RUNNER_TEMP/prompts-image-probe" images noevia-model-manager-qualification:ci'
+      - name: Actual production image advertises sections and prompts
         run: |
-          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges noevia-model-manager:ci noevia-model-manager --features | grep -Fx native-sections
+          native_features=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges noevia-model-manager:ci noevia-model-manager --features)
+          printf '%s\n' "$native_features" | grep -Fx native-sections
+          printf '%s\n' "$native_features" | grep -Fx native-prompts
