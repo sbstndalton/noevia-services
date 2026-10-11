@@ -347,18 +347,29 @@ mod tests {
     }
     #[test]
     fn all_four_immutable_runtime_pins_match() {
-        let expected_ref = "ARG NOEVIA_RS_REF=174078a20c214a609085bc44c1d668cd18a634eb";
+        let expected_ref = "ARG NOEVIA_RS_REF=0ae4195aede92a2313af456197d40c17a7bd0683";
         let expected_hash =
-            "ARG NOEVIA_RS_SHA256=edeab963f31832122a303999fcd5acbc46132a7b15e93f50758066c04ddf2773";
+            "ARG NOEVIA_RS_SHA256=ca1c5af1c34c3f8418a88f3780191a85a329c125a7d458917fa5dfb210e1160d";
+        let valid = |docker: &str| {
+            docker.lines().any(|l| l == expected_ref)
+                && docker.lines().any(|l| l == expected_hash)
+                && docker.contains("sha256sum -c -")
+        };
         for docker in [
             DOCKER,
             include_str!("../../ocr/Dockerfile"),
             include_str!("../../diary/Dockerfile"),
             include_str!("../../model-manager/Dockerfile"),
         ] {
-            assert!(docker.lines().any(|l| l == expected_ref));
-            assert!(docker.lines().any(|l| l == expected_hash));
-            assert!(docker.contains("sha256sum -c -"));
+            assert!(valid(docker));
+            assert!(!valid(&docker.replace(
+                expected_ref,
+                "ARG NOEVIA_RS_REF=174078a20c214a609085bc44c1d668cd18a634eb"
+            )));
+            assert!(!valid(&docker.replace(expected_hash, "ARG NOEVIA_RS_SHA256=edeab963f31832122a303999fcd5acbc46132a7b15e93f50758066c04ddf2773")));
+            assert!(!valid(
+                &docker.replace("sha256sum -c -", "# verification omitted")
+            ));
         }
     }
     #[test]

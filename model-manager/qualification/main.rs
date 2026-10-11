@@ -255,12 +255,65 @@ fn check(
     status: u16,
     body: Option<&str>,
 ) -> Result<String> {
-    let (actual, text) = request(port, method, path, authorized)?;
-    require(actual == status, "HTTP status mismatch")?;
+    let (actual, text) = request(port, method, path, authorized)
+        .map_err(|_| format!("HTTP {method} {path}: transport/framing/budget failure"))?;
+    require(
+        actual == status,
+        &format!("HTTP {method} {path}: expected status {status}, actual status {actual}"),
+    )?;
     if let Some(expected) = body {
-        require(text == expected, "HTTP body mismatch")?;
+        require(
+            text == expected,
+            &format!("HTTP {method} {path}: body assertion mismatch"),
+        )?;
     }
     Ok(text)
+}
+fn safe_probe_diagnostic(reason: &str) -> bool {
+    if [
+        "owned image readiness deadline",
+        "child marker cap",
+        "selected child confirmation",
+        "default clears stale confirmations",
+        "actual collection fixture",
+        "actual named fixture",
+        "actual defaults branch",
+        "read and rejected writes preserve INI",
+        "startup hooks stayed suppressed",
+    ]
+    .contains(&reason)
+    {
+        return true;
+    }
+    let Some((request, assertion)) = reason
+        .strip_prefix("HTTP ")
+        .and_then(|s| s.split_once(": "))
+    else {
+        return false;
+    };
+    let known_request = [
+        "GET /api/v1/sections",
+        "GET /api/v1/sections/tiny",
+        "GET /api/v1/sections/tiny?defaults=true",
+        "GET /api/v1/sections/tiny?defaults=bad",
+        "GET /api/v1/sections/bad!name",
+        "HEAD /api/v1/sections/tiny",
+        "PUT /api/v1/sections/tiny",
+    ]
+    .contains(&request);
+    if assertion == "body assertion mismatch" || assertion == "transport/framing/budget failure" {
+        return known_request;
+    }
+    let Some((expected, actual)) = assertion
+        .strip_prefix("expected status ")
+        .and_then(|s| s.split_once(", actual status "))
+    else {
+        return false;
+    };
+    known_request
+        && [expected, actual]
+            .iter()
+            .all(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
 }
 fn prepare() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -276,18 +329,30 @@ fn prepare() -> Result<()> {
     Ok(())
 }
 fn probe(mode: &str) -> Result<()> {
+    wait_ready(
+        8090,
+        (mode == "rust").then_some(8091),
+        Path::new(&format!("{ROOT}/child.json")),
+    )?;
+    let marker = fs::read_to_string(format!("{ROOT}/child.json"))?;
+    require(marker.len() < 1024, "child marker cap")?;
+    probe_ready(mode, &marker)
+}
+fn wait_ready(public: u16, private: Option<u16>, marker: &Path) -> Result<()> {
     let until = Instant::now() + Duration::from_secs(12);
     loop {
-        if request(8090, "GET", "/api/v1/sections", true).is_ok()
-            && Path::new(&format!("{ROOT}/child.json")).is_file()
+        if request(public, "GET", "/api/v1/sections", true).is_ok()
+            && marker.is_file()
+            && private.is_none_or(|port| request(port, "GET", "/api/v1/sections", true).is_ok())
         {
             break;
         }
         require(Instant::now() < until, "owned image readiness deadline")?;
         thread::sleep(Duration::from_millis(50));
     }
-    let marker = fs::read_to_string(format!("{ROOT}/child.json"))?;
-    require(marker.len() < 1024, "child marker cap")?;
+    Ok(())
+}
+fn probe_ready(mode: &str, marker: &str) -> Result<()> {
     if mode == "rust" {
         require(
             marker.contains("\"sections\": \"1\"")
@@ -461,10 +526,24 @@ fn images(image: &str) -> Result<()> {
         args.extend(["--entrypoint", "sections-image-probe", image, "serve"]);
         let owned = Container::acquire(&args)?;
         require(command(&["start", &owned.id])?, "owned image start")?;
-        require(
-            command(&["exec", &owned.id, "sections-image-probe", "probe", mode])?,
-            "actual image HTTP qualification",
-        )?;
+        let (status, diagnostic) = capture(
+            "docker",
+            &["exec", &owned.id, "sections-image-probe", "probe", mode],
+            Duration::from_secs(30),
+        ).map_err(|_| format!("actual image HTTP qualification mode={mode} stage=exec: bounded capture/launch failed"))?;
+        if status != Some(0) {
+            // Never forward Docker/application output. Only our own allowlisted
+            // fixed probe errors can be returned; bodies and environment are absent.
+            let reason = diagnostic
+                .lines()
+                .find_map(|line| line.strip_prefix("SECTIONS_PROBE_FAILURE "))
+                .filter(|reason| safe_probe_diagnostic(reason));
+            return Err(format!(
+                "actual image HTTP qualification mode={mode} status={status:?}: {}",
+                reason.unwrap_or("probe/transport failed without safe diagnostic")
+            )
+            .into());
+        }
         drop(owned);
     }
     for mode in ["omission", "refuse-mismatch", "refuse-invalid"] {
@@ -503,7 +582,16 @@ fn main() -> Result<()> {
     require(args.next().is_none(), "unexpected arguments")?;
     match (mode.as_str(), value.as_deref()) {
         ("images", Some(image)) => images(image),
-        ("probe", Some(mode @ ("python" | "rust"))) => probe(mode),
+        ("probe", Some(mode @ ("python" | "rust"))) => {
+            let result = probe(mode);
+            if let Err(error) = &result {
+                let reason = error.to_string();
+                if safe_probe_diagnostic(&reason) {
+                    eprintln!("SECTIONS_PROBE_FAILURE {reason}");
+                }
+            }
+            result
+        }
         ("omission", None) => omission(),
         ("refuse-mismatch", None) => refusal(
             "/usr/local/bin/noevia-model-manager",
@@ -528,6 +616,194 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn consume_fixed_request(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            bytes.extend(byte);
+            assert!(bytes.len() <= 4096);
+        }
+    }
+    #[test]
+    fn image_readiness_waits_for_actual_private_child_not_early_marker() {
+        use std::net::TcpListener;
+        let dir = std::env::temp_dir().join(format!("sections-ready-control-{}", nonce().unwrap()));
+        fs::create_dir(&dir).unwrap();
+        let marker = dir.join("child.json");
+        fs::write(&marker, "synthetic early marker").unwrap();
+        let public = TcpListener::bind("127.0.0.1:0").unwrap();
+        let public_port = public.local_addr().unwrap().port();
+        let private = TcpListener::bind("127.0.0.1:0").unwrap();
+        let private_port = private.local_addr().unwrap().port();
+        drop(private);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        public.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < until {
+                if let Ok((mut stream, _)) = public.accept() {
+                    consume_fixed_request(&mut stream);
+                    stream
+                        .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                        .unwrap();
+                } else {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        // The previous public+marker predicate succeeds while private ASGI is absent.
+        assert!(request(public_port, "GET", "/api/v1/sections", true).is_ok() && marker.is_file());
+        assert!(request(private_port, "GET", "/api/v1/sections", true).is_err());
+        let child = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let listener = TcpListener::bind(("127.0.0.1", private_port)).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            consume_fixed_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.0 503 Unavailable\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+        });
+        let start = Instant::now();
+        wait_ready(public_port, Some(private_port), &marker).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        child.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn image_diagnostics_report_fixed_assertions_without_body_or_environment() {
+        assert!(safe_probe_diagnostic(
+            "HTTP GET /api/v1/sections: expected status 200, actual status 503"
+        ));
+        assert!(safe_probe_diagnostic(
+            "HTTP PUT /api/v1/sections/tiny: body assertion mismatch"
+        ));
+        assert!(safe_probe_diagnostic("actual named fixture"));
+        for unsafe_text in [
+            "body contains token secret",
+            "HTTP GET /private-user-path: body assertion mismatch",
+            "HTTP GET /api/v1/sections: expected status 200, actual status 503 secret",
+            "actual named fixture\nuser body",
+        ] {
+            assert!(!safe_probe_diagnostic(unsafe_text));
+        }
+    }
+    #[test]
+    fn image_python_http_contract_with_actual_startup_suppressed_app() {
+        // Uses the same fixed seam, with Rust-owned temporary paths and an
+        // ephemeral loopback listener. Never starts the app's startup hooks.
+        let dir = std::env::temp_dir().join(format!("sections-app-control-{}", nonce().unwrap()));
+        fs::create_dir_all(dir.join("models")).unwrap();
+        fs::create_dir(dir.join("data")).unwrap();
+        fs::write(dir.join("models/models.ini"), INI).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let python = std::env::var("SECTIONS_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
+        let seam = SHIM.replace(ROOT, dir.to_str().unwrap());
+        let _child = OwnedProcess(
+            Command::new(python)
+                .args([
+                    "-B",
+                    "-c",
+                    &seam,
+                    "app.main:app",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                ])
+                .current_dir(Path::new(file!()).parent().unwrap().parent().unwrap())
+                .env("MODELS_DIR", dir.join("models"))
+                .env("MODELS_INI_PATH", dir.join("models/models.ini"))
+                .env("DATA_DIR", dir.join("data"))
+                .env("MODEL_LOADER_TOKEN", TOKEN)
+                .env("DOCKER_HOST", "unix:///tmp/absent-synthetic-docker.sock")
+                .env("LLAMA_CONTAINERS", "synthetic-only")
+                .env("MIGRATE_CACHE_RAM_ON_START", "false")
+                .env_remove("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED")
+                .env_remove("NOEVIA_NATIVE_MODEL_MANAGER_HOST_CONFIRMED")
+                .env_remove("NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let until = Instant::now() + Duration::from_secs(12);
+        while request(port, "GET", "/api/v1/sections", true).is_err() {
+            assert!(Instant::now() < until, "actual app readiness");
+            thread::sleep(Duration::from_millis(50));
+        }
+        check(
+            port,
+            "GET",
+            "/api/v1/sections",
+            false,
+            401,
+            Some("{\"error\":\"unauthorized\"}"),
+        )
+        .unwrap();
+        let collection = check(port, "GET", "/api/v1/sections", true, 200, None).unwrap();
+        assert!(
+            collection.contains("\"name\":\"tiny\""),
+            "actual collection name"
+        );
+        assert!(
+            collection.contains("\"raw\":\"version = 1\\n[tiny]\\nctx-size = 4096\\n\""),
+            "actual collection raw INI"
+        );
+        let section = check(port, "GET", "/api/v1/sections/tiny", true, 200, None).unwrap();
+        assert!(
+            section.contains("\"ctx-size\":\"4096\""),
+            "actual named ctx value"
+        );
+        let defaults = check(
+            port,
+            "GET",
+            "/api/v1/sections/tiny?defaults=true",
+            true,
+            200,
+            None,
+        )
+        .unwrap();
+        assert!(
+            defaults.contains("\"hints\"") && defaults.contains("\"exists\":true"),
+            "actual defaults"
+        );
+        check(
+            port,
+            "GET",
+            "/api/v1/sections/tiny?defaults=bad",
+            true,
+            422,
+            None,
+        )
+        .unwrap();
+        check(
+            port,
+            "GET",
+            "/api/v1/sections/bad!name",
+            true,
+            400,
+            Some("{\"detail\":\"invalid section name\"}"),
+        )
+        .unwrap();
+        check(port, "HEAD", "/api/v1/sections/tiny", true, 405, Some("")).unwrap();
+        check(port, "PUT", "/api/v1/sections/tiny", true, 422, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("models/models.ini")).unwrap(),
+            INI
+        );
+        assert!(fs::read_dir(dir.join("data")).unwrap().next().is_none());
+        drop(_child);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn repair_owned_cleanup_controls() {
         let dir = std::env::temp_dir().join(format!("sections-controls-{}", nonce().unwrap()));
