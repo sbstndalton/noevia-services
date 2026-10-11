@@ -55,3 +55,14 @@ def test_only_health_is_unauthenticated(monkeypatch):
             assert r.status_code == 401 and r.json() == {"error": "unauthorized"}
         assert c.put("/api/v1/models-ini", json={"baseRevision": "x", "text": "a=1"}).status_code == 401
         assert c.get("/api/v1/sections", headers={"X-Model-Loader-Token": "fixture-token"}).status_code == 200
+
+
+def test_native_owned_paths_refuse_without_python_fallback(monkeypatch):
+    monkeypatch.setenv("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED", "1")
+    monkeypatch.setattr(settings, "model_loader_token", "fixture-token")
+    with TestClient(app) as c:
+        assert c.get("/api/v1/health").status_code == 503
+        assert c.get("/api/v1/backends/synthetic/logs").status_code == 401
+        for method in (c.get, c.post):
+            assert method("/api/v1/backends/synthetic/logs", headers={"X-Model-Loader-Token": "fixture-token"}).status_code == 503
+        assert c.get("/api/v1/sections", headers={"X-Model-Loader-Token": "fixture-token"}).status_code == 200

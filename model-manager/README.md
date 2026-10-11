@@ -8,6 +8,14 @@
 > badges, backend discovery); where it says "page", "panel", "dashboard" or "OpenWebUI", read the
 > matching noevia screen or API route. Pages and OpenWebUI sync described below no longer exist here.
 
+## Native service ownership (#1319)
+
+The image includes `noevia-model-manager` with `native-logs` compiled and uses it as the entrypoint. `MODEL_MANAGER_IMPL` defaults to `python`, which execs the existing uvicorn command on port8090. Selecting `rust` gives native ownership to GET `/api/v1/health` and GET `/api/v1/backends/{name}/logs`; the binary supervises the existing Python app on private loopback8091 for explicitly allowed unported routes. Missing features, invalid configuration and failed native handlers refuse without Python fallback. The supervised Python child independently refuses native-owned paths after authentication.
+
+Unported business startup (DB initialization, prompt seeding, sampler, orphan handling and optional INI migration) remains Python-owned. Native startup does not duplicate it. Other endpoints, including model writes, loading, downloads, benchmarks and autoconfiguration, remain Python-owned. This source integration does not activate a deployed selector or complete umbrella #1318.
+
+Log redaction is bounded and intentionally stronger than Python for Unicode/counter boundaries and credentials crossing line separators. Non-ASCII search filters are refused; Docker failures are sanitized. The runtime integration tests use actual merged binaries and the actual Python app with owned temporary paths, a test-only hardware/discovery suppression shim and a Unix fake Docker peer. No model engine or live Docker operation is exercised.
+
 A tool for managing llama.cpp GGUF models and containers on a personal homelab box. FastAPI, one Docker container.
 
 ![The Model Loader overview page: disk and backend summary, live GPU utilisation and VRAM sparklines, per-GPU breakdown, recent downloads, and the models.ini sections](docs/model_loader.png)
