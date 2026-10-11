@@ -420,9 +420,22 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
-      - name: Build gguf-meta, model-files and model-autoconfig
+      - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
-        run: cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli
+        run: |
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-logs
+          ./target/release/noevia-model-manager --features | grep -qx native-logs
+          cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
+      - name: Build deliberately omitted native model-manager feature
+        working-directory: ${{ runner.temp }}/noevia-rs
+        run: |
+          cargo build --release --locked -p noevia-model-manager
+          cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-omission"
+      - name: Native binary and actual supervised Python runtime (synthetic peers only)
+        env:
+          MODEL_MANAGER_BIN: ${{ runner.temp }}/model-manager-native
+          MODEL_MANAGER_OMISSION_BIN: ${{ runner.temp }}/model-manager-omission
+        run: python -m pytest -q -rs tests/test_native_runtime.py
       - name: Differential test (gguf-meta vs Python parser)
         env:
           GGUF_META_BIN: ${{ runner.temp }}/noevia-rs/target/release/gguf-meta
