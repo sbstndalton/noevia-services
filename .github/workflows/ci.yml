@@ -485,8 +485,10 @@ jobs:
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-logs
-          ./target/release/noevia-model-manager --features | grep -qx native-logs
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host
+          native_features=$(./target/release/noevia-model-manager --features)
+          printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
+          printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
       - name: Build deliberately omitted native model-manager feature
         working-directory: ${{ runner.temp }}/noevia-rs
