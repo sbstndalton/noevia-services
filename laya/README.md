@@ -86,3 +86,47 @@ is process-wide. Per-process slots avoid all of that.
 Cost: every extra slot loads another model copy (RSS not yet measured; the container
 limit is 6 GiB and 2 CPUs, which also caps real speedup). Raising the bound, and
 `NOEVIA_ROUTER_CHUNKS`, needs a measured, owner-approved run.
+
+## Native image source (issue #1326)
+
+The image entrypoint is now `noevia-laya`. With `NOEVIA_LAYA_IMPL` absent or set to
+`python`, it execs the existing `python /service/server.py` command. Explicit `rust`
+selects the compiled Rust HTTP, validation, admission and process supervisor; the
+fixed Python Laya/PyTorch worker remains the ML engine through bounded framed IPC.
+An unknown or non-UTF-8 selector refuses startup. A build without `native-laya`
+refuses `rust` before spawning a child or binding a listener, with no fallback.
+
+The Dockerfile fetches a checksum-verified merged Rust source archive and builds
+the native and featureless binaries separately. `RUNTIME_IMAGE` remains a global
+build argument, and `REUSE_CPU_RUNTIME` remains available in the final production
+stage. The engine installation instructions and pinned package versions are
+byte-identical to services commit `4f3cf816225d4ed12db33fd8e4a7e2d7ae946a4b`.
+The Rust source guard checks that original instruction hash; this does not prove
+identity of an existing image's dependency layers or transitive package contents.
+
+The additive CI job builds only `--target synthetic` and
+`--target synthetic-featureless`. These targets use Python 3.12 without installing
+torch, Laya, tokenizer packages or models. A Rust qualification runner mounts its
+own fixed fake engine modules and a synthetic model marker read-only and exercises
+the actual retained `server.py`. Containers use UID 1000, a read-only root,
+`--network none`, no published ports, no capabilities, no new privileges, bounded
+memory/CPU/PIDs and a bounded `/tmp` tmpfs. Rust probes inside the network namespace
+check default/explicit Python, native HTTP and deadlines, busy `Retry-After: 1`,
+late reply discard, disconnect/recovery, selector and feature refusal, and
+startup/ready SIGTERM. Owned random labels restrict cleanup to these containers.
+
+Local source checks:
+
+```sh
+cargo fmt --manifest-path laya/qualification/Cargo.toml --check
+cargo clippy --locked --manifest-path laya/qualification/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path laya/qualification/Cargo.toml
+```
+
+Image execution requires authoritative Linux Docker CI. Do not use a production
+target build or real model startup to qualify this source change. The existing
+private network, read-only model mount, offline serving and provisioning runbook
+continue to apply. This source does not activate an owner or recreate a live Laya
+service. Synthetic evidence establishes no model quality, real-tokenizer parity,
+memory or inference-performance claim; issue #1326 remains open for production
+deployment qualification.
