@@ -41,8 +41,11 @@ impl Drop for OwnedProcess {
     }
 }
 fn command(args: &[&str]) -> Result<bool> {
+    command_named("docker", args)
+}
+fn command_named(program: &str, args: &[&str]) -> Result<bool> {
     let mut child = OwnedProcess(
-        Command::new("docker")
+        Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -61,12 +64,20 @@ fn command(args: &[&str]) -> Result<bool> {
     }
 }
 fn omission() -> Result<()> {
+    refusal(
+        "/usr/local/bin/model-manager-sections-omission",
+        "rust",
+        "rust",
+        "native-sections requires rust model manager and compiled native-sections feature",
+    )
+}
+fn refusal(binary: &str, manager: &str, sections: &str, expected: &str) -> Result<()> {
     prepare()?;
     let diagnostic = format!("{ROOT}/omission.stderr");
     let mut child = OwnedProcess(
-        Command::new("/usr/local/bin/model-manager-sections-omission")
-            .env("MODEL_MANAGER_IMPL", "rust")
-            .env("MODEL_MANAGER_SECTIONS_IMPL", "rust")
+        Command::new(binary)
+            .env("MODEL_MANAGER_IMPL", manager)
+            .env("MODEL_MANAGER_SECTIONS_IMPL", sections)
             .env(
                 "PATH",
                 "/tmp/sections-qualification/bin:/usr/local/bin:/usr/bin:/bin",
@@ -86,28 +97,117 @@ fn omission() -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     };
-    require(!status.success(), "omission binary accepted sections")?;
     let mut bytes = Vec::new();
     fs::File::open(diagnostic)?
         .take(65_537)
         .read_to_end(&mut bytes)?;
     require(bytes.len() <= 65_536, "omission diagnostic cap")?;
-    require(
-        String::from_utf8(bytes)?.contains(
-            "native-sections requires rust model manager and compiled native-sections feature",
-        ),
-        "specific omitted capability refusal",
-    )?;
-    require(
-        !Path::new(&format!("{ROOT}/child.json")).exists(),
-        "omission spawned actual app",
-    )?;
-    Ok(())
+    exact_refusal(
+        status.code(),
+        &String::from_utf8(bytes)?,
+        expected,
+        Path::new(&format!("{ROOT}/child.json")).exists(),
+    )
 }
-struct Container(String);
+fn exact_refusal(
+    status: Option<i32>,
+    diagnostic: &str,
+    expected: &str,
+    child_started: bool,
+) -> Result<()> {
+    require(!child_started, "refusal spawned actual app")?;
+    require(status == Some(1), "expected application rejection status 1")?;
+    require(
+        diagnostic == format!("Error: {expected:?}\n"),
+        "exact application rejection diagnostic",
+    )
+}
+const OWNER_LABEL: &str = "noevia.sections-qualification.owner";
+fn nonce() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+// Capture to private files rather than pipes: a verbose or stalled child cannot
+// block the parent, and both output size and elapsed time are bounded.
+fn capture(program: &str, args: &[&str], deadline: Duration) -> Result<(Option<i32>, String)> {
+    let dir = std::env::temp_dir().join(format!("sections-command-{}", nonce()?));
+    fs::create_dir(&dir)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let result = (|| {
+        let output = dir.join("output");
+        let file = fs::File::create(&output)?;
+        let mut child = OwnedProcess(
+            Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(file.try_clone()?)
+                .stderr(file)
+                .spawn()?,
+        );
+        let until = Instant::now() + deadline;
+        loop {
+            require(fs::metadata(&output)?.len() <= 65_536, "command output cap")?;
+            require(Instant::now() < until, "command deadline")?;
+            if let Some(status) = child.0.try_wait()? {
+                let mut bytes = Vec::new();
+                fs::File::open(&output)?
+                    .take(65_537)
+                    .read_to_end(&mut bytes)?;
+                require(bytes.len() <= 65_536, "command output cap")?;
+                return Ok((status.code(), String::from_utf8(bytes)?));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    })();
+    let _ = fs::remove_dir_all(dir);
+    result
+}
+struct Container {
+    id: String,
+    token: String,
+    program: String,
+}
+impl Container {
+    fn acquire(args: &[&str]) -> Result<Self> {
+        Self::acquire_with("docker", args, Duration::from_secs(30))
+    }
+    fn acquire_with(program: &str, args: &[&str], deadline: Duration) -> Result<Self> {
+        let token = nonce()?;
+        let label = format!("{OWNER_LABEL}={token}");
+        let mut create = vec!["create", "--label", &label];
+        create.extend_from_slice(args);
+        let (status, output) = capture(program, &create, deadline)?;
+        require(status == Some(0), "owned container acquisition failed")?;
+        let id = output.trim();
+        require(
+            id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "immutable container ID",
+        )?;
+        let owned = Self {
+            id: id.to_owned(),
+            token,
+            program: program.to_owned(),
+        };
+        require(owned.verified()?, "container ownership label mismatch")?;
+        Ok(owned)
+    }
+    fn verified(&self) -> Result<bool> {
+        let format = format!("{{{{.Id}}}} {{{{index .Config.Labels \"{OWNER_LABEL}\"}}}}");
+        let (status, output) = capture(
+            &self.program,
+            &["inspect", "--format", &format, &self.id],
+            Duration::from_secs(30),
+        )?;
+        Ok(status == Some(0) && output.trim() == format!("{} {}", self.id, self.token))
+    }
+}
 impl Drop for Container {
     fn drop(&mut self) {
-        let _ = command(&["rm", "-f", &self.0]);
+        if self.verified().unwrap_or(false) {
+            let _ = command_named(&self.program, &["rm", "-f", &self.id]);
+        }
     }
 }
 fn request(port: u16, method: &str, path: &str, authorized: bool) -> Result<(u16, String)> {
@@ -306,15 +406,9 @@ fn images(image: &str) -> Result<()> {
         "expected fixed qualification image",
     )?;
     for mode in ["python", "rust"] {
-        let name = format!("sections-qualification-{}-{mode}", std::process::id());
-        let owned = Container(name.clone());
         let selected = format!("MODEL_MANAGER_IMPL={mode}");
         let sections = format!("MODEL_MANAGER_SECTIONS_IMPL={mode}");
         let mut args = vec![
-            "run",
-            "-d",
-            "--name",
-            &name,
             "--network",
             "none",
             "--log-driver",
@@ -365,20 +459,16 @@ fn images(image: &str) -> Result<()> {
             args.extend(["-e", &selected, "-e", &sections]);
         }
         args.extend(["--entrypoint", "sections-image-probe", image, "serve"]);
-        require(command(&args)?, "owned image start")?;
+        let owned = Container::acquire(&args)?;
+        require(command(&["start", &owned.id])?, "owned image start")?;
         require(
-            command(&["exec", &name, "sections-image-probe", "probe", mode])?,
+            command(&["exec", &owned.id, "sections-image-probe", "probe", mode])?,
             "actual image HTTP qualification",
         )?;
         drop(owned);
     }
-    let name = format!("sections-omission-{}", std::process::id());
-    let _owned = Container(name.clone());
-    require(
-        command(&[
-            "run",
-            "--name",
-            &name,
+    for mode in ["omission", "refuse-mismatch", "refuse-invalid"] {
+        let owned = Container::acquire(&[
             "--network",
             "none",
             "--read-only",
@@ -397,10 +487,13 @@ fn images(image: &str) -> Result<()> {
             "--entrypoint",
             "sections-image-probe",
             image,
-            "omission",
-        ])?,
-        "specific sections omission qualification",
-    )?;
+            mode,
+        ])?;
+        require(
+            command(&["start", "-a", &owned.id])?,
+            "actual image refusal qualification",
+        )?;
+    }
     Ok(())
 }
 fn main() -> Result<()> {
@@ -412,6 +505,18 @@ fn main() -> Result<()> {
         ("images", Some(image)) => images(image),
         ("probe", Some(mode @ ("python" | "rust"))) => probe(mode),
         ("omission", None) => omission(),
+        ("refuse-mismatch", None) => refusal(
+            "/usr/local/bin/noevia-model-manager",
+            "python",
+            "rust",
+            "native-sections requires rust model manager and compiled native-sections feature",
+        ),
+        ("refuse-invalid", None) => refusal(
+            "/usr/local/bin/noevia-model-manager",
+            "rust",
+            "invalid",
+            "MODEL_MANAGER_SECTIONS_IMPL must be python or rust",
+        ),
         ("serve", None) => {
             prepare()?;
             use std::os::unix::process::CommandExt;
@@ -423,6 +528,110 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repair_owned_cleanup_controls() {
+        let dir = std::env::temp_dir().join(format!("sections-controls-{}", nonce().unwrap()));
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("fake.rs");
+        fs::write(&source, r#"
+use std::{env,fs,io::Write};
+fn main() {
+ let args:Vec<String>=env::args().skip(1).collect();
+ let dir=env::current_exe().unwrap().parent().unwrap().to_owned();
+ let mut log=fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
+ writeln!(log,"{}",args.join(" ")).unwrap();
+ let scenario=fs::read_to_string(dir.join("scenario")).unwrap();
+ let id="a".repeat(64);
+ match args[0].as_str() {
+  "create" => {
+   fs::write(dir.join("label"),args[2].split_once('=').unwrap().1).unwrap();
+   if scenario=="failure" || scenario=="collision" {std::process::exit(125)}
+   if scenario=="late" {std::thread::sleep(std::time::Duration::from_millis(300));}
+   println!("{id}");
+  },
+  "inspect" => {
+   let label=if scenario=="mismatch" {"unowned".into()} else {fs::read_to_string(dir.join("label")).unwrap()};
+   println!("{id} {label}");
+  },
+  "rm" => {assert_eq!(args[2],id);},
+  _ => std::process::exit(127)
+ }
+}
+"#).unwrap();
+        let program = dir.join("fake-docker");
+        assert!(Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success());
+        for launch in ["serve", "omission", "refuse-mismatch", "refuse-invalid"] {
+            for scenario in ["success", "failure", "collision", "mismatch", "late"] {
+                fs::write(dir.join("scenario"), scenario).unwrap();
+                fs::write(dir.join("log"), "").unwrap();
+                let result = Container::acquire_with(
+                    program.to_str().unwrap(),
+                    &[launch],
+                    Duration::from_millis(150),
+                );
+                assert_eq!(result.is_ok(), scenario == "success");
+                drop(result);
+                let log = fs::read_to_string(dir.join("log")).unwrap();
+                assert_eq!(
+                    log.lines().any(|line| line.starts_with("rm -f ")),
+                    scenario == "success",
+                    "{launch}/{scenario}: {log}"
+                );
+            }
+        }
+        // Ownership is revalidated at cleanup, even after successful acquisition.
+        fs::write(dir.join("scenario"), "success").unwrap();
+        fs::write(dir.join("log"), "").unwrap();
+        let owned = Container::acquire_with(
+            program.to_str().unwrap(),
+            &["serve"],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        fs::write(dir.join("scenario"), "mismatch").unwrap();
+        drop(owned);
+        assert!(!fs::read_to_string(dir.join("log"))
+            .unwrap()
+            .contains("rm -f"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn repair_refusal_rejects_infrastructure_and_diagnostic_mutants() {
+        let expected = "MODEL_MANAGER_SECTIONS_IMPL must be python or rust";
+        let diagnostic = format!("Error: {expected:?}\n");
+        assert!(exact_refusal(Some(1), &diagnostic, expected, false).is_ok());
+        assert!(exact_refusal(Some(1), &diagnostic, expected, true).is_err());
+        for status in [Some(0), Some(125), Some(126), Some(127), None] {
+            assert!(exact_refusal(status, &diagnostic, expected, false).is_err());
+        }
+        for wrong in ["", "unrelated infrastructure failure", "Error: wrong\n"] {
+            assert!(exact_refusal(Some(1), wrong, expected, false).is_err());
+        }
+        let dir = std::env::temp_dir().join(format!("sections-timeout-{}", nonce().unwrap()));
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("late.rs");
+        fs::write(
+            &source,
+            "fn main(){std::thread::sleep(std::time::Duration::from_secs(2));}",
+        )
+        .unwrap();
+        let program = dir.join("late");
+        assert!(Command::new("rustc")
+            .arg(source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success());
+        assert!(capture(program.to_str().unwrap(), &[], Duration::from_millis(50)).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn actual_http_probe_sends_auth_and_rejects_body_and_status_mutants() {
         use std::net::TcpListener;
