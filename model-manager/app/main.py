@@ -31,6 +31,11 @@ async def _require_token(request: Request, call_next):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_HOST_CONFIRMED") == "1" and request.url.path == "/api/v1/host":
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED") == "1" and request.method == "GET":
+        path = request.url.path
+        parts = path.split("/")
+        if path == "/api/v1/sections" or (len(parts) == 5 and parts[:4] == ["", "api", "v1", "sections"] and parts[4]):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     return await call_next(request)
 
 

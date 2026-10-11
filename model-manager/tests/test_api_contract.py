@@ -111,3 +111,36 @@ def test_default_python_host_contract_remains_available(monkeypatch):
     assert answer.json() == api.host()
     assert len(answer.json()["history"]) == 180
     assert answer.json()["current"]["ts"] == 449.0
+def test_native_sections_guard_is_authenticated_and_method_aware(monkeypatch):
+    import asyncio
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from app.main import _require_token
+
+    monkeypatch.setenv("NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED", "1")
+    monkeypatch.setattr(settings, "model_loader_token", "fixture-token")
+    calls = []
+
+    async def downstream(request):
+        calls.append((request.method, request.url.path))
+        return JSONResponse({"fixture": "python-owner"})
+
+    def invoke(method, path, token="fixture-token"):
+        request = Request({"type": "http", "method": method, "path": path,
+                           "query_string": b"", "headers": [(b"x-model-loader-token", token.encode())],
+                           "scheme": "http", "server": ("fixture", 80)})
+        return asyncio.run(_require_token(request, downstream))
+
+    for path in ("/api/v1/sections", "/api/v1/sections/tiny"):
+        assert invoke("GET", path, "wrong").status_code == 401
+        response = invoke("GET", path)
+        assert response.status_code == 503
+        assert response.body == b'{"detail":"Native model manager owns this endpoint"}'
+        assert not calls
+    for method, path in (("PUT", "/api/v1/sections/tiny"), ("DELETE", "/api/v1/sections/tiny"),
+                         ("HEAD", "/api/v1/sections/tiny"), ("POST", "/api/v1/sections/tiny/rename"),
+                         ("GET", "/api/v1/sections/tiny/autoconfig"), ("GET", "/api/v1/sections/")):
+        assert invoke(method, path).status_code == 200
+    assert len(calls) == 6
+    monkeypatch.delenv("NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED")
+    assert invoke("GET", "/api/v1/sections").status_code == 200
