@@ -15,8 +15,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=a74dbf0952927d433e8a345f5c485f8706f591aa
-ARG NOEVIA_RS_SHA256=d35fc6bb1955c2a811fd58b0f3e8f2d47415a9e04ec6e16aca58ba3457071f1f
+ARG NOEVIA_RS_REF=5f50a0856d85e26b369c3d19db25fef2ac57f16f
+ARG NOEVIA_RS_SHA256=078cb5e82b32c4ed3de2ef6b9844c41aabd549458f8d66b19d49634104d25b9c
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -25,12 +25,13 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-sections >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-diagnose >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -60,11 +61,17 @@ RUN rustc --edition=2021 /tmp/sections-image-probe.rs -o /tmp/sections-image-pro
 COPY qualification/prompts.rs qualification/prompts-image.rs /tmp/prompts-qualification/
 RUN rustc --edition=2021 /tmp/prompts-qualification/prompts-image.rs -o /tmp/prompts-image-probe
 
+COPY qualification/diagnosis-image.rs /tmp/prompts-qualification/diagnosis-image.rs
+RUN rustc --edition=2021 /tmp/prompts-qualification/diagnosis-image.rs -o /tmp/diagnosis-image-probe
+
 FROM runtime AS qualification
 COPY --from=qualification-builder /tmp/sections-image-probe /usr/local/bin/sections-image-probe
 COPY --from=qualification-builder /tmp/prompts-image-probe /usr/local/bin/prompts-image-probe
+COPY --from=qualification-builder /tmp/diagnosis-image-probe /usr/local/bin/diagnosis-image-probe
 COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-sections-omission
 COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-prompts-omission
+
+COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-diagnosis-omission
 
 # Default builds retain the production runtime and entrypoint.
 FROM runtime AS production
