@@ -66,86 +66,192 @@ fn mutation(
     println!("detected {file}: {test}");
     Ok(())
 }
-fn intended_failure(code: Option<i32>, out: &str, err: &str, test: &str, policy: &str) -> bool {
-    let selected = format!("tests::{test}");
-    let source = include_str!("prompts.rs");
-    let line = source
+fn registered_policy(test: &str) -> Option<&'static str> {
+    match test {
+        "actual_direct_writers_are_guarded_before_database" => {
+            Some("all direct prompt writers refuse exact confirmation")
+        }
+        "actual_startup_seed_has_exact_confirmation_and_preserves_hooks" => {
+            Some("startup seed ownership and other hooks")
+        }
+        "actual_private_prompt_http_is_authenticated_and_method_aware" => {
+            Some("auth-first exact three method/path pairs")
+        }
+        _ => None,
+    }
+}
+fn policy_location() -> Option<String> {
+    let mut sites = include_str!("prompts.rs")
         .lines()
-        .position(|line| line.contains("panic!(\"PROMPTS_POLICY_ASSERT:"))
-        .map(|line| line + 1);
-    let Some(line) = line else {
+        .enumerate()
+        .filter_map(|(line, text)| {
+            text.find("panic!(\"PROMPTS_POLICY_ASSERT:")
+                .map(|column| (line + 1, column + 1))
+        });
+    let (line, column) = sites.next()?;
+    if sites.next().is_some() {
+        return None;
+    }
+    // Both original rustc commands use the same qualification directory. Bind the
+    // whole sibling compile-time path, including an absolute prefix when supplied.
+    let path = Path::new(file!()).with_file_name("prompts.rs");
+    Some(format!("{}:{line}:{column}", path.to_str()?))
+}
+fn decimal_duration(value: &str) -> bool {
+    let Some((whole, fraction)) = value.split_once('.') else {
         return false;
     };
-    let location = format!("prompts.rs:{line}:");
-    code == Some(101)
-        && out.contains("running 1 test")
-        && out.contains("0 passed; 1 failed;")
-        && out
-            .lines()
-            .filter(|line| line.starts_with("    tests::"))
-            .eq(std::iter::once(format!("    {selected}").as_str()))
-        && (out.contains(&format!("test {selected} ... FAILED"))
-            || out.contains(&format!("{selected} --- FAILED")))
-        && err.matches("panicked at").count() == 1
-        && err.contains(&format!("thread '{selected}'"))
-        && err.contains(&location)
-        && err
-            .lines()
-            .filter(|line| line.starts_with("PROMPTS_POLICY_ASSERT:"))
-            .eq(std::iter::once(
-                format!("PROMPTS_POLICY_ASSERT:{policy}").as_str(),
-            ))
-        && !out.contains("error[E")
-        && !err.contains("error[E")
-        && !err.contains("PROMPTS_INFRASTRUCTURE_FAILURE")
+    !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.len() == 2
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<f64>().is_ok_and(f64::is_finite)
+}
+fn intended_failure(code: Option<i32>, out: &str, err: &str, test: &str, policy: &str) -> bool {
+    if code != Some(101) || registered_policy(test) != Some(policy) {
+        return false;
+    }
+    let Some(location) = policy_location() else {
+        return false;
+    };
+    let selected = format!("tests::{test}");
+    // Rust 1.99 pretty libtest with one --exact --nocapture test: the first
+    // failures section is empty because its panic was already sent to stderr.
+    let prefix = format!(
+        "\nrunning 1 test\ntest {selected} ... FAILED\n\nfailures:\n\nfailures:\n    {selected}\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in "
+    );
+    let Some(duration) = out
+        .strip_prefix(&prefix)
+        .and_then(|s| s.strip_suffix("s\n\n"))
+    else {
+        return false;
+    };
+    if !decimal_duration(duration) {
+        return false;
+    }
+    let panic_prefix = format!("\nthread '{selected}' (");
+    let Some(panic) = err.strip_prefix(&panic_prefix) else {
+        return false;
+    };
+    let Some((pid, tail)) = panic.split_once(") panicked at ") else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && pid.parse::<u64>().is_ok_and(|pid| pid != 0)
+        && tail == format!(
+            "{location}:\nPROMPTS_POLICY_ASSERT:{policy}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+        )
 }
 #[cfg(test)]
 mod classifier_tests {
+    fn fixture(name: &str, policy: &str) -> (String, String) {
+        let selected = format!("tests::{name}");
+        let location = super::policy_location().unwrap();
+        (
+            format!("\nrunning 1 test\ntest {selected} ... FAILED\n\nfailures:\n\nfailures:\n    {selected}\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s\n\n"),
+            format!("\nthread '{selected}' (123) panicked at {location}:\nPROMPTS_POLICY_ASSERT:{policy}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"),
+        )
+    }
     #[test]
     fn exact_policy_rejects_infrastructure_and_other_assertions() {
-        let name = "actual_direct_writers_are_guarded_before_database";
-        let policy = "all direct prompt writers refuse exact confirmation";
-        let line = include_str!("prompts.rs")
-            .lines()
-            .position(|l| l.contains("panic!(\"PROMPTS_POLICY_ASSERT:"))
-            .unwrap()
-            + 1;
-        let out=format!("running 1 test\ntest tests::{name} ... FAILED\nfailures:\n    tests::{name}\ntest result: FAILED. 0 passed; 1 failed;");
-        let err=format!("thread 'tests::{name}' (123) panicked at qualification/prompts.rs:{line}:13:\nPROMPTS_POLICY_ASSERT:{policy}\n");
-        assert!(super::intended_failure(Some(101), &out, &err, name, policy));
-        for bad in [
-            err.replace(policy, "other policy"),
-            err.replace("PROMPTS_POLICY_ASSERT", "PROMPTS_INFRASTRUCTURE_FAILURE"),
-            err.replace(&format!(":{line}:"), ":1:"),
-            format!("{err}thread 'other' panicked at setup.rs:1:1\n"),
-            format!("{err}error[E0001]: compile\n"),
+        // These pure fixtures are libtest grammar controls, not actual mutant captures.
+        assert_eq!(
+            include_str!("prompts.rs").matches("    #[test]\n").count(),
+            5
+        );
+        for name in [
+            "actual_direct_writers_are_guarded_before_database",
+            "actual_startup_seed_has_exact_confirmation_and_preserves_hooks",
+            "actual_private_prompt_http_is_authenticated_and_method_aware",
         ] {
-            assert!(!super::intended_failure(
+            let policy = super::registered_policy(name).unwrap();
+            let (out, err) = fixture(name, policy);
+            assert!(super::intended_failure(Some(101), &out, &err, name, policy));
+            assert!(super::intended_failure(
                 Some(101),
-                &out,
-                &bad,
+                &out.replace("0.00s", "12.34s"),
+                &err.replace("(123)", "(8157242)"),
                 name,
                 policy
             ));
+            let location = super::policy_location().unwrap();
+            let (path_line, column) = location.rsplit_once(':').unwrap();
+            let (path, line) = path_line.rsplit_once(':').unwrap();
+            for bad in [
+                format!("prefix\n{err}"), format!("{err}tail\n"), format!("{err}{err}"),
+                err.replace(policy, "other policy"),
+                err.replace("PROMPTS_POLICY_ASSERT", "PROMPTS_INFRASTRUCTURE_FAILURE"),
+                err.replace(&location, &format!("{path_line}:{}", column.parse::<usize>().unwrap() + 1)),
+                err.replace(&location, &format!("{path}:{}:{column}", line.parse::<usize>().unwrap() + 1)),
+                err.replace(&location, &format!("arbitrary/{location}")),
+                err.replace(&location, &format!("prompts.rs:{line}:{column}")),
+                err.replace(name, "other_test"), err.replace("(123)", "(0)"),
+                err.replace("(123)", "(-1)"), err.replace("(123)", "(1x)"),
+                err.replace("(123)", "(18446744073709551616)"),
+                err.replace("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n", ""),
+                err.trim_start().to_owned(), err.trim_end().to_owned(),
+                format!("{err}thread 'other' panicked at setup.rs:1:1\n"),
+                format!("{err}error[E0001]: compile\n"),
+                "spawn failed".into(), "capture cap".into(), "deadline".into(),
+                "called Result::unwrap() on Err".into(),
+            ] {
+                assert!(!super::intended_failure(Some(101), &out, &bad, name, policy), "accepted stderr {bad:?}");
+            }
+            for bad in [
+                format!("prefix\n{out}"),
+                format!("{out}tail\n"),
+                format!("{out}{out}"),
+                out.replace("running 1 test", "running 2 tests"),
+                out.replace(name, "other_test"),
+                out.replace(" ... FAILED", " --- FAILED"),
+                out.replace(&format!("    tests::{name}\n"), ""),
+                out.replace(
+                    &format!("    tests::{name}\n"),
+                    &format!("    tests::{name}\n    tests::other\n"),
+                ),
+                out.replace("test result: FAILED.", "test result: ok."),
+                out.replace("0 passed; 1 failed;", "1 passed; 0 failed;"),
+                out.replace("4 filtered out", "5 filtered out"),
+                out.split("test result:").next().unwrap().to_owned(),
+                out.trim_start().to_owned(),
+                out.trim_end().to_owned(),
+                out.replace("0.00s", "NaNs"),
+                out.replace("0.00s", "infs"),
+                out.replace("0.00s", "-0.01s"),
+                out.replace("0.00s", "1e2s"),
+                out.replace("0.00s", "0.0s"),
+                out.replace("0.00s", ".00s"),
+                out.replace("0.00s", "0.00junk s"),
+                out.replace("0.00s", &format!("{}.00s", "9".repeat(400))),
+                format!("{out}error[E0001]: compile\n"),
+                format!("{out}capture cap\n"),
+                format!("{out}deadline\n"),
+            ] {
+                assert!(
+                    !super::intended_failure(Some(101), &bad, &err, name, policy),
+                    "accepted stdout {bad:?}"
+                );
+            }
+            for code in [None, Some(1), Some(0), Some(102)] {
+                assert!(!super::intended_failure(code, &out, &err, name, policy));
+            }
+            assert!(!super::intended_failure(
+                Some(101),
+                &out,
+                &err,
+                name,
+                "other policy"
+            ));
         }
-        for code in [None, Some(1), Some(0)] {
-            assert!(!super::intended_failure(code, &out, &err, name, policy));
-        }
+        let (out, err) = fixture("unregistered", "unregistered policy");
         assert!(!super::intended_failure(
             Some(101),
-            &out.replace(name, "wrong_test"),
+            &out,
             &err,
-            name,
-            policy
+            "unregistered",
+            "unregistered policy"
         ));
-        for bad in [
-            "spawn failed",
-            "capture cap",
-            "deadline",
-            "called Result::unwrap() on Err",
-        ] {
-            assert!(!super::intended_failure(Some(101), &out, bad, name, policy));
-        }
     }
 }
 fn main() -> Result<()> {
