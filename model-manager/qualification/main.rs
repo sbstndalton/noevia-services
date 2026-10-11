@@ -707,6 +707,11 @@ mod tests {
         drop(listener);
         let python = std::env::var("SECTIONS_TEST_PYTHON").unwrap_or_else(|_| "python3".into());
         let seam = SHIM.replace(ROOT, dir.to_str().unwrap());
+        // Resolve the source before taking parents: CI's qualification/main.rs
+        // has an empty lexical grandparent, but an absolute app root exists.
+        let source = Path::new(file!()).canonicalize().unwrap();
+        let app_root = source.parent().unwrap().parent().unwrap();
+        assert!(app_root.is_absolute() && app_root.join("app/main.py").is_file());
         let _child = OwnedProcess(
             Command::new(python)
                 .args([
@@ -719,7 +724,7 @@ mod tests {
                     "--port",
                     &port.to_string(),
                 ])
-                .current_dir(Path::new(file!()).parent().unwrap().parent().unwrap())
+                .current_dir(app_root)
                 .env("MODELS_DIR", dir.join("models"))
                 .env("MODELS_INI_PATH", dir.join("models/models.ini"))
                 .env("DATA_DIR", dir.join("data"))
