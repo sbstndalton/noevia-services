@@ -111,7 +111,9 @@ def test_model_downloads_are_pinned_to_commits():
 def test_overlay_docs_list_exactly_the_files_the_dockerfile_copies_to_app():
     """docs/deployment.md's app-only overlay must replace the same files the final COPY places."""
     docker = (HERE / "Dockerfile").read_text(encoding="utf-8")
-    copies = re.findall(r"^COPY ((?:[\w.]+ )+)\./\s*$", docker, re.M)
+    stages = re.split(r"^FROM [^\n]+ AS production\s*$", docker, flags=re.M)
+    assert len(stages) == 2 and not re.search(r"^FROM ", stages[1], re.M), "expected final named production stage"
+    copies = re.findall(r"^COPY ((?:[\w.]+ )+)\./\s*$", stages[1], re.M)
     assert len(copies) == 1, "expected one `COPY <files> ./` into /app"
     app_files = set(copies[0].split())
     docs = (HERE.parent.parent / "docs" / "deployment.md").read_text(encoding="utf-8")

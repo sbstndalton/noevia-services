@@ -414,6 +414,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+        with:
+          components: rustfmt, clippy
       - name: Rust-owned source guard and bounded probe controls
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/laya-image-target

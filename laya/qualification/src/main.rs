@@ -812,6 +812,32 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     #[test]
+    fn ci_installs_required_rust_components() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let workflow = fs::read_to_string(source.join(".github/workflows/ci.yml")).unwrap();
+        let job = workflow
+            .split_once("  laya-image:\n")
+            .unwrap()
+            .1
+            .split_once("\n  model-manager:\n")
+            .unwrap()
+            .0;
+        let required = "      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0\n        with:\n          components: rustfmt, clippy";
+        assert!(job.contains(required));
+        for replacement in ["components: clippy", "components: rustfmt"] {
+            let mutant = job.replace("components: rustfmt, clippy", replacement);
+            assert_ne!(mutant, job);
+            assert!(
+                !mutant.contains(required),
+                "missing component mutation survived"
+            );
+        }
+    }
+    #[test]
     fn cargo_target_directory_uses_supported_step_context() {
         fn valid(workflow: &str) -> bool {
             let Some((_, rest)) = workflow.split_once("  laya-image:\n") else {

@@ -290,6 +290,62 @@ mod tests {
         assert!(DOCKER.contains("FROM native-contract AS omission-contract\nCOPY --from=native-docling /out/noevia-docling-omission /usr/local/bin/noevia-docling"));
     }
     #[test]
+    fn actual_overlay_guard_counts_only_production_copies() {
+        let directory =
+            std::env::temp_dir().join(format!("docling-overlay-guard-{}", std::process::id()));
+        std::fs::create_dir_all(directory.join("services/docling")).expect("owned fixture");
+        std::fs::create_dir_all(directory.join("docs")).expect("owned docs");
+        std::fs::write(directory.join("docs/deployment.md"), "COPY server.py extract.py isolation.py isolated_worker.py selftest.py synthetic_pdfs.py /app/\n").expect("overlay docs");
+        let loader = "import runpy,sys; from pathlib import Path; g=runpy.run_path(sys.argv[1]); f=g['test_overlay_docs_list_exactly_the_files_the_dockerfile_copies_to_app']; f.__globals__['HERE']=Path(sys.argv[2]); f()";
+        let test = std::path::Path::new(file!())
+            .parent()
+            .expect("test directory")
+            .join("../test_requirements_pinned.py");
+        let production_copy = "COPY server.py extract.py isolation.py isolated_worker.py selftest.py synthetic_pdfs.py ./";
+        let controls = [
+            (DOCKER.to_owned(), true),
+            (
+                DOCKER.replace(production_copy, "# missing production copy"),
+                false,
+            ),
+            (
+                DOCKER.replace(
+                    production_copy,
+                    &format!("{production_copy}\n{production_copy}"),
+                ),
+                false,
+            ),
+            (
+                DOCKER.replace(
+                    "COPY tests/fixtures/native_extract.py ./extract.py",
+                    "COPY tests/fixtures/native_extract.py ./extract.py\nCOPY synthetic_only.py ./",
+                ),
+                true,
+            ),
+        ];
+        for (docker, valid) in controls {
+            std::fs::write(directory.join("services/docling/Dockerfile"), docker)
+                .expect("fixture Docker");
+            let answer = std::process::Command::new("python3")
+                .args(["-B", "-c", loader])
+                .arg(&test)
+                .arg(directory.join("services/docling"))
+                .output()
+                .expect("actual Python guard");
+            assert_eq!(
+                answer.status.success(),
+                valid,
+                "{}",
+                String::from_utf8_lossy(&answer.stderr)
+            );
+            if !valid {
+                assert!(String::from_utf8_lossy(&answer.stderr)
+                    .contains("AssertionError: expected one `COPY"));
+            }
+        }
+        std::fs::remove_dir_all(directory).expect("owned cleanup");
+    }
+    #[test]
     fn all_four_immutable_runtime_pins_match() {
         let expected_ref = "ARG NOEVIA_RS_REF=174078a20c214a609085bc44c1d668cd18a634eb";
         let expected_hash =
