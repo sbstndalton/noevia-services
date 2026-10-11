@@ -463,7 +463,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pytest==9.1.1 pytest-asyncio==1.4.0
-      - run: python -m pytest -q
+      - name: Host ownership and remaining Python backend sampler
+        run: python -m pytest -q tests/test_native_host_ownership.py
+      - run: python -m pytest -q --ignore=tests/test_native_host_ownership.py
       # gguf-meta (sbstndalton/noevia-rs) at the Dockerfile's pinned ref, checksum-verified, then
       # compared with the Python parser (#909).
       - name: Fetch noevia-rs at the pinned ref
