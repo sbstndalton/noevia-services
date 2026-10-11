@@ -539,6 +539,7 @@ jobs:
           "$RUNNER_TEMP/prompts-image-tests" tests::cleanup_requires_exact_immutable_id_and_owned_label
           "$RUNNER_TEMP/prompts-image-tests" tests::send_budget_bounds_slow_progress_and_no_progress
           "$RUNNER_TEMP/prompts-image-tests" tests::failed_docker_diagnostics_are_fixed_and_reject_contamination --exact
+          "$RUNNER_TEMP/prompts-image-tests" tests::readiness_requires_successful_owned_endpoints_before_deadline --exact
           rustfmt --edition 2021 --check qualification/prompts-mutations.rs
           clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts-mutations.rs -o "$RUNNER_TEMP/prompts-guard-mutants"
           rustc --edition=2021 --test qualification/prompts-mutations.rs -o "$RUNNER_TEMP/prompts-mutant-classifier-tests"

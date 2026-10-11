@@ -190,17 +190,44 @@ fn validate_marker(mode: &str, marker: &str) -> Result<()> {
     }
     Ok(())
 }
+fn readiness_ready(
+    mode: &str,
+    marker: bool,
+    parent: Option<&(u16, String)>,
+    private: Option<&(u16, String)>,
+    within_deadline: bool,
+) -> bool {
+    within_deadline
+        && marker
+        && parent.is_some_and(|(status, _)| *status == 200)
+        && (mode != "rust"
+            || private.is_some_and(|(status, body)| {
+                *status == 503 && body == "{\"detail\":\"Native model manager owns this endpoint\"}"
+            }))
+}
 fn probe(mode: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(12);
     let marker = Path::new(ROOT).join("child.json");
     loop {
-        if marker.is_file()
-            && http(8090, "GET", "/api/v1/prompts", "", true).is_ok()
-            && (mode != "rust" || http(8091, "GET", "/api/v1/prompts", "", true).is_ok())
-        {
+        require(Instant::now() < deadline, "image readiness deadline")?;
+        let present = marker.is_file();
+        let parent = present
+            .then(|| http(8090, "GET", "/api/v1/prompts", "", true))
+            .and_then(std::result::Result::ok);
+        let private = (present && mode == "rust")
+            .then(|| http(8091, "GET", "/api/v1/prompts", "", true))
+            .and_then(std::result::Result::ok);
+        let within_deadline = Instant::now() < deadline;
+        require(within_deadline, "image readiness deadline")?;
+        if readiness_ready(
+            mode,
+            present,
+            parent.as_ref(),
+            private.as_ref(),
+            within_deadline,
+        ) {
             break;
         }
-        require(Instant::now() < deadline, "image readiness deadline")?;
         thread::sleep(Duration::from_millis(20));
     }
     let marker = bounded_text(&marker)?;
@@ -590,6 +617,88 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readiness_requires_successful_owned_endpoints_before_deadline() {
+        let public = (200, String::new());
+        let owned = (
+            503,
+            "{\"detail\":\"Native model manager owns this endpoint\"}".to_owned(),
+        );
+        for mode in ["python", "off", "rust"] {
+            assert!(super::readiness_ready(
+                mode,
+                true,
+                Some(&public),
+                Some(&owned),
+                true
+            ));
+            assert!(!super::readiness_ready(
+                mode,
+                false,
+                Some(&public),
+                Some(&owned),
+                true
+            ));
+            assert!(!super::readiness_ready(
+                mode,
+                true,
+                None,
+                Some(&owned),
+                true
+            ));
+            assert!(!super::readiness_ready(
+                mode,
+                true,
+                Some(&public),
+                Some(&owned),
+                false
+            ));
+            for status in [401, 404, 500, 502, 503] {
+                assert!(!super::readiness_ready(
+                    mode,
+                    true,
+                    Some(&(status, String::new())),
+                    Some(&owned),
+                    true
+                ));
+            }
+        }
+        assert!(!super::readiness_ready(
+            "rust",
+            true,
+            Some(&public),
+            None,
+            true
+        ));
+        assert!(!super::readiness_ready(
+            "rust",
+            true,
+            Some(&public),
+            Some(&public),
+            true
+        ));
+        assert!(!super::readiness_ready(
+            "rust",
+            true,
+            Some(&public),
+            Some(&(503, "unrelated refusal".to_owned())),
+            true
+        ));
+        assert!(super::readiness_ready(
+            "off",
+            true,
+            Some(&public),
+            None,
+            true
+        ));
+        assert!(super::readiness_ready(
+            "python",
+            true,
+            Some(&public),
+            None,
+            true
+        ));
+    }
     #[test]
     fn failed_docker_diagnostics_are_fixed_and_reject_contamination() {
         use std::os::unix::process::ExitStatusExt;
