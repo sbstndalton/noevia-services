@@ -352,7 +352,67 @@ fn refusal(mode: &str) -> Result<()> {
 fn docker(args: &[&str]) -> Result<Vec<u8>> {
     let mut command = Command::new("docker");
     command.args(args);
-    guards::capture(command, Duration::from_secs(30))
+    let output = guards::capture_output(command, Duration::from_secs(30))?;
+    docker_output(args, output)
+}
+fn docker_output(args: &[&str], output: guards::Output) -> Result<Vec<u8>> {
+    if !output.status.success() {
+        return Err(docker_failure(args, &output.stderr).into());
+    }
+    Ok(output.stdout)
+}
+fn docker_failure(args: &[&str], stderr: &[u8]) -> String {
+    let operation = match args.first().copied() {
+        Some("create") => "create",
+        Some("inspect") => "inspect",
+        Some("start") => "start",
+        Some("exec") => "exec",
+        Some("rm") => "cleanup",
+        _ => "unknown",
+    };
+    let mode = if operation == "exec" {
+        match args.last().copied() {
+            Some("python") => "python",
+            Some("rust") => "rust",
+            Some("off") => "off",
+            Some("omission") => "omission",
+            Some("mismatch") => "mismatch",
+            Some("invalid") => "invalid",
+            _ => "unknown",
+        }
+    } else {
+        "none"
+    };
+    // Accept only a complete, single registered Rust diagnostic. Never relay
+    // arbitrary Docker/Python output, environment, request bodies or paths.
+    let diagnostic = [
+        "image HTTP status assertion",
+        "image HTTP body assertion",
+        "image HTTP deadline",
+        "image HTTP response cap",
+        "image readiness deadline",
+        "image marker cap",
+        "canonical child DATA_DIR",
+        "native seed precedes exact child confirmation",
+        "off child owns startup seed",
+        "default clears inherited prompt confirmation",
+        "whole four literal startup seed",
+        "native or default whole POST and ID",
+        "actual indirect readers see same WAL commit",
+        "whole DELETE readback",
+        "actual indirect readers see delete and fixed flag",
+        "compiled prompt omission preserves host",
+        "exact selector refusal exit",
+        "exact selector refusal diagnostic",
+        "selector refusal before child and database",
+        "actual app qualification process failed",
+        "actual app qualification deadline",
+        "actual app qualification output cap",
+    ]
+    .into_iter()
+    .find(|message| stderr.len() <= 65_536 && stderr == format!("Error: {message:?}\n").as_bytes())
+    .unwrap_or("unrecognized bounded diagnostic");
+    format!("prompt image Docker {operation} mode={mode} failed: {diagnostic}")
 }
 fn nonce() -> Result<String> {
     let mut bytes = [0; 32];
@@ -530,6 +590,66 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_docker_diagnostics_are_fixed_and_reject_contamination() {
+        use std::os::unix::process::ExitStatusExt;
+        let args = [
+            "exec",
+            "private-container-id",
+            "prompts-image-probe",
+            "probe",
+            "rust",
+        ];
+        let known = b"Error: \"image HTTP status assertion\"\n";
+        let failed = super::docker_output(
+            &args,
+            super::guards::Output {
+                status: std::process::ExitStatus::from_raw(256),
+                stdout: b"private-body-and-token".to_vec(),
+                stderr: known.to_vec(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            failed.to_string(),
+            "prompt image Docker exec mode=rust failed: image HTTP status assertion"
+        );
+        assert_eq!(
+            super::docker_output(
+                &args,
+                super::guards::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"fixed-success".to_vec(),
+                    stderr: Vec::new(),
+                }
+            )
+            .unwrap(),
+            b"fixed-success"
+        );
+        assert_eq!(
+            super::docker_failure(&args, known),
+            "prompt image Docker exec mode=rust failed: image HTTP status assertion"
+        );
+        for bytes in [
+            b"secret-token".to_vec(),
+            [known.as_slice(), b"private-body"].concat(),
+            [b"private-prefix".as_slice(), known.as_slice()].concat(),
+            vec![b'x'; 65_537],
+        ] {
+            assert_eq!(
+                super::docker_failure(&args, &bytes),
+                "prompt image Docker exec mode=rust failed: unrecognized bounded diagnostic"
+            );
+        }
+        assert_eq!(
+            super::docker_failure(&["private-operation", "private-mode"], known),
+            "prompt image Docker unknown mode=none failed: image HTTP status assertion"
+        );
+        assert_eq!(
+            super::docker_failure(&["exec", "private-mode"], known),
+            "prompt image Docker exec mode=unknown failed: image HTTP status assertion"
+        );
+    }
     #[test]
     fn send_budget_bounds_slow_progress_and_no_progress() {
         struct Slow {
