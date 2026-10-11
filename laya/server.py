@@ -3,6 +3,9 @@ import json
 import multiprocessing as mp
 import os
 import re
+import select
+import struct
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,6 +68,61 @@ def touch_weights(agent, torch, stop=lambda: False):
                     tensor.detach().sum()
                     count += 1
     return count
+
+
+class FramedEnginePipe:
+    """Private native-front transport: big-endian u32 length, then UTF-8 JSON.
+
+    One engine per process, one outstanding request; no HTTP, admission or recovery
+    policy lives here. The native parent owns deadlines and terminates stalled I/O.
+    Reads are unbuffered so poll() also sees the next frame after recv().
+    """
+    MAX_FRAME_BYTES = 16384
+
+    def __init__(self, reader, writer):
+        self.reader, self.writer = reader, writer
+
+    def poll(self, timeout=0):
+        return bool(select.select([self.reader], [], [], timeout)[0])
+
+    def _read_exact(self, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.reader.read(size - len(data))
+            if not chunk:
+                raise EOFError('Engine transport closed')
+            data.extend(chunk)
+        return bytes(data)
+
+    def recv(self):
+        size, = struct.unpack('!I', self._read_exact(4))
+        if not 0 < size <= self.MAX_FRAME_BYTES:
+            raise ValueError('Invalid engine frame size')
+        return json.loads(self._read_exact(size))
+
+    def send(self, value):
+        data = json.dumps(value, ensure_ascii=True, allow_nan=False).encode('utf-8')
+        if not 0 < len(data) <= self.MAX_FRAME_BYTES:
+            raise ValueError('Invalid engine frame size')
+        data = struct.pack('!I', len(data)) + data
+        while data:
+            written = self.writer.write(data)
+            if not written:
+                raise BrokenPipeError('Engine transport closed')
+            data = data[written:]
+        self.writer.flush()
+
+
+def engine_worker_stdio():
+    """Retained engine only. Reserve stdout before importing third-party engines.
+
+    Redirect fd 1 as well as Python stdout: native-library diagnostics must never
+    corrupt the framed channel. Fixed /model and imports remain in worker().
+    """
+    with os.fdopen(os.dup(1), 'wb', buffering=0) as writer:
+        os.dup2(2, 1)
+        with os.fdopen(os.dup(0), 'rb', buffering=0) as reader:
+            worker(FramedEnginePipe(reader, writer))
 
 
 def worker(pipe):
@@ -456,6 +514,9 @@ def serve(runtime, address=('0.0.0.0', 8040), on_server=None):
 
 
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--engine-worker']:
+        engine_worker_stdio()
+        sys.exit(0)
     runtime = Pool.start(max_concurrency_from_env(), queue_timeout_from_env(), decision_timeout=decision_timeout_from_env())
     try:
         serve(runtime)
