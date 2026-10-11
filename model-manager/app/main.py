@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -21,6 +22,13 @@ async def _require_token(request: Request, call_next):
         sent = request.headers.get("x-model-loader-token", "")
         if not hmac.compare_digest(sent.encode(), token.encode()):
             return Response('{"error":"unauthorized"}', status_code=401, media_type="application/json")
+    # Native selector's supervised loopback child keeps ONLY unported routes. Refuse
+    # native-owned paths even if the Rust handler fails; never silently serve them twice.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED") == "1":
+        path = request.url.path
+        parts = path.split("/")
+        if path == "/api/v1/health" or (len(parts) == 6 and parts[:4] == ["", "api", "v1", "backends"] and parts[4] and parts[5] == "logs"):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     return await call_next(request)
 
 
