@@ -553,7 +553,16 @@ jobs:
           printf '%s\n' "$native_features" | grep -Fx native-sections >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
+      - name: Check out immutable prompt oracle
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          ref: 2360cb51f6475122ba0aa3d32272849a63028d66
+          path: prompts-oracle
       - name: Native sections oracle and prompt startup, properties and Linux containment
+        env:
+          NOEVIA_PROMPTS_APP: ${{ github.workspace }}/prompts-oracle/model-manager/app
+          PYTHON: python
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
           cargo run --locked -q -p noevia-model-manager --bin generate-sections-schema -- "$GITHUB_WORKSPACE/ws/services/model-manager/app" "$RUNNER_TEMP/sections-schema.json"
