@@ -15,8 +15,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=0ae4195aede92a2313af456197d40c17a7bd0683
-ARG NOEVIA_RS_SHA256=ca1c5af1c34c3f8418a88f3780191a85a329c125a7d458917fa5dfb210e1160d
+ARG NOEVIA_RS_REF=a74dbf0952927d433e8a345f5c485f8706f591aa
+ARG NOEVIA_RS_SHA256=d35fc6bb1955c2a811fd58b0f3e8f2d47415a9e04ec6e16aca58ba3457071f1f
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -25,11 +25,12 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-sections >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -56,9 +57,14 @@ COPY qualification/main.rs /tmp/sections-image-probe.rs
 RUN rustc --edition=2021 /tmp/sections-image-probe.rs -o /tmp/sections-image-probe \
  && cargo build --release --locked -p noevia-model-manager --features native-host
 
+COPY qualification/prompts.rs qualification/prompts-image.rs /tmp/prompts-qualification/
+RUN rustc --edition=2021 /tmp/prompts-qualification/prompts-image.rs -o /tmp/prompts-image-probe
+
 FROM runtime AS qualification
 COPY --from=qualification-builder /tmp/sections-image-probe /usr/local/bin/sections-image-probe
+COPY --from=qualification-builder /tmp/prompts-image-probe /usr/local/bin/prompts-image-probe
 COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-sections-omission
+COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-prompts-omission
 
 # Default builds retain the production runtime and entrypoint.
 FROM runtime AS production

@@ -524,23 +524,54 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
+      - name: Rust-owned actual prompt guards and startup seed ownership
+        env:
+          PROMPTS_TEST_PYTHON: python
+        run: |
+          rustfmt --edition 2021 --check qualification/prompts.rs
+          clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts.rs -o "$RUNNER_TEMP/prompts-guard-probe"
+          rustc --edition=2021 --test qualification/prompts.rs -o "$RUNNER_TEMP/prompts-guard-tests"
+          "$RUNNER_TEMP/prompts-guard-tests"
+          rustfmt --edition 2021 --check qualification/prompts-image.rs
+          clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts-image.rs -o "$RUNNER_TEMP/prompts-image-probe"
+          rustc --edition=2021 --test qualification/prompts-image.rs -o "$RUNNER_TEMP/prompts-image-tests"
+          "$RUNNER_TEMP/prompts-image-tests" tests::marker_requires_canonical_data_preseed_and_exact_confirmation
+          "$RUNNER_TEMP/prompts-image-tests" tests::cleanup_requires_exact_immutable_id_and_owned_label
+          "$RUNNER_TEMP/prompts-image-tests" tests::send_budget_bounds_slow_progress_and_no_progress
+          "$RUNNER_TEMP/prompts-image-tests" tests::failed_docker_diagnostics_are_fixed_and_reject_contamination --exact
+          "$RUNNER_TEMP/prompts-image-tests" tests::readiness_requires_successful_owned_endpoints_before_deadline --exact
+          rustfmt --edition 2021 --check qualification/prompts-mutations.rs
+          clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts-mutations.rs -o "$RUNNER_TEMP/prompts-guard-mutants"
+          rustc --edition=2021 --test qualification/prompts-mutations.rs -o "$RUNNER_TEMP/prompts-mutant-classifier-tests"
+          "$RUNNER_TEMP/prompts-mutant-classifier-tests" classifier_tests
+          "$RUNNER_TEMP/prompts-guard-mutants" "$RUNNER_TEMP/prompts-guard-tests"
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts
           native_features=$(./target/release/noevia-model-manager --features)
           printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-sections >/dev/null
+          printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
-      - name: Native sections actual-service oracle and Linux containment
+      - name: Check out immutable prompt oracle
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          ref: 2360cb51f6475122ba0aa3d32272849a63028d66
+          path: prompts-oracle
+      - name: Native sections oracle and prompt startup, properties and Linux containment
+        env:
+          NOEVIA_PROMPTS_APP: ${{ github.workspace }}/prompts-oracle/model-manager/app
+          PYTHON: python
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
           cargo run --locked -q -p noevia-model-manager --bin generate-sections-schema -- "$GITHUB_WORKSPACE/ws/services/model-manager/app" "$RUNNER_TEMP/sections-schema.json"
           cmp bins/noevia-model-manager/src/sections/schema.json "$RUNNER_TEMP/sections-schema.json"
           cargo run --locked -q -p noevia-model-manager --bin generate-sections-oracle -- "$GITHUB_WORKSPACE/ws/services/model-manager/app" "$RUNNER_TEMP/sections.json"
           cmp bins/noevia-model-manager/tests/fixtures/sections.json "$RUNNER_TEMP/sections.json"
-          cargo test --locked -p noevia-model-manager --features native-host,native-sections
+          cargo test --locked -p noevia-model-manager --features native-host,native-sections,native-prompts
       - name: Sections capability omission preserves native host
         working-directory: ${{ runner.temp }}/noevia-rs
         run: cargo test --locked -p noevia-model-manager --features native-host --test lifecycle
@@ -604,6 +635,10 @@ jobs:
           rustc --edition=2021 --test qualification/main.rs -o "$RUNNER_TEMP/sections-image-tests"
           "$RUNNER_TEMP/sections-image-tests"
           "$RUNNER_TEMP/sections-image-probe" images noevia-model-manager-qualification:ci
-      - name: Actual production image advertises sections
+      - name: Rust-owned actual image prompt writers, private child and default ownership
+        run: '"$RUNNER_TEMP/prompts-image-probe" images noevia-model-manager-qualification:ci'
+      - name: Actual production image advertises sections and prompts
         run: |
-          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges noevia-model-manager:ci noevia-model-manager --features | grep -Fx native-sections
+          native_features=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges noevia-model-manager:ci noevia-model-manager --features)
+          printf '%s\n' "$native_features" | grep -Fx native-sections
+          printf '%s\n' "$native_features" | grep -Fx native-prompts
