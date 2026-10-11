@@ -812,6 +812,50 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     #[test]
+    fn cargo_target_directory_uses_supported_step_context() {
+        fn valid(workflow: &str) -> bool {
+            let Some((_, rest)) = workflow.split_once("  laya-image:\n") else {
+                return false;
+            };
+            let Some((job, _)) = rest.split_once("\n  model-manager:\n") else {
+                return false;
+            };
+            let Some((header, _)) = job.split_once("    steps:\n") else {
+                return false;
+            };
+            if header.contains("runner.temp") || header.contains("CARGO_TARGET_DIR") {
+                return false;
+            }
+            let environment = "        env:\n          CARGO_TARGET_DIR: ${{ runner.temp }}/laya-image-target\n        run:";
+            job.matches(environment).count() == 2
+                && [
+                    "Rust-owned source guard and bounded probe controls",
+                    "Nonroot read-only network-none image qualification, synthetic ML only",
+                ]
+                .iter()
+                .all(|name| job.contains(&format!("      - name: {name}\n{environment}")))
+        }
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let workflow = fs::read_to_string(source.join(".github/workflows/ci.yml")).unwrap();
+        assert!(
+            valid(&workflow),
+            "Cargo target requires supported step environment"
+        );
+        let mutant = workflow.replace(
+            "  laya-image:\n    name: Laya synthetic native image contract\n    runs-on: ubuntu-latest\n    steps:",
+            "  laya-image:\n    name: Laya synthetic native image contract\n    runs-on: ubuntu-latest\n    env:\n      CARGO_TARGET_DIR: ${{ runner.temp }}/laya-image-target\n    steps:",
+        );
+        assert_ne!(mutant, workflow, "job-level mutation must apply");
+        assert!(
+            !valid(&mutant),
+            "unsupported runner context mutation survived"
+        );
+    }
+    #[test]
     fn production_image_names_are_refused_before_docker_or_source_access() {
         assert!(run_images(
             "cowork-laya:production",
