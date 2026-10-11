@@ -1,4 +1,39 @@
-FROM python:3.12-slim-bookworm
+# Native Docling HTTP/worker supervision (#1322). Engine layers below remain unchanged.
+FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS native-docling
+ARG NOEVIA_RS_REF=73f4a020576ba849991cab944db0f9b5b967cef7
+ARG NOEVIA_RS_SHA256=48c875a6c42b90d7820af163de315d9a95dcffdf33ffabf48ad11dadf5646c4e
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+WORKDIR /src
+ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
+RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
+ && rm /tmp/noevia-rs.tar.gz \
+ && mkdir /out \
+ && cargo build --release --locked -p noevia-docling --features native-docling \
+ && cp target/release/noevia-docling /out/noevia-docling \
+ && cargo build --release --locked -p noevia-docling \
+ && cp target/release/noevia-docling /out/noevia-docling-omission
+COPY tests/native_image.rs /build/native_image.rs
+RUN rustc --edition=2021 /build/native_image.rs -o /out/native-image-probe
+
+# CI-only target: actual HTTP/isolation/worker with a synthetic engine. No model or
+# extraction dependencies are installed. This does not qualify the production engine.
+FROM python:3.12-slim-bookworm AS native-contract
+WORKDIR /app
+COPY --from=native-docling /out/noevia-docling /usr/local/bin/noevia-docling
+COPY --from=native-docling /out/native-image-probe /usr/local/bin/native-image-probe
+COPY server.py isolation.py isolated_worker.py fake_converter.py ./
+COPY tests/fixtures/native_extract.py ./extract.py
+ENV NOEVIA_DOCLING_IMPL=python PYTHONDONTWRITEBYTECODE=1
+USER 65534:65534
+HEALTHCHECK --interval=1s --timeout=6s --start-period=1s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health',timeout=5)"
+CMD ["noevia-docling"]
+
+FROM native-contract AS omission-contract
+COPY --from=native-docling /out/noevia-docling-omission /usr/local/bin/noevia-docling
+
+FROM python:3.12-slim-bookworm AS production
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu \
@@ -53,6 +88,8 @@ ENV HF_HUB_OFFLINE=1 \
 RUN HF_HUB_OFFLINE=0 python /build/download_models.py /opt/docling-models \
     && chmod -R a+rX /opt/docling-models && rm -rf /build
 
+COPY --from=native-docling /out/noevia-docling /usr/local/bin/noevia-docling
+ENV NOEVIA_DOCLING_IMPL=python
 WORKDIR /app
 # isolation.py + isolated_worker.py run each conversion in a child process the server can kill
 # on a deadline or client disconnect (#854); the server cannot start without them.
@@ -63,4 +100,4 @@ USER 65534:65534
 EXPOSE 8031
 HEALTHCHECK --interval=30s --timeout=6s --start-period=120s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health',timeout=5)"
-CMD ["python", "server.py"]
+CMD ["noevia-docling"]
