@@ -1,0 +1,25 @@
+services:
+  python:
+    image: noevia-docling:ci
+    network_mode: none
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 1g
+    cpus: 1
+    pids_limit: 64
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,size=536870912,mode=1777"]
+  rust:
+    image: noevia-docling:ci
+    network_mode: none
+    read_only: true
+    user: "65534:65534"
+    mem_limit: 1g
+    cpus: 1
+    pids_limit: 64
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,size=536870912,mode=1777"]
+    environment:
+      NOEVIA_DOCLING_IMPL: rust

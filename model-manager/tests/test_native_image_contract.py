@@ -8,8 +8,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_native_image_build_copy_capability_and_default_entrypoint():
     source = (ROOT / "model-manager" / "Dockerfile").read_text()
-    assert "-p noevia-model-manager --features noevia-model-manager/native-logs" in source
-    assert "./target/release/noevia-model-manager --features | grep -qx native-logs" in source
+    assert "-p noevia-model-manager --features noevia-model-manager/native-host" in source
+    assert "native_features=$(./target/release/noevia-model-manager --features)" in source
+    for capability in ("native-logs", "native-host"):
+        assert f"printf '%s\\n' \"$native_features\" | grep -Fx {capability} >/dev/null" in source
     assert "COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager" in source
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]

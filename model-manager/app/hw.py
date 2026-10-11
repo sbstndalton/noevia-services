@@ -571,7 +571,8 @@ def _sample_loop() -> None:
             names = services._effective_container_names()
         except Exception:  # noqa: BLE001
             names, discovery_ok = [], False
-        host = _read_host()
+        # Backend stats remain Python-owned; only the host sampler moves with its confirmed owner.
+        host = None if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_HOST_CONFIRMED") == "1" else _read_host()
         if host is not None:
             with _LOCK:
                 _HOST_HISTORY.append(host)

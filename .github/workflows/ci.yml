@@ -163,6 +163,66 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest==9.1.1 "pypdfium2!=4.30.1,>=4.30.0,<6.0.0"
       - run: python -m pytest -q
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - name: Docling runtime pins and frozen engine image guards
+        # Host-only guards read this PR workflow; assembled services omit .github.
+        working-directory: self/docling
+        run: |
+          rustc --edition=2021 --test tests/native_image.rs -o "$RUNNER_TEMP/docling-image-guards"
+          "$RUNNER_TEMP/docling-image-guards"
+      - name: Fetch actual merged Rust runtime
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ARG NOEVIA_RS_REF=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG NOEVIA_RS_SHA256=//p' Dockerfile)
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          curl -fsSL -o /tmp/docling-rs.tgz "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
+          echo "$sum  /tmp/docling-rs.tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/docling-rs"
+          tar -xzf /tmp/docling-rs.tgz -C "$RUNNER_TEMP/docling-rs" --strip-components=1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ${{ runner.temp }}/docling-rs
+      - name: Actual HTTP worker binary default/native/featureless contracts
+        working-directory: ${{ runner.temp }}/docling-rs
+        env:
+          NOEVIA_DOCLING_REFERENCE: ${{ github.workspace }}/ws/services/docling
+        run: |
+          cargo test --locked -p docling-service -p noevia-docling
+          cargo test --locked -p noevia-docling --features native-docling
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Synthetic targets only. Never execute the model-bearing production layers in CI.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ws/services/docling
+          target: native-contract
+          push: false
+          load: true
+          tags: noevia-docling:ci
+          cache-from: type=gha,scope=docling-native
+          cache-to: type=gha,mode=max,scope=docling-native
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ws/services/docling
+          target: omission-contract
+          push: false
+          load: true
+          tags: noevia-docling:omission-ci
+          cache-from: type=gha,scope=docling-native
+      - name: Both image owners and specific capability omission (synthetic only)
+        run: |
+          set -euo pipefail
+          compose=(docker compose -p docling-native-ci -f tests/native-runtime.compose.yml)
+          cleanup() { "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true; docker rm -f docling-omission-ci >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          "${compose[@]}" up -d --wait --wait-timeout 60 --no-build
+          "${compose[@]}" exec -T python native-image-probe python
+          "${compose[@]}" exec -T rust native-image-probe rust
+          if timeout --kill-after=2s 10s docker run --rm --name docling-omission-ci --network none --read-only --memory 1g --cpus 1 --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --tmpfs /tmp:rw,size=536870912,mode=1777 -e NOEVIA_DOCLING_IMPL=rust noevia-docling:omission-ci > "$RUNNER_TEMP/docling-omission.log" 2>&1; then
+            echo 'featureless native image incorrectly started'; exit 1
+          fi
+          grep -Fq 'native-docling feature required' "$RUNNER_TEMP/docling-omission.log"
+          echo 'specific featureless native image refusal passed'
 
   ocr:
     name: OCR service tests
@@ -348,6 +408,46 @@ jobs:
       - run: pip install pytest==9.1.1
       - run: python -m pytest -q
 
+  laya-image:
+    name: Laya synthetic native image contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+        with:
+          components: rustfmt, clippy
+      - name: Rust-owned source guard and bounded probe controls
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/laya-image-target
+        run: |
+          cargo fmt --manifest-path laya/qualification/Cargo.toml --check
+          cargo clippy --locked --manifest-path laya/qualification/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path laya/qualification/Cargo.toml
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+      # These targets have no dependency on production pip/model layers.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: laya
+          target: synthetic
+          tags: noevia-laya-synthetic:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=laya-synthetic
+          cache-to: type=gha,mode=max,scope=laya-synthetic
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: laya
+          target: synthetic-featureless
+          tags: noevia-laya-featureless:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=laya-synthetic
+          cache-to: type=gha,mode=max,scope=laya-synthetic
+      - name: Nonroot read-only network-none image qualification, synthetic ML only
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/laya-image-target
+        run: cargo run --locked --manifest-path laya/qualification/Cargo.toml -- images noevia-laya-synthetic:ci noevia-laya-featureless:ci laya
+
   model-manager:
     name: Model manager test suite
     runs-on: ubuntu-latest
@@ -403,7 +503,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pytest==9.1.1 pytest-asyncio==1.4.0
-      - run: python -m pytest -q
+      - name: Host ownership and remaining Python backend sampler
+        run: python -m pytest -q tests/test_api_contract.py -k "backend_sampler_skips_only_confirmed_native_host or confirmed_host_refuses_direct_python_after_token_gate or default_python_host_contract_remains_available"
+      - run: python -m pytest -q -k "not backend_sampler_skips_only_confirmed_native_host and not confirmed_host_refuses_direct_python_after_token_gate and not default_python_host_contract_remains_available"
       # gguf-meta (sbstndalton/noevia-rs) at the Dockerfile's pinned ref, checksum-verified, then
       # compared with the Python parser (#909).
       - name: Fetch noevia-rs at the pinned ref
@@ -423,8 +525,10 @@ jobs:
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-logs
-          ./target/release/noevia-model-manager --features | grep -qx native-logs
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host
+          native_features=$(./target/release/noevia-model-manager --features)
+          printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
+          printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
       - name: Build deliberately omitted native model-manager feature
         working-directory: ${{ runner.temp }}/noevia-rs

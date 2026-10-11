@@ -207,3 +207,35 @@ carries `"reason": "native-fallback"` and `"method": "pdfium"` (see below). 415 
 422 = document could not be read or exceeded its time limit, 503 = busy. The client
 (`apps/web/server/docling.cjs`) treats 415/422 as permanent — cache the
 failure, keep the original — and everything else as retryable.
+
+## Native HTTP and worker supervision (#1322)
+
+The checksum-pinned `native-docling` Docker stage produces
+`/out/noevia-docling` with `native-docling` compiled, plus
+`/out/noevia-docling-omission` without that capability. The production image
+uses `noevia-docling` as its entrypoint. `NOEVIA_DOCLING_IMPL` defaults to
+`python`, which execs the existing `python server.py`; `rust` selects the native
+HTTP server and process-group worker supervisor. The Python extraction engine
+remains the same. Missing native capability refuses before binding or spawning
+a worker, and never falls back to Python HTTP.
+
+The existing engine/dependency/model-download layers are unchanged. Ordinary
+release packaging must use the documented app overlay onto the existing engine
+image, with the Bookworm-compatible compiled binary; rebuilding model layers is
+not part of native interface qualification.
+
+The unconditional Docling CI job builds only `native-contract` and
+`omission-contract`, using the actual HTTP/isolation/worker source and a fixed
+synthetic converter. It checks default Python exec, native warm-worker reuse,
+generic conversion errors, full/half-close cancellation, temporary-file cleanup,
+nonroot/read-only/network-none/resource isolation, and specific feature omission.
+The Rust host guards run from `self/docling` so they inspect the actual PR
+workflow, outside the assembled workspace and Docker image. No real model is
+imported, downloaded, loaded, or exercised by these targets. These checks qualify
+the interface and supervisor, not production ML extraction accuracy.
+
+Native admission is deliberately bounded: 25 MiB input, 200-byte document names,
+32 MiB framed output, one conversion and eight admitted connections. Existing
+Rust worker/oracle tests cover output/depth/deadline limits and the stricter
+refusal boundaries. Production Python remains the default until a separately
+reviewed deployment selects native HTTP.

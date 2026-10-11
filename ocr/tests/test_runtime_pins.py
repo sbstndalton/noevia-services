@@ -1,13 +1,13 @@
-"""Merged S1 runtime defaults remain consistent across native sidecar builds."""
+"""Merged S4 runtime defaults remain consistent across native sidecar builds."""
 import re
 from pathlib import Path
 
 
-def test_native_sidecar_runtime_defaults_match_merged_s1():
+def test_native_sidecar_runtime_defaults_match_merged_s4():
     root = Path(__file__).resolve().parents[2]
     expected = {
-        "NOEVIA_RS_REF": "90357b9512db69ad81b1f4f1f1967f135f6883dc",
-        "NOEVIA_RS_SHA256": "f2b8852b4b7882b2733f391b5c872828d4a2802d152a3ebcb5ad4f1d526d2217",
+        "NOEVIA_RS_REF": "174078a20c214a609085bc44c1d668cd18a634eb",
+        "NOEVIA_RS_SHA256": "edeab963f31832122a303999fcd5acbc46132a7b15e93f50758066c04ddf2773",
     }
     for service in ("ocr", "diary", "model-manager"):
         text = (root / service / "Dockerfile").read_text()
@@ -17,5 +17,5 @@ def test_native_sidecar_runtime_defaults_match_merged_s1():
 
 
 if __name__ == "__main__":
-    test_native_sidecar_runtime_defaults_match_merged_s1()
+    test_native_sidecar_runtime_defaults_match_merged_s4()
     print("three merged native runtime defaults/checksum guards verified")
