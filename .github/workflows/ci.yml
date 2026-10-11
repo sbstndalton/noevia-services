@@ -524,6 +524,25 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
+      - name: Rust-owned actual prompt guards and startup seed ownership
+        env:
+          PROMPTS_TEST_PYTHON: python
+        run: |
+          rustfmt --edition 2021 --check qualification/prompts.rs
+          clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts.rs -o "$RUNNER_TEMP/prompts-guard-probe"
+          rustc --edition=2021 --test qualification/prompts.rs -o "$RUNNER_TEMP/prompts-guard-tests"
+          "$RUNNER_TEMP/prompts-guard-tests"
+          rustfmt --edition 2021 --check qualification/prompts-image.rs
+          clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts-image.rs -o "$RUNNER_TEMP/prompts-image-probe"
+          rustc --edition=2021 --test qualification/prompts-image.rs -o "$RUNNER_TEMP/prompts-image-tests"
+          "$RUNNER_TEMP/prompts-image-tests" tests::marker_requires_canonical_data_preseed_and_exact_confirmation
+          "$RUNNER_TEMP/prompts-image-tests" tests::cleanup_requires_exact_immutable_id_and_owned_label
+          "$RUNNER_TEMP/prompts-image-tests" tests::send_budget_bounds_slow_progress_and_no_progress
+          rustfmt --edition 2021 --check qualification/prompts-mutations.rs
+          clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/prompts-mutations.rs -o "$RUNNER_TEMP/prompts-guard-mutants"
+          rustc --edition=2021 --test qualification/prompts-mutations.rs -o "$RUNNER_TEMP/prompts-mutant-classifier-tests"
+          "$RUNNER_TEMP/prompts-mutant-classifier-tests" classifier_tests
+          "$RUNNER_TEMP/prompts-guard-mutants" "$RUNNER_TEMP/prompts-guard-tests"
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |

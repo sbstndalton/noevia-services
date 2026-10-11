@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -240,6 +241,8 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
+    if key == _BENCH_SEED_KEY and os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") == "1":
+        raise RuntimeError("Native model manager owns prompt writes")
     with _LOCK, _conn() as c:
         c.execute(
             "INSERT INTO kv(key, value) VALUES(?, ?) "
@@ -314,6 +317,8 @@ def list_prompts() -> list[dict]:
 
 
 def add_prompt(name: str, body: str) -> int:
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") == "1":
+        raise RuntimeError("Native model manager owns prompt writes")
     import time as _t
     with _LOCK, _conn() as c:
         cur = c.execute(
@@ -324,6 +329,8 @@ def add_prompt(name: str, body: str) -> int:
 
 
 def delete_prompt(pid: int) -> bool:
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") == "1":
+        raise RuntimeError("Native model manager owns prompt writes")
     with _LOCK, _conn() as c:
         cur = c.execute("DELETE FROM prompts WHERE id = ?", (pid,))
         return cur.rowcount > 0
@@ -627,6 +634,8 @@ _BENCH_PROMPTS = (
 
 def seed_bench_prompts() -> int:
     """Add the built-in benchmark prompts once. Returns how many were added."""
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") == "1":
+        raise RuntimeError("Native model manager owns prompt writes")
     if get_setting(_BENCH_SEED_KEY, ""):
         return 0
     have = {p["name"] for p in list_prompts()}

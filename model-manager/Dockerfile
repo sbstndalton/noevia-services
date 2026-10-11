@@ -56,9 +56,14 @@ COPY qualification/main.rs /tmp/sections-image-probe.rs
 RUN rustc --edition=2021 /tmp/sections-image-probe.rs -o /tmp/sections-image-probe \
  && cargo build --release --locked -p noevia-model-manager --features native-host
 
+COPY qualification/prompts.rs qualification/prompts-image.rs /tmp/prompts-qualification/
+RUN rustc --edition=2021 /tmp/prompts-qualification/prompts-image.rs -o /tmp/prompts-image-probe
+
 FROM runtime AS qualification
 COPY --from=qualification-builder /tmp/sections-image-probe /usr/local/bin/sections-image-probe
+COPY --from=qualification-builder /tmp/prompts-image-probe /usr/local/bin/prompts-image-probe
 COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-sections-omission
+COPY --from=qualification-builder /src/target/release/noevia-model-manager /usr/local/bin/model-manager-prompts-omission
 
 # Default builds retain the production runtime and entrypoint.
 FROM runtime AS production

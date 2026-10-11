@@ -36,6 +36,11 @@ async def _require_token(request: Request, call_next):
         parts = path.split("/")
         if path == "/api/v1/sections" or (len(parts) == 5 and parts[:4] == ["", "api", "v1", "sections"] and parts[4]):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") == "1":
+        path = request.url.path
+        parts = path.split("/")
+        if (path == "/api/v1/prompts" and request.method in {"GET", "POST"}) or (request.method == "DELETE" and len(parts) == 5 and parts[:4] == ["", "api", "v1", "prompts"] and parts[4]):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     return await call_next(request)
 
 
@@ -61,7 +66,8 @@ async def _model_files_refused(_request: Request, exc: model_files.ModelFilesErr
 @app.on_event("startup")
 def _startup() -> None:
     db.init()
-    db.seed_bench_prompts()
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") != "1":
+        db.seed_bench_prompts()
     hw.start_sampler()
     try:
         from . import bench

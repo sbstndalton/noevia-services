@@ -14,6 +14,12 @@ The image includes `noevia-model-manager` with `native-logs` compiled and uses i
 
 Unported business startup (DB initialization, prompt seeding, sampler, orphan handling and optional INI migration) remains Python-owned. Native startup does not duplicate it. Other endpoints, including model writes, loading, downloads, benchmarks and autoconfiguration, remain Python-owned. This source integration does not activate a deployed selector or complete umbrella #1318.
 
+### Prompt writer handoff (#1356)
+
+Exact `NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED=1` reserves prompt writes for the native parent: direct add/delete/seed and the fixed `bench_prompts_seeded` kv write refuse before SQLite access, startup suppresses only seed, and authenticated GET/POST collection plus DELETE of one ID refuse in the private child. Other kv keys, tables, startup hooks and indirect prompt reads retain their existing behavior. Every other confirmation spelling leaves Python ownership in place. The parent must clear inherited confirmation, validate selection and the compiled capability, acquire the trusted stable DATA_DIR writer lease, and finish native seeding before granting confirmation.
+
+The prompt source guard and qualification probes are prepared here. The current Docker Rust pin predates `native-prompts`; it must remain unchanged until that Rust source lands and its actual merged SHA/archive pair is independently verified. Full `prompts-image-probe images noevia-model-manager-qualification:ci` execution is therefore a required pending Linux image gate, alongside all six existing services jobs. Local guard/startup and marker/cleanup controls do not certify the image or authorize selector activation. Runtime qualification uses owned synthetic temporary stores and suppresses only sampler/recovery/Docker discovery; it never loads a model.
+
 Log redaction is bounded and intentionally stronger than Python for Unicode/counter boundaries and credentials crossing line separators. Non-ASCII search filters are refused; Docker failures are sanitized. The runtime integration tests use actual merged binaries and the actual Python app with owned temporary paths, a test-only hardware/discovery suppression shim and a Unix fake Docker peer. No model engine or live Docker operation is exercised.
 
 A tool for managing llama.cpp GGUF models and containers on a personal homelab box. FastAPI, one Docker container.
