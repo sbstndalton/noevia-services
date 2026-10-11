@@ -14,6 +14,7 @@ use std::{
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const CAP: usize = 16_384;
 const OUTPUT_CAP: u64 = 65_536;
+const REFUSAL_TMPFS: &str = "/tmp:rw,exec,size=16777216,mode=1777";
 const SERVER_HASH: &str = "fa9965aa8d2606699e0cb1a4c16a71106e7fd0762b54e30656dfd224a17383e3";
 const ENGINE_DOCKER_HASH: &str = "3e63e74b0265b9a524d601a1ad1222335122a4988671c1a22924574d7d20d964";
 // Fixed ML collaborators: the actual retained server remains the policy/IPC
@@ -430,6 +431,9 @@ fn refusal(featureless: bool) -> Result<()> {
         ),
     )?;
     fs::set_permissions(&python, fs::Permissions::from_mode(0o700))?;
+    // Docker tmpfs defaults to noexec. Prove this owned marker can execute
+    // before any absence-of-marker assertion can count as selector refusal.
+    interpreter_control(&python, &marker)?;
     for selector in [
         std::ffi::OsString::from("unknown"),
         std::ffi::OsString::from_vec(vec![0xff]),
@@ -467,9 +471,17 @@ fn refusal(featureless: bool) -> Result<()> {
         if let Some(selector) = selector {
             owner.env("NOEVIA_LAYA_IMPL", selector);
         }
-        let (success, _) = command(&mut owner, Duration::from_secs(2))?;
+        let (success, output) = command(&mut owner, Duration::from_secs(2))?;
+        let phase = if selector.is_some() {
+            "explicit-python"
+        } else {
+            "default-python"
+        };
+        let actual = fs::read_to_string(&marker).map_err(|error| {
+            format!("refusal {phase}: interpreter marker missing at {}: {error}; owner output: {output}", marker.display())
+        })?;
         require(
-            !success && fs::read_to_string(&marker)? == "/service/server.py",
+            !success && actual == "/service/server.py",
             "legacy argv changed",
         )?;
         fs::remove_file(&marker)?;
@@ -478,6 +490,30 @@ fn refusal(featureless: bool) -> Result<()> {
         exchange("GET", &[]).is_err(),
         "refused owner unexpectedly opened listener",
     )?;
+    Ok(())
+}
+fn interpreter_control(python: &Path, marker: &Path) -> Result<()> {
+    let (success, output) = command(
+        Command::new(python).arg("/service/server.py"),
+        Duration::from_secs(2),
+    )
+    .map_err(|error| {
+        format!(
+            "refusal interpreter preflight: {}: {error}",
+            python.display()
+        )
+    })?;
+    let actual = fs::read_to_string(marker).map_err(|error| {
+        format!(
+            "refusal interpreter preflight: marker {}: {error}; output: {output}",
+            marker.display()
+        )
+    })?;
+    require(
+        !success && actual == "/service/server.py",
+        "refusal interpreter preflight argv/status mismatch",
+    )?;
+    fs::remove_file(marker)?;
     Ok(())
 }
 struct Container {
@@ -756,7 +792,7 @@ fn run_images(image: &str, featureless: &str, source: &Path) -> Result<()> {
             "--pids-limit",
             "32",
             "--tmpfs",
-            "/tmp:rw,size=16777216,mode=1777",
+            REFUSAL_TMPFS,
             "--entrypoint",
             "laya-image-probe",
             selected_image,
@@ -764,7 +800,8 @@ fn run_images(image: &str, featureless: &str, source: &Path) -> Result<()> {
             mode,
         ];
         // No worker/model mount needed: every refusal occurs before engine start.
-        docker(&args)?;
+        docker(&args)
+            .map_err(|error| format!("synthetic refusal phase {suffix} ({mode}): {error}"))?;
         args.clear();
     }
     let failed = Container::start(image, directory.path(), "failed", Some("rust"), "fail")?;
@@ -811,6 +848,73 @@ fn main() -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+    #[test]
+    fn refusal_preflight_requires_executable_actual_argv_and_cleans_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let python = directory.path().join("python");
+        let marker = directory.path().join("marker");
+        let valid = format!(
+            "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nexit 17\n",
+            marker.display()
+        );
+        fs::write(&python, &valid).unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+        interpreter_control(&python, &marker).unwrap();
+        assert!(
+            !marker.exists(),
+            "preflight marker must not taint refusal controls"
+        );
+        // Executability mutation: an infrastructure failure must fail the probe,
+        // even though it also leaves no interpreter marker.
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = interpreter_control(&python, &marker)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusal interpreter preflight"));
+        assert!(error.contains(python.to_str().unwrap()));
+        assert!(!marker.exists());
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+        for mutant in [
+            valid.replace("\"$*\"", "wrong-argv"),
+            valid.replace("exit 17", "exit 0"),
+        ] {
+            fs::write(&python, mutant).unwrap();
+            assert!(interpreter_control(&python, &marker).is_err());
+            fs::remove_file(&marker).unwrap();
+        }
+        fs::write(&python, "#!/bin/sh\nexit 17\n").unwrap();
+        let error = interpreter_control(&python, &marker)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusal interpreter preflight: marker"));
+    }
+    #[test]
+    fn refusal_tmpfs_explicitly_allows_owned_interpreter_only() {
+        fn executable(value: &str) -> bool {
+            value == "/tmp:rw,exec,size=16777216,mode=1777"
+        }
+        assert!(executable(REFUSAL_TMPFS));
+        assert!(!executable(&REFUSAL_TMPFS.replace(",exec", "")));
+        assert!(!executable(&REFUSAL_TMPFS.replace(",exec", ",noexec")));
+        let source = include_str!("main.rs");
+        let refusal_run = source
+            .split_once("for (suffix, selected_image, mode)")
+            .unwrap()
+            .1
+            .split_once("let failed =")
+            .unwrap()
+            .0;
+        assert!(refusal_run.contains("REFUSAL_TMPFS"));
+        let startup = source
+            .split_once("impl Container {")
+            .unwrap()
+            .1
+            .split_once("fn restrictions")
+            .unwrap()
+            .0;
+        assert!(startup.contains("\"/tmp:rw,size=16777216,mode=1777\""));
+    }
     #[test]
     fn ci_installs_required_rust_components() {
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
