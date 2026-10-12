@@ -560,7 +560,13 @@ def backend_diagnose(name: str) -> dict:
     if name not in services._effective_container_names():
         raise HTTPException(404, "unknown backend")
     from .diagnose import analyse
-    return {"failures": _plain(analyse(_logs_since_start(name)))}
+    failures = analyse(_logs_since_start(name))
+    # #1379: evidence is raw container output. It leaves through the same redaction as the log
+    # endpoint, after matching, so rule order and failure bookkeeping are unchanged.
+    for failure in failures:
+        failure.model = redact_log_line(failure.model)
+        failure.evidence = [redact_log_line(line) for line in failure.evidence]
+    return {"failures": _plain(failures)}
 
 
 # ---------- Hugging Face settings ----------
