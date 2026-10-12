@@ -14,7 +14,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
-from .storage_backoff import gate_for
+from .storage_backoff import StorageReply, gate_for
 from .util import ensure_not_redirect, make_client
 
 log = logging.getLogger(__name__)
@@ -183,30 +183,30 @@ class WebDAVCorpusBackend:
         try:
             tree = ET.fromstring(resp.text)
         except ET.ParseError as exc:
-            raise ValueError("Invalid WebDAV directory response") from exc
+            raise StorageReply("Invalid WebDAV directory response") from exc
         if tree.tag != '{DAV:}multistatus':
-            raise ValueError("Invalid WebDAV directory response")
+            raise StorageReply("Invalid WebDAV directory response")
         entries = []
         for response in tree.findall('{DAV:}response'):
             href = response.findtext('{DAV:}href')
             if not href:
-                raise ValueError("WebDAV directory response omitted a path")
+                raise StorageReply("WebDAV directory response omitted a path")
             href_path = unquote(urlparse(href).path)
             if not href_path.startswith(self.base_path):
-                raise ValueError("WebDAV directory response escaped its root")
+                raise StorageReply("WebDAV directory response escaped its root")
             path = href_path[len(self.base_path):].rstrip('/')
             if path == remote_dir.strip('/'):
                 continue
             parent = path.rsplit('/', 1)[0] if '/' in path else ''
             if parent != remote_dir.strip('/'):
-                raise ValueError("WebDAV directory response contained an unrelated path")
+                raise StorageReply("WebDAV directory response contained an unrelated path")
             props = None
             for propstat in response.findall('{DAV:}propstat'):
                 if ' 200 ' in (propstat.findtext('{DAV:}status') or ''):
                     props = propstat.find('{DAV:}prop')
                     break
             if props is None:
-                raise ValueError("WebDAV directory properties could not be read")
+                raise StorageReply("WebDAV directory properties could not be read")
             resource = props.find('{DAV:}resourcetype')
             entries.append({
                 'name': path.rsplit('/', 1)[-1], 'path': path,

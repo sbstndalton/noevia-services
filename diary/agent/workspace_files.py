@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import httpx
 from fastapi import HTTPException
 
-from .storage_backoff import StorageBackoff, StorageThrottled, StorageUpstreamError, as_response_error  # noqa: F401
+from .storage_backoff import StorageBackoff, StorageReply, StorageThrottled, StorageUpstreamError, as_response_error  # noqa: F401
 
 MAX_FILE = 512 * 1024
 MAX_TOTAL = 12 * 1024 * 1024
@@ -28,7 +28,7 @@ def storage_login_guard():
     touched here."""
     try:
         yield
-    except (httpx.HTTPError, StorageBackoff) as exc:
+    except (httpx.HTTPError, StorageBackoff, StorageReply) as exc:
         mapped = as_response_error(exc, StorageLoginRejected)
         if mapped is None:
             raise
