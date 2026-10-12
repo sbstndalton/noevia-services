@@ -61,7 +61,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import EngineUnreachable, LLMClient
+from .llm import EngineUnreachable, LLMClient, strip_reasoning
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .storage import create_backend
@@ -788,7 +788,8 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     else:
         reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7))
 
-    visible, marker = LLMClient.strip_log_marker(reply)
+    # #1505: inline reasoning is removed again here, so neither the saved entry nor the reply can carry it.
+    visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
     if marker is None:
         marker = "ok"  # model omitted the marker — default to logging (never lose content)
 
@@ -805,7 +806,9 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     del sess["turns"][:-32]
     if background:
         threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
-    return {"reply": visible, "reasoning": getattr(reply, "reasoning", ""), "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
+    # #1505: "reasoning" stays in the payload for older callers but is always empty: the companion's
+    # reasoning is never returned to the user.
+    return {"reply": visible, "reasoning": "", "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
 
 
 def _reindex_dirty(st: AppState) -> None:
