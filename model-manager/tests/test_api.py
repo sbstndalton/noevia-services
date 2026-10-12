@@ -297,6 +297,39 @@ def test_engine_log_lines_are_scrubbed_before_leaving_the_server(client, monkeyp
         assert api.redact_log_line(line) == line
 
 
+def test_diagnosis_evidence_leaves_through_the_same_redaction_as_the_log_endpoint(client, monkeypatch):
+    """#1379: diagnosis reads the same container output the log endpoint redacts, so its evidence
+    lines (recognised and fallback rules alike) must carry no credential-shaped text either."""
+    from app import api, services
+    # Synthetic only. The first failure has no recognised rule (fallback evidence); the second is
+    # recognised (gpu-memory) and its evidence line carries several credential shapes.
+    log = "\n".join([
+        "spawning server instance with name=synthetic-model on port 18001",
+        "[18001] failed request api_key=synthetic-secret-only",
+        "instance name=synthetic-model exited with status 1",
+        "spawning server instance with name=synthetic-gpu on port 18002",
+        "[18002] ggml: Device memory allocation of size 9000 failed Authorization: Bearer synthBearerTok123456 "
+        "url=https://synthuser:synthpass99@models.example/x hf_syntheticabcdefghijklmnop0123 "
+        "sk-syntheticabcdefghijklmnop ghp_syntheticabcdefghijklmnop0123 AKIASYNTHETIC0123456 "
+        "eyJsynthetichdr.eyJsyntheticpayload.synthsignaturepart password=synthetic-pw-7788",
+        "instance name=synthetic-gpu exited with status 1",
+    ])
+    monkeypatch.setattr(api, "_logs_since_start", lambda name: log)
+    monkeypatch.setattr(services, "_effective_container_names", lambda: ["cowork-llama-1"])
+    body = client.get("/api/v1/backends/cowork-llama-1/diagnose").json()
+    text = repr(body)
+    for secret in ("synthetic-secret-only", "synthBearerTok123456", "synthpass99", "syntheticabcdefghijklmnop0123",
+                   "sk-syntheticabcdefghijklmnop", "ghp_syntheticabcdefghijklmnop0123", "AKIASYNTHETIC0123456",
+                   "eyJsynthetichdr", "synthetic-pw-7788"):
+        assert secret not in text, secret
+    # Failure bookkeeping and rule ordering are unchanged: newest first, the fallback rule for the
+    # unrecognised one, gpu-memory for the other, both with their statuses.
+    failures = body["failures"]
+    assert [(f["model"], f["cause"], f["status"]) for f in failures] == [("synthetic-gpu", "gpu-memory", 1), ("synthetic-model", "unknown", 1)]
+    assert any("[redacted]" in e for e in failures[0]["evidence"])
+    assert api.redact_log_line("failed request api_key=synthetic-secret-only") in failures[1]["evidence"]
+
+
 def test_download_targets_are_limited_to_declared_folders_inside_models(client, monkeypatch):
     from app.config import settings
     (ROOT / "models" / "archive").mkdir(exist_ok=True)
