@@ -60,7 +60,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import LLMClient
+from .llm import EngineUnreachable, LLMClient
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .storage import create_backend
@@ -88,6 +88,7 @@ class AppState:
             timeout_s=float(cfg.get("llm.timeout_s", 300)),
             max_retries=int(cfg.get("llm.max_retries", 3)),
             embed_base_url=cfg.get("llm.embed_base_url") or "",
+            resolve_served_model=True,
         )
         self.llm_aux = LLMClient(
             base_url=cfg.get("llm.aux.base_url"),
@@ -96,6 +97,9 @@ class AppState:
             embed_model=cfg.get("llm.embed_model"),
             timeout_s=float(cfg.get("llm.timeout_s", 300)),
             max_retries=int(cfg.get("llm.max_retries", 3)),
+            resolve_served_model=True,
+            # Same engine: when the aux model is not served either, follow the chat model's choice.
+            prefer_model_from=self.llm_main if cfg.get("llm.aux.base_url") == cfg.get("llm.base_url") else None,
         )
         self.store = CorpusStore(cfg, self.backend, self.journal)
         self.retrieval = Retriever(Path(cfg.get("retrieval.db_path")), self.llm_main)
@@ -1294,6 +1298,21 @@ async def api_storage_import(request: Request):
     return await run_in_threadpool(perform)
 
 
+def _health_model() -> dict:
+    """The chat model the companion will actually use (noevia core's modelNotServed diagnosis reads
+    `model`), how that was decided, and the configured id. Never fails a liveness probe."""
+    configured = _base_cfg.get("llm.chat_model")
+    resolve = getattr(get_state().llm_main, "resolve_chat_model", None)
+    if resolve is None:
+        return {"model": configured, "model_configured": configured, "model_source": "configured"}
+    try:
+        model, source = resolve()
+    except Exception as exc:  # noqa: BLE001 - engine down or serves no chat model
+        return {"model": configured, "model_configured": configured,
+                "model_source": "unreachable" if isinstance(exc, EngineUnreachable) else "none_served"}
+    return {"model": model, "model_configured": configured, "model_source": source}
+
+
 @app.get("/api/health")
 def api_health(request: Request) -> JSONResponse:
     if not check_auth(request):
@@ -1311,9 +1330,9 @@ def api_health(request: Request) -> JSONResponse:
     )
     payload: dict = {
         "ok": True,
-        "model": _base_cfg.get("llm.chat_model"),
         "auth_required": bool(get_state().auth_token),
     }
+    payload.update(_health_model())
     if has_tenant:
         try:
             st = _tenant_state(request)

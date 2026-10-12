@@ -1,9 +1,24 @@
 """Request-local progress stream around the single journaled exchange."""
 import asyncio
 import json
+import logging
 import queue
 import threading
 from fastapi.responses import StreamingResponse
+
+log = logging.getLogger("diary.streaming")
+
+
+def describe_failure(exc):
+    """Exception types and an HTTP status only: provider bodies, request URLs, prompts and diary text
+    never reach the log (LLMError and httpx messages can carry them)."""
+    chain, seen = [], set()
+    while exc is not None and id(exc) not in seen and len(chain) < 4:
+        seen.add(id(exc))
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        chain.append(type(exc).__name__ + (f" status={status}" if status else ""))
+        exc = exc.__cause__ or exc.__context__
+    return " <- ".join(chain)
 
 
 def exchange_stream(work):
@@ -23,7 +38,8 @@ def exchange_stream(work):
             result = work(emit)
             emit({"type": "diary", **result})
             emit({"type": "done"})
-        except Exception:
+        except Exception as exc:
+            log.error("Diary exchange failed: %s", describe_failure(exc))
             # Never expose provider HTML, credentials or private prompt bodies.
             emit({"type": "error", "text": "Diary processing failed. Saving may be incomplete; check the saved entry before sending again."})
         finally:

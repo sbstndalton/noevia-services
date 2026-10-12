@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
 
 from .util import make_client
 
@@ -26,6 +29,39 @@ class LLMError(RuntimeError):
     pass
 
 
+# #1422 / #1065: the model the companion is configured for need not be an id the local engine
+# serves. The served list is read at call time and remembered this long.
+SERVED_TTL_S = 60.0
+_LIST_TIMEOUT_S = 3.0
+# Router launch flags that make a section something other than a chat model. Read from the router's
+# own per-model status (flags, never names).
+_NON_CHAT_FLAGS = frozenset({"--embedding", "--embeddings", "--reranking", "--rerank"})
+
+
+class EngineUnreachable(LLMError):
+    """The model engine could not be contacted at all (transport failure)."""
+
+
+def _served_entries(data: Any) -> List[Dict[str, Any]]:
+    """The router's /v1/models body as [{id, loaded, chat}]. A fixed single-model server has no
+    per-model `status`; it only answers once that model is loaded."""
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("unexpected model list shape")
+    out = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            continue
+        status = item.get("status")
+        args = status.get("args") if isinstance(status, dict) else None
+        out.append({
+            "id": item["id"],
+            "loaded": not isinstance(status, dict) or status.get("value") == "loaded",
+            "chat": not (isinstance(args, list) and _NON_CHAT_FLAGS.intersection(a for a in args if isinstance(a, str))),
+        })
+    return out
+
+
 class LLMClient:
     def __init__(
         self,
@@ -37,9 +73,18 @@ class LLMClient:
         max_retries: int = 3,
         retry_backoff_s: float = 2.0,
         embed_base_url: str = "",
+        resolve_served_model: bool = False,
+        prefer_model_from: Optional["LLMClient"] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.chat_model = chat_model
+        # Opt-in so a client built for a fixed endpoint behaves exactly as before. When on, every
+        # chat call uses a model the endpoint serves (see resolve_chat_model).
+        self.resolve_served_model = resolve_served_model
+        self._prefer_from = prefer_model_from
+        self._resolve_lock = threading.Lock()
+        self._resolved: Optional[Tuple[float, str, str]] = None  # (expires, model, source)
+        self._logged: Optional[Tuple[str, str]] = None
         self.embed_model = embed_model
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
@@ -56,6 +101,75 @@ class LLMClient:
             make_client(base_url=embed_base, timeout_s=timeout_s, headers={"Content-Type": "application/json"}, follow_redirects=True)
             if embed_base and embed_base != self.base_url else self._client
         )
+    # ---------------- served-model resolution ----------------
+
+    def _list_served(self) -> List[Dict[str, Any]]:
+        try:
+            resp = self._client.get("/models", timeout=_LIST_TIMEOUT_S)
+        except httpx.TransportError as exc:
+            raise EngineUnreachable(f"model engine unreachable ({type(exc).__name__})") from exc
+        resp.raise_for_status()
+        return _served_entries(resp.json())
+
+    def resolve_chat_model(self) -> Tuple[str, str]:
+        """(model id, source) to send as `model`; source is "configured" (the endpoint serves the
+        configured id), "fallback" (it does not, so another served id was chosen) or "unverified"
+        (the endpoint cannot list models, so the configured id is kept). The configured id when the endpoint serves it;
+        otherwise a model the endpoint does serve: the one this client's partner already resolved to
+        (aux follows chat), else the first loaded chat model, else the first listed chat model. The
+        answer is remembered for SERVED_TTL_S. An endpoint that cannot list models keeps the
+        configured id. Raises EngineUnreachable when the engine cannot be
+        contacted and LLMError when it serves no chat model. Never leaves the configured endpoint."""
+        if not self.resolve_served_model:
+            return self.chat_model, "configured"
+        with self._resolve_lock:
+            now = time.monotonic()
+            if self._resolved and self._resolved[0] > now:
+                return self._resolved[1], self._resolved[2]
+            try:
+                entries = self._list_served()
+            except EngineUnreachable:
+                self._resolved = None
+                log.error("Diary model engine could not be reached to list its models")
+                raise
+            except Exception as exc:  # noqa: BLE001 - endpoint without a usable model list
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                log.warning("model list unavailable (%s%s); using the configured model %r",
+                            type(exc).__name__, f" {status}" if status else "", self.chat_model)
+                model, source, why = self.chat_model, "unverified", "the endpoint did not list its models"
+            else:
+                model, source, why = self._choose(entries)
+            self._resolved = (now + SERVED_TTL_S, model, source)
+            if self._logged != (model, source):
+                self._logged = (model, source)
+                (log.info if source != "fallback" else log.warning)(
+                    "Diary chat model %r chosen (%s): %s; configured %r", model, source, why, self.chat_model)
+            return model, source
+
+    def _choose(self, entries: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        ids = {e["id"] for e in entries}
+        if self.chat_model in ids:
+            return self.chat_model, "configured", "the configured model is served"
+        chat = [e for e in entries if e["chat"]]
+        partner = ""
+        if self._prefer_from is not None and self._prefer_from is not self:
+            try:
+                partner = self._prefer_from.resolve_chat_model()[0]
+            except LLMError:
+                pass
+        if partner and any(e["id"] == partner for e in chat):
+            return partner, "fallback", "the configured model is not served; using the chat model's"
+        for e in chat:
+            if e["loaded"]:
+                return e["id"], "fallback", "the configured model is not served; using the first loaded model"
+        if chat:
+            return chat[0]["id"], "fallback", "the configured model is not served and none is loaded; using the first listed model"
+        raise LLMError("the model engine serves no chat model")
+
+    def invalidate_resolution(self) -> None:
+        with self._resolve_lock:
+            self._resolved = None
+
     # ---------------- shared retry plumbing ----------------
 
     def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse, client=None) -> Any:
@@ -89,7 +203,7 @@ class LLMClient:
         stop: Optional[List[str]] = None,
     ) -> str:
         payload: Dict[str, Any] = {
-            "model": model or self.chat_model,
+            "model": model or self.resolve_chat_model()[0],
             "messages": messages,
             "temperature": temperature,
             "stream": False,
@@ -107,16 +221,28 @@ class LLMClient:
             reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
             return ChatReply(content, reasoning if isinstance(reasoning, str) else "")
 
-        return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
+        try:
+            return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
+        except LLMError:
+            self.invalidate_resolution()  # the served list may have changed; look again next time
+            raise
 
     def chat_stream(self, messages, emit, temperature=0.7):
         """Stream real provider output once; retain log markers only for capture."""
-        payload = {"model": self.chat_model, "messages": messages,
+        try:
+            return self._chat_stream(messages, emit, temperature)
+        except Exception:
+            self.invalidate_resolution()  # the served list may have changed; look again next time
+            raise
+
+    def _chat_stream(self, messages, emit, temperature):
+        chat_model = self.resolve_chat_model()[0]
+        payload = {"model": chat_model, "messages": messages,
                    "temperature": temperature, "stream": True}
         def telemetry(data):
             timings = data.get("timings")
             if isinstance(timings, dict) and "draft_n" in timings and "draft_n_accepted" in timings:
-                emit({"type": "mtp", "model": data.get("model") or self.chat_model,
+                emit({"type": "mtp", "model": data.get("model") or chat_model,
                       "timings": {"draft_n": timings["draft_n"], "draft_n_accepted": timings["draft_n_accepted"]}})
         content, reasoning, sent = "", "", 0
         completed = False
