@@ -246,3 +246,98 @@ def test_streamed_failure_is_logged_with_types_and_status_only(caplog):
     assert any("LLMError" in m and "HTTPStatusError status=400" in m for m in messages)
     assert secret not in caplog.text and "router.invalid" not in caplog.text
     assert all(r.exc_info is None for r in caplog.records)
+
+
+# ---------------- the status contract noevia core's "nothing was saved" claim relies on ----------------
+
+
+def test_status_contract_pre_save_texts_and_saving_began_before_any_store_write():
+    """noevia-core server/diary-stream.cjs (PRE_SAVE_STATUSES, MODEL_STATUS) claims "nothing was saved"
+    when the companion fails after one of these statuses and before any other status. Any status text
+    NOT in that set counts as saving having begun, so the companion must (a) send those texts exactly,
+    and (b)/(c) send "Checking whether to save this exchange…" before it touches the store at all."""
+    from types import SimpleNamespace
+    import yaml
+    import agent.app as appmod
+    from pathlib import Path
+    from agent.pipeline import LoggingPipeline
+
+    # Copied verbatim from ~/noevia-work/w1422-core/server/diary-stream.cjs lines 13-16 (noevia-core):
+    # MODEL_STATUS and PRE_SAVE_STATUSES. Change both sides together.
+    core_model_status = "Generating companion response…"
+    core_pre_save = {"Opening diary context…", "Reading diary entries and memory…", core_model_status}
+    saving_began = "Checking whether to save this exchange…"  # pipeline.py log_exchange; NOT in core's set
+
+    timeline = []  # ("status", text) | ("store", method) | ("model", kind), in order
+
+    class RecordingStore:
+        def get_standing_sections_text(self, max_chars=0):
+            timeline.append(("store", "get_standing_sections_text"))
+            return ""
+
+        def update_standing_sections(self, *a, **k):
+            timeline.append(("store", "update_standing_sections"))
+            return None
+
+        def log_exchange(self, **k):
+            timeline.append(("store", "log_exchange"))
+            return "xid-synthetic"
+
+    class Main:
+        def chat_stream(self, messages, emit, temperature=0.7):
+            timeline.append(("model", "chat_stream"))
+            return llm_mod.ChatReply("A synthetic reply.\n\n[LOG: ok]")
+
+    class Aux:
+        def chat(self, messages, **k):
+            prompt = messages[-1]["content"]
+            timeline.append(("model", "aux"))
+            return "LOG" if "Verdict (LOG or SKIP)" in prompt else ("NO" if "UPDATE or NO" in prompt else "Synthetic prose.")
+
+    templates = yaml.safe_load((Path(appmod.__file__).resolve().parent.parent / "config" / "prompts" / "logging.md").read_text(encoding="utf-8"))
+    store = RecordingStore()
+    st = SimpleNamespace(
+        assembler=SimpleNamespace(build=lambda day, message, session_turns=None: [{"role": "user", "content": message}]),
+        llm_main=Main(),
+        pipeline=LoggingPipeline(store, Main(), Aux(), templates),
+        store=store,
+    )
+
+    def work(emit):
+        def record(event):
+            if event.get("type") == "status":
+                timeline.append(("status", event["text"]))
+            emit(event)
+        return appmod._run_exchange(st, "Synthetic message", "contract-test", "legacy", background=False, emit=record)
+
+    async def run():
+        return [c async for c in exchange_stream(work).body_iterator]
+
+    import unittest.mock as mock
+    with mock.patch.object(appmod, "_reindex_dirty", lambda s: timeline.append(("store", "reindex_dirty"))):
+        chunks = asyncio.run(run())
+    appmod.SESSIONS.pop("legacy:contract-test", None)
+
+    # What the browser/core actually receive over the wire.
+    wire = [json.loads(c[6:]) for c in chunks if c.startswith("data: ")]
+    wire_statuses = [e["text"] for e in wire if e["type"] == "status"]
+    assert wire[-1]["type"] == "done" and "diary" in [e["type"] for e in wire]
+
+    # (a) the pre-save texts are emitted exactly as core spells them, in order, before anything else.
+    assert wire_statuses[:3] == ["Opening diary context…", "Reading diary entries and memory…", core_model_status]
+    assert set(wire_statuses[:3]) == core_pre_save
+
+    # (b) the saving-began status follows the model status and is not one of core's pre-save texts.
+    assert saving_began not in core_pre_save
+    assert wire_statuses[3] == saving_began
+    assert all(t not in core_pre_save for t in wire_statuses[3:]), "every later status counts as saving to core"
+
+    # (c) no store access (reads included) happens between the pre-save statuses and "Checking whether
+    # to save", and no write of any kind precedes it. The real write is log_exchange, after it.
+    order = timeline
+    began = order.index(("status", saving_began))
+    before = order[:began]
+    assert [e for e in before if e[0] == "store" and e[1] in ("log_exchange", "update_standing_sections")] == []
+    assert ("store", "log_exchange") in order[began:]
+    assert order.index(("status", core_model_status)) < order.index(("model", "chat_stream"))
+    assert order.index(("model", "chat_stream")) < began
