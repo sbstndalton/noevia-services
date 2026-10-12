@@ -227,15 +227,16 @@ class LLMClient:
             self.invalidate_resolution()  # the served list may have changed; look again next time
             raise
 
-    def chat_stream(self, messages, emit, temperature=0.7):
-        """Stream real provider output once; retain log markers only for capture."""
+    def chat_stream(self, messages, emit, temperature=0.7, alive=None):
+        """Stream real provider output once; retain log markers only for capture. `alive`, when given,
+        is called on every line the provider sends (#1505: the exchange deadline counts it as progress)."""
         try:
-            return self._chat_stream(messages, emit, temperature)
+            return self._chat_stream(messages, emit, temperature, alive)
         except Exception:
             self.invalidate_resolution()  # the served list may have changed; look again next time
             raise
 
-    def _chat_stream(self, messages, emit, temperature):
+    def _chat_stream(self, messages, emit, temperature, alive=None):
         chat_model = self.resolve_chat_model()[0]
         payload = {"model": chat_model, "messages": messages,
                    "temperature": temperature, "stream": True}
@@ -250,6 +251,8 @@ class LLMClient:
             response.raise_for_status()
             if "text/event-stream" not in response.headers.get("content-type", ""):
                 data = json.loads(response.read())
+                if alive is not None:
+                    alive()
                 telemetry(data)
                 completed = True
                 message = data["choices"][0]["message"]
@@ -261,6 +264,8 @@ class LLMClient:
                     emit({"type": "reasoning", "text": reasoning})
             else:
                 for line in response.iter_lines():
+                    if alive is not None:
+                        alive()
                     if not line.startswith("data:"):
                         continue
                     raw = line[5:].strip()
