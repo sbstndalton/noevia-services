@@ -240,16 +240,33 @@ def test_sections_switch_routes_reads_to_the_native_binary(runtime_env):
 
 
 @pytest.mark.parametrize("env_update", [{"MODEL_MANAGER_SECTIONS_IMPL": "rust"},
-    {"MODEL_MANAGER_SECTIONS_IMPL": "maybe", "MODEL_MANAGER_IMPL": "rust"}])
+    {"MODEL_MANAGER_SECTIONS_IMPL": "maybe", "MODEL_MANAGER_IMPL": "rust"},
+    # An empty value (a compose line that expands to nothing) is not the default `python`: it is refused
+    # by name, in either manager mode, rather than guessed at.
+    {"MODEL_MANAGER_SECTIONS_IMPL": "", "MODEL_MANAGER_IMPL": "rust"},
+    {"MODEL_MANAGER_SECTIONS_IMPL": "", "MODEL_MANAGER_IMPL": "python"}])
 def test_sections_switch_refuses_before_python_spawn(runtime_env, env_update):
     # #1334: rust sections need the rust manager and a compiled native-sections capability; an
-    # unknown value is refused. Each refuses before the Python child is started.
+    # unknown or empty value is refused. Each refuses before the Python child is started.
     env, marker = runtime_env
     env.update(env_update)
     answer = subprocess.run([_binary("MODEL_MANAGER_BIN")], env=env, cwd=SERVICE,
                             capture_output=True, timeout=5)
     assert answer.returncode != 0
     assert not marker.exists()
+    if env_update["MODEL_MANAGER_SECTIONS_IMPL"] in ("", "maybe"):
+        assert b"MODEL_MANAGER_SECTIONS_IMPL must be python or rust" in answer.stderr
+
+
+def test_the_python_service_alone_ignores_the_sections_selector(monkeypatch):
+    # No Rust parent: only the parent's confirmation (=1) makes Python refuse section reads, so an empty or
+    # absent selector leaves the Python endpoint answering them (the default).
+    from fastapi.testclient import TestClient
+    from app.main import app
+    monkeypatch.setenv("MODEL_MANAGER_SECTIONS_IMPL", "")
+    monkeypatch.delenv("NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED", raising=False)
+    with TestClient(app) as client:
+        assert client.get("/api/v1/sections").status_code != 503
 
 
 @pytest.mark.parametrize("setting,value", [("MODEL_MANAGER_IMPL", "invalid"),
