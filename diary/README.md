@@ -32,6 +32,18 @@ python -m pytest -q
 
 Configuration defaults live in `config/config.yaml`. Environment variables override YAML values. Set an OpenAI-compatible endpoint and valid chat/embedding model IDs before starting a conversation.
 
+## Which model answers
+
+The chat and aux model ids (`LLM_CHAT_MODEL`, `LLM_AUX_MODEL`) must be ids the engine serves. The
+companion checks this at call time against the engine's `/v1/models` (remembered for 60 s): a
+served configured id is used; otherwise it uses the first loaded chat model (else the first listed
+one; sections launched with an embedding or reranking flag are never chosen), logs the choice once
+at WARNING with ids only, and never leaves the configured endpoint. An engine that cannot be reached
+is a logged `EngineUnreachable` error. `GET /api/health` reports `model` (the id in use),
+`model_configured` and `model_source` (`configured`, `fallback`, `unverified`, `unreachable` or
+`none_served`). The companion has no access to noevia's per-user Auto roles (they live in the web
+server's workspace), so the fallback does not consult them.
+
 ## API and safety
 
 - `GET /api/health`
