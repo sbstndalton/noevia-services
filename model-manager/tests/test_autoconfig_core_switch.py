@@ -155,11 +155,11 @@ def test_python_exceptions_still_raise_under_rust(tmp_path, monkeypatch):
     binary is never asked."""
     fake = _fake_bin(tmp_path, ECHO)
     b = _backends()
-    b[0].update(gpu_count=3, card_vram_gb=[12.0])     # fewer cards than GPUs: IndexError
-    with pytest.raises(IndexError):
+    b[0].update(gpu_count=3, card_vram_gb=["twelve"])  # a non-numeric card: TypeError in Python prep
+    with pytest.raises(TypeError):
         _analyze(backends=b, file_size=30 * 2**30)
     _use_rust(monkeypatch, fake)
-    with pytest.raises(IndexError):
+    with pytest.raises(TypeError):
         _analyze(backends=b, file_size=30 * 2**30)
     assert _calls(tmp_path) == []
 

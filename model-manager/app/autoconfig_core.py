@@ -358,7 +358,9 @@ def _split_feasible(layers: int, n_cpu_moe: int, attention_gb: float,
         return True
     idx, n = 0, len(costs)
     for card in range(gpu_count):
-        budget = caps[card] - (pinned_gb if card == 0 else 0.0)
+        # A card the sampler reported no capacity for holds nothing (#1140: never IndexError).
+        cap = caps[card] if card < len(caps) else 0.0
+        budget = cap - (pinned_gb if card == 0 else 0.0)
         took = 0
         while idx < n and costs[idx] <= budget:
             budget -= costs[idx]
@@ -803,7 +805,9 @@ def size_plan(req: dict[str, Any]) -> dict[str, Any]:
         # Per-card capacities for the single-device feasibility check below. Falls back to an
         # even division of the pool when the sampler has not reported individual cards.
         card_caps = [c - _RESERVE_PER_GPU for c in b["cards"]]
-        if gpu_count > 1 and not card_caps:
+        # A list that names fewer cards than GPUs (#1140) is unusable per card: same even division.
+        # A longer list keeps its first gpu_count entries, as it always has.
+        if gpu_count > 1 and len(card_caps) < gpu_count:
             card_caps = [(vram / gpu_count) - _RESERVE_PER_GPU] * gpu_count
         # The projector, compute buffer and cuBLAS workspace are not layer-split: they all
         # land on the main GPU, so device 0 starts with less room than its siblings.
