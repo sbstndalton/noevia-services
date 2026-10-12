@@ -279,6 +279,10 @@ class ManagedCorpusBackend:
                 settings = self.meta(db, 'settings', '{}')
                 snapshot_time = float(self.meta(db, 'snapshot_time', '0'))
             base = '/'.join(p.strip('/') for p in (storage.get('corpusRoot', ''), 'noevia-backups', self.tenant) if p)
+            # #1609: only a run that read and wrote the remote and verified what it wrote proves the saved
+            # storage login was accepted. Every other reply here (not due, already complete, lock busy,
+            # failed, abandoned) is a status that may never have left this host.
+            verified = False
             try:
                 safe_key(base)
                 manifest = {'format': 'noevia-diary-backup-v1', 'tenant': self.tenant, 'generation': generation,
@@ -312,6 +316,7 @@ class ManagedCorpusBackend:
                 self._create_verified(remote, base + '/manifests/' + digest(body) + '.json', body)
                 with self.db() as db:
                     db.execute('INSERT OR REPLACE INTO backups VALUES (?,?,?,0,0,NULL)', (destination, generation, time.time()))
+                verified = True
             except _SnapshotChanged:
                 # A save, move or delete landed mid-run. It also advanced the
                 # generation and pushed `due` out, so the run is simply
@@ -336,7 +341,8 @@ class ManagedCorpusBackend:
                                 previous['last_success'] if previous else None,
                                 now + min(300, 5 * 2 ** min(failures - 1, 6)), failures,
                                 'Backup could not be verified. Check the connection or remote conflict; app saves are retained.'))
-            return self.status(storage)
+            status = self.status(storage)
+            return {**status, 'storageContacted': True} if verified else status
 
     @staticmethod
     def _create_verified(remote, path, data):

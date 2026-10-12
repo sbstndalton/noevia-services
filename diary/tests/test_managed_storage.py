@@ -437,3 +437,47 @@ def test_an_aborted_backup_run_is_logged_without_paths_or_tenant(managed, tmp_pa
     with caplog.at_level(logging.WARNING, logger='agent.managed_storage'):
         assert managed.backup(remote, storage, now=time.time() + 20)['backup'] == 'complete'
     assert not [r for r in caplog.records if 'abandoned' in r.getMessage()]
+
+
+def test_only_a_verified_remote_run_reports_storage_contacted(managed, tmp_path, storage):
+    """#1609: the web app clears a storage login hold on a backup reply only when the reply says the remote was
+    reached. Every status the backup answers without a verified run must leave the flag out."""
+    remote = LocalCorpusBackend(str(tmp_path / 'remote'))
+    managed.put('a.md', b'one')
+    # No destination, a destination that is not due yet, and a lock held by another worker: nothing left this host.
+    assert 'storageContacted' not in managed.backup(remote, None, now=time.time() + 10)
+    assert 'storageContacted' not in managed.backup(remote, storage)
+    # A real run reads and writes the remote and verifies it.
+    done = managed.backup(remote, storage, now=time.time() + 10)
+    assert done['backup'] == 'complete' and done['storageContacted'] is True
+    assert managed.status(storage).get('storageContacted') is None
+    # Already complete for this generation: answered from the local record.
+    assert managed.backup(remote, storage, now=time.time() + 20) == managed.status(storage)
+    assert 'storageContacted' not in managed.backup(remote, storage, now=time.time() + 20)
+    # A run whose verification failed is a 200 status with an error, not proof of a working login.
+    managed.put('b.md', b'two')
+    class Offline:
+        def get(self, path):
+            raise OSError('unreachable')
+    failed = managed.backup(Offline(), storage, now=time.time() + 100)
+    assert failed['backup'] == 'failed' and 'storageContacted' not in failed
+
+
+def test_a_backup_abandoned_mid_run_does_not_report_storage_contacted(managed, tmp_path, storage):
+    """#1609: a save that lands before the next file is read abandons the run; no manifest is written and the
+    status is pending, which proves nothing about the saved login."""
+    remote = LocalCorpusBackend(str(tmp_path / 'remote'))
+    managed.put('a.md', b'one')
+    managed.put('b.md', b'two')
+    original = remote.put
+    edited = []
+    def put(path, data, **kwargs):
+        if '/objects/' in path and not edited:
+            _, v = managed.get('b.md')
+            managed.put('b.md', b'two v2', if_match=v)
+            edited.append(path)
+        return original(path, data, **kwargs)
+    remote.put = put
+    abandoned = managed.backup(remote, storage, now=time.time() + 10)
+    assert edited, 'the edit hook never ran'
+    assert abandoned['backup'] == 'pending' and 'storageContacted' not in abandoned
