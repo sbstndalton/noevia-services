@@ -124,3 +124,52 @@ def test_saved_entry_and_stream_carry_no_reasoning_from_a_real_exchange(monkeypa
     assert saved and "secret" not in json.dumps(saved, ensure_ascii=False, default=str)
     assert "secret" not in json.dumps(events, ensure_ascii=False)
     assert "secret" not in json.dumps(result, ensure_ascii=False)
+
+
+# ---- review follow-up (#1505): only leading reasoning is removed -----------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "Use the <think> tag to start a reasoning block.",
+    "Here is the snippet: <think>not reasoning</think> and more.",
+    "Answer first.\n<thinking>an aside the user asked for</thinking>",
+    "A lone <thi at the end is just text <thi",
+])
+def test_a_literal_think_tag_inside_a_reply_is_kept(text):
+    from agent.llm import strip_reasoning
+    assert strip_reasoning(text) == text
+    assert strip_reasoning(text, final=False) == text
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("<think>Synthetic secret</think>Visible answer.", "Visible answer."),
+    ("\n  <THINK>Synthetic secret</think>\n\nVisible answer.", "Visible answer."),
+    ("<think>one</think><thinking>two</thinking>Visible answer. <think>kept</think>", "Visible answer. <think>kept</think>"),
+    ("<think>Synthetic reasoning that never closes", ""),
+    ("<think>Visible-looking text after an opener</thin", ""),
+])
+def test_leading_reasoning_is_removed(text, expected):
+    from agent.llm import strip_reasoning
+    assert strip_reasoning(text) == expected
+
+
+def test_a_streamed_prefix_never_shrinks_whatever_the_chunking():
+    from agent.llm import strip_reasoning
+    for full in ["<think>Synthetic secret plan</think>Visible answer here.", "Use the <think> tag like so.",
+                 "  \n<thinking>plan</thinking>\nAnswer."]:
+        shown_before = ""
+        for end in range(len(full) + 1):
+            shown = strip_reasoning(full[:end], final=False)
+            assert shown.startswith(shown_before), (full[:end], shown_before, shown)
+            shown_before = shown
+
+
+def test_a_reply_that_mentions_the_tag_mid_text_is_streamed_whole():
+    chunks = [{"content": "You can write "}, {"content": "<think>"}, {"content": " yourself if you like.\n[LOG: ok]"}]
+    client = _client(lambda request: _sse(chunks))
+    events = []
+    reply = client.chat_stream([], events.append)
+    assert reply.startswith("You can write <think> yourself if you like.")
+    answer = [e for e in events if e["type"] == "answer"]
+    assert answer and answer[0]["text"] == "You can write <think> yourself if you like."
+    client.close()

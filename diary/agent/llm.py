@@ -15,26 +15,30 @@ from .util import make_client
 log = logging.getLogger(__name__)
 
 _LOG_MARKER_RE = re.compile(r"\n?\s*\[LOG:\s*(ok|skip)\s*\]\s*$")
-# #1505: a model that writes its reasoning inline. A complete block is removed; an opener with no
-# closer means the reasoning never ended, so everything after it is dropped too.
-_THINK_BLOCK_RE = re.compile(r"<(think|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
-_THINK_OPEN_RE = re.compile(r"<(think|thinking)>", re.IGNORECASE)
+# #1505: a model that writes its reasoning inline puts it FIRST: one or more complete leading blocks are
+# removed, and a leading opener with no closer means the reasoning never ended, so nothing follows it as an
+# answer. A literal "<think>" later in a reply (a question about the tag, a quoted snippet) is the user's
+# text and stays.
+_THINK_LEAD_BLOCK_RE = re.compile(r"\s*<(think|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+_THINK_LEAD_OPEN_RE = re.compile(r"\s*<(think|thinking)>", re.IGNORECASE)
 _THINK_OPENERS = ("<think>", "<thinking>")
 
 
 def strip_reasoning(text: str, final: bool = True) -> str:
-    """Visible text without a model's inline reasoning. With final=False (while streaming) a trailing
-    fragment that could still become an opener is held back too, so a streamed prefix never shrinks."""
-    text = _THINK_BLOCK_RE.sub("", text)
-    opened = _THINK_OPEN_RE.search(text)
-    if opened:
-        return text[:opened.start()]
+    """Visible text without a model's leading inline reasoning. With final=False (while streaming) the
+    text is held back while it could still turn into a leading opener (nothing but whitespace, or a
+    prefix of one), so a streamed prefix never shrinks."""
+    while True:
+        block = _THINK_LEAD_BLOCK_RE.match(text)
+        if not block:
+            break
+        text = text[block.end():]
+    if _THINK_LEAD_OPEN_RE.match(text):
+        return ""
     if not final:
-        lowered = text.lower()
-        for size in range(min(len(text), len("<thinking>") - 1), 0, -1):
-            tail = lowered[-size:]
-            if any(opener.startswith(tail) for opener in _THINK_OPENERS):
-                return text[:-size]
+        head = text.lstrip().lower()
+        if not head or (len(head) < len("<thinking>") and any(opener.startswith(head) for opener in _THINK_OPENERS)):
+            return ""
     return text
 
 

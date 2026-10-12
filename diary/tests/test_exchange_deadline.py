@@ -225,3 +225,104 @@ def test_a_stalled_companion_answer_ends_before_any_save_and_says_so_to_the_stre
     statuses = [e["text"] for e in events if e.get("type") == "status"]
     assert statuses[-1] == "Generating companion response…", "the failure must come before the saving-began status"
     assert not any("Checking whether to save" in s for s in statuses)
+
+
+# ---- review follow-up (#1505) ---------------------------------------------------------------------------
+
+
+def test_an_abandoned_call_stops_at_its_next_sign_of_life():
+    dl = _dl()
+    release, ended = threading.Event(), threading.Event()
+    progress = []
+
+    def call(gate, alive):
+        try:
+            alive()
+            release.wait(5)
+            for i in range(50):  # the provider keeps sending lines after we gave up
+                alive()
+                progress.append(i)
+            return "late"
+        finally:
+            ended.set()
+
+    budget = dl.ExchangeBudget(total_s=0.3, first_token_s=0.2)
+    with pytest.raises(dl.ExchangeTimeout):
+        budget.run(call)
+    release.set()
+    assert ended.wait(2), "the abandoned call must end"
+    assert progress == [], "alive() raised before the call read another line"
+
+
+def _stalled_local_exchange(monkeypatch, fast, stream):
+    import agent.app as appmod
+    from fastapi.testclient import TestClient
+    release = threading.Event()
+    strip_marker = appmod.LLMClient.strip_log_marker
+
+    class LLM:
+        strip_log_marker = staticmethod(strip_marker)
+
+        def __init__(self, **kwargs):
+            pass
+
+        def chat(self, *args, **kwargs):
+            release.wait(5)
+            return "late"
+
+        def chat_stream(self, messages, emit, **kwargs):
+            release.wait(5)
+            return "late"
+
+        def embed(self, *args, **kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(appmod, "LLMClient", LLM)
+    monkeypatch.setattr(appmod, "check_auth", lambda r: True)
+    monkeypatch.setattr(appmod, "_tenant_state", lambda r: pytest.fail("local mode must not resolve remote storage"))
+    client = TestClient(appmod.app)
+    try:
+        return client.post("/api/local-exchange", headers={"X-Cowork-User-ID": "11111111-1111-4111-8111-111111111111"},
+                           json={"stream": stream, "files": {}, "message": "A quiet day.", "history": []})
+    finally:
+        release.set()
+
+
+def test_a_stalled_non_streamed_local_exchange_is_a_coded_not_saved_failure_not_a_500(monkeypatch, fast):
+    r = _stalled_local_exchange(monkeypatch, fast, stream=False)
+    assert r.status_code == 503, r.text
+    body = r.json()
+    assert body["code"] == "modelFailed" and body["saved"] is False
+    assert "nothing was saved" in body["error"]
+    assert "Saving may be incomplete" not in r.text
+
+
+def test_a_stalled_streamed_local_exchange_says_nothing_was_saved(monkeypatch, fast):
+    r = _stalled_local_exchange(monkeypatch, fast, stream=True)
+    assert r.status_code == 200
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "modelFailed" and error["saved"] is False
+    assert "nothing was saved" in error["text"] and "incomplete" not in error["text"].lower()
+
+
+def test_a_failure_after_a_save_began_keeps_the_may_be_incomplete_wording():
+    import asyncio
+    from agent.deadline import ExchangeTimeout
+    from agent.streaming import exchange_stream
+
+    def wire(exc):
+        def work(emit):
+            raise exc
+
+        async def run():
+            return "".join([c async for c in exchange_stream(work).body_iterator])
+        return asyncio.run(run())
+
+    for exc in (RuntimeError("synthetic failure while saving"), ExchangeTimeout("a timeout nobody marked as pre-save")):
+        out = wire(exc)
+        assert "Saving may be incomplete" in out
+        assert '"saved"' not in out

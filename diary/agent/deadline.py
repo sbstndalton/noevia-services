@@ -26,7 +26,12 @@ AUX_STEP_DEADLINE_S = 60.0
 
 
 class ExchangeTimeout(RuntimeError):
-    """The exchange passed its deadline; the call was abandoned rather than waited for."""
+    """The exchange passed its deadline; the call was abandoned rather than waited for.
+
+    `nothing_saved` is set by the caller that knows no save had begun when it was raised (the
+    companion's answer always precedes the save), so the user can be told nothing was written."""
+
+    nothing_saved = False
 
 
 class _Abandoned(BaseException):
@@ -56,6 +61,10 @@ class ExchangeBudget:
         box = {}
 
         def alive():
+            # An abandoned call that is still reading the provider stops at its next sign of life,
+            # the same way an abandoned emit does, instead of streaming to the end unobserved.
+            if abandoned.is_set():
+                raise _Abandoned()
             started.set()
 
         def gate(event):

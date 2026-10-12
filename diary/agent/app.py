@@ -46,13 +46,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
-from .streaming import exchange_stream
+from .streaming import MODEL_TIMEOUT_TEXT, exchange_stream
 from pydantic import BaseModel
 
 from . import corpus as fmt
 from .config import load_config
 from .context import ContextAssembler, completed_exchanges
-from .deadline import ExchangeBudget
+from .deadline import ExchangeBudget, ExchangeTimeout
 from .corpus_store import MONTH_ID_RE, CorpusError, CorpusStore, EditConflict
 from .external_sources import (
     external_source_paths,
@@ -783,10 +783,15 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     budget = ExchangeBudget()
     if emit:
         emit({"type": "status", "text": "Generating companion response…"})
-        reply = budget.run(lambda gate, alive: st.llm_main.chat_stream(messages, gate, temperature=0.7, alive=alive),
-                           emit=emit, first_token=True)
-    else:
-        reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7))
+    try:
+        if emit:
+            reply = budget.run(lambda gate, alive: st.llm_main.chat_stream(messages, gate, temperature=0.7, alive=alive),
+                               emit=emit, first_token=True)
+        else:
+            reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7))
+    except ExchangeTimeout as exc:
+        exc.nothing_saved = True  # the answer comes first; no save has begun
+        raise
 
     # #1505: inline reasoning is removed again here, so neither the saved entry nor the reply can carry it.
     visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
@@ -1600,4 +1605,13 @@ def local_exchange(body: dict, request: Request):
             _close_state(st)
             with _tenant_lock:
                 SESSIONS.pop(f"{tenant_id}:{sid}", None)
-    return exchange_stream(work) if body.get("stream") is True else work()
+    if body.get("stream") is True:
+        return exchange_stream(work)
+    try:
+        return work()
+    except ExchangeTimeout as exc:
+        # #1505: a stalled model is a coded failure the caller can act on, not a bare 500.
+        if not exc.nothing_saved:
+            raise
+        return JSONResponse({"error": MODEL_TIMEOUT_TEXT, "detail": MODEL_TIMEOUT_TEXT, "code": "modelFailed", "saved": False},
+                            status_code=503)

@@ -6,7 +6,14 @@ import queue
 import threading
 from fastapi.responses import StreamingResponse
 
+from .deadline import ExchangeTimeout
+
 log = logging.getLogger("diary.streaming")
+
+# #1505: the companion's answer comes before any save, so a deadline passing while it was still
+# generating means nothing was written. The code is the one noevia core and web already map for a
+# model failure that saved nothing (saved:false keeps them from rewording or restoring it as unknown).
+MODEL_TIMEOUT_TEXT = "The local model did not answer in time — nothing was saved. You can resend."
 
 
 def describe_failure(exc):
@@ -41,6 +48,12 @@ def exchange_stream(work):
             result = work(emit)
             emit({"type": "diary", **result})
             emit({"type": "done"})
+        except ExchangeTimeout as exc:
+            log.error("Diary exchange failed: %s", describe_failure(exc))
+            if exc.nothing_saved:
+                emit({"type": "error", "code": "modelFailed", "saved": False, "text": MODEL_TIMEOUT_TEXT})
+            else:
+                emit({"type": "error", "text": "Diary processing failed. Saving may be incomplete; check the saved entry before sending again."})
         except Exception as exc:
             log.error("Diary exchange failed: %s", describe_failure(exc))
             # Never expose provider HTML, credentials or private prompt bodies.
