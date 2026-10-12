@@ -47,6 +47,30 @@ def _uri_encode(value: str) -> str:
     return quote(value, safe="-_.~")
 
 
+# ECMAScript String.prototype.trim() strips exactly these (WhiteSpace and LineTerminator). core signs
+# with it, so a header value is trimmed the same way here (#1094). Python's str.strip() differs: it
+# also strips U+0085 and the C0 separators, and it leaves U+FEFF alone.
+_JS_TRIM_CHARS = (
+    "\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
+
+def js_trim(value: str) -> str:
+    return value.strip(_JS_TRIM_CHARS)
+
+
+def canonical_query(query: Optional[dict]) -> str:
+    """The SigV4 canonical query string. Pairs are ordered by key, then value, in UTF-16 code units,
+    which is the order core's JS sort gives (#1094); Python's code-point order differs only for
+    astral keys against U+E000-U+FFFF, and core never sends those, but the rule is now the same."""
+    def order(item):
+        key, value = item
+        return (key.encode("utf-16-be", "surrogatepass"), str(value).encode("utf-16-be", "surrogatepass"))
+
+    return "&".join(f"{_uri_encode(k)}={_uri_encode(str(v))}" for k, v in sorted((query or {}).items(), key=order))
+
+
 class S3CorpusBackend:
     def __init__(
         self,
@@ -60,8 +84,16 @@ class S3CorpusBackend:
         session_token: str = "",
     ):
         parsed = urlparse(endpoint_url if "://" in endpoint_url else f"https://{endpoint_url}")
+        if "@" in parsed.netloc:
+            # httpx would drop the userinfo from the request, and SigV4 does not cover it, so a
+            # credential in the URL could never be signed for. Refuse, and never echo the URL (#1094).
+            raise ValueError("S3 endpoint_url must not contain credentials; use access_key and secret_key")
         self.scheme = parsed.scheme or "https"
-        self.host = parsed.netloc
+        # The Host value the client sends (lower case, IDNA, default port dropped). SigV4 must cover
+        # exactly that value; signing the raw netloc made every non-canonical endpoint fail (#1094).
+        self.host = httpx.URL(f"{self.scheme}://{parsed.netloc}").netloc.decode("ascii")
+        if not self.host:
+            raise ValueError("S3 endpoint_url has no host")
         self.base = f"{self.scheme}://{self.host}"
         self.bucket = bucket.strip("/")
         self.prefix = prefix.strip("/")
@@ -116,13 +148,10 @@ class S3CorpusBackend:
         for k, v in (extra or {}).items():
             headers[k.lower()] = str(v)
 
-        canonical_headers = "".join(f"{k}:{headers[k].strip()}\n" for k in sorted(headers))
+        canonical_headers = "".join(f"{k}:{js_trim(headers[k])}\n" for k in sorted(headers))
         signed_headers = ";".join(sorted(headers))
 
-        canonical_query = "&".join(
-            f"{_uri_encode(k)}={_uri_encode(str(v))}" for k, v in sorted((query or {}).items())
-        )
-        canonical_request = "\n".join([method, path, canonical_query, canonical_headers, signed_headers, payload_hash])
+        canonical_request = "\n".join([method, path, canonical_query(query), canonical_headers, signed_headers, payload_hash])
 
         scope = f"{datestamp}/{self.region}/s3/aws4_request"
         string_to_sign = "\n".join([
