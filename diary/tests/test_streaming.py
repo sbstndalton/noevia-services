@@ -22,7 +22,8 @@ def test_provider_reasoning_is_emitted_before_answer_and_marker_is_not_shown():
     client._client=httpx.Client(base_url='http://synthetic/v1',transport=httpx.MockTransport(provider))
     events=[]
     result=client.chat_stream([],events.append)
-    assert events[0] == {'type':'reasoning','text':'Synthetic live thinking'}
+    assert not any(e['type']=='reasoning' for e in events)  # #1505: provider reasoning is never streamed
+    assert all('Synthetic live thinking' not in str(e) for e in events)
     assert any(e['type']=='delta' for e in events)
     assert events[-1]['type']=='answer'
     assert all('[LOG:' not in e.get('text','') for e in events)
@@ -47,7 +48,7 @@ def test_exchange_progress_is_available_while_work_is_blocked():
     calls=[]
     def work(emit):
         calls.append('once')
-        emit({'type':'reasoning','text':'Synthetic live thought'})
+        emit({'type':'status','text':'Synthetic live thought'})
         assert release.wait(5)
         emit({'type':'answer','text':'Synthetic answer'})
         return {'reply':'Synthetic answer','decision':'skipped'}
@@ -90,7 +91,7 @@ def test_v1_stream_keeps_tenant_and_one_exchange(monkeypatch):
     assert 'text/event-stream' in r.headers['content-type']
     assert calls==['Synthetic message']
     events=[json.loads(line[6:]) for line in r.text.splitlines() if line.startswith('data: ')]
-    assert [e['type'] for e in events]==['status','status','reasoning','answer','diary','done']
+    assert [e['type'] for e in events]==['status','status','answer','diary','done']  # #1505: the reasoning event is dropped
     appmod.SESSIONS.pop(f'{tenant}:stream-test',None)
 
 

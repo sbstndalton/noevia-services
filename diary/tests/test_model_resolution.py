@@ -284,7 +284,7 @@ def test_status_contract_pre_save_texts_and_saving_began_before_any_store_write(
             return "xid-synthetic"
 
     class Main:
-        def chat_stream(self, messages, emit, temperature=0.7):
+        def chat_stream(self, messages, emit, temperature=0.7, alive=None):  # alive: #1505 deadline progress hook
             timeline.append(("model", "chat_stream"))
             return llm_mod.ChatReply("A synthetic reply.\n\n[LOG: ok]")
 

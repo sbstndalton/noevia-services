@@ -26,6 +26,9 @@ def exchange_stream(work):
     closed = threading.Event()
 
     def emit(event):
+        # #1505: a model's reasoning is never shown to the user, whatever produced it.
+        if isinstance(event, dict) and event.get("type") == "reasoning":
+            return
         while not closed.is_set():
             try:
                 events.put(event, timeout=0.1)

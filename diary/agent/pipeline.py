@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
+from . import deadline as _deadline
 from .corpus_store import CorpusStore
+from .deadline import ExchangeBudget
 from .llm import LLMClient
 
 log = logging.getLogger(__name__)
@@ -40,26 +42,33 @@ class LoggingPipeline:
 
     # ---------------- LLM template calls (aux server) ----------------
 
-    def _aux_call(self, template_key: str, system_prompt: str, **fields) -> str:
+    def _aux_call(self, template_key: str, system_prompt: str, budget: Optional[ExchangeBudget] = None, **fields) -> str:
         prompt = self.templates[template_key].format(**fields)
-        return self.llm_aux.chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=2048,
-            stop=None,
-        )
+
+        def call(gate, alive):  # aux calls are not streamed; the budget only bounds the wait (#1505)
+            return self.llm_aux.chat(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=2048,
+                stop=None,
+            )
+
+        if budget is None:
+            return call(None, None)
+        return budget.run(call, cap=_deadline.AUX_STEP_DEADLINE_S)
 
     # ---------------- steps ----------------
 
-    def classify(self, user_message: str, assistant_message: str) -> bool:
+    def classify(self, user_message: str, assistant_message: str, budget: Optional[ExchangeBudget] = None) -> bool:
         """True => log, False => skip."""
         try:
             verdict = self._aux_call(
                 "skip_classifier",
                 THINKING_MODEL_HINT,
+                budget=budget,
                 user_message=user_message,
                 assistant_message=assistant_message,
             )
@@ -76,9 +85,9 @@ class LoggingPipeline:
         first_token = tokens[0].strip(".,:;!").upper() if tokens else ""
         return first_token != "SKIP"
 
-    def summarize(self, assistant_message: str) -> str:
+    def summarize(self, assistant_message: str, budget: Optional[ExchangeBudget] = None) -> str:
         try:
-            out = self._aux_call("summarizer", THINKING_MODEL_HINT, assistant_message=assistant_message)
+            out = self._aux_call("summarizer", THINKING_MODEL_HINT, budget=budget, assistant_message=assistant_message)
             prose = out.strip()
             if prose.startswith('"') and prose.endswith('"') and len(prose) >= 2:
                 prose = prose[1:-1].strip()
@@ -87,7 +96,7 @@ class LoggingPipeline:
             log.error("summarizer failed (%s); logging verbatim assistant reply", exc)
             return assistant_message.strip()
 
-    def maintain_index(self, user_message: str, assistant_summary: str, today: str) -> bool:
+    def maintain_index(self, user_message: str, assistant_summary: str, today: str, budget: Optional[ExchangeBudget] = None) -> bool:
         """Gate then edit INDEX.md standing sections. Returns True if INDEX.md changed."""
         if not getattr(self.store, "index_enabled", True):
             return False  # corpus runs without an INDEX.md — skip the gate call entirely
@@ -98,6 +107,7 @@ class LoggingPipeline:
             gate = self._aux_call(
                 "index_maintenance",
                 THINKING_MODEL_HINT,
+                budget=budget,
                 user_message=user_message,
                 assistant_summary=assistant_summary,
                 current_sections=current_sections,
@@ -107,6 +117,7 @@ class LoggingPipeline:
             raw = self._aux_call(
                 "index_edit",
                 THINKING_MODEL_HINT,
+                budget=budget,
                 user_message=user_message,
                 assistant_summary=assistant_summary,
                 current_sections=current_sections,
@@ -131,18 +142,23 @@ class LoggingPipeline:
         now: Optional[datetime] = None,
         day: Optional[date] = None,
         progress=None,
+        budget: Optional[ExchangeBudget] = None,
     ) -> LogOutcome:
         now = now or datetime.now()
         day = day or now.date()
+        # #1505: the classifier and summary share the exchange's deadline; each falls back when it
+        # runs out, so a stuck aux call can delay the save but never hold it open.
+        if budget is None:
+            budget = ExchangeBudget()
 
         if progress:
             progress({"type": "status", "text": "Checking whether to save this exchange…"})
-        if not self.classify(user_message, assistant_message):
+        if not self.classify(user_message, assistant_message, budget=budget):
             return LogOutcome(decision="skipped", xid=None, reason="meta/administrative or non-substantive")
 
         if progress:
             progress({"type": "status", "text": "Summarizing the saved diary entry…"})
-        summary = self.summarize(assistant_message)
+        summary = self.summarize(assistant_message, budget=budget)
         if progress:
             progress({"type": "status", "text": "Saving diary entry…"})
         try:
@@ -160,7 +176,9 @@ class LoggingPipeline:
         # Standing sections: opportunistic; failures never affect the logged exchange.
         if progress:
             progress({"type": "status", "text": "Checking diary memory updates…"})
-        self.maintain_index(user_message, summary, day.isoformat())
+        # After the save, index upkeep gets its own short budget: a slow exchange must not skip it,
+        # and it can never hold the reply open for longer than one aux step.
+        self.maintain_index(user_message, summary, day.isoformat(), budget=ExchangeBudget(total_s=_deadline.AUX_STEP_DEADLINE_S))
         return LogOutcome(decision="logged", xid=xid, reason="")
 
 

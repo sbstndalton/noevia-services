@@ -96,7 +96,9 @@ def test_local_exchange_uses_memory_only_and_selected_date(monkeypatch, stream):
         assert [e['type'] for e in events].index('answer') < next(i for i,e in enumerate(events) if e.get('text')=='Saving diary entry…')
         assert events[-1]['type']=='done'
     assert value['decision'] == 'logged'
-    assert value['reasoning'] == 'Synthetic provider reasoning'
+    assert value['reasoning'] == ''  # #1505: reasoning is never returned to the user
+    if stream:
+        assert all('Synthetic provider reasoning' not in json.dumps(e) for e in events)
     changed = value['files']
     assert all('Synthetic provider reasoning' not in text for text in changed.values())
     assert changed
