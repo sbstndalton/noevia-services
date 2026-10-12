@@ -51,7 +51,7 @@ from pydantic import BaseModel
 
 from . import corpus as fmt
 from .config import load_config
-from .context import ContextAssembler
+from .context import ContextAssembler, completed_exchanges
 from .corpus_store import MONTH_ID_RE, CorpusError, CorpusStore, EditConflict
 from .external_sources import (
     external_source_paths,
@@ -753,6 +753,17 @@ def optional_reference(body: dict) -> str:
     return value[:12000] if body.get("extrasEnabled") is True and isinstance(value, str) else ""
 
 
+def _replayable_history(messages) -> list:
+    """#1505: the client's earlier turns that may be shown to the model: answered exchanges only,
+    the most recent 16 messages' worth, starting on a question."""
+    raw = [{"role": m["role"], "content": m["content"]} for m in messages
+           if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
+    pairs = completed_exchanges(raw)[-16:]
+    if pairs and pairs[0]["role"] != "user":
+        pairs = pairs[1:]
+    return pairs
+
+
 def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy", entry_time=None, entry_day=None, background=True, extra_context="", emit=None) -> dict:
     """One full exchange: context build -> main model -> strip marker -> log -> return payload."""
     if emit:
@@ -776,10 +787,13 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
 
     outcome = st.pipeline.log_exchange(user_message=message, assistant_message=visible, now=now, day=day, **({"progress": emit} if emit else {}))
 
-    sess["turns"].extend([
-        {"role": "user", "content": message},
-        {"role": "companion", "content": visible},
-    ])
+    # #1505: remember only an answered exchange that was saved (or deliberately skipped by the
+    # classifier). A failed save was never written, so the model must not be shown it as history.
+    if outcome.decision in ("logged", "skipped"):
+        sess["turns"].extend([
+            {"role": "user", "content": message},
+            {"role": "companion", "content": visible},
+        ])
 
     del sess["turns"][:-32]
     if background:
@@ -1367,12 +1381,14 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return JSONResponse({"error": {"message": "invalid request body", "type": "invalid_request_error"}}, status_code=400)
     messages_in = body.get("messages") or []
-    user_msgs = [m.get("content", "") for m in messages_in if isinstance(m, dict) and m.get("role") == "user"]
-    if not user_msgs or not str(user_msgs[-1]).strip():
+    # #1505: the new message is the LAST user turn, whatever follows it in the client's thread; the
+    # history it may be answered with is everything before it.
+    last_at = max((i for i, m in enumerate(messages_in) if isinstance(m, dict) and m.get("role") == "user"), default=None)
+    last_content = messages_in[last_at].get("content", "") if last_at is not None else ""
+    if last_at is None or not str(last_content).strip():
         return JSONResponse({"error": {"message": "no user message", "type": "invalid_request_error"}}, status_code=400)
-    last = str(user_msgs[-1]).strip()
-    prior = [{"role": m["role"], "content": m["content"]} for m in messages_in[:-1]
-             if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)][-16:]
+    last = str(last_content).strip()
+    prior = _replayable_history(messages_in[:last_at])
 
     session_id = str(body.get("session_id") or "openai-client")
     tenant_id = request.headers.get("X-Cowork-User-ID", "legacy")
@@ -1560,9 +1576,9 @@ def local_exchange(body: dict, request: Request):
         sid = secrets.token_hex(16)
         try:
             sess = _session(sid, tenant_id)
-            sess["turns"] = [{"role": m["role"], "content": m["content"][:32000]}
-                             for m in body.get("history", [])[-16:]
-                             if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
+            # #1505: the same rule as the /v1 path: answered exchanges only.
+            sess["turns"] = _replayable_history([{"role": m.get("role"), "content": m.get("content", "")[:32000]}
+                                                 for m in body.get("history", [])[-16:] if isinstance(m, dict) and isinstance(m.get("content"), str)])
             # Local context is bounded and selected without durable indexing.
             st.assembler.local_reference = reference_text(backend.files, message)
             result = _run_exchange(st, message, sid, tenant_id, now, day, False, optional_reference(body), emit)
