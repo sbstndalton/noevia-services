@@ -49,6 +49,12 @@ class StorageThrottled(Exception):
         super().__init__(throttled_message(self.retry_after))
 
 
+class StorageReply(ValueError):
+    """Storage answered 2xx, but not with a usable reply (a listing that does not parse, a path outside
+    its root). A ValueError for the callers that already catch one; the storage-only routes answer it
+    as a storage failure (502, retryable), never as an unhandled 500 (#1519)."""
+
+
 class StorageUpstreamError(Exception):
     """Storage answered 5xx or could not be reached. Answered with 502."""
 
@@ -188,6 +194,8 @@ def classify(exc: BaseException):
     that only talks to storage."""
     if isinstance(exc, StorageBackoff):
         return exc.kind, exc.retry_after
+    if isinstance(exc, StorageReply):
+        return "upstream", None
     if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
         code = exc.response.status_code
         if code in (401, 403):
