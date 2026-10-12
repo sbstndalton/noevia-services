@@ -48,6 +48,12 @@ MAX_PER_LAYER_KEPT = 4096
 # Numbers kept in whole per-layer arrays across one header. Past it, a block_count-length array
 # falls back to sample + count: a hostile header of many such arrays stays cheap.
 MAX_PER_LAYER_VALUES = 64 * MAX_PER_LAYER_KEPT
+# #1197: the tensor-info block after the KV pairs. ggml allows at most GGML_MAX_DIMS (4) dimensions
+# and a real model has thousands of tensors; past these the count is not read (no number is shown).
+MAX_TENSOR_COUNT = 100_000
+MAX_TENSOR_DIMS = 4
+MAX_TENSOR_ELEMENTS = (1 << 64) - 1  # the whole count must fit in an unsigned 64-bit value
+MAX_TENSOR_DIM = (1 << 53) - 1  # a dimension past this is refused by the JS and Rust readers too
 _NUMERIC_TYPES = frozenset(
     (_UINT8, _INT8, _UINT16, _INT16, _UINT32, _INT32, _FLOAT32, _UINT64, _INT64, _FLOAT64)
 )
@@ -200,6 +206,33 @@ def _read_value(src: _Source, vtype: int, depth: int = 0, per_layer: int | None 
     raise GgufMetaError(f"unknown value type {vtype}")
 
 
+def _tensor_params(src: _Source, count: int) -> int:
+    """The parameter count: the element counts of the tensor-info block, summed. Each entry is a
+    name (string), n_dimensions (u32), that many dimensions (u64), a ggml type (u32) and a data
+    offset (u64); the weights themselves are never read. A 0-dimension entry is one element."""
+    if count > MAX_TENSOR_COUNT:
+        raise GgufMetaError(f"implausible tensor_count {count}")
+    total = 0
+    for _ in range(count):
+        _skip_string(src)
+        dims = src.unpack("<I", 4)
+        if dims > MAX_TENSOR_DIMS:
+            raise GgufMetaError(f"tensor declares {dims} dimensions")
+        elements = 1
+        for _ in range(dims):
+            dim = src.unpack("<Q", 8)
+            if dim > MAX_TENSOR_DIM:
+                raise GgufMetaError("tensor dimension out of range")
+            elements *= dim
+            if elements > MAX_TENSOR_ELEMENTS:
+                raise GgufMetaError("tensor element count overflows")
+        total += elements
+        if total > MAX_TENSOR_ELEMENTS:
+            raise GgufMetaError("parameter count overflows")
+        src.skip(4 + 8)  # ggml type, data offset
+    return total
+
+
 def _read_raw_stream(f) -> dict[str, Any]:
     """Parse GGUF metadata from any seekable binary stream.
 
@@ -234,6 +267,12 @@ def _read_raw_stream(f) -> dict[str, Any]:
         out["_error"] = f"stopped at KV read: {e or type(e).__name__}"
     if src.ran_out and "_error" not in out:
         out["_error"] = "stopped at KV read: array runs past the end of the data"
+    if "_error" not in out and tensor_count:
+        # #1197: read after the KV pairs only when they were read whole. A cut-off block leaves no count.
+        try:
+            out["_tensor_params"] = _tensor_params(src, tensor_count)
+        except (GgufMetaError, struct.error, OSError, OverflowError, MemoryError) as e:
+            out["_tensor_params_error"] = f"tensor info block: {e or type(e).__name__}"
     return out
 
 
@@ -402,6 +441,18 @@ def summarize(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _param_count(raw: dict[str, Any]) -> Any:
+    """general.parameter_count when the header declares a usable one (as before #1197); else the
+    element count of its tensor-info block (#1197), or None when that block was not read whole."""
+    declared = raw.get("general.parameter_count")
+    if isinstance(declared, (int, float)) and not isinstance(declared, bool) and _fmt_params(declared):
+        return declared
+    counted = raw.get("_tensor_params")
+    if isinstance(counted, int) and counted > 0:
+        return counted
+    return declared
+
+
 def _summarize(raw: dict[str, Any]) -> dict[str, Any]:
     arch = raw.get("general.architecture", "") or ""
 
@@ -427,8 +478,8 @@ def _summarize(raw: dict[str, Any]) -> dict[str, Any]:
             "url": raw.get("general.url"),
             "quant": quant_name,
             "quant_version": raw.get("general.quantization_version"),
-            "params": _fmt_params(raw.get("general.parameter_count")),
-            "params_raw": raw.get("general.parameter_count"),
+            "params": _fmt_params(_param_count(raw)),
+            "params_raw": _param_count(raw),
             "gguf_version": raw.get("_gguf_version"),
             "tensor_count": raw.get("_tensor_count"),
             "kv_count": raw.get("_kv_count"),
