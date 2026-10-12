@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import io
+import logging
 import os
 import re
 import shlex
@@ -411,6 +412,8 @@ def to_cli(name: str, items: list[tuple[str, str]]) -> str:
     for k, v in items:
         if k == "model":
             continue  # already emitted
+        if k == "role":
+            continue  # #1179: a noevia marker for system sections, not an engine option
         val = str(v).strip()
         low = val.lower()
         # Whether a key is a bare flag is a property of the KEY, not of its value. Deciding it
@@ -700,13 +703,35 @@ def _is_non_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
     return bool(re.search(r"embed|rerank", name, re.I))
 
 
+# #1179: the explicit marker for a system routing section. Names and paths are not a role.
+LAYA_ROLE = "laya"
+_name_rule_logged: set[str] = set()
+_log = logging.getLogger(__name__)
+
+
+def _section_role(cp: configparser.ConfigParser, name: str) -> str:
+    """The section's explicit `role` key, lower-cased; '' when it has none (or is the defaults section)."""
+    if name == "*" or not cp.has_section(name):
+        return ""
+    return cp.get(name, "role", fallback="").strip().lower()
+
+
 def _is_laya_section(cp: configparser.ConfigParser, name: str) -> bool:
-    """A system routing (Laya) section: named laya*, or pointing at a laya* path. Laya runs as its
-    own service and loads its own model, so llama.cpp tuning does not apply to it (noevia#1163)."""
+    """A system routing (Laya) section: `role = laya`. Laya runs as its own service and loads its own
+    model, so llama.cpp tuning does not apply to it (noevia#1163). A section with no role key falls back
+    to the old name/path rule (laya*, or a laya* model path); that fallback is deprecated and logged once
+    per section, so the key can be added to it (#1179)."""
     if name == "*" or not cp.has_section(name):
         return False
+    role = _section_role(cp, name)
+    if role:
+        return role == LAYA_ROLE
     model = cp.get(name, "model", fallback=cp.get(name, "m", fallback=""))
-    return any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
+    matched = any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
+    if matched and name not in _name_rule_logged:
+        _name_rule_logged.add(name)
+        _log.warning("models.ini [%s] is treated as Laya by the deprecated name/path rule; add 'role = laya' to it (#1179)", name)
+    return matched
 
 
 def is_laya_section(name: str) -> bool:
