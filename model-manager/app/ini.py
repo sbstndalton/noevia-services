@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import io
+import json
 import logging
 import os
 import re
@@ -412,8 +413,6 @@ def to_cli(name: str, items: list[tuple[str, str]]) -> str:
     for k, v in items:
         if k == "model":
             continue  # already emitted
-        if k == "role":
-            continue  # #1179: a noevia marker for system sections, not an engine option
         val = str(v).strip()
         low = val.lower()
         # Whether a key is a bare flag is a property of the KEY, not of its value. Deciding it
@@ -703,24 +702,83 @@ def _is_non_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
     return bool(re.search(r"embed|rerank", name, re.I))
 
 
-# #1179: the explicit marker for a system routing section. Names and paths are not a role.
+# #1179 / #1596: the explicit marker for a system routing section. Names and paths are not a role.
+# llama-server reads models.ini too and its preset loader throws on a key it does not know, so the
+# marker is NOT a key in models.ini: it is noevia's own `models.roles.json` beside it, a JSON object
+# of section id -> role (e.g. {"laya_multilingual_f16": "laya"}). Nothing here writes it for the
+# operator; models.ini only ever holds keys llama.cpp accepts.
 LAYA_ROLE = "laya"
+ROLES_FILENAME = "models.roles.json"
 _name_rule_logged: set[str] = set()
+_roles_bad_logged: set[str] = set()
 _log = logging.getLogger(__name__)
 
 
+def roles_path():
+    return settings.models_ini_path.with_name(ROLES_FILENAME)
+
+
+def read_roles() -> dict[str, str]:
+    """Section id -> lower-cased role from the roles file; {} when it is missing or unusable
+    (an unreadable file is logged once and never stops a models.ini read)."""
+    path = roles_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        _roles_bad(path, str(exc))
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        _roles_bad(path, f"not valid JSON ({exc})")
+        return {}
+    if not isinstance(data, dict):
+        _roles_bad(path, "not a JSON object of section id to role")
+        return {}
+    return {str(k): v.strip().lower() for k, v in data.items() if isinstance(v, str) and v.strip()}
+
+
+def _roles_bad(path, why: str) -> None:
+    if str(path) not in _roles_bad_logged:
+        _roles_bad_logged.add(str(path))
+        _log.warning("%s is ignored: %s (#1596)", path, why)
+
+
+def _write_roles(roles: dict[str, str]) -> None:
+    path = roles_path()
+    if not roles:
+        path.unlink(missing_ok=True)
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(roles, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _forget_role(name: str, new_name: str | None = None) -> None:
+    """A deleted section's role is dropped; a renamed one's moves with it."""
+    roles = read_roles()
+    if name not in roles:
+        return
+    role = roles.pop(name)
+    if new_name:
+        roles[new_name] = role
+    _write_roles(roles)
+
+
 def _section_role(cp: configparser.ConfigParser, name: str) -> str:
-    """The section's explicit `role` key, lower-cased; '' when it has none (or is the defaults section)."""
+    """The section's explicit role from the roles file, lower-cased; '' when it has none (or is the defaults section)."""
     if name == "*" or not cp.has_section(name):
         return ""
-    return cp.get(name, "role", fallback="").strip().lower()
+    return read_roles().get(name, "")
 
 
 def _is_laya_section(cp: configparser.ConfigParser, name: str) -> bool:
-    """A system routing (Laya) section: `role = laya`. Laya runs as its own service and loads its own
-    model, so llama.cpp tuning does not apply to it (noevia#1163). A section with no role key falls back
-    to the old name/path rule (laya*, or a laya* model path); that fallback is deprecated and logged once
-    per section, so the key can be added to it (#1179)."""
+    """A system routing (Laya) section: `"<id>": "laya"` in models.roles.json. Laya runs as its own service
+    and loads its own model, so llama.cpp tuning does not apply to it (noevia#1163). A section with no role
+    falls back to the old name/path rule (laya*, or a laya* model path); that fallback is deprecated and
+    logged once per section, so the role can be added to it (#1179)."""
     if name == "*" or not cp.has_section(name):
         return False
     role = _section_role(cp, name)
@@ -730,7 +788,10 @@ def _is_laya_section(cp: configparser.ConfigParser, name: str) -> bool:
     matched = any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
     if matched and name not in _name_rule_logged:
         _name_rule_logged.add(name)
-        _log.warning("models.ini [%s] is treated as Laya by the deprecated name/path rule; add 'role = laya' to it (#1179)", name)
+        _log.warning(
+            "models.ini [%s] is treated as Laya by the deprecated name/path rule; mark it in %s "
+            '(\'{"%s": "laya"}\'), not in models.ini, which llama.cpp also reads (#1179, #1596)',
+            name, ROLES_FILENAME, name)
     return matched
 
 
@@ -816,6 +877,7 @@ def _delete_section(name: str) -> bool:
         return False
     cp.remove_section(name)
     _atomic_write(cp)
+    _forget_role(name)
     return True
 
 
@@ -835,6 +897,7 @@ def _rename_section(old: str, new: str) -> bool:
     if renamed is not None:
         with WRITE_LOCK:
             _replace_file(settings.models_ini_path, renamed)
+        _forget_role(old, new)
         return True
     items = list(cp.items(old))
     cp.remove_section(old)
@@ -842,6 +905,7 @@ def _rename_section(old: str, new: str) -> bool:
     for k, v in items:
         cp.set(new, k, v)
     _atomic_write(cp)
+    _forget_role(old, new)
     return True
 
 
