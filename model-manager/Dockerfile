@@ -38,6 +38,9 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
 
 FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
+# #1334: native section reads stay off by default (python answers them); rust needs MODEL_MANAGER_IMPL=rust
+# too and is refused otherwise. Compose must pass ${MODEL_MANAGER_SECTIONS_IMPL:-python}, never an empty value.
+ENV MODEL_MANAGER_SECTIONS_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt

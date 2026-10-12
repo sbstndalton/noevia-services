@@ -12,6 +12,8 @@
 
 The image includes `noevia-model-manager` with `native-logs` compiled and uses it as the entrypoint. `MODEL_MANAGER_IMPL` defaults to `python`, which execs the existing uvicorn command on port8090. Selecting `rust` gives native ownership to GET `/api/v1/health` and GET `/api/v1/backends/{name}/logs`; the binary supervises the existing Python app on private loopback8091 for explicitly allowed unported routes. Missing features, invalid configuration and failed native handlers refuse without Python fallback. The supervised Python child independently refuses native-owned paths after authentication.
 
+`MODEL_MANAGER_SECTIONS_IMPL` (#1334) defaults to `python` (the image sets it explicitly). Selecting `rust` requires `MODEL_MANAGER_IMPL=rust` and the compiled `native-sections` capability; the parent then answers GET `/api/v1/sections` and GET `/api/v1/sections/{name}` itself, after the token check, and the Python child is started with `NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED=1` and refuses those reads with 503. Native section reads are Linux-only (noevia-rs `sections/access.rs`), so on any other platform `rust` refuses at startup. Every other value refuses before anything is spawned. This source change does not flip the selector in any deployment.
+
 Unported business startup (DB initialization, sampler, orphan handling and optional INI migration) remains Python-owned. Prompt seeding follows the selector and writer handoff below. Other endpoints, including model writes, loading, downloads, benchmarks and autoconfiguration, remain Python-owned. This source integration does not activate a deployed selector or complete umbrella #1318.
 
 ### Prompt writer handoff (#1356)

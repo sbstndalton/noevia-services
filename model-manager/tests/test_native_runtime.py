@@ -79,7 +79,7 @@ from app import main, services
 main.hw.start_sampler = lambda: None
 services._docker_client = lambda: None
 services.container_logs = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Python must not own logs"))
-Path(os.environ["S1_RUNTIME_CHILD"]).write_text(json.dumps({"confirmed": os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED"), "argv": sys.argv[1:]}))
+Path(os.environ["S1_RUNTIME_CHILD"]).write_text(json.dumps({"confirmed": os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED"), "sections": os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED"), "argv": sys.argv[1:]}))
 import uvicorn
 uvicorn.run(main.app, host=sys.argv[3], port=int(sys.argv[5]), log_level="error")
 ''')
@@ -176,7 +176,7 @@ def test_default_binary_execs_actual_python_and_clears_confirmation(runtime_env)
         assert _wait("/api/v1/health", process)[1] == {"ok": True}
         assert _request("/api/v1/sections")[0] == 200
         child = json.loads(marker.read_text())
-        assert child == {"confirmed": None, "argv": ["app.main:app", "--host", "0.0.0.0", "--port", "8090"]}
+        assert child == {"confirmed": None, "sections": None, "argv": ["app.main:app", "--host", "0.0.0.0", "--port", "8090"]}
 
 
 def test_native_runtime_owns_logs_and_supervises_actual_python(runtime_env):
@@ -186,7 +186,7 @@ def test_native_runtime_owns_logs_and_supervises_actual_python(runtime_env):
         with _process(_binary("MODEL_MANAGER_BIN"), env) as process:
             assert _wait("/api/v1/sections", process)[0] == 200
             child = json.loads(marker.read_text())
-            assert child == {"confirmed": "1", "argv": ["app.main:app", "--host", "127.0.0.1", "--port", "8091"]}
+            assert child == {"confirmed": "1", "sections": "0", "argv": ["app.main:app", "--host", "127.0.0.1", "--port", "8091"]}
             assert _request("/api/v1/health", token=None) == (200, {"ok": True})
             assert calls == []
             assert _request("/api/v1/backends/synthetic-engine/logs", token=None)[0] == 401
@@ -209,6 +209,47 @@ def test_native_runtime_owns_logs_and_supervises_actual_python(runtime_env):
         with socket.socket() as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", 8091))
+
+
+def test_sections_switch_default_keeps_reads_with_python(runtime_env):
+    # #1334: MODEL_MANAGER_SECTIONS_IMPL defaults to python; the rust parent still supervises a child that
+    # is not told the sections are native, so the Python endpoint answers them.
+    env, marker = runtime_env
+    env["MODEL_MANAGER_IMPL"] = "rust"
+    with _docker_peer(Path(env["DOCKER_HOST"].removeprefix("unix://"))):
+        with _process(_binary("MODEL_MANAGER_BIN"), env) as process:
+            assert _wait("/api/v1/sections", process)[0] == 200
+            child = json.loads(marker.read_text())
+            assert child["sections"] == "0"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native section reads are Linux-only (noevia-rs sections/access.rs)")
+def test_sections_switch_routes_reads_to_the_native_binary(runtime_env):
+    # #1334: MODEL_MANAGER_SECTIONS_IMPL=rust answers GET /api/v1/sections natively and the Python child
+    # refuses those reads (confirmation 1), after authentication as before.
+    env, marker = runtime_env
+    env.update(MODEL_MANAGER_IMPL="rust", MODEL_MANAGER_SECTIONS_IMPL="rust")
+    with _docker_peer(Path(env["DOCKER_HOST"].removeprefix("unix://"))):
+        with _process(_binary("MODEL_MANAGER_BIN"), env) as process:
+            assert _wait("/api/v1/sections", process)[0] == 200
+            child = json.loads(marker.read_text())
+            assert child["sections"] == "1"
+            assert _request("/api/v1/sections", port=8091)[0] == 503
+            assert _request("/api/v1/sections/tiny", port=8091)[0] == 503
+            assert _request("/api/v1/sections", token=None)[0] == 401
+
+
+@pytest.mark.parametrize("env_update", [{"MODEL_MANAGER_SECTIONS_IMPL": "rust"},
+    {"MODEL_MANAGER_SECTIONS_IMPL": "maybe", "MODEL_MANAGER_IMPL": "rust"}])
+def test_sections_switch_refuses_before_python_spawn(runtime_env, env_update):
+    # #1334: rust sections need the rust manager and a compiled native-sections capability; an
+    # unknown value is refused. Each refuses before the Python child is started.
+    env, marker = runtime_env
+    env.update(env_update)
+    answer = subprocess.run([_binary("MODEL_MANAGER_BIN")], env=env, cwd=SERVICE,
+                            capture_output=True, timeout=5)
+    assert answer.returncode != 0
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("setting,value", [("MODEL_MANAGER_IMPL", "invalid"),
