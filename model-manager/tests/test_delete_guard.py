@@ -54,6 +54,14 @@ def test_embedding_model_env_blocks_delete_but_default_placeholder_does_not(clie
     assert services.model_holders(_tiny(), [{"name": "web", "Config": {"Env": ["EMBEDDING_MODEL=default"]}}]) == []
 
 
+def test_reindex_and_diary_embedding_models_block_delete(client):
+    # #1636: a re-index target (web or Diary) and the Diary's own embedding model are in use too.
+    for key in ("EMBEDDING_NEXT_MODEL", "LLM_EMBED_MODEL", "LLM_EMBED_NEXT_MODEL"):
+        holder = {"name": "c", "Config": {"Env": [f"{key}=tiny"]}}
+        assert services.model_holders(_tiny(), [holder]) == [f"c ({key} is set to tiny)"]
+    assert services.model_holders(_tiny(), [{"name": "c", "Config": {"Env": ["LLM_EMBED_MODEL=default"]}}]) == []
+
+
 def test_rerank_model_only_counts_while_the_reranker_feature_is_on(client):
     off = {"name": "web", "Config": {"Env": ["RERANK_MODEL=tiny"]}}
     on = {"name": "web", "Config": {"Env": ["RERANK_MODEL=tiny", "NOEVIA_FEATURE_RAG_RERANK=true"]}}

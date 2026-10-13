@@ -64,6 +64,8 @@ from .journal import Journal
 from .llm import EngineUnreachable, LLMClient, strip_reasoning
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
+from . import embedding as embedding_mod
+from .embedding_migration import EmbeddingMigration
 from .storage import create_backend
 from .dedicated_storage import StorageUnavailable, tenant_volume
 from .managed_storage import ManagedCorpusBackend
@@ -103,7 +105,9 @@ class AppState:
             prefer_model_from=self.llm_main if cfg.get("llm.aux.base_url") == cfg.get("llm.base_url") else None,
         )
         self.store = CorpusStore(cfg, self.backend, self.journal)
-        self.retrieval = Retriever(Path(cfg.get("retrieval.db_path")), self.llm_main)
+        # #1636: the service's one embedding configuration (shared by every tenant state).
+        self.retrieval = Retriever(Path(cfg.get("retrieval.db_path")), self.llm_main,
+                                   embedding=embedding_mod.view_for(cfg, self.llm_main))
         self.assembler = ContextAssembler(self.store, self.retrieval, cfg)
         templates_path = Path(__file__).resolve().parent.parent / "config" / "prompts" / "logging.md"
         templates = yaml.safe_load(templates_path.read_text(encoding="utf-8"))
@@ -141,6 +145,12 @@ MAX_STORAGE_HEADER_LEN = 4096
 _TENANT_STATE_CAP = 128
 _TENANT_STATE_TTL_S = 24 * 60 * 60
 _base_cfg = load_config()
+# #1636: one embedding configuration for the whole service, saved beside the service index (not
+# per tenant): tenant configs are copies of this one and inherit the path.
+if not _base_cfg.get("retrieval.embedding_state_path"):
+    _db = str(_base_cfg.get("retrieval.db_path") or "")
+    _set_cfg_early = _base_cfg.as_dict().setdefault("retrieval", {})
+    _set_cfg_early["embedding_state_path"] = str((Path(_db).parent if _db and _db != ":memory:" else Path(".")) / "embedding-config.json")
 
 # Tombstone of deleted tenant ids, protected by _tenant_lock.
 # DELETE /api/internal/tenant rmtree's the tenant root; without this, a
@@ -597,13 +607,40 @@ def _evict_tenant_states_locked() -> list:
     return evicted
 
 
+# ---------------- embedding re-index (#1636) ----------------
+
+_embedding_migration: Optional[EmbeddingMigration] = None
+_embedding_migration_lock = threading.Lock()
+
+
+def _tenant_deleted(user_id: str) -> bool:
+    with _tenant_lock:
+        return _tenant_recently_deleted_locked(user_id)
+
+
+def embedding_migration() -> EmbeddingMigration:
+    """The service's one re-index driver (agent/embedding_migration.py)."""
+    global _embedding_migration
+    with _embedding_migration_lock:
+        if _embedding_migration is None:
+            _embedding_migration = EmbeddingMigration(
+                embedding_mod.shared_for(_base_cfg), Path(_base_cfg.get("retrieval.db_path")),
+                duty=_base_cfg.get("retrieval.reindex_duty"), skip_user=_tenant_deleted)
+        return _embedding_migration
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     st = get_state()
     enforce_open_mode_policy(st.auth_token)
     # Replay is tenant-scoped in _tenant_state. Never replay the retired global
     # corpus after a tenant has explicitly moved into app storage.
+    # #1636: a re-index configured at start (LLM_EMBED_NEXT_*, or saved) resumes in the background.
+    if embedding_mod.shared_for(_base_cfg).config.next() is not None:
+        embedding_migration().kick()
     yield
+    if _embedding_migration is not None:
+        _embedding_migration.stop()
     st.backend.close()
     st.llm_main.close()
     st.llm_aux.close()
@@ -643,6 +680,64 @@ def check_auth(request: Request) -> bool:
         return True
     supplied = _client_token(request)
     return bool(supplied) and secrets.compare_digest(supplied, st.auth_token)
+
+
+_EMBEDDING_ACTIONS = ("set-next", "clear-next", "switch", "rollback", "finish")
+
+
+def _embedding_guard(request: Request, mutating: bool) -> Optional[JSONResponse]:
+    """Service-wide and web-only: the service token, and never a tenant (#1636)."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if mutating and not get_state().auth_token:
+        # Open (LAN-only) mode has no caller identity at all: refuse changes, fail closed.
+        return JSONResponse({"error": "set DIARY_AUTH_TOKEN to change the embedding model"}, status_code=403)
+    if request.headers.get("X-Cowork-User-ID"):
+        return JSONResponse({"error": "service-wide endpoint: no tenant"}, status_code=400)
+    return None
+
+
+@app.get("/api/internal/embedding")
+async def embedding_status(request: Request) -> JSONResponse:
+    refused = _embedding_guard(request, mutating=False)
+    if refused is not None:
+        return refused
+    return JSONResponse(await run_in_threadpool(lambda: embedding_migration().status()))
+
+
+@app.post("/api/internal/embedding")
+async def embedding_action(request: Request) -> JSONResponse:
+    refused = _embedding_guard(request, mutating=True)
+    if refused is not None:
+        return refused
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict) or body.get("action") not in _EMBEDDING_ACTIONS:
+        return JSONResponse({"error": f"action must be one of {', '.join(_EMBEDDING_ACTIONS)}"}, status_code=400)
+    action, mig = body["action"], embedding_migration()
+
+    def run():
+        if action == "set-next":
+            return mig.set_next(body.get("target"))
+        if action == "clear-next":
+            return mig.clear_next()
+        if action == "switch":
+            return mig.switch(force=body.get("force") is True)
+        if action == "rollback":
+            return mig.rollback()
+        return mig.finish()
+
+    try:
+        result = await run_in_threadpool(run)
+    except embedding_mod.EmbeddingConfigError as exc:
+        payload = {"error": str(exc), "code": exc.code}
+        if getattr(exc, "coverage", None) is not None:
+            payload["coverage"] = exc.coverage
+        return JSONResponse(payload, status_code=exc.status)
+    log.info("embedding %s: active %s/%s", action, result["active"]["profile"], result["active"]["model"])
+    return JSONResponse(result)
 
 
 @app.delete("/api/internal/tenant")
