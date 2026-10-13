@@ -15,7 +15,9 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const CAP: usize = 16_384;
 const OUTPUT_CAP: u64 = 65_536;
 const REFUSAL_TMPFS: &str = "/tmp:rw,exec,size=16777216,mode=1777";
-const SERVER_HASH: &str = "fa9965aa8d2606699e0cb1a4c16a71106e7fd0762b54e30656dfd224a17383e3";
+// Re-pinned for sbstndalton/noevia#1074 (late-answer guards in Runtime.decide); the
+// previous pin was services commit 4f3cf816225d4ed12db33fd8e4a7e2d7ae946a4b.
+const SERVER_HASH: &str = "858f39094eb66e99d582a47e62fd4ff380408e0278db592e40e0cd828f30c76d";
 const ENGINE_DOCKER_HASH: &str = "3e63e74b0265b9a524d601a1ad1222335122a4988671c1a22924574d7d20d964";
 // Fixed ML collaborators: the actual retained server remains the policy/IPC
 // oracle. No case generation, HTTP client or test assertions run in Python.
