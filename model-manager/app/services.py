@@ -266,7 +266,9 @@ class ModelInUse(Exception):
     """A model file is referenced by a running container; deleting it would break that container."""
 
 
-_MODEL_ENV_KEYS = ("EMBEDDING_MODEL", "EMBED_MODEL", "RERANK_MODEL")
+# #1636: also the Diary's embedding model and, while a re-index is under way (or kept for rollback),
+# the next model of web (EMBEDDING_NEXT_MODEL) and of the Diary (LLM_EMBED_NEXT_MODEL).
+_MODEL_ENV_KEYS = ("EMBEDDING_MODEL", "EMBED_MODEL", "EMBEDDING_NEXT_MODEL", "LLM_EMBED_MODEL", "LLM_EMBED_NEXT_MODEL", "RERANK_MODEL")
 
 
 def _running_containers() -> list[dict]:
@@ -320,9 +322,10 @@ def model_holders(entry: "GgufEntry", containers: list[dict] | None = None) -> l
       1. a command-line argument naming one of the model's files (the embed sidecar runs
          `--model /models/<file>`), matched by models-dir-relative path so a different mount
          point in the other container still counts;
-      2. EMBEDDING_MODEL / EMBED_MODEL / RERANK_MODEL in the container's environment naming this
-         model ("default" is a placeholder; RERANK_MODEL only counts while the reranker feature
-         is on, matching the web-side guard).
+      2. EMBEDDING_MODEL / EMBED_MODEL / EMBEDDING_NEXT_MODEL / LLM_EMBED_MODEL /
+         LLM_EMBED_NEXT_MODEL / RERANK_MODEL in the container's environment naming this model
+         ("default" is a placeholder; RERANK_MODEL only counts while the reranker feature is on,
+         matching the web-side guard).
     """
     root = settings.models_dir
     rels: set[str] = set()

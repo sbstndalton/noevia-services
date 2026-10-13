@@ -44,6 +44,29 @@ is a logged `EngineUnreachable` error. `GET /api/health` reports `model` (the id
 `none_served`). The companion has no access to noevia's per-user Auto roles (they live in the web
 server's workspace), so the fallback does not consult them.
 
+## Embedding model and re-indexing (#1636)
+
+Retrieval embeds each `###` subsection with the configured embedding model. `LLM_EMBED_MODEL` and
+`LLM_EMBED_BASE_URL` name it (empty base URL: the chat engine); `LLM_EMBED_PROFILE` says how text is
+framed for it: `nomic-v1` (default, text sent unchanged, as always) or `embeddinggemma-2` (the model
+card's prompts: `task: search result | query: …` for searches, `title: none | text: …` for stored
+subsections). Vectors from different models are kept apart in the same index file
+(`agent/vector_slots.py`) and never compared.
+
+Changing the model is a re-index, never an edit of the settings alone (`agent/embedding_migration.py`):
+`POST /api/internal/embedding` (service token only, no tenant header; web's `/api/embedding` calls it)
+with `set-next` and a target builds the new model's vectors for every tenant's index in the
+background, from the text already in each index, while search keeps using the current model;
+`switch` makes it active once it covers at least what the current model covers; `rollback` returns to
+the previous model, whose vectors are kept until `finish`. `LLM_EMBED_NEXT_MODEL`,
+`LLM_EMBED_NEXT_BASE_URL` and `LLM_EMBED_NEXT_PROFILE` start a re-index from the environment.
+An embeddings address from the environment (`LLM_EMBED_BASE_URL`, `LLM_EMBED_NEXT_BASE_URL`) must be on this
+network: it is checked at start-up and a public one is logged and not used. A name that does not resolve is
+retried for about 30 s, then held back and re-checked every minute.
+`EMBEDDING_REINDEX_DUTY` (default 0.5) caps how much of the time the background pass keeps the
+embeddings server busy. Runtime changes are saved to `embedding-config.json` beside the service index
+and win over the environment until that file is deleted.
+
 ## API and safety
 
 - `GET /api/health`

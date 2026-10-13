@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from .util import make_client
+from .util import ensure_not_redirect, make_client
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +52,10 @@ class ChatReply(str):
 
 class LLMError(RuntimeError):
     pass
+
+
+class _Redirected(LLMError):
+    """An embeddings server answered with a redirect; never retried."""
 
 
 # #1422 / #1065: the model the companion is configured for need not be an id the local engine
@@ -122,9 +126,13 @@ class LLMClient:
         # the one-model inference engine to swap its chat model out. Like web's EMBEDDING_BASE_URL,
         # the inference credential is not sent there.
         embed_base = (embed_base_url or "").rstrip("/")
+        # Embedding calls never follow a redirect, on either path: the administrator can point them at
+        # another address at runtime (embedding_migration), and a 307/308 would carry the Diary's text
+        # wherever it says. The chat client above stays as it was.
         self._embed_client = (
-            make_client(base_url=embed_base, timeout_s=timeout_s, headers={"Content-Type": "application/json"}, follow_redirects=True)
-            if embed_base and embed_base != self.base_url else self._client
+            make_client(base_url=embed_base, timeout_s=timeout_s, headers={"Content-Type": "application/json"}, follow_redirects=False)
+            if embed_base and embed_base != self.base_url
+            else make_client(base_url=self.base_url, timeout_s=timeout_s, headers=headers, follow_redirects=False)
         )
     # ---------------- served-model resolution ----------------
 
@@ -197,7 +205,8 @@ class LLMClient:
 
     # ---------------- shared retry plumbing ----------------
 
-    def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse, client=None) -> Any:
+    def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse, client=None,
+                           refuse_redirect: bool = False) -> Any:
         """POST with bounded retries; `parse` validates the response body and
         returns the result. Shared by chat() and embed(), which previously
         duplicated the retry loop (including its bug of sleeping after the
@@ -206,8 +215,15 @@ class LLMClient:
         for attempt in range(self.max_retries):
             try:
                 resp = (client or self._client).post(path, json=payload)
+                if refuse_redirect:
+                    try:
+                        ensure_not_redirect(resp)  # raise_for_status() counts a 3xx as success
+                    except RuntimeError as redirected:
+                        raise _Redirected(f"{describe} server redirected (HTTP {resp.status_code}); redirects are refused") from redirected
                 resp.raise_for_status()
                 return parse(resp.json())
+            except _Redirected:
+                raise  # not retried: the answer would be the same, and each try would send the text again
             except Exception as exc:  # noqa: BLE001 - retry any transport/parse failure
                 last_exc = exc
                 if attempt == self.max_retries - 1:
@@ -362,9 +378,9 @@ class LLMClient:
             "embeddings",
             parse_embed,
             client=self._embed_client,
+            refuse_redirect=True,
         )
 
     def close(self) -> None:
-        if self._embed_client is not self._client:
-            self._embed_client.close()
+        self._embed_client.close()
         self._client.close()

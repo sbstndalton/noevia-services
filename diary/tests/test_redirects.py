@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 import pytest
 
-from agent.llm import LLMClient
+from agent.llm import LLMClient, LLMError
 from agent.s3_storage import S3CorpusBackend
 from agent.util import ensure_not_redirect, make_client
 from agent.webdav import WebDAVCorpusBackend
@@ -76,10 +76,103 @@ def test_s3_corpus_backend_refuses_redirects(redirect_server):
         client.get("2026/2026-09.md")
 
 
-def test_llm_client_still_follows_redirects():
-    """The LLM endpoint is operator-configured (config.yaml), not user-supplied."""
+def test_llm_client_still_follows_redirects_for_chat_but_never_for_embeddings():
+    """The chat endpoint is operator-configured (config.yaml), not user-supplied. The embeddings
+    server can be pointed elsewhere at runtime (#1636), so embedding calls refuse redirects on both
+    paths: a dedicated server and the chat engine."""
     client = LLMClient(base_url="http://example.invalid", chat_model="m", embed_model="e", timeout_s=5)
-    assert client._client.follow_redirects is True
+    dedicated = LLMClient(base_url="http://example.invalid", chat_model="m", embed_model="e", timeout_s=5,
+                          embed_base_url="http://embed.invalid:8080/v1")
+    try:
+        assert client._client.follow_redirects is True
+        assert dedicated._client.follow_redirects is True
+        assert client._embed_client.follow_redirects is False
+        assert client._embed_client is not client._client
+        assert dedicated._embed_client.follow_redirects is False
+        # The engine key still goes to the engine's embeddings path, and never to a dedicated server.
+        keyed = LLMClient(base_url="http://example.invalid", api_key="engine-key", embed_base_url="http://embed.invalid:8080/v1", timeout_s=5)
+        try:
+            assert keyed._embed_client.headers.get("Authorization") is None
+        finally:
+            keyed.close()
+        shared = LLMClient(base_url="http://example.invalid", api_key="engine-key", timeout_s=5)
+        try:
+            assert shared._embed_client.headers["Authorization"] == "Bearer engine-key"
+        finally:
+            shared.close()
+    finally:
+        client.close()
+        dedicated.close()
+
+
+class _Recorder(BaseHTTPRequestHandler):
+    """Answers every POST with 307 to `server.location` (when set) and records what it was sent."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.hits.append((self.path, body))
+        if getattr(self.server, "location", None):
+            self.send_response(307)  # keeps the method and the body: the worst case
+            self.send_header("Location", self.server.location)
+            self.send_header("Content-Length", "0")
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            payload = b'{"data": [{"index": 0, "embedding": [0.1, 0.2]}]}'
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        self.end_headers()
+
+
+@pytest.fixture()
+def bounce():
+    """A server that redirects POSTs to a second server, and the second server."""
+    servers = []
+
+    def start(location=None):
+        srv = HTTPServer(("127.0.0.1", 0), _Recorder)
+        srv.hits = []
+        srv.location = location
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        servers.append(srv)
+        return srv
+
+    sink = start()
+    redirector = start(f"http://127.0.0.1:{sink.server_address[1]}/v1/embeddings")
+    yield redirector, sink
+    for srv in servers:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize("dedicated", [True, False], ids=["dedicated embeddings server", "chat engine"])
+def test_embeddings_refuse_redirects_and_send_the_text_once(bounce, dedicated):
+    redirector, sink = bounce
+    origin = f"http://127.0.0.1:{redirector.server_address[1]}/v1"
+    client = LLMClient(base_url="http://127.0.0.1:9/v1" if dedicated else origin, chat_model="m", embed_model="e", timeout_s=5,
+                       max_retries=3, retry_backoff_s=0.0, embed_base_url=origin if dedicated else "")
+    try:
+        with pytest.raises(LLMError, match="redirected"):
+            client.embed(["synthetic diary entry"])
+    finally:
+        client.close()
+    assert len(redirector.hits) == 1, "refused at once, not retried (each retry would send the text again)"
+    assert sink.hits == [], "nothing reached the address the redirect named"
+
+
+def test_embeddings_still_work_without_a_redirect(bounce):
+    _redirector, sink = bounce
+    client = LLMClient(base_url="http://127.0.0.1:9/v1", chat_model="m", embed_model="e", timeout_s=5,
+                       embed_base_url=f"http://127.0.0.1:{sink.server_address[1]}/v1")
+    try:
+        assert client.embed(["x"]) == [[0.1, 0.2]]
+    finally:
+        client.close()
 
 
 def test_make_client_default_is_strict():

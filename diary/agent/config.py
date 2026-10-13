@@ -72,6 +72,12 @@ def _apply_env(cfg: Config) -> None:
         "LLM_CHAT_MODEL": "llm.chat_model",
         "LLM_EMBED_MODEL": "llm.embed_model",
         "LLM_EMBED_BASE_URL": "llm.embed_base_url",
+        # #1636: the embedding profile (prompt framing) and a re-index target (agent/embedding.py).
+        "LLM_EMBED_PROFILE": "llm.embed_profile",
+        "LLM_EMBED_NEXT_MODEL": "llm.embed_next_model",
+        "LLM_EMBED_NEXT_BASE_URL": "llm.embed_next_base_url",
+        "LLM_EMBED_NEXT_PROFILE": "llm.embed_next_profile",
+        "EMBEDDING_REINDEX_DUTY": "retrieval.reindex_duty",
         "LLM_AUX_BASE_URL": "llm.aux.base_url",
         "LLM_AUX_MODEL": "llm.aux.model",
         "LLM_AUX_API_KEY": "llm.aux.api_key",
