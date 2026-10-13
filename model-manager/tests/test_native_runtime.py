@@ -232,9 +232,12 @@ def test_sections_switch_routes_reads_to_the_native_binary(runtime_env):
     with _docker_peer(Path(env["DOCKER_HOST"].removeprefix("unix://"))):
         with _process(_binary("MODEL_MANAGER_BIN"), env) as process:
             assert _wait("/api/v1/sections", process)[0] == 200
+            # The parent answers native reads as soon as it listens, before its Python child has
+            # started, so a native 200 says nothing about the child: wait for the child's own
+            # refusal on its private port before reading the marker it writes at startup.
+            assert _wait("/api/v1/sections", process, expected=503, port=8091)[0] == 503
             child = json.loads(marker.read_text())
             assert child["sections"] == "1"
-            assert _request("/api/v1/sections", port=8091)[0] == 503
             assert _request("/api/v1/sections/tiny", port=8091)[0] == 503
             assert _request("/api/v1/sections", token=None)[0] == 401
 
