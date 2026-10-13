@@ -211,6 +211,11 @@ def fake_worker(pipe):
             time.sleep(0.3)
             pipe.send({'selected': 'verify', 'scores': {'continue': 0, 'verify': 1},
                        'model': 'fake', 'calibrated': False})
+        elif body['state'] == 'slower':
+            # #1074: long enough that three requests while it is still running cannot race its answer.
+            time.sleep(1.0)
+            pipe.send({'selected': 'verify', 'scores': {'continue': 0, 'verify': 1},
+                       'model': 'fake', 'calibrated': False})
         elif body['state'] == 'crash':
             os._exit(2)
         elif body['state'] == 'error':
@@ -310,6 +315,36 @@ class KeepWarmTests(unittest.TestCase):
         self.assertEqual(touch_weights(Agent(), Torch), 0)
 
 
+class WaitingPipe:
+    """Test double for the parent end of the worker pipe. poll(t > 0) waits as a real pipe would:
+    it reports an answer after `arrives_after` seconds (or never, when None), and sends are recorded
+    instead of reaching a worker."""
+
+    def __init__(self, real, arrives_after):
+        # arrives_after: seconds into a wait, or 'at_deadline' (the answer lands as the wait ends).
+        self.real, self.arrives_after, self.sent = real, arrives_after, []
+
+    def poll(self, timeout=0):
+        if timeout and timeout > 0:
+            if self.arrives_after == 'at_deadline':
+                time.sleep(timeout)
+                return True
+            if self.arrives_after is not None and self.arrives_after <= timeout:
+                time.sleep(self.arrives_after)
+                return True
+            time.sleep(timeout)
+        return False
+
+    def recv(self):
+        return {'selected': 'verify', 'scores': {'continue': 0, 'verify': 1}, 'model': 'fake', 'calibrated': False}
+
+    def send(self, value):
+        self.sent.append(value)
+
+    def close(self):
+        self.real.close()
+
+
 class LateAnswerTests(unittest.TestCase):
     """noevia#1070: a missed deadline keeps the worker and drops its stale answer."""
 
@@ -355,6 +390,40 @@ class LateAnswerTests(unittest.TestCase):
         self.assertEqual(self.runtime.late, 0)
         self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
 
+    def test_no_send_once_the_budget_is_spent_waiting_for_an_abandoned_answer(self):
+        # #1074: the abandoned answer arrives exactly at the deadline; nothing may be sent after it.
+        real = self.runtime.pipe
+        fake = WaitingPipe(real, arrives_after='at_deadline')
+        self.runtime.pipe = fake
+        self.runtime.decision_timeout = 0.2
+        self.runtime.late, self.runtime.late_since = 1, time.monotonic()
+        try:
+            with self.assertRaises(Late):
+                self.runtime.decide(BODY)
+        finally:
+            self.runtime.pipe = real
+        self.assertEqual(fake.sent, [])
+
+    def test_a_replaced_worker_does_not_get_a_late_mark(self):
+        # #1074: the request's worker was replaced while it waited; the new worker owes no answer.
+        real, process = self.runtime.pipe, self.runtime.process
+        runtime = self.runtime
+
+        class ReplacedWhileWaiting(WaitingPipe):
+            def poll(self, timeout=0):
+                if timeout and timeout > 0:
+                    runtime.process = None      # the worker this request went to is gone
+                return super().poll(timeout)
+
+        fake = ReplacedWhileWaiting(real, arrives_after=None)
+        runtime.pipe = fake
+        try:
+            with self.assertRaises(Late):
+                runtime.decide(BODY)
+        finally:
+            runtime.pipe, runtime.process = real, process
+        self.assertEqual(runtime.late, 0)
+
     def test_arrived_late_answer_after_grace_keeps_the_worker(self):
         first = self.runtime.process.pid
         with self.assertRaises(Late):
@@ -367,12 +436,12 @@ class LateAnswerTests(unittest.TestCase):
     def test_nothing_is_sent_behind_unfinished_abandoned_work(self):
         first = self.runtime.process.pid
         with self.assertRaises(Late):
-            self.runtime.decide({**BODY, 'state': 'slow'})
+            self.runtime.decide({**BODY, 'state': 'slower'})
         for _ in range(2):  # still running: 503 without queueing more work
             with self.assertRaises(Late):
-                self.runtime.decide({**BODY, 'state': 'slow'})
+                self.runtime.decide({**BODY, 'state': 'slower'})
             self.assertEqual(self.runtime.late, 1)
-        time.sleep(0.4)
+        time.sleep(1.3)  # the abandoned 1.0 s decision has finished by now (#1074)
         self.assertEqual(self.runtime.decide(BODY)['selected'], 'continue')
         self.assertEqual(first, self.runtime.process.pid)
         self.assertEqual(self.runtime.late, 0)

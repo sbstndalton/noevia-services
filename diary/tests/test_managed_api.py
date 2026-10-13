@@ -62,3 +62,17 @@ def test_blocked_backup_never_blocks_managed_primary_or_opens_legacy(volume, mon
     assert client.get('/api/storage-status', headers=headers).json()['backup'] == 'failed'
     headers['X-Cowork-User-ID'] = A
     assert client.get('/api/storage-status', headers=headers).status_code == 403
+
+
+def test_backup_answers_that_never_reached_storage_carry_no_storage_contacted(volume, monkeypatch):
+    """#1609: no managed database (legacy) and no backup destination both answer 200 from this host."""
+    monkeypatch.setattr(appmod, '_reindex_dirty', lambda st: None)
+    client = TestClient(appmod.app)
+    headers = {'X-Cowork-User-ID': B}
+    legacy = client.post('/api/storage-backup', headers=headers)
+    assert legacy.status_code == 200 and legacy.json() == {'mode': 'legacy'}
+    assert client.get('/api/storage-status', headers=headers).json()['mode'] == 'managed'
+    no_destination = client.post('/api/storage-backup', headers=headers)
+    assert no_destination.status_code == 200
+    assert no_destination.json()['backup'] == 'not_configured'
+    assert 'storageContacted' not in no_destination.json()

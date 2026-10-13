@@ -324,13 +324,21 @@ class Runtime:
                     raise Late('Worker still finishing an abandoned decision')
                 pipe.recv()
                 self.late = max(0, self.late - 1)
+                if time.monotonic() >= deadline:
+                    # The abandoned answer used this request's whole budget: nothing is sent, since
+                    # no answer could come back in time (#1074).
+                    raise Late('Decision deadline passed before it could be sent')
             pipe.send(body)
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not pipe.poll(remaining):
                 if self.late_grace <= 0:
                     raise RuntimeError('Decision deadline exceeded')
-                self.late_since = time.monotonic()
-                self.late = 1
+                with self.lock:
+                    # Only the worker this request went to can owe the answer; a worker replaced
+                    # meanwhile must not inherit a late mark (#1074).
+                    if self.process is process:
+                        self.late_since = time.monotonic()
+                        self.late = 1
                 raise Late('Decision deadline exceeded')
             result = pipe.recv()
         except Late:

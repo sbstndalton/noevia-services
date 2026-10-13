@@ -15,6 +15,31 @@ from .util import make_client
 log = logging.getLogger(__name__)
 
 _LOG_MARKER_RE = re.compile(r"\n?\s*\[LOG:\s*(ok|skip)\s*\]\s*$")
+# #1505: a model that writes its reasoning inline puts it FIRST: one or more complete leading blocks are
+# removed, and a leading opener with no closer means the reasoning never ended, so nothing follows it as an
+# answer. A literal "<think>" later in a reply (a question about the tag, a quoted snippet) is the user's
+# text and stays.
+_THINK_LEAD_BLOCK_RE = re.compile(r"\s*<(think|thinking)>.*?</\1>\s*", re.DOTALL | re.IGNORECASE)
+_THINK_LEAD_OPEN_RE = re.compile(r"\s*<(think|thinking)>", re.IGNORECASE)
+_THINK_OPENERS = ("<think>", "<thinking>")
+
+
+def strip_reasoning(text: str, final: bool = True) -> str:
+    """Visible text without a model's leading inline reasoning. With final=False (while streaming) the
+    text is held back while it could still turn into a leading opener (nothing but whitespace, or a
+    prefix of one), so a streamed prefix never shrinks."""
+    while True:
+        block = _THINK_LEAD_BLOCK_RE.match(text)
+        if not block:
+            break
+        text = text[block.end():]
+    if _THINK_LEAD_OPEN_RE.match(text):
+        return ""
+    if not final:
+        head = text.lstrip().lower()
+        if not head or (len(head) < len("<thinking>") and any(opener.startswith(head) for opener in _THINK_OPENERS)):
+            return ""
+    return text
 
 
 class ChatReply(str):
@@ -219,7 +244,7 @@ class LLMClient:
                 raise LLMError(f"unexpected chat response shape: {data!r}")
             message = data["choices"][0]["message"]
             reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-            return ChatReply(content, reasoning if isinstance(reasoning, str) else "")
+            return ChatReply(strip_reasoning(content), reasoning if isinstance(reasoning, str) else "")
 
         try:
             return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
@@ -227,15 +252,16 @@ class LLMClient:
             self.invalidate_resolution()  # the served list may have changed; look again next time
             raise
 
-    def chat_stream(self, messages, emit, temperature=0.7):
-        """Stream real provider output once; retain log markers only for capture."""
+    def chat_stream(self, messages, emit, temperature=0.7, alive=None):
+        """Stream real provider output once; retain log markers only for capture. `alive`, when given,
+        is called on every line the provider sends (#1505: the exchange deadline counts it as progress)."""
         try:
-            return self._chat_stream(messages, emit, temperature)
+            return self._chat_stream(messages, emit, temperature, alive)
         except Exception:
             self.invalidate_resolution()  # the served list may have changed; look again next time
             raise
 
-    def _chat_stream(self, messages, emit, temperature):
+    def _chat_stream(self, messages, emit, temperature, alive=None):
         chat_model = self.resolve_chat_model()[0]
         payload = {"model": chat_model, "messages": messages,
                    "temperature": temperature, "stream": True}
@@ -250,6 +276,8 @@ class LLMClient:
             response.raise_for_status()
             if "text/event-stream" not in response.headers.get("content-type", ""):
                 data = json.loads(response.read())
+                if alive is not None:
+                    alive()
                 telemetry(data)
                 completed = True
                 message = data["choices"][0]["message"]
@@ -257,10 +285,12 @@ class LLMClient:
                 reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
                 if not isinstance(content, str) or not isinstance(reasoning, str):
                     raise LLMError("invalid provider answer")
-                if reasoning:
-                    emit({"type": "reasoning", "text": reasoning})
+                # #1505: provider reasoning is kept request-local, never streamed or stored as the answer.
+                content = strip_reasoning(content)
             else:
                 for line in response.iter_lines():
+                    if alive is not None:
+                        alive()
                     if not line.startswith("data:"):
                         continue
                     raw = line[5:].strip()
@@ -279,18 +309,19 @@ class LLMClient:
                     delta = choices[0].get("delta") or {}
                     thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
                     if isinstance(thought, str) and thought:
-                        reasoning += thought
-                        emit({"type": "reasoning", "text": thought})
+                        reasoning += thought  # #1505: retained request-local only; never streamed
                     text = delta.get("content") or ""
                     if isinstance(text, str):
                         content += text
-                        # Keep the trailing protocol marker out of visible tokens.
-                        end = max(sent, len(content) - 128)
+                        # Keep inline reasoning and the trailing protocol marker out of visible tokens.
+                        shown = strip_reasoning(content, final=False)
+                        end = max(sent, len(shown) - 128)
                         if end > sent:
-                            emit({"type": "delta", "text": content[sent:end]})
+                            emit({"type": "delta", "text": shown[sent:end]})
                             sent = end
         if not completed:
             raise LLMError("provider stream ended before completion")
+        content = strip_reasoning(content)  # #1505: the final answer never carries inline reasoning
         visible, _ = self.strip_log_marker(content)
         if not visible:
             raise LLMError("provider returned no final answer")

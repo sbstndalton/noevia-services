@@ -437,3 +437,106 @@ def test_an_aborted_backup_run_is_logged_without_paths_or_tenant(managed, tmp_pa
     with caplog.at_level(logging.WARNING, logger='agent.managed_storage'):
         assert managed.backup(remote, storage, now=time.time() + 20)['backup'] == 'complete'
     assert not [r for r in caplog.records if 'abandoned' in r.getMessage()]
+
+
+def test_only_a_verified_remote_run_reports_storage_contacted(managed, tmp_path, storage):
+    """#1609: the web app clears a storage login hold on a backup reply only when the reply says the remote was
+    reached. Every status the backup answers without a verified run must leave the flag out."""
+    remote = LocalCorpusBackend(str(tmp_path / 'remote'))
+    managed.put('a.md', b'one')
+    # No destination, a destination that is not due yet, and a lock held by another worker: nothing left this host.
+    assert 'storageContacted' not in managed.backup(remote, None, now=time.time() + 10)
+    assert 'storageContacted' not in managed.backup(remote, storage)
+    # A real run reads and writes the remote and verifies it.
+    done = managed.backup(remote, storage, now=time.time() + 10)
+    assert done['backup'] == 'complete' and done['storageContacted'] is True
+    assert managed.status(storage).get('storageContacted') is None
+    # Already complete for this generation: answered from the local record.
+    assert managed.backup(remote, storage, now=time.time() + 20) == managed.status(storage)
+    assert 'storageContacted' not in managed.backup(remote, storage, now=time.time() + 20)
+    # A run whose verification failed is a 200 status with an error, not proof of a working login.
+    managed.put('b.md', b'two')
+    class Offline:
+        def get(self, path):
+            raise OSError('unreachable')
+    failed = managed.backup(Offline(), storage, now=time.time() + 100)
+    assert failed['backup'] == 'failed' and 'storageContacted' not in failed
+
+
+def test_a_backup_abandoned_mid_run_does_not_report_storage_contacted(managed, tmp_path, storage):
+    """#1609: a save that lands before the next file is read abandons the run; no manifest is written and the
+    status is pending, which proves nothing about the saved login."""
+    remote = LocalCorpusBackend(str(tmp_path / 'remote'))
+    managed.put('a.md', b'one')
+    managed.put('b.md', b'two')
+    original = remote.put
+    edited = []
+    def put(path, data, **kwargs):
+        if '/objects/' in path and not edited:
+            _, v = managed.get('b.md')
+            managed.put('b.md', b'two v2', if_match=v)
+            edited.append(path)
+        return original(path, data, **kwargs)
+    remote.put = put
+    abandoned = managed.backup(remote, storage, now=time.time() + 10)
+    assert edited, 'the edit hook never ran'
+    assert abandoned['backup'] == 'pending' and 'storageContacted' not in abandoned
+
+
+def _status_error(code):
+    import httpx
+    request = httpx.Request('PUT', 'https://synthetic.invalid/Diary/x')
+    return httpx.HTTPStatusError(f'HTTP {code}', request=request, response=httpx.Response(code, request=request))
+
+
+@pytest.mark.parametrize('code', [401, 403])
+def test_a_backup_the_storage_server_refused_the_login_for_says_loginRefused(managed, storage, code):
+    """#1617: the 200 'failed' reply names a refused login, so the web service can latch it. The run still counts
+    as a failure on the sidecar's own retry schedule, and does not claim the storage server was contacted."""
+    class Refusing:
+        def get(self, path):
+            raise _status_error(code)
+    managed.put('a.md', b'one')
+    now = time.time() + 10
+    reply = managed.backup(Refusing(), storage, now=now)
+    assert reply['backup'] == 'failed' and reply['loginRefused'] is True
+    assert 'storageContacted' not in reply
+    assert reply['retryAt'] > now, 'the sidecar keeps its own retry cool-down'
+    again = managed.backup(Refusing(), storage, now=now + 1)
+    assert 'loginRefused' not in again, 'inside the cool-down the run does not even reach storage, so nothing is claimed'
+
+
+def test_a_refusal_through_the_real_webdav_client_says_loginRefused_and_the_gate_stays_closed(managed, storage):
+    import httpx
+    from agent.webdav import WebDAVCorpusBackend
+    from agent.storage_backoff import StorageBackoff
+    managed.put('a.md', b'one')
+    remote = WebDAVCorpusBackend('https://synthetic.invalid/dav', 'fixture', 'synthetic-pw', transport=httpx.MockTransport(lambda req: httpx.Response(401)))
+    try:
+        reply = managed.backup(remote, storage, now=time.time() + 10)
+        assert reply['backup'] == 'failed' and reply['loginRefused'] is True
+        assert remote.storage_gate.state()[0] == 'login', 'the sidecar cool-down is intact'
+        with pytest.raises(StorageBackoff):
+            remote.get('anything.md')
+    finally:
+        remote.close()
+
+
+@pytest.mark.parametrize('failure', ['500', '404', '429', 'offline', 'backoff', 'conflict'])
+def test_other_backup_failures_never_say_loginRefused(managed, tmp_path, storage, failure):
+    from agent.storage_backoff import StorageBackoff
+    class Failing:
+        def get(self, path):
+            if failure == 'offline':
+                raise OSError('unreachable')
+            if failure == 'backoff':
+                raise StorageBackoff('login', 120)
+            if failure == 'conflict':
+                return b'someone else wrote this', None
+            raise _status_error(int(failure))
+        def put(self, *a, **k):
+            return True, None, 201
+    managed.put('a.md', b'one')
+    reply = managed.backup(Failing(), storage, now=time.time() + 10)
+    assert reply['backup'] == 'failed'
+    assert 'loginRefused' not in reply

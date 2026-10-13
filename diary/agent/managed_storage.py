@@ -17,6 +17,8 @@ from pathlib import Path
 from contextlib import contextmanager
 import fcntl
 import os
+
+import httpx
 from .dedicated_storage import StorageUnavailable
 
 log = logging.getLogger(__name__)
@@ -279,6 +281,11 @@ class ManagedCorpusBackend:
                 settings = self.meta(db, 'settings', '{}')
                 snapshot_time = float(self.meta(db, 'snapshot_time', '0'))
             base = '/'.join(p.strip('/') for p in (storage.get('corpusRoot', ''), 'noevia-backups', self.tenant) if p)
+            # #1609: only a run that read and wrote the remote and verified what it wrote proves the saved
+            # storage login was accepted. Every other reply here (not due, already complete, lock busy,
+            # failed, abandoned) is a status that may never have left this host.
+            verified = False
+            refused = False
             try:
                 safe_key(base)
                 manifest = {'format': 'noevia-diary-backup-v1', 'tenant': self.tenant, 'generation': generation,
@@ -312,6 +319,7 @@ class ManagedCorpusBackend:
                 self._create_verified(remote, base + '/manifests/' + digest(body) + '.json', body)
                 with self.db() as db:
                     db.execute('INSERT OR REPLACE INTO backups VALUES (?,?,?,0,0,NULL)', (destination, generation, time.time()))
+                verified = True
             except _SnapshotChanged:
                 # A save, move or delete landed mid-run. It also advanced the
                 # generation and pushed `due` out, so the run is simply
@@ -326,7 +334,11 @@ class ManagedCorpusBackend:
                 log.warning('managed backup abandoned at generation %s: a save landed mid-run '
                          '(%d of %d files verified, %.1fs); retrying after the debounce',
                          generation, len(manifest['files']), len(file_meta), time.monotonic() - started)
-            except Exception:
+            except Exception as exc:
+                # #1617: the remote refusing the saved login (401/403) is told apart from every other failure, so
+                # the web service can latch the login like it does for the storage routes. Only the remote's own
+                # answer counts: the sidecar's cool-down (StorageBackoff) and transport errors never set it.
+                refused = isinstance(exc, httpx.HTTPStatusError) and exc.response is not None and exc.response.status_code in (401, 403)
                 # Never persist server exceptions/URLs: these can contain credentials.
                 with self.db() as db:
                     previous = db.execute('SELECT * FROM backups WHERE destination=?', (destination,)).fetchone()
@@ -336,7 +348,10 @@ class ManagedCorpusBackend:
                                 previous['last_success'] if previous else None,
                                 now + min(300, 5 * 2 ** min(failures - 1, 6)), failures,
                                 'Backup could not be verified. Check the connection or remote conflict; app saves are retained.'))
-            return self.status(storage)
+            status = self.status(storage)
+            if refused:
+                return {**status, 'loginRefused': True}
+            return {**status, 'storageContacted': True} if verified else status
 
     @staticmethod
     def _create_verified(remote, path, data):
