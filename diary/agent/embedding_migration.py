@@ -8,8 +8,11 @@ The one path that changes the Diary's embedding model, profile or endpoint:
   switch(force)     make next active (one configuration write; every later query and reindex reads
                     it). Refused until next covers every index file unless forced, and, for a move of
                     the same model to another endpoint, until that endpoint gives the same vectors.
-                    The old target stays as ``previous`` with its vectors, for rollback.
-  rollback()        previous becomes active again; vectors for chunks written since are filled in.
+                    The old target stays as ``previous`` with its vectors, for rollback; a ``previous``
+                    it displaces (one never finished) loses its vectors. The switch is for the ``next``
+                    that was checked: if next changed meanwhile, nothing switches (nextChanged).
+  rollback()        previous becomes active again; vectors for chunks written since are filled in. A next
+                    that was still being built is abandoned and loses its partial vectors.
   finish()          drop previous and its vectors.
   clear_next()      abandon a re-index (its partial vectors are dropped).
 
@@ -306,6 +309,14 @@ class EmbeddingMigration:
             finally:
                 conn.close()
 
+    def _drop_if_orphaned(self, target: Optional[Target]) -> None:
+        """Drops ``target``'s vectors unless the configuration still holds that model and profile."""
+        if target is None:
+            return
+        held = {t.identity for t in (self.config.active(), self.config.next(), self.config.previous()) if t is not None}
+        if target.identity not in held:
+            self._drop_everywhere(target)
+
     def set_next(self, raw) -> dict:
         before = self.config.next()
         self.config.set_next(raw)
@@ -324,7 +335,7 @@ class EmbeddingMigration:
         return self.status()
 
     def switch(self, force: bool = False) -> dict:
-        nxt, active = self.config.next(), self.config.active()
+        nxt, active = self.config.next(), self.config.active()  # nxt: what the checks below are about
         if nxt is None:
             raise EmbeddingConfigError("No re-index is under way.", "noNext", 409)
         if nxt.identity == active.identity:
@@ -343,14 +354,20 @@ class EmbeddingMigration:
                 err = EmbeddingConfigError("The new model has not finished indexing every Diary file yet.", "notReady", 409)
                 err.coverage = cov  # type: ignore[attr-defined]
                 raise err
-        self.config.switch_to_next()
+        displaced = self.config.previous()
+        self.config.switch_to_next(expected=nxt)
+        # An older rollback target is displaced by the new one: its vectors would never be read again.
+        self._drop_if_orphaned(displaced)
         log.info("embedding switched to %s/%s%s; previous %s/%s kept for rollback", nxt.profile, nxt.model,
                  " (forced)" if force else "", active.profile, active.model)
         self.kick()
         return self.status()
 
     def rollback(self) -> dict:
+        abandoned = self.config.next()
         self.config.rollback()
+        # The re-index that was under way is abandoned by a rollback: no partly built slot stays behind.
+        self._drop_if_orphaned(abandoned)
         log.info("embedding rolled back to %s/%s", self.config.active().profile, self.config.active().model)
         self.kick()
         return self.status()

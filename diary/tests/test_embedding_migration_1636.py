@@ -102,6 +102,19 @@ def test_seed_defaults_match_the_pre_1636_settings(tmp_path):
     assert seed["next"] == emb.Target("http://embed-next:8080/v1", "gemma-test", "embeddinggemma-2")
 
 
+def test_a_forgotten_next_profile_is_warned_about_with_no_change_of_behaviour(tmp_path, caplog):
+    with caplog.at_level("WARNING", logger="agent.embedding"):
+        seed = emb.seed_from_cfg(cfg_for(tmp_path, embed_next_model="embeddinggemma-2"))
+    assert seed["next"] == emb.Target(None, "embeddinggemma-2", "nomic-v1")
+    warned = [r.getMessage() for r in caplog.records]
+    assert len(warned) == 1 and "LLM_EMBED_NEXT_MODEL=embeddinggemma-2" in warned[0] and "LLM_EMBED_NEXT_PROFILE" in warned[0]
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="agent.embedding"):
+        emb.seed_from_cfg(cfg_for(tmp_path, embed_next_model="embeddinggemma-2", embed_next_profile="embeddinggemma-2"))
+        emb.seed_from_cfg(cfg_for(tmp_path))
+    assert caplog.records == [], "no warning when the profile is set, or when there is no next model"
+
+
 def test_targets_are_validated():
     assert emb.normalize_target({"model": "m", "base_url": "http://x:1/v1/"}).base_url == "http://x:1/v1"
     for bad in ({}, {"model": "two words"}, {"model": "m", "profile": "typo"}, {"model": "m", "base_url": "http://u:p@x"},
@@ -247,6 +260,82 @@ def test_switch_waits_for_the_new_model_and_refused_chunks_do_not_block_the_rest
         _close(svc)
 
 
+def _slot_models(path):
+    conn = sqlite3.connect(str(path))
+    try:
+        return sorted(json.loads(v)["model"] for (v,) in conn.execute("SELECT value FROM vec_meta WHERE key LIKE 'slot:%'"))
+    finally:
+        conn.close()
+
+
+def test_a_switch_is_for_the_next_that_was_checked(tmp_path):
+    _vec_or_skip(tmp_path)
+    svc = _service(tmp_path)
+    try:
+        # Same model on another endpoint: the switch awaits a parity check before it changes anything.
+        elsewhere = emb.Target("http://other:8080/v1", "nomic-test", "nomic-v1")
+        svc.config.set_next(elsewhere)
+        swapped = []
+        original = svc.fake.embed
+
+        def embed_then_change_next(target, texts, kind="document", titles=None):
+            if not swapped:  # an administrator picks another model while the parity check runs
+                swapped.append(svc.config.set_next({"model": "gemma-test", "profile": "embeddinggemma-2"}))
+            return original(target, texts, kind, titles)
+
+        svc.fake.embed = embed_then_change_next
+        with pytest.raises(emb.EmbeddingConfigError) as refused:
+            svc.mig.switch()
+        assert refused.value.code == "nextChanged" and refused.value.status == 409
+        assert svc.config.active().base_url is None, "the endpoint did not move"
+        assert svc.config.next().model == "gemma-test", "the newer choice is untouched"
+        assert svc.config.previous() is None
+        with pytest.raises(emb.EmbeddingConfigError) as stale:
+            svc.config.switch_to_next(expected=elsewhere)
+        assert stale.value.code == "nextChanged"
+    finally:
+        _close(svc)
+
+
+def test_switching_drops_the_rollback_target_it_displaces_and_a_rollback_drops_a_partly_built_next(tmp_path):
+    _vec_or_skip(tmp_path)
+    svc = _service(tmp_path)
+    gemma = {"model": "gemma-test", "profile": "embeddinggemma-2"}
+    gemma_b = {"model": "gemma-test-b", "profile": "embeddinggemma-2"}
+    try:
+        svc.mig.set_next(gemma)
+        svc.mig.wait(10)
+        svc.mig.switch()  # active gemma-test, previous nomic-test
+        assert _slot_models(svc.paths["service"]) == ["gemma-test", "nomic-test"]
+
+        # A rollback leaves no partly built next behind.
+        svc.mig.set_next(gemma_b)
+        svc.mig.wait(10)
+        assert _slot_models(svc.paths["service"]) == ["gemma-test", "gemma-test-b", "nomic-test"]
+        svc.mig.rollback()  # active nomic-test, previous gemma-test, next abandoned
+        svc.mig.wait(10)
+        assert svc.config.active().model == "nomic-test" and svc.config.next() is None
+        for path in svc.paths.values():
+            assert _slot_models(path) == ["gemma-test", "nomic-test"], path
+
+        # Going forward again displaces gemma-test (the older previous): its vectors go.
+        svc.mig.set_next(gemma_b)
+        svc.mig.wait(10)
+        svc.mig.switch()  # active gemma-test-b, previous nomic-test
+        svc.mig.wait(10)
+        assert svc.config.previous().model == "nomic-test"
+        for path in svc.paths.values():
+            assert _slot_models(path) == ["gemma-test-b", "nomic-test"], path
+        # The kept rollback target still serves at once.
+        svc.mig.rollback()
+        svc.mig.wait(10)
+        svc.fake.calls.clear()
+        assert "garden" in svc.retrievers["service"].search("garden", top_k=1, min_score=0.0)[0]["text"]
+        assert svc.fake.calls == [("nomic-test", ["garden"])]
+    finally:
+        _close(svc)
+
+
 def test_a_legacy_index_is_never_searched_with_another_model(tmp_path):
     _vec_or_skip(tmp_path)
     svc = _service(tmp_path)
@@ -323,7 +412,10 @@ def test_internal_endpoint_is_service_only(monkeypatch):
     assert client.get("/api/internal/embedding").status_code == 401
     assert client.get("/api/internal/embedding", headers=auth).json()["active"]["model"] == "nomic-test"
     tenant = {**auth, "X-Cowork-User-ID": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
-    assert client.post("/api/internal/embedding", headers=tenant, json={"action": "switch"}).status_code in (400, 401)
+    refused_tenant = client.post("/api/internal/embedding", headers=tenant, json={"action": "switch"})
+    assert refused_tenant.status_code == 400
+    assert refused_tenant.json() == {"error": "service-wide endpoint: no tenant"}
+    assert calls == [], "a tenant-scoped call never reaches the migration"
     assert client.post("/api/internal/embedding", headers=auth, json={"action": "nuke"}).status_code == 400
     r = client.post("/api/internal/embedding", headers=auth, json={"action": "switch"})
     assert r.status_code == 409 and r.json()["code"] == "notReady"

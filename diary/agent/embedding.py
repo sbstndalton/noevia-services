@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+
+log = logging.getLogger(__name__)
 
 DEFAULT_PROFILE = "nomic-v1"
 PROFILES = ("nomic-v1", "embeddinggemma-2")
@@ -116,6 +119,12 @@ def seed_from_cfg(cfg) -> Dict[str, Optional[Target]]:
     active = Target(get("llm.embed_base_url").rstrip("/") or None, get("llm.embed_model") or "default", get("llm.embed_profile") or DEFAULT_PROFILE)
     nxt = None
     if get("llm.embed_next_model"):
+        # A forgotten profile is not an error (nomic-v1 is the default), but for a model that needs the
+        # other framing it silently builds vectors from unframed text.
+        if not get("llm.embed_next_profile"):
+            log.warning("LLM_EMBED_NEXT_MODEL=%s is set without LLM_EMBED_NEXT_PROFILE: using %s, which sends text "
+                        "unframed. Set the profile if the model needs prompts (known: %s).",
+                        get("llm.embed_next_model"), DEFAULT_PROFILE, ", ".join(PROFILES))
         nxt = Target(get("llm.embed_next_base_url").rstrip("/") or None, get("llm.embed_next_model"), get("llm.embed_next_profile") or DEFAULT_PROFILE)
         if nxt == active:
             nxt = None
@@ -206,10 +215,15 @@ class EmbeddingConfig:
         with self._lock:
             return self._change({**self._state, "next": None})
 
-    def switch_to_next(self) -> Dict[str, Any]:
+    def switch_to_next(self, expected: Optional[Target] = None) -> Dict[str, Any]:
+        """next becomes active; the old active is kept as previous. ``expected`` is what the caller
+        checked readiness for: if next is something else by now, nothing switches."""
         with self._lock:
             if not self._state["next"]:
                 raise EmbeddingConfigError("No re-index is under way.", "noNext", 409)
+            if expected is not None and self._state["next"] != expected:
+                raise EmbeddingConfigError("The re-index target changed while the switch was being checked. Nothing was switched.",
+                                           "nextChanged", 409)
             return self._change({"active": self._state["next"], "next": None, "previous": self._state["active"]})
 
     def rollback(self) -> Dict[str, Any]:
