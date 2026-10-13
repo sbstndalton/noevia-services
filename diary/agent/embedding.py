@@ -18,14 +18,18 @@ Mirrors noevia-core's embedding-profile.cjs and embedding-config.cjs:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +37,13 @@ DEFAULT_PROFILE = "nomic-v1"
 PROFILES = ("nomic-v1", "embeddinggemma-2")
 KINDS = ("query", "document", "similarity")
 _MODEL_RE = re.compile(r"^[^\s\x00-\x1f]{1,200}$")
+
+
+# A start-up check that cannot get an answer (a resolver that is not up yet, a compose service that
+# is still starting) is retried for about half a minute, then re-checked every minute; only a public
+# answer or a malformed address is a permanent refusal.
+RETRY_DELAYS_S = (1.0, 2.0, 4.0, 8.0, 15.0)
+RECHECK_S = 60.0
 
 
 class EmbeddingConfigError(ValueError):
@@ -139,6 +150,7 @@ class EmbeddingConfig:
         self.state_file = Path(state_file) if state_file else None
         self.version = 0
         self.damaged: Optional[str] = None
+        self._held: Dict[str, Dict[str, Any]] = {}  # 'active' | 'next' -> {reason, transient, target}
         saved = self._read()
         self.source = "saved" if saved else "environment"
         self._state = saved or seed_from_cfg(cfg)
@@ -160,6 +172,48 @@ class EmbeddingConfig:
             # Fail closed: an unknown profile refuses every embed call, and nothing is saved over the file.
             unavailable = Target(None, "unavailable", "unavailable")
             return {"active": unavailable, "next": None, "previous": None}
+
+    # ---- seeded addresses refused at start-up (check_embedding_address); in memory, never saved ----
+
+    def refuse_seeded(self, reasons: Dict[str, str], transient: bool = False) -> None:
+        """An address the environment seeded is not on this network. A refused next is dropped; a
+        refused active turns embedding off (unknown profile: every embed call refuses) and locks
+        changes like a damaged file, because falling back to the chat engine would send it the same
+        text. ``transient`` (the name did not resolve yet) can be undone by release_seeded."""
+        with self._lock:
+            if self.source != "environment":
+                return
+            for which in ("active", "next"):
+                reason = reasons.get(which)
+                if not reason:
+                    continue
+                if which in self._held:
+                    self._held[which] = {**self._held[which], "reason": reason, "transient": transient}
+                else:
+                    self._held[which] = {"reason": reason, "transient": transient, "target": self._state[which]}
+                    if which == "next":
+                        self._state = {**self._state, "next": None}
+                    else:
+                        a = self._state["active"]
+                        self._state = {**self._state, "active": Target(a.base_url, a.model, "unavailable")}
+                if which == "active":
+                    self.damaged = reason
+            self.version += 1
+
+    def release_seeded(self, which: str) -> None:
+        """Takes back a transient refusal once the address resolves to this network."""
+        with self._lock:
+            held = self._held.get(which)
+            if held is None or not held["transient"] or self.source != "environment":
+                return
+            del self._held[which]
+            if which == "next":
+                if self._state["next"] is None:  # not over an administrator's own choice
+                    self._state = {**self._state, "next": held["target"]}
+            else:
+                self._state = {**self._state, "active": held["target"]}
+                self.damaged = None
+            self.version += 1
 
     def _persist(self, state) -> None:
         if not self.state_file:
@@ -237,6 +291,152 @@ class EmbeddingConfig:
             if not self._state["previous"]:
                 raise EmbeddingConfigError("There is no previous embedding model to remove.", "noPrevious", 409)
             return self._change({**self._state, "previous": None})
+
+
+# ---- where an embeddings server may be (mirrors noevia-core's embedding-address.cjs) ----
+#
+# A re-index sends the Diary's text to that address, so it must be on this network: loopback, a
+# private range, or a compose service name that resolves to one. The decision is positive: the URL
+# must parse, the host must resolve (a literal is its own answer) and EVERY answer must be a local
+# address. Public, unspecified, link-local, multicast and reserved addresses, and the IPv6 forms that
+# carry another address, are refused. An unresolvable name is "transient" (it may resolve later); a
+# public or malformed answer is permanent.
+
+_V6_RESERVED = tuple(ipaddress.ip_network(n) for n in ("64:ff9b::/96", "2001::/32", "2001:db8::/32", "100::/64"))
+_V4_RESERVED = tuple(ipaddress.ip_network(n) for n in ("0.0.0.0/8", "192.0.0.0/24", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"))
+
+
+@dataclass(frozen=True)
+class AddressCheck:
+    ok: bool
+    reason: str = ""
+    transient: bool = False
+
+
+def non_local_reason(address: str) -> Optional[str]:
+    """None when ``address`` is on this network (loopback, private, Tailscale), else why not."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return "not an address"
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_global:
+        return "a public address"
+    if ip.is_unspecified:
+        return "the unspecified address"
+    if ip.is_link_local:
+        return "a link-local address"
+    if ip.is_multicast:
+        return "a multicast address"
+    if ip.version == 4:
+        if ip.packed[0] >= 240 or any(ip in n for n in _V4_RESERVED):
+            return "a reserved address"
+    else:
+        if int(ip) >> 32 == 0 and int(ip) != 1:  # ::/96 minus ::1: v4-compatible forms
+            return "a reserved address"
+        if any(ip in n for n in _V6_RESERVED):
+            return "a reserved address"
+    return None
+
+
+def check_embedding_address(url: str, resolver: Callable[[str], Sequence[str]] = None) -> AddressCheck:
+    """Never raises. ``resolver(host)`` returns every address of the name (default: getaddrinfo)."""
+    def resolve(host: str) -> List[str]:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        return sorted({str(i[4][0]) for i in infos})
+    resolver = resolver or resolve
+    try:
+        parts = urlsplit(str(url))
+        host = parts.hostname or ""
+        parts.port  # noqa: B018 — raises ValueError for a bad port
+    except ValueError:
+        return AddressCheck(False, "not a URL")
+    if parts.scheme not in ("http", "https"):
+        return AddressCheck(False, "not an http(s) URL")
+    if parts.username or parts.password:
+        return AddressCheck(False, "credentials in the URL")
+    if not host:
+        return AddressCheck(False, "no host")
+    try:
+        ipaddress.ip_address(host)
+        addresses = [host]
+    except ValueError:
+        try:
+            addresses = list(resolver(host))
+        except Exception as exc:  # noqa: BLE001 — a resolver that is down is not a public answer
+            return AddressCheck(False, f"the name does not resolve ({type(exc).__name__})", transient=True)
+    if not addresses:
+        return AddressCheck(False, "the name does not resolve", transient=True)
+    for address in addresses:
+        why = non_local_reason(str(address))
+        if why:
+            return AddressCheck(False, f"{host} is not on this network ({address} is {why})")
+    return AddressCheck(True)
+
+
+def guard_seeded_addresses(config: "EmbeddingConfig", *, check: Callable[[str], AddressCheck] = check_embedding_address,
+                           sleep: Callable[[float], None] = time.sleep, schedule: Optional[Callable[[Callable[[], None], float], None]] = None,
+                           retry_delays: Sequence[float] = RETRY_DELAYS_S, recheck_s: float = RECHECK_S) -> None:
+    """Start-up guard for LLM_EMBED_BASE_URL / LLM_EMBED_NEXT_BASE_URL. A refused value is logged and
+    not used (in memory only); it never stops the service from starting. A name that does not
+    resolve is retried with back-off, then held back and re-checked every ``recheck_s``, and used
+    again as soon as it resolves to local addresses. Blocks until the first round has decided (run
+    it on a thread); later re-checks run on daemon timers."""
+    def default_schedule(fn: Callable[[], None], seconds: float) -> None:
+        t = threading.Timer(seconds, fn)
+        t.daemon = True
+        t.start()
+    schedule = schedule or default_schedule
+    names = {"active": "LLM_EMBED_BASE_URL", "next": "LLM_EMBED_NEXT_BASE_URL"}
+    try:
+        state = config.get()
+        if state["source"] != "environment":
+            return
+        urls = {w: state[w]["base_url"] for w in ("active", "next") if state[w] and state[w].get("base_url")}
+        pending, results = dict(urls), {}  # results: the last answer for each address
+        for delay in (0.0, *retry_delays):
+            if delay:
+                sleep(delay)
+            for which in list(pending):
+                results[which] = r = check(pending[which])
+                if r.ok or not r.transient:
+                    del pending[which]
+            if not pending:
+                break
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not check the seeded embeddings address (%s)", type(exc).__name__)
+        return
+
+    def refuse_for_good(which: str, r: AddressCheck) -> None:
+        log.error("%s %s refused: %s. The embeddings server must be on this network.", names[which], urls[which], r.reason)
+        config.refuse_seeded({which: f"{names[which]} {urls[which]} refused: {r.reason}"})
+
+    for which, r in results.items():
+        if not r.ok and which not in pending:
+            refuse_for_good(which, r)
+    for which in pending:
+        reason = results[which].reason
+        log.warning("%s %s not used yet: %s. Checking again every %d s.", names[which], urls[which], reason, int(recheck_s))
+        config.refuse_seeded({which: f"{names[which]} {urls[which]} not used yet: {reason}"}, transient=True)
+
+        def again(which: str = which) -> None:
+            if config.source != "environment":
+                return  # an administrator has chosen since: the seed no longer matters
+            try:
+                r = check(urls[which])
+                if r.ok:
+                    config.release_seeded(which)
+                    log.info("%s %s resolves to this network now; in use.", names[which], urls[which])
+                    return
+                if not r.transient:
+                    refuse_for_good(which, r)
+                    return
+            except Exception:  # noqa: BLE001 — try again at the next round
+                pass
+            schedule(again, recheck_s)
+
+        schedule(again, recheck_s)
 
 
 class Embedder:
@@ -350,4 +550,5 @@ def reset_shared_for_tests() -> None:
 
 __all__ = ["DEFAULT_PROFILE", "PROFILES", "frame", "clean_title", "Target", "normalize_target", "seed_from_cfg",
            "EmbeddingConfig", "EmbeddingConfigError", "Embedder", "EmbeddingView", "shared_for", "view_for",
-           "state_path_for", "reset_shared_for_tests"]
+           "state_path_for", "reset_shared_for_tests", "AddressCheck", "check_embedding_address", "non_local_reason",
+           "guard_seeded_addresses"]

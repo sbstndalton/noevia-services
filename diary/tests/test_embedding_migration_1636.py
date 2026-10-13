@@ -425,3 +425,176 @@ def test_internal_endpoint_is_service_only(monkeypatch):
     # Open (LAN-only) mode: nobody may change the model.
     state.auth_token = ""
     assert client.post("/api/internal/embedding", json={"action": "switch"}).status_code == 403
+
+
+# ---------------- where an embeddings server may be ----------------
+
+def _dns(table):
+    def resolve(host):
+        if host not in table:
+            raise OSError(f"cannot resolve {host}")
+        return table[host]
+    return resolve
+
+
+def test_the_address_check_is_positive_and_only_local_addresses_pass():
+    ok = ["http://127.0.0.1:8080/v1", "http://10.1.2.3/v1", "http://192.168.0.5:8081", "http://172.31.255.255/", "http://100.64.1.1/",
+          "http://[::1]:8080/v1", "http://[fd00::5]/", "http://[::ffff:127.0.0.1]/", "https://127.0.0.1/v1"]
+    for url in ok:
+        assert emb.check_embedding_address(url).ok, url
+    refused = ["http://8.8.8.8/v1", "http://[2001:4860:4860::8888]/v1", "http://[::ffff:8.8.8.8]/", "http://0.0.0.0:8080/v1", "http://0.1.2.3/",
+               "http://169.254.169.254/latest", "http://[fe80::1]/", "http://224.0.0.1/", "http://239.255.255.250/", "http://240.0.0.1/",
+               "http://255.255.255.255/", "http://192.0.2.10/", "http://[::]/", "http://[::ffff:0.0.0.0]/", "http://[ff02::1]/",
+               "http://[::8.8.8.8]/", "http://[64:ff9b::a00:1]/", "http://[2001:db8::1]/",
+               "ftp://127.0.0.1/", "http://user:pw@127.0.0.1/", "http://127.0.0.1:notaport/", "file:///etc/passwd", "http:///", "", "embed:8080"]
+    for url in refused:
+        r = emb.check_embedding_address(url)
+        assert not r.ok and r.reason and not r.transient, url
+
+
+def test_names_are_judged_by_every_answer_and_an_unresolvable_one_is_not_a_public_one():
+    resolver = _dns({"embed": ["10.0.0.6"], "mixed": ["10.0.0.8", "93.184.216.34"], "public.example": ["93.184.216.34"],
+                     "linklocal": ["169.254.169.254"], "mapped": ["::ffff:8.8.8.8"], "empty": [], "private.example.": ["192.168.1.20"]})
+    assert emb.check_embedding_address("http://embed:8080/v1", resolver).ok
+    assert emb.check_embedding_address("http://private.example./v1", resolver).ok, "a trailing dot is a name like another"
+    for name in ("mixed", "public.example", "linklocal", "mapped"):
+        r = emb.check_embedding_address(f"http://{name}/v1", resolver)
+        assert not r.ok and not r.transient, name
+    for name in ("empty", "nowhere"):
+        r = emb.check_embedding_address(f"http://{name}/v1", resolver)
+        assert not r.ok and r.transient, name
+
+
+def _env_config(tmp_path, **llm):
+    return emb.EmbeddingConfig(cfg_for(tmp_path, **llm), None)
+
+
+class _Net:
+    """A fake resolver for the start-up guard: fails `failing` times, then answers."""
+
+    def __init__(self, failing=0, answers=None):
+        self.failing = failing
+        self.answers = answers or {"embed": ["10.0.0.6"], "embed-next": ["10.0.0.7"]}
+        self.slept, self.scheduled = [], []
+
+    def resolve(self, host):
+        if self.failing > 0 or host not in self.answers:
+            self.failing -= 1
+            raise OSError(f"temporary failure resolving {host}")
+        return self.answers[host]
+
+    def guard(self, config):
+        emb.guard_seeded_addresses(config, check=lambda url: emb.check_embedding_address(url, self.resolve),
+                                   sleep=self.slept.append, schedule=lambda fn, s: self.scheduled.append((fn, s)))
+
+
+def test_a_resolver_that_is_not_up_yet_is_retried_and_the_seeded_address_used_once_it_answers(tmp_path):
+    config = _env_config(tmp_path, embed_base_url="http://embed:8080/v1")
+    net = _Net(failing=2)
+    net.guard(config)
+    assert net.slept == [1.0, 2.0] and net.scheduled == []
+    assert config.active().profile == "nomic-v1" and config.active().base_url == "http://embed:8080/v1"
+    assert config.damaged is None
+
+
+def test_a_name_unresolvable_for_30_seconds_is_held_back_rechecked_and_used_again(tmp_path):
+    config = _env_config(tmp_path, embed_base_url="http://embed:8080/v1", embed_next_model="gemma-test",
+                         embed_next_profile="embeddinggemma-2", embed_next_base_url="http://embed-next:8080/v1")
+    net = _Net(failing=10_000)
+    net.guard(config)
+    assert sum(net.slept) == 30.0
+    assert config.active().profile == "unavailable" and config.next() is None
+    assert "not used yet" in config.damaged
+    assert [s for _fn, s in net.scheduled] == [60.0, 60.0]
+    with pytest.raises(emb.EmbeddingConfigError) as locked:
+        config.set_next({"model": "m"})
+    assert locked.value.code == "badState"
+    net.failing = 0  # the network comes up
+    for fn, _s in net.scheduled[:]:
+        net.scheduled.pop(0)
+        fn()
+    assert config.active().profile == "nomic-v1" and config.next().base_url == "http://embed-next:8080/v1"
+    assert config.damaged is None and net.scheduled == [] and config.source == "environment"
+    config.set_next({"model": "other"})  # changes work again
+
+
+def test_a_name_that_later_resolves_to_a_public_address_stays_refused(tmp_path):
+    config = _env_config(tmp_path, embed_base_url="http://embed:8080/v1")
+    net = _Net(failing=10_000)
+    net.guard(config)
+    assert config.active().profile == "unavailable"
+    net.failing = 0
+    net.answers["embed"] = ["93.184.216.34"]
+    fn, _s = net.scheduled.pop(0)
+    fn()
+    assert config.active().profile == "unavailable" and "refused" in config.damaged and net.scheduled == []
+    config.release_seeded("active")
+    assert config.active().profile == "unavailable", "a permanent refusal cannot be released"
+
+
+def test_a_public_seeded_address_is_logged_and_not_used_without_crashing(tmp_path, caplog):
+    config = _env_config(tmp_path, embed_base_url="http://[2001:4860:4860::8888]/v1", embed_next_model="gemma-test",
+                         embed_next_profile="embeddinggemma-2", embed_next_base_url="http://127.0.0.1:8081/v1")
+    with caplog.at_level("ERROR", logger="agent.embedding"):
+        emb.guard_seeded_addresses(config)
+    assert config.active().profile == "unavailable"
+    with pytest.raises(emb.EmbeddingConfigError):
+        emb.frame(config.active().profile, ["x"])
+    assert config.next().base_url == "http://127.0.0.1:8081/v1", "a private next is left alone"
+    assert any("LLM_EMBED_BASE_URL" in r.getMessage() and "refused" in r.getMessage() for r in caplog.records)
+    assert config.source == "environment"
+
+
+def test_an_administrators_choice_while_next_is_held_back_is_kept(tmp_path):
+    config = _env_config(tmp_path, embed_next_model="gemma-test", embed_next_profile="embeddinggemma-2",
+                         embed_next_base_url="http://embed-next:8080/v1")
+    net = _Net(failing=10_000)
+    net.guard(config)
+    assert config.next() is None
+    config.set_next({"model": "chosen", "base_url": "http://127.0.0.1:9000/v1"})
+    net.failing = 0
+    fn, _s = net.scheduled.pop(0)
+    fn()
+    assert config.next().model == "chosen"
+
+
+def test_a_saved_configuration_is_not_second_guessed(tmp_path):
+    state = tmp_path / "embedding-config.json"
+    state.write_text(json.dumps({"version": 1, "active": {"model": "m", "profile": "nomic-v1", "base_url": "http://8.8.8.8/v1"}, "next": None, "previous": None}))
+    config = emb.EmbeddingConfig(cfg_for(tmp_path), state)
+    emb.guard_seeded_addresses(config, check=lambda url: pytest.fail("checked a saved value"))
+    assert config.active().profile == "nomic-v1"
+
+
+# ---------------- a fill does not write after the configuration changed ----------------
+
+class _ProxyConn:
+    """A connection whose BEGIN IMMEDIATE first runs `before_begin` (the configuration changes while the
+    embeddings were being computed, after the fill's first check)."""
+
+    def __init__(self, conn, before_begin):
+        self._conn, self._before = conn, before_begin
+
+    def execute(self, sql, *args):
+        if str(sql).strip().upper().startswith("BEGIN IMMEDIATE"):
+            self._before()
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_a_fill_rechecks_the_configuration_inside_its_write_transaction(tmp_path):
+    _vec_or_skip(tmp_path)
+    svc = _service(tmp_path)
+    try:
+        gemma = emb.Target(None, "gemma-test", "embeddinggemma-2")
+        svc.config.set_next(gemma)
+        version = svc.config.version
+        real_open = svc.mig._open
+        svc.mig._open = lambda path: (lambda c: c and _ProxyConn(c, svc.config.clear_next))(real_open(path))
+        result = svc.mig._fill(svc.paths["service"], gemma, version)
+        assert result.get("aborted") is True
+        assert _slot_models(svc.paths["service"]) == ["nomic-test"], "nothing was written for the abandoned next"
+    finally:
+        _close(svc)

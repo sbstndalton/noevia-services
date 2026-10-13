@@ -60,6 +60,9 @@ background, from the text already in each index, while search keeps using the cu
 `switch` makes it active once it covers at least what the current model covers; `rollback` returns to
 the previous model, whose vectors are kept until `finish`. `LLM_EMBED_NEXT_MODEL`,
 `LLM_EMBED_NEXT_BASE_URL` and `LLM_EMBED_NEXT_PROFILE` start a re-index from the environment.
+An embeddings address from the environment (`LLM_EMBED_BASE_URL`, `LLM_EMBED_NEXT_BASE_URL`) must be on this
+network: it is checked at start-up and a public one is logged and not used. A name that does not resolve is
+retried for about 30 s, then held back and re-checked every minute.
 `EMBEDDING_REINDEX_DUTY` (default 0.5) caps how much of the time the background pass keeps the
 embeddings server busy. Runtime changes are saved to `embedding-config.json` beside the service index
 and win over the environment until that file is deleted.

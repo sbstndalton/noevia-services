@@ -629,15 +629,26 @@ def embedding_migration() -> EmbeddingMigration:
         return _embedding_migration
 
 
+def _start_embedding() -> None:
+    try:
+        config = embedding_mod.shared_for(_base_cfg).config
+        embedding_mod.guard_seeded_addresses(config)
+        if config.next() is not None:
+            embedding_migration().kick()
+    except Exception:  # noqa: BLE001 — retrieval is optional; never take the service down
+        log.exception("embedding start-up check failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     st = get_state()
     enforce_open_mode_policy(st.auth_token)
     # Replay is tenant-scoped in _tenant_state. Never replay the retired global
     # corpus after a tenant has explicitly moved into app storage.
-    # #1636: a re-index configured at start (LLM_EMBED_NEXT_*, or saved) resumes in the background.
-    if embedding_mod.shared_for(_base_cfg).config.next() is not None:
-        embedding_migration().kick()
+    # #1636: a re-index configured at start (LLM_EMBED_NEXT_*, or saved) resumes in the background,
+    # once the seeded embeddings addresses have been checked to be on this network (which can take a
+    # while when the resolver is not up yet, so not on the startup path).
+    threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
     yield
     if _embedding_migration is not None:
         _embedding_migration.stop()

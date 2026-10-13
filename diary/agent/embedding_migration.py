@@ -197,6 +197,10 @@ class EmbeddingMigration:
                 if done:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # The embedding took a while: check again, now that nothing else can write.
+                        if self._stop.is_set() or self.config.version != version:
+                            conn.rollback()
+                            return {"embedded": embedded, "aborted": True}
                         slots.adopt_legacy(conn, self.config.active())
                         slot = slots.ensure_slot(conn, target, len(done[0][2]))
                         # Only while the chunk still holds the text that was embedded.
