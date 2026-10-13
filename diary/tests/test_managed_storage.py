@@ -481,3 +481,62 @@ def test_a_backup_abandoned_mid_run_does_not_report_storage_contacted(managed, t
     abandoned = managed.backup(remote, storage, now=time.time() + 10)
     assert edited, 'the edit hook never ran'
     assert abandoned['backup'] == 'pending' and 'storageContacted' not in abandoned
+
+
+def _status_error(code):
+    import httpx
+    request = httpx.Request('PUT', 'https://synthetic.invalid/Diary/x')
+    return httpx.HTTPStatusError(f'HTTP {code}', request=request, response=httpx.Response(code, request=request))
+
+
+@pytest.mark.parametrize('code', [401, 403])
+def test_a_backup_the_storage_server_refused_the_login_for_says_loginRefused(managed, storage, code):
+    """#1617: the 200 'failed' reply names a refused login, so the web service can latch it. The run still counts
+    as a failure on the sidecar's own retry schedule, and does not claim the storage server was contacted."""
+    class Refusing:
+        def get(self, path):
+            raise _status_error(code)
+    managed.put('a.md', b'one')
+    now = time.time() + 10
+    reply = managed.backup(Refusing(), storage, now=now)
+    assert reply['backup'] == 'failed' and reply['loginRefused'] is True
+    assert 'storageContacted' not in reply
+    assert reply['retryAt'] > now, 'the sidecar keeps its own retry cool-down'
+    again = managed.backup(Refusing(), storage, now=now + 1)
+    assert 'loginRefused' not in again, 'inside the cool-down the run does not even reach storage, so nothing is claimed'
+
+
+def test_a_refusal_through_the_real_webdav_client_says_loginRefused_and_the_gate_stays_closed(managed, storage):
+    import httpx
+    from agent.webdav import WebDAVCorpusBackend
+    from agent.storage_backoff import StorageBackoff
+    managed.put('a.md', b'one')
+    remote = WebDAVCorpusBackend('https://synthetic.invalid/dav', 'fixture', 'synthetic-pw', transport=httpx.MockTransport(lambda req: httpx.Response(401)))
+    try:
+        reply = managed.backup(remote, storage, now=time.time() + 10)
+        assert reply['backup'] == 'failed' and reply['loginRefused'] is True
+        assert remote.storage_gate.state()[0] == 'login', 'the sidecar cool-down is intact'
+        with pytest.raises(StorageBackoff):
+            remote.get('anything.md')
+    finally:
+        remote.close()
+
+
+@pytest.mark.parametrize('failure', ['500', '404', '429', 'offline', 'backoff', 'conflict'])
+def test_other_backup_failures_never_say_loginRefused(managed, tmp_path, storage, failure):
+    from agent.storage_backoff import StorageBackoff
+    class Failing:
+        def get(self, path):
+            if failure == 'offline':
+                raise OSError('unreachable')
+            if failure == 'backoff':
+                raise StorageBackoff('login', 120)
+            if failure == 'conflict':
+                return b'someone else wrote this', None
+            raise _status_error(int(failure))
+        def put(self, *a, **k):
+            return True, None, 201
+    managed.put('a.md', b'one')
+    reply = managed.backup(Failing(), storage, now=time.time() + 10)
+    assert reply['backup'] == 'failed'
+    assert 'loginRefused' not in reply
