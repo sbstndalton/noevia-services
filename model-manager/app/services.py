@@ -269,6 +269,15 @@ class ModelInUse(Exception):
 # #1636: also the Diary's embedding model and, while a re-index is under way (or kept for rollback),
 # the next model of web (EMBEDDING_NEXT_MODEL) and of the Diary (LLM_EMBED_NEXT_MODEL).
 _MODEL_ENV_KEYS = ("EMBEDDING_MODEL", "EMBED_MODEL", "EMBEDDING_NEXT_MODEL", "LLM_EMBED_MODEL", "LLM_EMBED_NEXT_MODEL", "RERANK_MODEL")
+_EMBED_ENV_KEYS = frozenset(_MODEL_ENV_KEYS) - {"RERANK_MODEL"}
+
+
+def _embed_service_guarded() -> bool:
+    """#1668: the native front (noevia-model-manager) runs the embedding service from saved settings
+    and refuses deletes of whatever that service serves or still holds, from its router's state. The
+    embedding env names are then only seeds and must not pin a model forever. Set by the native
+    front on this child process only."""
+    return os.environ.get("NOEVIA_EMBED_SERVICE_GUARDED") == "1"
 
 
 def _running_containers() -> list[dict]:
@@ -359,7 +368,10 @@ def model_holders(entry: "GgufEntry", containers: list[dict] | None = None) -> l
         if not why:
             env = _env_map(c)
             rerank_on = env.get("NOEVIA_FEATURE_RAG_RERANK", "").lower() in ("1", "true", "on")
+            guarded = _embed_service_guarded()
             for key in _MODEL_ENV_KEYS:
+                if guarded and key in _EMBED_ENV_KEYS:
+                    continue
                 v = env.get(key, "").strip()
                 if not v or v.lower() == "default" or (key == "RERANK_MODEL" and not rerank_on):
                     continue

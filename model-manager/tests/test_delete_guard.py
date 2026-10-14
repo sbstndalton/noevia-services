@@ -112,3 +112,17 @@ def test_free_model_still_deletes(client, monkeypatch):
     finally:
         TINY.parent.mkdir(exist_ok=True)
         TINY.write_bytes(keep)
+
+
+def test_embedding_env_names_are_only_seeds_once_the_native_front_guards_the_service(client, monkeypatch):
+    # #1668: the web/Diary env still names the seed model, but the embedding service may run another
+    # one (or be off). The native front guards the service's real state; the env must not pin it.
+    web = {"name": "web", "Config": {"Env": ["EMBEDDING_MODEL=tiny", "LLM_EMBED_MODEL=tiny"]}}
+    monkeypatch.delenv("NOEVIA_EMBED_SERVICE_GUARDED", raising=False)
+    assert services.model_holders(_tiny(), [web]) != []
+    monkeypatch.setenv("NOEVIA_EMBED_SERVICE_GUARDED", "1")
+    assert services.model_holders(_tiny(), [web]) == []
+    # The reranker name and a command line that runs the file still block.
+    rerank = {"name": "web", "Config": {"Env": ["NOEVIA_FEATURE_RAG_RERANK=true", "RERANK_MODEL=tiny"]}}
+    assert services.model_holders(_tiny(), [rerank]) != []
+    assert services.model_holders(_tiny(), [_embed(["--model", "/models/tiny/tiny-Q4_K_M.gguf"])]) != []
