@@ -58,6 +58,45 @@ class _Redirected(LLMError):
     """An embeddings server answered with a redirect; never retried."""
 
 
+class InputTooLarge(LLMError):
+    """#1759: the embeddings server refused an input as longer than it can take in one batch or
+    context (llama.cpp: "input (N tokens) is too large to process. increase the physical batch size
+    (current batch size: B)", or the context-size form). Never retried: the answer would be the same.
+    ``tokens`` and ``limit`` are what the server reported, when it did."""
+
+    def __init__(self, message: str, tokens: Optional[int] = None, limit: Optional[int] = None):
+        super().__init__(message)
+        self.tokens = tokens
+        self.limit = limit
+
+
+_TOO_LARGE_RE = re.compile(r"too large to process|exceeds the available context size|larger than the max context size"
+                           r"|exceed_context_size", re.IGNORECASE)
+_TOO_LARGE_TOKENS_RE = re.compile(r"input \((\d+) tokens\)|\"n_prompt_tokens\"\s*:\s*(\d+)")
+_TOO_LARGE_LIMIT_RE = re.compile(r"current batch size:\s*(\d+)|\"n_ctx\"\s*:\s*(\d+)")
+
+
+def _first_int(rx: "re.Pattern[str]", text: str) -> Optional[int]:
+    m = rx.search(text)
+    if not m:
+        return None
+    return int(next(g for g in m.groups() if g))
+
+
+def too_large_from_response(resp: httpx.Response) -> Optional[InputTooLarge]:
+    """An InputTooLarge for an error answer that says the input is too long; None for any other answer."""
+    if resp.status_code < 400:
+        return None
+    try:
+        body = resp.text[:4000]
+    except Exception:  # noqa: BLE001
+        return None
+    if not _TOO_LARGE_RE.search(body):
+        return None
+    return InputTooLarge(f"embeddings refused as too long (HTTP {resp.status_code}): {body[:300]}",
+                         _first_int(_TOO_LARGE_TOKENS_RE, body), _first_int(_TOO_LARGE_LIMIT_RE, body))
+
+
 # #1422 / #1065: the model the companion is configured for need not be an id the local engine
 # serves. The served list is read at call time and remembered this long.
 SERVED_TTL_S = 60.0
@@ -206,7 +245,7 @@ class LLMClient:
     # ---------------- shared retry plumbing ----------------
 
     def _post_with_retries(self, path: str, payload: Dict[str, Any], describe: str, parse, client=None,
-                           refuse_redirect: bool = False) -> Any:
+                           refuse_redirect: bool = False, detect_too_large: bool = False) -> Any:
         """POST with bounded retries; `parse` validates the response body and
         returns the result. Shared by chat() and embed(), which previously
         duplicated the retry loop (including its bug of sleeping after the
@@ -220,9 +259,13 @@ class LLMClient:
                         ensure_not_redirect(resp)  # raise_for_status() counts a 3xx as success
                     except RuntimeError as redirected:
                         raise _Redirected(f"{describe} server redirected (HTTP {resp.status_code}); redirects are refused") from redirected
+                if detect_too_large:
+                    too_large = too_large_from_response(resp)
+                    if too_large is not None:
+                        raise too_large
                 resp.raise_for_status()
                 return parse(resp.json())
-            except _Redirected:
+            except (_Redirected, InputTooLarge):
                 raise  # not retried: the answer would be the same, and each try would send the text again
             except Exception as exc:  # noqa: BLE001 - retry any transport/parse failure
                 last_exc = exc
@@ -379,6 +422,7 @@ class LLMClient:
             parse_embed,
             client=self._embed_client,
             refuse_redirect=True,
+            detect_too_large=True,
         )
 
     def close(self) -> None:
