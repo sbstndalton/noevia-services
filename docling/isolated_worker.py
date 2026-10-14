@@ -1,7 +1,8 @@
 """Child half of isolation.py: a long-lived process that runs conversions on request.
 
 Protocol, deliberately tiny so it cannot be confused by anything Docling prints:
-  * requests arrive on stdin, one JSON object per line: {"path": ..., "name": ...}
+  * requests arrive on stdin, one JSON object per line: {"path": ..., "name": ...}, plus
+    "figures": true when the caller wants the document's figures too (#1726)
   * replies go to a dedicated pipe (the fd given on the command line), each as a
     4-byte big-endian length followed by that many bytes of JSON:
         {"ok": <result>}   the target returned
@@ -47,7 +48,8 @@ def main(argv):
     for line in sys.stdin.buffer:
         try:
             request = json.loads(line)
-            payload = {"ok": function(request["path"], request["name"])}
+            extra = {"figures": True} if request.get("figures") is True else {}
+            payload = {"ok": function(request["path"], request["name"], **extra)}
         except BaseException:
             payload = {"error": True}
         try:

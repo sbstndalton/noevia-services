@@ -19,7 +19,7 @@ from pathlib import Path
 SECRET = "PATIENT NAME: REDACTED-CANARY"
 
 
-def extract(path, name):
+def extract(path, name, figures=False):
     directive = Path(path).read_bytes().decode("latin-1").split()
     word = directive[0] if directive else ""
     if word == "SLEEP":
@@ -32,9 +32,12 @@ def extract(path, name):
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
         Path(directive[1]).write_text(str(child.pid))
         time.sleep(120)
-    return {"pages": [{"number": 1, "text": "ok", "status": "native",
-                       "method": "docling", "truncated": False}],
-            "total": 1, "truncatedPages": False, "pid": os.getpid()}
+    out = {"pages": [{"number": 1, "text": "ok", "status": "native",
+                      "method": "docling", "truncated": False}],
+           "total": 1, "truncatedPages": False, "pid": os.getpid()}
+    if figures:
+        out["figures"] = []  # #1726: the caller asked for figures; this stand-in has none
+    return out
 
 
 def big(path, name):

@@ -104,6 +104,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             size = int(self.headers.get("Content-Length", "0"))
             name = self.headers.get("X-Document-Name", "")
+            # #1726: multimodal RAG asks for the figures too (noevia-core docling.cjs).
+            figures = self.headers.get("X-Document-Figures", "") == "1"
             # The name decides the parser, so it is validated like a name and
             # never used as a path: only the suffix is read, and the bytes are
             # written to a generated temp filename.
@@ -114,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
         if not slot.acquire(blocking=False):
             return self.reply(503, {"error": "Document extraction is busy; refresh to retry."})
         try:
-            outcome = self.convert(size, name)
+            outcome = self.convert(size, name, figures)
         finally:
             # Released BEFORE the answer is written: a client that retries the
             # instant it reads a 422 must find the slot free, not a 503.
@@ -122,7 +124,7 @@ class Handler(BaseHTTPRequestHandler):
         if outcome:
             self.reply(*outcome)
 
-    def convert(self, size, name):
+    def convert(self, size, name, figures=False):
         """Read the body and convert it; returns (status, body), or None when nobody is left to answer."""
         self.connection.settimeout(30)
         data = self.rfile.read(size)
@@ -135,6 +137,8 @@ class Handler(BaseHTTPRequestHandler):
             path = Path(directory) / ("input" + suffix)
             path.write_bytes(data)
             try:
+                if figures:
+                    return 200, runner.run(str(path), name, timeout_for(suffix), self.client_gone, figures=True)
                 return 200, runner.run(str(path), name, timeout_for(suffix), self.client_gone)
             except isolation.ClientGone:
                 # Nobody is listening; the conversion process is already killed.

@@ -357,3 +357,38 @@ def test_a_large_result_arrives_whole(worker, monkeypatch):
     status, body = post(worker, b"data")
     assert status == 200
     assert body["pages"][0]["text"] == "x" * 190_000
+
+
+# ── #1726: figures for multimodal RAG ────────────────────────────────────────────────────────────
+def test_figures_are_asked_of_the_worker_only_with_the_header(worker):
+    status, body = post(worker, b"%PDF-1.4 fake")
+    assert status == 200 and "figures" not in body, "without the header the reply is what it always was"
+    status, body = post(worker, b"%PDF-1.4 fake", headers={"X-Document-Figures": "1"})
+    assert status == 200 and body["figures"] == []
+
+
+def test_the_request_line_is_unchanged_without_figures(monkeypatch):
+    runner = isolation.IsolatedExtractor("fake_converter:extract")
+    lines = []
+
+    class Pipe:
+        def write(self, data):
+            lines.append(data)
+
+        def flush(self):
+            pass
+
+    class Proc:
+        stdin = Pipe()
+
+        def poll(self):
+            return None
+
+    runner._proc = Proc()
+    monkeypatch.setattr(runner, "_read_exact", lambda *a: (_ for _ in ()).throw(isolation.ConversionFailed()))
+    monkeypatch.setattr(runner, "kill", lambda: None)
+    for figures in (False, True):
+        with pytest.raises(isolation.ConversionFailed):
+            runner.run("/unused", "doc.pdf", 1, figures=figures)
+    assert json.loads(lines[0]) == {"path": "/unused", "name": "doc.pdf"}
+    assert json.loads(lines[1]) == {"path": "/unused", "name": "doc.pdf", "figures": True}
