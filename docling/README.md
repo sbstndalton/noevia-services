@@ -182,6 +182,25 @@ overlay FROM the running image, documented in `docs/deployment.md` ("Docling rel
                 "method": "docling", "truncated": false}],
      "total": 12, "truncatedPages": false}
 
+### Figures (#1726, multimodal RAG)
+
+With `X-Document-Figures: 1` (sent by noevia-core only while `NOEVIA_MULTIMODAL_RAG` is on) the reply
+also carries the document's figures, and every page says whether its text came from OCR:
+
+    {"pages": [{..., "ocr": false}, {..., "ocr": true}],
+     "figures": [{"page": 1, "index": 0, "mime": "image/png", "data": "<base64>",
+                  "caption": "Figure 1: ...", "text": "words inside the picture"}], ...}
+
+- `ocr: true` marks a scanned page: a PDF page whose own text layer has fewer than 20 visible
+  characters although Docling returned text for it (so that text is OCR), or any page of an image
+  input with text. Core embeds such a page as text only, so its figures are **never returned**.
+- Figures are each picture Docling found (`generate_picture_images`, rendered at scale 2.0 for PDFs),
+  as PNG at most 1024 px on the longer side; pictures under 64 px on a side are skipped. At most 64
+  per document and 12 MiB of base64 in all, so the reply stays inside the 32 MiB frame. An image
+  input returns none (it is its own image).
+- A second converter carries the picture rendering, built on first use, so a request without the
+  header converts exactly as before and its reply is unchanged.
+
 ### Per-document limits (#854)
 
 Every input type has a wall-clock limit, enforced by **killing the conversion**, not by asking

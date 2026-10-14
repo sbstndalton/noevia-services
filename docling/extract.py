@@ -83,10 +83,33 @@ SUPPORTED = {
 }
 
 _converter = None
+_figure_converter = None
+
+# #1726 (multimodal RAG): figures, returned only when the caller asks (X-Document-Figures: 1). Each is
+# a PNG at most FIGURE_MAX_SIDE pixels on its longer side; smaller than FIGURE_MIN_SIDE on either side
+# (bullets, rules, logos) is skipped. At most FIGURE_CAP per document and FIGURE_TOTAL_CAP base64
+# characters in all, so a reply stays far inside the 32 MiB frame (the text alone can take ~12 MiB
+# escaped). FIGURE_IMAGES_SCALE is Docling's render scale for PDF crops (1.0 = 72 dpi).
+FIGURE_CAP = 64
+FIGURE_TOTAL_CAP = 12 * 1024 * 1024
+FIGURE_MAX_SIDE = 1024
+FIGURE_MIN_SIDE = 64
+FIGURE_IMAGES_SCALE = 2.0
+# A PDF page whose own text layer has fewer visible characters than this, yet came back from Docling
+# with text, was read by OCR: a scanned page. Its figures are never returned (core embeds such a page
+# as text only) and the page says `"ocr": true`.
+OCR_TEXT_LAYER_MIN = 20
+# An image input is itself the image: it has no figures to return.
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 
 
-def _build_converter():
-    """One converter, reused. Construction loads the layout and table models."""
+def _build_converter(figures=False):
+    """One converter, reused. Construction loads the layout and table models.
+
+    #1726: the figures variant also renders each picture's crop (generate_picture_images); it is a
+    second converter, built the first time figures are asked for, so a request without them works
+    exactly as before.
+    """
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -100,6 +123,9 @@ def _build_converter():
     # image and is what the previous OCR worker used, so output stays
     # comparable. Languages match services/ocr/server.py.
     options.ocr_options = TesseractCliOcrOptions(lang=["eng", "deu"])
+    if figures:
+        options.generate_picture_images = True
+        options.images_scale = FIGURE_IMAGES_SCALE
     # Charts are deliberately NOT enabled. Chart extraction loads
     # granite-vision-3.3-2b-chart2csv, a 2B vision model, which is a different
     # order of cost from the ~1.6 GB layout+table pair and would contend with
@@ -107,7 +133,7 @@ def _build_converter():
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
 
 
-def _convert(path):
+def _convert(path, figures=False):
     """Convert, bounded to PAGE_CAP pages of actual work.
 
     `page_range` matters more than it looks. Without it Docling converts every
@@ -121,13 +147,19 @@ def _convert(path):
     read from the input document rather than from the pages we chose to
     convert.
     """
-    global _converter
-    if _converter is None:
-        _converter = _build_converter()
+    global _converter, _figure_converter
+    if figures:
+        if _figure_converter is None:
+            _figure_converter = _build_converter(figures=True)
+        converter = _figure_converter
+    else:
+        if _converter is None:
+            _converter = _build_converter()
+        converter = _converter
     limits = {"max_file_size": FILE_SIZE_CAP}
     if not str(path).lower().endswith(".pdf"):
         limits["max_num_pages"] = NON_PDF_MAX_PAGES
-    result = _converter.convert(path, page_range=(1, PAGE_CAP), **limits)
+    result = converter.convert(path, page_range=(1, PAGE_CAP), **limits)
     source_pages = getattr(getattr(result, "input", None), "page_count", None)
     if not isinstance(source_pages, bool) and isinstance(source_pages, int) and source_pages > 0:
         return Converted(result.document, source_pages)
@@ -161,6 +193,53 @@ def _pages_from(document):
         if piece and piece.strip():
             pages.setdefault(int(page_no), []).append(piece.strip())
     return pages
+
+
+def _pictures_from(document):
+    """(page, image, caption, text) for each picture Docling found, in document order (#1726).
+
+    `image` is a PIL image (None when Docling kept none), `caption` its caption text, `text` the text
+    Docling read inside the picture region (chart labels, a diagram's words).
+    """
+    out = []
+    for picture in getattr(document, "pictures", None) or []:
+        prov = getattr(picture, "prov", None)
+        page_no = getattr(prov[0], "page_no", None) if prov else None
+        try:
+            image = picture.get_image(document)
+        except Exception:
+            image = None
+        try:
+            caption = picture.caption_text(document) or ""
+        except Exception:
+            caption = ""
+        words = []
+        for ref in getattr(picture, "children", None) or []:
+            try:
+                item = ref.resolve(document)
+            except Exception:
+                continue
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                words.append(text.strip())
+        out.append((int(page_no) if page_no else 1, image, caption, "\n".join(words)))
+    return out
+
+
+def _encode_png(image):
+    """A PIL image as PNG bytes, at most FIGURE_MAX_SIDE on its longer side; None when too small."""
+    import io
+
+    width, height = getattr(image, "size", (0, 0))
+    if width < FIGURE_MIN_SIDE or height < FIGURE_MIN_SIDE:
+        return None
+    if image.mode not in ("RGB", "RGBA", "L"):
+        image = image.convert("RGB")
+    image = image.copy()
+    image.thumbnail((FIGURE_MAX_SIDE, FIGURE_MAX_SIDE))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
 
 
 def _native_page_text(path, numbers):
@@ -219,13 +298,16 @@ def _clean_native(text):
     return "\n".join(out).strip()
 
 
-def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_native_page_text):
-    """Convert one document. `convert`/`pages_from`/`native_text` are injectable for tests."""
+def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_native_page_text,
+            figures=False, pictures_from=_pictures_from, encode_png=_encode_png):
+    """Convert one document. `convert`/`pages_from`/`native_text`/`pictures_from`/`encode_png` are
+    injectable for tests. `figures` (#1726) also returns the document's figures and marks each page
+    read by OCR (`"ocr": true`); without it the result is exactly what it always was."""
     suffix = "." + str(name).rsplit(".", 1)[-1].lower() if "." in str(name) else ""
     if suffix not in SUPPORTED:
         raise ValueError("unsupported format")
 
-    converted = convert(path)
+    converted = convert(path, figures=True) if figures else convert(path)
     # Tolerant of both shapes: the real `_convert` returns a Converted, while a
     # test may inject a bare document.
     document = getattr(converted, "document", converted)
@@ -300,4 +382,57 @@ def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_n
         if reason:
             page["reason"] = reason
         results.append(page)
-    return {"pages": results, "total": total, "truncatedPages": total > PAGE_CAP}
+    out = {"pages": results, "total": total, "truncatedPages": total > PAGE_CAP}
+    if figures:
+        out["figures"] = _figures(path, suffix, document, results, docling_text, fallback, native_text, pictures_from, encode_png)
+    return out
+
+
+def _figures(path, suffix, document, results, docling_text, fallback, native_text, pictures_from, encode_png):
+    """#1726: mark the pages read by OCR, then return the figures of every other page."""
+    import base64
+
+    scanned = set()
+    if suffix in IMAGE_SUFFIXES:
+        scanned = {p["number"] for p in results if p["text"].strip()}
+    elif suffix == ".pdf":
+        try:
+            layer = native_text(path, [p["number"] for p in results]) or {}
+        except Exception:
+            layer = {}
+        for p in results:
+            n = p["number"]
+            if n not in fallback and _visible(docling_text.get(n, "")) > 0 and _visible(str(layer.get(n, "") or "")) < OCR_TEXT_LAYER_MIN:
+                scanned.add(n)
+    for p in results:
+        p["ocr"] = p["number"] in scanned
+    if suffix in IMAGE_SUFFIXES:
+        return []
+    known = {p["number"] for p in results}
+    found, spent = [], 0
+    try:
+        pictures = pictures_from(document)
+    except Exception:
+        pictures = []
+    for index, (page, image, caption, text) in enumerate(pictures):
+        if len(found) >= FIGURE_CAP:
+            break
+        if page not in known or page in scanned or image is None:
+            continue
+        try:
+            data = encode_png(image)
+        except Exception:
+            data = None
+        if not data:
+            continue
+        encoded = base64.b64encode(data).decode("ascii")
+        if spent + len(encoded) > FIGURE_TOTAL_CAP:
+            continue
+        spent += len(encoded)
+        figure = {"page": page, "index": index, "mime": "image/png", "data": encoded}
+        if caption and caption.strip():
+            figure["caption"] = caption.strip()[:300]
+        if text and text.strip():
+            figure["text"] = text.strip()[:4000]
+        found.append(figure)
+    return found

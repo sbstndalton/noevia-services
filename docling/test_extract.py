@@ -366,3 +366,79 @@ def test_fallback_text_obeys_the_page_cap_and_stays_degraded(tmp_path, monkeypat
     assert page["status"] == "degraded"
     assert page["truncated"] is True
     assert len(page["text"]) == 300
+
+
+# ── #1726: figures and the scanned-page marker (multimodal RAG) ─────────────────────────────────
+class FakeImage:
+    def __init__(self, size=(400, 300)):
+        self.size = size
+
+
+def run_figures(items, pictures, name="doc.pdf", total=2, layer=None, encode=None):
+    document = type("Doc", (), {"pages": {n: None for n in range(1, total + 1)}})()
+    seen = {}
+
+    def convert(path, figures=False):
+        seen["figures"] = figures
+        return document
+
+    out = extractor.extract("/unused", name, convert=convert, pages_from=fake_pages_from(items),
+                            native_text=lambda _p, numbers: {n: t for n, t in (layer or {}).items() if n in numbers},
+                            figures=True, pictures_from=lambda _d: pictures,
+                            encode_png=encode or (lambda image: b"\x89PNG synthetic " + str(image.size).encode()))
+    return out, seen
+
+
+def test_without_figures_the_result_has_no_figures_and_no_ocr_marker():
+    out = run([FakeText("first", 1)])
+    assert "figures" not in out
+    assert all("ocr" not in p for p in out["pages"])
+
+
+def test_figures_come_back_with_page_caption_and_text_and_the_converter_is_asked_for_them():
+    layer = {1: "A real text layer " * 10, 2: "A real text layer " * 10}
+    out, seen = run_figures([FakeText("intro", 1), FakeText("more", 2)],
+                            [(1, FakeImage(), "Figure 1: Orchard yield", "apples 40%"), (2, FakeImage(), "", "")], layer=layer)
+    assert seen["figures"] is True
+    assert [(f["page"], f["index"], f.get("caption"), f.get("text")) for f in out["figures"]] == [(1, 0, "Figure 1: Orchard yield", "apples 40%"), (2, 1, None, None)]
+    assert out["figures"][0]["mime"] == "image/png"
+    import base64
+    assert base64.b64decode(out["figures"][0]["data"]).startswith(b"\x89PNG")
+    assert [p["ocr"] for p in out["pages"]] == [False, False]
+
+
+def test_a_scanned_page_is_marked_and_its_figures_are_never_returned():
+    # Page 2 has no text layer, yet Docling returned text for it: that text came from OCR.
+    layer = {1: "A real text layer " * 10, 2: ""}
+    out, _ = run_figures([FakeText("intro", 1), FakeText("words Tesseract read", 2)],
+                         [(1, FakeImage(), "", ""), (2, FakeImage(), "", "")], layer=layer)
+    assert [p["ocr"] for p in out["pages"]] == [False, True]
+    assert [f["page"] for f in out["figures"]] == [1]
+
+
+def test_an_image_input_has_no_figures_of_its_own():
+    out, _ = run_figures([FakeText("receipt text", 1)], [(1, FakeImage(), "", "")], name="photo.png", total=1)
+    assert out["figures"] == []
+    assert out["pages"][0]["ocr"] is True
+
+
+def test_figures_skip_missing_images_unknown_pages_tiny_images_and_respect_the_caps(monkeypatch):
+    layer = {1: "A real text layer " * 10}
+    pictures = [(1, None, "", ""), (9, FakeImage(), "", ""), (1, FakeImage((10, 10)), "", "")] + [(1, FakeImage(), "", "")] * 70
+    out, _ = run_figures([FakeText("intro", 1)], pictures, total=1, layer=layer,
+                         encode=lambda image: None if image.size[0] < extractor.FIGURE_MIN_SIDE else b"\x89PNG x")
+    assert len(out["figures"]) == extractor.FIGURE_CAP
+    monkeypatch.setattr(extractor, "FIGURE_TOTAL_CAP", 30)
+    out, _ = run_figures([FakeText("intro", 1)], [(1, FakeImage(), "", "")] * 5, total=1, layer=layer,
+                         encode=lambda image: b"\x89PNG " + b"x" * 10)
+    assert len(out["figures"]) == 1, "the total size cap stops further figures"
+
+
+def test_encode_png_downscales_and_skips_tiny_images():
+    pil = pytest.importorskip("PIL.Image")
+    big = pil.new("RGB", (3000, 1500), (200, 10, 10))
+    data = extractor._encode_png(big)
+    import io
+    again = pil.open(io.BytesIO(data))
+    assert again.format == "PNG" and max(again.size) == extractor.FIGURE_MAX_SIDE
+    assert extractor._encode_png(pil.new("RGB", (20, 400))) is None

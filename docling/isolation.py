@@ -140,10 +140,11 @@ class IsolatedExtractor:
             buffer += chunk
         return buffer
 
-    def run(self, path, name, timeout, gone=lambda: False):
+    def run(self, path, name, timeout, gone=lambda: False, figures=False):
         """Convert `path`; return the target's result or raise one of the four above.
 
-        Not re-entrant: callers hold the worker's single slot.
+        Not re-entrant: callers hold the worker's single slot. `figures` (#1726) asks the target for
+        the document's figures too; without it the request line is exactly what it always was.
         """
         deadline = time.monotonic() + timeout
         if self._proc is not None and self._proc.poll() is not None:
@@ -152,7 +153,8 @@ class IsolatedExtractor:
             self._start(gone)
         try:
             try:
-                self._proc.stdin.write(json.dumps({"path": path, "name": name}).encode() + b"\n")
+                request = {"path": path, "name": name, **({"figures": True} if figures else {})}
+                self._proc.stdin.write(json.dumps(request).encode() + b"\n")
                 self._proc.stdin.flush()
             except OSError:
                 # The child went away between jobs (or never listened): not the document's fault.
