@@ -527,6 +527,8 @@ fn images(image: &str) -> Result<()> {
             "-e",
             "MIGRATE_CACHE_RAM_ON_START=false",
             "-e",
+            "CHAT_MODEL_IDLE_UNLOAD_SECONDS=0",
+            "-e",
             "MODEL_MANAGER_HOST_IMPL=python",
             "-e",
             "MODEL_MANAGER_SECTIONS_IMPL=python",

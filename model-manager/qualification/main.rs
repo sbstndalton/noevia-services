@@ -512,6 +512,8 @@ fn images(image: &str) -> Result<()> {
             "-e",
             "MIGRATE_CACHE_RAM_ON_START=false",
             "-e",
+            "CHAT_MODEL_IDLE_UNLOAD_SECONDS=0",
+            "-e",
             "NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED=1",
             "-e",
             "NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED=1",
