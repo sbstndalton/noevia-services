@@ -3,7 +3,7 @@ import socket
 from fake_converter import extract as fake
 
 SUPPORTED = {".bmp", ".csv", ".docx", ".epub", ".htm", ".html", ".jpeg", ".jpg",
-             ".md", ".odp", ".ods", ".odt", ".pdf", ".png", ".pptx", ".tif", ".tiff", ".xlsx"}
+             ".odp", ".ods", ".odt", ".pdf", ".png", ".pptx", ".tif", ".tiff", ".xlsx"}
 
 
 def extract(path, name):

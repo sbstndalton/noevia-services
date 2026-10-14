@@ -71,9 +71,15 @@ NATIVE_FALLBACK_RATIO = 0.10
 # Formats worth accepting here. Anything not listed is refused by name rather
 # than attempted and silently returned empty — the failure mode this whole
 # change exists to remove.
+#
+# .md is deliberately absent (#1711). The image does not install docling's
+# `format-markdown` extra, so a Markdown input died on a missing `marko` import
+# and came back as a 422 "processing limits" error, which read like a document
+# problem. Core never sends Markdown here anyway: it reads text-like files
+# itself (documents.cjs PLAIN_TEXT, #577). Refusing by name gives a 415.
 SUPPORTED = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".odt", ".odp", ".ods",
-    ".html", ".htm", ".md", ".epub", ".csv", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
+    ".html", ".htm", ".epub", ".csv", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
 }
 
 _converter = None
