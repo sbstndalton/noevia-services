@@ -184,6 +184,16 @@ def test_an_unsupported_suffix_is_415_not_a_silent_empty_result(worker):
     assert ".zip" in body["error"]
 
 
+def test_markdown_is_refused_as_unsupported_not_a_processing_limit_422(worker):
+    # #1711: the image has no Markdown reader, so .md used to reach the
+    # converter, fail on a missing import and come back as a 422 that blamed
+    # the document. It must be refused by name, before any conversion.
+    status, body = post(worker, b"# QA synthetic\nline two\nline three\n", name="qa-synthetic.md")
+    assert status == 415
+    assert ".md" in body["error"]
+    assert "processing limits" not in body["error"]
+
+
 def test_an_extractor_failure_is_422_and_quotes_no_document_content(worker):
     import fake_converter
     status, body = post(worker, b"BOOM")
@@ -226,7 +236,7 @@ def test_an_unknown_route_is_404(worker):
 def test_each_input_type_has_a_time_limit_and_pdfs_keep_the_long_one():
     assert server.timeout_for(".pdf") == server.LONG_TIMEOUT
     assert server.timeout_for(".tiff") == server.LONG_TIMEOUT
-    for suffix in [".xlsx", ".ods", ".docx", ".pptx", ".odt", ".odp", ".html", ".htm", ".md", ".epub", ".csv", ".png", ".jpg"]:
+    for suffix in [".xlsx", ".ods", ".docx", ".pptx", ".odt", ".odp", ".html", ".htm", ".epub", ".csv", ".png", ".jpg"]:
         assert server.timeout_for(suffix) == server.SHORT_TIMEOUT, suffix
     # Under the web client's 65 min abort, so it gets a 422 rather than giving up itself.
     assert server.LONG_TIMEOUT < 3900
@@ -235,7 +245,7 @@ def test_each_input_type_has_a_time_limit_and_pdfs_keep_the_long_one():
     assert {server.timeout_for(s) for s in extractor.SUPPORTED} <= {server.LONG_TIMEOUT, server.SHORT_TIMEOUT}
 
 
-@pytest.mark.parametrize("name", ["big.xlsx", "page.html", "deck.pptx", "notes.md", "scan.png"])
+@pytest.mark.parametrize("name", ["big.xlsx", "page.html", "deck.pptx", "scan.png"])
 def test_a_non_pdf_that_never_finishes_is_cut_off_with_a_422_and_frees_the_slot(worker, monkeypatch, name):
     monkeypatch.setattr(server, "SHORT_TIMEOUT", 1.0)
     started = time.monotonic()

@@ -51,7 +51,7 @@ def run(items, name="doc.pdf", total=None):
 def test_unsupported_formats_are_refused_by_name_not_silently_empty():
     # The bug this replaces: .xlsx was accepted, filed as a Document, and then
     # produced empty content with no error anywhere.
-    for name in ["archive.zip", "firmware.bin", "noextension"]:
+    for name in ["archive.zip", "firmware.bin", "noextension", "notes.md"]:
         with pytest.raises(ValueError):
             run([], name=name)
 

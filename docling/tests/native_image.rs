@@ -17,7 +17,7 @@ fn request(body: Option<&[u8]>) -> Result<TcpStream, Error> {
     socket.set_read_timeout(Some(Duration::from_secs(10)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     let header = if let Some(data) = body {
-        format!("POST /extract HTTP/1.0\r\nHost: localhost\r\nX-Document-Name: synthetic.md\r\nContent-Length: {}\r\n\r\n",data.len())
+        format!("POST /extract HTTP/1.0\r\nHost: localhost\r\nX-Document-Name: synthetic.docx\r\nContent-Length: {}\r\n\r\n",data.len())
     } else {
         "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n".to_owned()
     };
@@ -126,7 +126,7 @@ fn pid(reply: &Reply) -> Result<u32, Error> {
     Ok(pid)
 }
 fn health_valid(reply: &Reply) -> Result<bool, Error> {
-    let formats = r#"[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".md",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]"#;
+    let formats = r#"[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]"#;
     let python = format!(r#"{{"service":"docling","formats":{formats}}}"#);
     let native = format!(r#"{{"formats":{formats},"service":"docling"}}"#);
     let body = compact_json(&reply.body)?;
@@ -347,9 +347,9 @@ mod tests {
     }
     #[test]
     fn all_four_immutable_runtime_pins_match() {
-        let expected_ref = "ARG NOEVIA_RS_REF=0cfe6736d8d056f85954c13dae270277b6496a80";
+        let expected_ref = "ARG NOEVIA_RS_REF=08fd5a41eb6fa705c9425f0bffff7490cc2676e6";
         let expected_hash =
-            "ARG NOEVIA_RS_SHA256=7dbd8582e2d7b16f2e377e679cb44b1b86750eb45c6d93a47df258b054a5d671";
+            "ARG NOEVIA_RS_SHA256=76a5e1284736c0dce36f63fd938c67c7cc3f40b57236e89168768cc40f213c6c";
         let valid = |docker: &str| {
             docker.lines().any(|l| l == expected_ref)
                 && docker.lines().any(|l| l == expected_hash)
@@ -436,7 +436,9 @@ mod tests {
     fn fixed_shapes_and_resource_bounds_refuse_partial_proofs() {
         assert!(cpu_valid("100000 100000\n"));
         assert_eq!(pid(&Reply { status: 200, body: r#"{"pages":[{"number":1,"text":"ok","status":"native","method":"docling","truncated":false}],"total":1,"truncatedPages":false,"pid":42}"#.into() }).expect("complete extraction"), 42);
-        assert!(health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".md",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("complete health"));
+        assert!(health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("complete health"));
+        // #1711: .md is no longer advertised; an image still listing it is stale.
+        assert!(!health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".md",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("stale health"));
         for bad in ["", "max 100000", "0 0", "100000 200000", "1 1 extra"] {
             assert!(!cpu_valid(bad));
         }
