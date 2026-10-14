@@ -94,6 +94,7 @@ def frame(profile: str, texts: Sequence[str], kind: Union[str, Sequence[str]] = 
 SPLIT_MARGIN = 0.85       # pieces aim at this share of the limit the server reported
 SPLIT_MAX_DEPTH = 6       # a piece refused again is cut again, at most this many times
 SPLIT_MIN_CHARS = 64      # a piece this short that is still refused is a real refusal
+SPLIT_MAX_PARTS = 32      # one cut never makes more pieces than this, whatever token count a server reports (#1766)
 
 
 def split_text(text: str, parts: int) -> List[str]:
@@ -143,17 +144,20 @@ def embed_fitting(send: Callable[[List[str], List[str], List[Optional[str]]], Li
     try:
         return send(texts, kinds, tlist)
     except InputTooLarge as exc:
-        if len(texts) > 1:  # find the one that is too long; the others go as they are
-            out: List[List[float]] = []
-            for t, k, ti in zip(texts, kinds, tlist):
-                out.extend(embed_fitting(send, [t], [k], [ti], _depth))
-            return out
+        if len(texts) > 1:
+            # The server refused the whole batch without saying which text. Bisect: a half it accepts goes
+            # out once as a batch, only a half that is refused again is cut further, so the accepted texts
+            # are not sent one by one and only the refused text is ever split (#1766).
+            mid = len(texts) // 2
+            return (embed_fitting(send, texts[:mid], kinds[:mid], tlist[:mid], _depth)
+                    + embed_fitting(send, texts[mid:], kinds[mid:], tlist[mid:], _depth))
         text, k = texts[0], kinds[0]
         if k != "document" or _depth >= SPLIT_MAX_DEPTH or len(text) < SPLIT_MIN_CHARS:
             raise
         parts = 2
         if exc.tokens and exc.limit and exc.limit > 0:
             parts = max(2, -(-exc.tokens // max(1, int(exc.limit * SPLIT_MARGIN))))
+        parts = min(parts, SPLIT_MAX_PARTS)
         pieces = split_text(text, parts)
         log.info("embedding: a document of %d characters was too long for the server (%s); embedding it in %d pieces",
                  len(text), f"{exc.tokens} tokens, limit {exc.limit}" if exc.tokens else "no token count", len(pieces))
