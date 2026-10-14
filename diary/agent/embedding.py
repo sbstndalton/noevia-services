@@ -80,6 +80,87 @@ def frame(profile: str, texts: Sequence[str], kind: Union[str, Sequence[str]] = 
     return out
 
 
+# ---- #1759: a document longer than the embeddings server takes in one batch ----
+#
+# The server refuses an input with more tokens than its batch (llama.cpp ``-ub``) or per-slot context.
+# The Diary's chunk is a whole ``###`` subsection, which can be longer than that, and EmbeddingGemma 2
+# counts about 9% more tokens than nomic for the same text. A document the server refuses as too long
+# is cut into pieces at paragraph, line, sentence or word boundaries (sized by the token counts the
+# server reported, with a safety margin, or halved when it reported none), each piece is framed and
+# embedded on its own, and the chunk's vector is the length-weighted mean of the piece vectors,
+# normalised. The chunk stays the unit of retrieval and storage (one row, one vector), so search
+# results, the index schema and the per-model slots are unchanged. A text the server accepts is sent
+# exactly as before: nothing is split ahead of time, under any model or profile. Queries are never split.
+SPLIT_MARGIN = 0.85       # pieces aim at this share of the limit the server reported
+SPLIT_MAX_DEPTH = 6       # a piece refused again is cut again, at most this many times
+SPLIT_MIN_CHARS = 64      # a piece this short that is still refused is a real refusal
+
+
+def split_text(text: str, parts: int) -> List[str]:
+    """``text`` cut into about ``parts`` pieces of similar length, at the best boundary near each cut."""
+    parts = max(2, int(parts))
+    size = len(text) / parts
+    pieces: List[str] = []
+    start = 0
+    for i in range(1, parts):
+        ideal = int(i * size)
+        if ideal <= start:
+            continue
+        lo = max(start + 1, ideal - int(size * 0.4))
+        cut = ideal
+        for sep in ("\n\n", "\n", ". ", " "):
+            at = text.rfind(sep, lo, ideal + 1)
+            if at > start:
+                cut = at + len(sep)
+                break
+        piece = text[start:cut]
+        if piece.strip():
+            pieces.append(piece)
+        start = cut
+    rest = text[start:]
+    if rest.strip():
+        pieces.append(rest)
+    return pieces if len(pieces) > 1 else [text[: len(text) // 2], text[len(text) // 2:]]
+
+
+def _mean(vectors: List[List[float]], weights: List[int]) -> List[float]:
+    total = float(sum(weights)) or 1.0
+    out = [sum(v[j] * w for v, w in zip(vectors, weights)) / total for j in range(len(vectors[0]))]
+    norm = sum(x * x for x in out) ** 0.5
+    return [x / norm for x in out] if norm > 0 else out
+
+
+def embed_fitting(send: Callable[[List[str], List[str], List[Optional[str]]], List[List[float]]],
+                  texts: Sequence[str], kind: Union[str, Sequence[str]] = "document",
+                  titles: Optional[Sequence[Optional[str]]] = None, _depth: int = 0) -> List[List[float]]:
+    """``send(texts, kinds, titles)`` for ``texts``, re-splitting any document the server refuses as
+    too long (see above). Any other error, and a refused query, is raised unchanged."""
+    from .llm import InputTooLarge  # local import: llm imports nothing from here
+
+    texts = [str(t if t is not None else "") for t in texts]
+    kinds = [kind[i] if isinstance(kind, (list, tuple)) else kind for i in range(len(texts))]
+    tlist = [titles[i] if titles else None for i in range(len(texts))]
+    try:
+        return send(texts, kinds, tlist)
+    except InputTooLarge as exc:
+        if len(texts) > 1:  # find the one that is too long; the others go as they are
+            out: List[List[float]] = []
+            for t, k, ti in zip(texts, kinds, tlist):
+                out.extend(embed_fitting(send, [t], [k], [ti], _depth))
+            return out
+        text, k = texts[0], kinds[0]
+        if k != "document" or _depth >= SPLIT_MAX_DEPTH or len(text) < SPLIT_MIN_CHARS:
+            raise
+        parts = 2
+        if exc.tokens and exc.limit and exc.limit > 0:
+            parts = max(2, -(-exc.tokens // max(1, int(exc.limit * SPLIT_MARGIN))))
+        pieces = split_text(text, parts)
+        log.info("embedding: a document of %d characters was too long for the server (%s); embedding it in %d pieces",
+                 len(text), f"{exc.tokens} tokens, limit {exc.limit}" if exc.tokens else "no token count", len(pieces))
+        vectors = [embed_fitting(send, [p], [k], [tlist[0]], _depth + 1)[0] for p in pieces]
+        return [_mean(vectors, [len(p) for p in pieces])]
+
+
 @dataclass(frozen=True)
 class Target:
     base_url: Optional[str]
@@ -468,8 +549,10 @@ class Embedder:
 
     def embed(self, target: Target, texts: Sequence[str], kind: Union[str, Sequence[str]] = "document",
               titles: Optional[Sequence[Optional[str]]] = None) -> List[List[float]]:
-        framed = frame(target.profile, texts, kind, titles)
-        return self._client(target).embed(framed, model=target.model)
+        frame(target.profile, [], kind, titles)  # fail closed on an unknown profile before any call
+        client = self._client(target)
+        return embed_fitting(lambda ts, ks, tis: client.embed(frame(target.profile, ts, ks, tis), model=target.model),
+                             texts, kind, titles)
 
     def close(self) -> None:
         with self._lock:
@@ -498,7 +581,9 @@ class EmbeddingView:
     def embed(self, target: Target, texts: Sequence[str], kind: Union[str, Sequence[str]] = "document",
               titles: Optional[Sequence[Optional[str]]] = None) -> List[List[float]]:
         if self.own_llm is not None and (self.embedder is None or target == self.own_target):
-            return self.own_llm.embed(frame(target.profile, texts, kind, titles), model=target.model)
+            own = self.own_llm
+            return embed_fitting(lambda ts, ks, tis: own.embed(frame(target.profile, ts, ks, tis), model=target.model),
+                                 texts, kind, titles)
         return self.embedder.embed(target, texts, kind, titles)
 
 
