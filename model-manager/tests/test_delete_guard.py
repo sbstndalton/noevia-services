@@ -112,3 +112,44 @@ def test_free_model_still_deletes(client, monkeypatch):
     finally:
         TINY.parent.mkdir(exist_ok=True)
         TINY.write_bytes(keep)
+
+
+def _guard(monkeypatch):
+    monkeypatch.setenv("NOEVIA_EMBED_SERVICE_GUARDED", "1")
+    monkeypatch.setenv("NOEVIA_EMBED_SERVICE_CONTAINER", "cowork-embed-1")
+    monkeypatch.setenv("NOEVIA_EMBED_SERVICE_URL", "http://embed:8080")
+
+
+def test_embedding_env_names_are_only_seeds_once_the_native_front_guards_the_service(client, monkeypatch):
+    # #1668: the web/Diary env still names the seed model, but the embedding service may run another
+    # one (or be off). The native front guards the service's real state; the env must not pin it.
+    web = {"name": "web", "Config": {"Env": ["EMBEDDING_MODEL=tiny", "EMBEDDING_BASE_URL=http://embed:8080/v1"]}}
+    for k in ("NOEVIA_EMBED_SERVICE_GUARDED", "NOEVIA_EMBED_SERVICE_CONTAINER", "NOEVIA_EMBED_SERVICE_URL"):
+        monkeypatch.delenv(k, raising=False)
+    assert services.model_holders(_tiny(), [web]) != []
+    _guard(monkeypatch)
+    assert services.model_holders(_tiny(), [web]) == []
+    # The embed container's own seed is the service's too.
+    assert services.model_holders(_tiny(), [_embed(["--models-preset", "/config/embedding.ini"], ["EMBED_MODEL=tiny"])]) == []
+    # The reranker name and a command line that runs the file still block.
+    rerank = {"name": "web", "Config": {"Env": ["NOEVIA_FEATURE_RAG_RERANK=true", "RERANK_MODEL=tiny"]}}
+    assert services.model_holders(_tiny(), [rerank]) != []
+    assert services.model_holders(_tiny(), [_embed(["--model", "/models/tiny/tiny-Q4_K_M.gguf"])]) != []
+
+
+def test_embedding_names_on_another_engine_stay_protected_while_guarded(client, monkeypatch):
+    # #1638 / #1668 review: a Diary embedding model on the chat engine (or any other server) is not
+    # the guarded service's; its env name must keep blocking the delete.
+    _guard(monkeypatch)
+    for env in (
+        ["LLM_EMBED_MODEL=tiny"],
+        ["LLM_EMBED_MODEL=tiny", "LLM_EMBED_BASE_URL=http://llama:8080/v1"],
+        ["LLM_EMBED_NEXT_MODEL=tiny", "LLM_EMBED_NEXT_BASE_URL=http://embed-next:8080/v1"],
+        ["EMBEDDING_MODEL=tiny", "EMBEDDING_BASE_URL=http://embed:9999/v1"],
+    ):
+        diary = {"name": "cowork-diary-1", "Config": {"Env": env}}
+        assert services.model_holders(_tiny(), [diary]) != [], env
+    # Without the service address the guard fails closed.
+    monkeypatch.delenv("NOEVIA_EMBED_SERVICE_URL")
+    web = {"name": "web", "Config": {"Env": ["EMBEDDING_MODEL=tiny", "EMBEDDING_BASE_URL=http://embed:8080/v1"]}}
+    assert services.model_holders(_tiny(), [web]) != []

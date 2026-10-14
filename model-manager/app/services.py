@@ -269,6 +269,49 @@ class ModelInUse(Exception):
 # #1636: also the Diary's embedding model and, while a re-index is under way (or kept for rollback),
 # the next model of web (EMBEDDING_NEXT_MODEL) and of the Diary (LLM_EMBED_NEXT_MODEL).
 _MODEL_ENV_KEYS = ("EMBEDDING_MODEL", "EMBED_MODEL", "EMBEDDING_NEXT_MODEL", "LLM_EMBED_MODEL", "LLM_EMBED_NEXT_MODEL", "RERANK_MODEL")
+# #1668: each embedding model key, with the key naming the server that model runs on.
+_EMBED_ENV_KEYS = {
+    "EMBEDDING_MODEL": "EMBEDDING_BASE_URL",
+    "EMBEDDING_NEXT_MODEL": "EMBEDDING_NEXT_BASE_URL",
+    "LLM_EMBED_MODEL": "LLM_EMBED_BASE_URL",
+    "LLM_EMBED_NEXT_MODEL": "LLM_EMBED_NEXT_BASE_URL",
+    "EMBED_MODEL": None,
+}
+
+
+def _embed_service_guarded() -> bool:
+    """#1668: the native front (noevia-model-manager) runs the embedding service from saved settings
+    and refuses deletes of whatever that service serves or still holds, from its router's state. The
+    embedding env names that point at that service are then only seeds and must not pin a model
+    forever. Set by the native front on this child process only."""
+    return os.environ.get("NOEVIA_EMBED_SERVICE_GUARDED") == "1"
+
+
+def _host_port(url: str) -> tuple[str, int] | None:
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(url.strip())
+        if not u.hostname:
+            return None
+        return u.hostname.lower(), u.port or (443 if u.scheme == "https" else 80)
+    except ValueError:
+        return None
+
+
+def _seed_only(container: dict, env: dict[str, str], key: str) -> bool:
+    """True when `key` in this container's env names a model of the guarded embedding service, so the
+    native front's guard covers it. Anything else (e.g. a Diary embedding model on another engine,
+    #1638) keeps blocking. Fails closed: unknown service address or container means not skipped."""
+    if not _embed_service_guarded() or key not in _EMBED_ENV_KEYS:
+        return False
+    own = os.environ.get("NOEVIA_EMBED_SERVICE_CONTAINER", "").strip()
+    if own and str(container.get("name", "")).lstrip("/") == own:
+        return True
+    url_key = _EMBED_ENV_KEYS[key]
+    service = _host_port(os.environ.get("NOEVIA_EMBED_SERVICE_URL", ""))
+    if url_key is None or service is None:
+        return False
+    return _host_port(env.get(url_key, "")) == service
 
 
 def _running_containers() -> list[dict]:
@@ -360,6 +403,8 @@ def model_holders(entry: "GgufEntry", containers: list[dict] | None = None) -> l
             env = _env_map(c)
             rerank_on = env.get("NOEVIA_FEATURE_RAG_RERANK", "").lower() in ("1", "true", "on")
             for key in _MODEL_ENV_KEYS:
+                if _seed_only(c, env, key):
+                    continue
                 v = env.get(key, "").strip()
                 if not v or v.lower() == "default" or (key == "RERANK_MODEL" and not rerank_on):
                     continue
