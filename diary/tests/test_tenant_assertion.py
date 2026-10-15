@@ -384,21 +384,37 @@ def test_real_process_start_does_not_refuse_current_traffic():
 
 
 def test_concurrent_verify_accepts_each_nonce_exactly_once(monkeypatch):
+    """Nonces spread over several seconds with a tiny cap: the cap is exceeded while other threads are
+    verifying, so eviction (past and future seconds) and _lost pruning run under contention."""
     import threading
-    monkeypatch.setattr(ta, '_nonce_cap', 50)  # also exercises eviction under contention
+    monkeypatch.setattr(ta, '_nonce_cap', 6)
     now = time.time()
-    ts = int(now)
-    unique = [signed(A, 'GET', '/x', ts=ts) for _ in range(300)]
-    dup = signed(A, 'GET', '/x', ts=ts)
+    base = int(now)
+    # Past seconds, the current one and future ones (future evictions land in _lost).
+    seconds = [base - 8, base - 6, base - 4, base - 2, base, base + 2, base + 4, base + 6, base + 8]
+    unique = [signed(A, 'GET', '/x', ts=seconds[i % len(seconds)]) for i in range(360)]
+    dup = signed(A, 'GET', '/x', ts=base)
+    assert ta.verify(KEY, dup, 'GET', '/x', now=now) is None  # accepted once, before the storm
     results, errors = [], []
     lock = threading.Lock()
     barrier = threading.Barrier(8)
+    evicted = []
+    real_drop = ta._drop_second
+
+    def counting_drop(second, at):
+        evicted.append(second)
+        return real_drop(second, at)
+
+    monkeypatch.setattr(ta, '_drop_second', counting_drop)
 
     def work(slice_):
         try:
             barrier.wait()
-            local = [('u', ta.verify(KEY, h, 'GET', '/x', now=now)) for h in slice_]
-            local += [('d', ta.verify(KEY, dup, 'GET', '/x', now=now)) for _ in range(40)]
+            local = []
+            for i, h in enumerate(slice_):
+                local.append(('u', h, ta.verify(KEY, h, 'GET', '/x', now=now)))
+                if i % 8 == 0:
+                    local.append(('d', dup, ta.verify(KEY, dup, 'GET', '/x', now=now)))
             with lock:
                 results.extend(local)
         except Exception as exc:  # noqa: BLE001
@@ -410,6 +426,34 @@ def test_concurrent_verify_accepts_each_nonce_exactly_once(monkeypatch):
     for t in threads:
         t.join()
     assert not errors
-    assert sum(1 for k, r in results if k == 'd' and r is None) == 1
-    assert sum(1 for k, r in results if k == 'u' and r is None) == 300
-    assert ta._nonce_count() <= 50 + 301
+    # Eviction really ran (it could not with one second), and the future ones were remembered.
+    assert evicted and ta._lost
+    # A nonce is never accepted twice, whatever was evicted.
+    accepted = [h[ta.HEADER] for k, h, r in results if r is None]
+    assert len(accepted) == len(set(accepted))
+    # The pre-accepted nonce is never accepted again, even once its bucket has been evicted (the floor / _lost
+    # refuse it instead).
+    assert not [1 for k, h, r in results if k == 'd' and r is None]
+    # Every refusal is a replay-cache refusal, never a crash or another reason.
+    assert {r for k, h, r in results if r is not None} <= {'replayed', 'replayed or older than the replay cache'}
+    assert ta._nonce_count() <= ta._nonce_cap + 360
+
+
+def test_concurrent_verify_same_second_exactly_once(monkeypatch):
+    """The plain exactly-once case: one second, one duplicate hammered from every thread."""
+    import threading
+    now = time.time()
+    dup = signed(A, 'GET', '/x', ts=int(now))
+    results = []
+    barrier = threading.Barrier(8)
+
+    def work():
+        barrier.wait()
+        results.extend(ta.verify(KEY, dup, 'GET', '/x', now=now) for _ in range(40))
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(1 for r in results if r is None) == 1
