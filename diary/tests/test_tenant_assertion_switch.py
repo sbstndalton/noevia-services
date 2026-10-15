@@ -144,12 +144,41 @@ def test_missing_or_non_executable_binary_rejects(tmp_path, monkeypatch, caplog)
     assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'
 
 
+def test_bin_override_must_be_an_absolute_executable_file(tmp_path, monkeypatch, caplog):
+    """#1832: a bare name (PATH lookup), a relative path, a directory or a non-executable file is
+    ignored with one warning and the fixed default is used, never the override."""
+    good, _ = fake(tmp_path, ACCEPT, name='good-bin')
+    fixed, _ = fake(tmp_path, REJECT, name='fixed-default')
+    monkeypatch.setattr(ta, 'DEFAULT_BIN', str(fixed))
+    bindir = tmp_path / 'onpath'
+    bindir.mkdir()
+    (bindir / 'tenant-assertion-on-path').write_text(good.read_text())
+    (bindir / 'tenant-assertion-on-path').chmod(0o755)
+    monkeypatch.setenv('PATH', f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'rust')
+    plain = tmp_path / 'plain'
+    plain.write_text('x')
+    plain.chmod(0o644)
+    monkeypatch.chdir(tmp_path)
+    for bad in ('tenant-assertion-on-path', './good-bin', 'good-bin', str(tmp_path), str(plain)):
+        ta._logged.clear()
+        monkeypatch.setenv('TENANT_ASSERTION_BIN', bad)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=ta.__name__):
+            assert ta._rust_binary() == str(fixed), bad
+            assert ta._rust_binary() == str(fixed), bad
+            assert verify(signed(A, 'GET', '/api/day')) == 'rust refused', bad  # the default ran, not the override
+        assert sum('ignoring it' in r.getMessage() for r in caplog.records) == 1, bad
+    monkeypatch.setenv('TENANT_ASSERTION_BIN', str(good))
+    assert ta._rust_binary() == str(good)
+    assert verify(signed(A, 'GET', '/api/day')) is None
+
+
 def test_default_binary_is_the_fixed_image_path(monkeypatch):
     assert ta.RUST_TIMEOUT_S == 0.5
     assert ta.DEFAULT_BIN == '/usr/local/bin/tenant-assertion'
     seen = []
     monkeypatch.setattr(ta.os.path, 'isfile', lambda p: seen.append(p) or False)
-    monkeypatch.setattr(ta.shutil, 'which', lambda *a: pytest.fail('PATH lookup for the default binary'))
     assert ta._rust_binary() is None and seen == ['/usr/local/bin/tenant-assertion']
 
 

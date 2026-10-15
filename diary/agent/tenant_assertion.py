@@ -60,7 +60,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -204,11 +203,18 @@ def impl_choice() -> str:
 
 
 def _rust_binary() -> Optional[str]:
-    # A fixed absolute path by default (never a PATH lookup); TENANT_ASSERTION_BIN is for tests.
-    configured = (os.environ.get("TENANT_ASSERTION_BIN") or DEFAULT_BIN).strip() or DEFAULT_BIN
-    if os.sep in configured:
-        return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
-    return shutil.which(configured)
+    # A fixed absolute path by default (never a PATH lookup). TENANT_ASSERTION_BIN (tests, operators)
+    # is honoured only as an absolute path to an existing, executable regular file; anything else,
+    # including a bare name, is ignored with one warning and the default is used (#1832, the same
+    # rule as WORKSPACE_RESTORE_VERIFY_BIN in workspace_restore.py).
+    configured = (os.environ.get("TENANT_ASSERTION_BIN") or "").strip()
+    binary = DEFAULT_BIN
+    if configured:
+        if os.path.isabs(configured) and os.path.isfile(configured) and os.access(configured, os.X_OK):
+            binary = configured
+        else:
+            _log_once("rust:bad_override", "TENANT_ASSERTION_BIN is not an absolute path to an executable file; ignoring it")
+    return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
 
 
 def _rust_decision(payload: dict) -> Optional[str]:
