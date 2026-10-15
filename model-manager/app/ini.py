@@ -16,6 +16,16 @@ from . import discover, gguf_meta
 from .config import settings
 
 BACKUPS_TO_KEEP = 10
+# #1783: the only names `_backup_current` makes (`.bak-<YYYYMMDD-HHMMSS>[-n]`). Pruning touches
+# these and the revision copies only; any other `.bak-*` beside models.ini is an operator's.
+_OWN_ROTATING = r"\.bak-\d{8}-\d{6}(?:-\d+)?"
+_OWN_REVISION = r"\.noevia-backup-[0-9a-f]{64}"
+
+
+def _is_own_copy(path, name: str) -> bool:
+    """Whether `name` is a recovery copy of `path` this manager made (and may remove)."""
+    prefix = re.escape(path.name)
+    return any(re.fullmatch(prefix + own, name) for own in (_OWN_ROTATING, _OWN_REVISION))
 # #1021: noevia-backup-<revision> copies kept (MODEL_FILES_IMPL=rust decides which).
 REVISION_BACKUPS_TO_KEEP = 10
 
@@ -979,7 +989,8 @@ def _rust_backups(path, base_revision: str | None, backup: bool):
         _immutable_backup(path, base_revision)
     if plan["rotating"] is not None:
         shutil.copy(path, path.with_name(plan["rotating"]))
-    return [path.with_name(n) for n in plan["prune"]]
+    # #1783: an older binary prunes every listed `.bak-*`; never remove a file we did not make.
+    return [path.with_name(n) for n in plan["prune"] if _is_own_copy(path, n)]
 
 
 def _replace_file(path, text: str, *, base_revision: str | None = None, backup: bool = True) -> None:
@@ -1223,10 +1234,12 @@ def write_raw_text(text: str, base_revision: str | None = None, backup: bool = T
 
 
 def _prune_backups() -> None:
+    """Keep the newest BACKUPS_TO_KEEP of this manager's own rotating copies (by name, which is
+    their time order); operator files such as `models.ini.bak-before-upgrade` are never touched."""
     path = settings.models_ini_path
-    pattern = f"{path.name}.bak-*"
     try:
-        backups = sorted(path.parent.glob(pattern), reverse=True)
+        backups = sorted((p for p in path.parent.glob(f"{path.name}.bak-*")
+                          if re.fullmatch(re.escape(path.name) + _OWN_ROTATING, p.name)), reverse=True)
     except OSError:
         return
     for old in backups[BACKUPS_TO_KEEP:]:
