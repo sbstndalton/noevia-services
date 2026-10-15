@@ -15,8 +15,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=54d6f3284d3883ac6b2e0271c85ae912f707a559
-ARG NOEVIA_RS_SHA256=eaf6337a6196520b4cfc48aa0ade507f10bfc40a264e105981b6fc5717c12fac
+ARG NOEVIA_RS_REF=418cd4d04ba6c88d40708aa4ccced077d53eaf10
+ARG NOEVIA_RS_SHA256=8889bdc087d8a75f57c8b61cc135a3ecd4502275289584ec853e2c28c29ab0d7
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -25,7 +25,7 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
@@ -33,6 +33,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-diagnose >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-settings >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-model-updates >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -44,6 +45,8 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
 ENV MODEL_MANAGER_SECTIONS_IMPL=python
 # #1318: native GET /api/v1/settings stays off by default; PUT always stays Python (single writer).
 ENV MODEL_MANAGER_SETTINGS_IMPL=python
+# #1318: native GET /api/v1/models/updates stays off by default; every update_check writer stays Python.
+ENV MODEL_MANAGER_MODEL_UPDATES_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt

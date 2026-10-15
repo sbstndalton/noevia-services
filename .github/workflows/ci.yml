@@ -603,7 +603,7 @@ jobs:
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates
           native_features=$(./target/release/noevia-model-manager --features)
           printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
@@ -611,6 +611,7 @@ jobs:
           printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-diagnose >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-settings >/dev/null
+          printf '%s\n' "$native_features" | grep -Fx native-model-updates >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
       - name: Check out immutable prompt oracle
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -696,7 +697,7 @@ jobs:
         run: '"$RUNNER_TEMP/prompts-image-probe" images noevia-model-manager-qualification:ci'
       - name: Rust-owned actual image diagnosis, private child, default and capability refusal
         run: '"$RUNNER_TEMP/diagnosis-image-probe" images noevia-model-manager-qualification:ci'
-      - name: Actual production image advertises sections, prompts, diagnosis and settings
+      - name: Actual production image advertises sections, prompts, diagnosis, settings and model updates
         run: |
           native_features=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges noevia-model-manager:ci noevia-model-manager --features)
           printf '%s\n' "$native_features" | grep -Fx native-sections
@@ -704,3 +705,5 @@ jobs:
           printf '%s\n' "$native_features" | grep -Fx native-diagnose
           printf '%s\n' "$native_features" | grep -Fx native-settings
           [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SETTINGS_IMPL)" = python ]
+          printf '%s\n' "$native_features" | grep -Fx native-model-updates
+          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_MODEL_UPDATES_IMPL)" = python ]
