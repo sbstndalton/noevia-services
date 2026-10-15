@@ -296,7 +296,6 @@ def enforce_open_mode_policy(auth_token: str) -> None:
 
 
 MAX_SIGNED_BODY = 64 * 1024 * 1024
-_nonce_full_logged = False
 
 
 class TenantAssertionMiddleware:
@@ -312,7 +311,7 @@ class TenantAssertionMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        global _open_tenant_logged, _nonce_full_logged
+        global _open_tenant_logged
         if scope.get("type") == "http":
             headers = Headers(scope=scope)
             if headers.get("x-cowork-user-id", ""):
@@ -345,20 +344,14 @@ class TenantAssertionMiddleware:
                         downstream_receive = receive_buffered
                     else:
                         body_hash, downstream_receive = tenant_assertion.STREAM, receive
-                    try:
-                        args = (key, headers, scope.get("method", "GET"), tenant_assertion.wire_path(scope))
-                        kwargs = {"query": scope.get("query_string", b""), "body_hash": body_hash}
-                        if tenant_assertion.impl_choice() == "rust":
-                            # The Rust check spawns a child; keep the event loop free (#1144).
-                            reason = await run_in_threadpool(tenant_assertion.verify, *args, **kwargs)
-                        else:
-                            reason = tenant_assertion.verify(*args, **kwargs)
-                    except tenant_assertion.NonceCacheFull:
-                        if not _nonce_full_logged:
-                            _nonce_full_logged = True
-                            log.error("tenant assertion nonce cache full of unexpired nonces: refusing requests (503)")
-                        await JSONResponse({"detail": "tenant assertion capacity exhausted"}, status_code=503)(scope, receive, send)
-                        return
+                    args = (key, headers, scope.get("method", "GET"), tenant_assertion.wire_path(scope))
+                    kwargs = {"query": scope.get("query_string", b""), "body_hash": body_hash}
+                    if tenant_assertion.impl_choice() == "rust":
+                        # The Rust check spawns a child; keep the event loop free (#1144).
+                        reason = await run_in_threadpool(tenant_assertion.verify, *args, **kwargs)
+                    else:
+                        # The bounded replay cache never refuses a fresh request (#1680).
+                        reason = tenant_assertion.verify(*args, **kwargs)
                     if reason:
                         log.warning("tenant assertion rejected: %s", reason)
                         await JSONResponse({"detail": "invalid tenant assertion"}, status_code=401)(scope, receive, send)

@@ -92,26 +92,50 @@ def test_json_bodies_are_hashed_and_other_media_types_sign_stream():
     assert not ta.body_is_hashed('application/zip') and not ta.body_is_hashed('multipart/form-data; boundary=x')
 
 
-def test_full_nonce_cache_purges_expired_then_refuses_instead_of_evicting(monkeypatch):
-    monkeypatch.setattr(ta, '_nonce_cap', 2)
+def test_more_signed_requests_than_the_cache_cap_are_all_accepted_and_replays_stay_refused(monkeypatch):
+    # #1680: over the cap the Diary used to raise NonceCacheFull (503) for fresh, legitimate requests.
+    monkeypatch.setattr(ta, '_nonce_cap', 5)
     now = 1_000_000.0
-    assert ta._remember_nonce('a' * 32, now)
-    assert ta._remember_nonce('b' * 32, now + 1)
-    with pytest.raises(ta.NonceCacheFull):
-        ta._remember_nonce('c' * 32, now + 2)
-    assert not ta._remember_nonce('a' * 32, now + 3), 'a live nonce was evicted'
-    # Once the oldest expires it is purged and there is room again.
-    assert ta._remember_nonce('c' * 32, now + 2 * ta.SKEW_S + 0.5)
+    sent = []
+    for i in range(40):  # 8x the cap inside one replay window, spread over 20 seconds
+        t = now + i * 0.5
+        h = signed(A, 'GET', '/api/storage-status', ts=int(t))
+        assert ta.verify(KEY, h, 'GET', '/api/storage-status', now=t) is None, f'fresh request {i} refused'
+        sent.append(h)
+    assert ta._nonce_count() <= 5 + 2, 'the cache must stay bounded (cap plus the newest second)'
+    # Every replay inside the window is still caught, including nonces evicted to make room.
+    replay_at = now + 20
+    for i, h in enumerate(sent):
+        assert ta.verify(KEY, h, 'GET', '/api/storage-status', now=replay_at) is not None, f'replay {i} accepted'
 
 
-def test_full_nonce_cache_answers_503_and_logs_once(keyed, monkeypatch, caplog):
+def test_expired_nonces_are_purged_first_and_never_raise_the_floor_for_live_traffic(monkeypatch):
+    monkeypatch.setattr(ta, '_nonce_cap', 3)
+    now = 1_000_000.0
+    for i in range(3):
+        assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now)), 'GET', '/x', now=now) is None
+    later = now + ta.SKEW_S + 1  # all three are outside the clock window now
+    h = signed(A, 'GET', '/x', ts=int(later) - ta.SKEW_S + 1)  # oldest timestamp still valid
+    assert ta.verify(KEY, h, 'GET', '/x', now=later) is None
+    assert ta._nonce_count() == 1
+
+
+def test_a_replay_after_the_clock_steps_back_is_refused(monkeypatch):
+    now = 1_000_000.0
+    h = signed(A, 'GET', '/x', ts=int(now))
+    assert ta.verify(KEY, h, 'GET', '/x', now=now) is None
+    # Purge it (clock far ahead), then step the clock back into its window: still a replay.
+    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + 500), 'GET', '/x', now=now + 500) is None
+    assert ta.verify(KEY, h, 'GET', '/x', now=now + 1) is not None
+
+
+def test_over_the_cap_http_answers_200_and_replay_answers_401(keyed, monkeypatch):
     monkeypatch.setattr(ta, '_nonce_cap', 1)
-    monkeypatch.setattr(appmod, '_nonce_full_logged', False)
-    assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 200
-    with caplog.at_level('ERROR', logger='diary'):
-        for _ in range(2):
-            assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 503
-    assert sum('nonce cache full' in r.getMessage() for r in caplog.records) == 1
+    first = signed(B, 'GET', '/api/storage-status')
+    assert keyed.get('/api/storage-status', headers=first).status_code == 200
+    for _ in range(3):
+        assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 200
+    assert keyed.get('/api/storage-status', headers=first).status_code == 401
 
 
 def test_path_is_signed_percent_encoded_as_on_the_wire():
@@ -302,3 +326,13 @@ def test_backup_without_the_secret_asks_for_it(volume, monkeypatch):  # noqa: F8
     r = client.post('/api/storage-backup', headers={'X-Cowork-User-ID': B, 'X-Cowork-Storage': storage})
     assert r.status_code == 428
     assert r.json()['detail'] == {'code': 'storage_credential_required'}
+
+
+def test_real_cap_sustains_2000_signed_requests_per_second_for_a_full_window():
+    # #1680 at the shipped cap: 2,000 req/s for 60 s is 120,000 nonces, over the 100k cap.
+    now = 1_000_000.0
+    for i in range(120_000):
+        t = now + i / 2000
+        assert ta._remember_nonce(f'{i:032x}', int(t), t) is None, f'request {i} refused'
+    assert ta._nonce_count() <= ta._nonce_cap + 2000
+    assert ta._remember_nonce(f'{119_999:032x}', int(now + 59.9995), now + 60) is not None
