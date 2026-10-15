@@ -49,6 +49,10 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SETTINGS_CONFIRMED") == "1" and request.method == "GET"
             and request.url.path == "/api/v1/settings"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent owns only this read; every update_check writer stays here.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_UPDATES_CONFIRMED") == "1" and request.method == "GET"
+            and request.url.path == "/api/v1/models/updates"):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     return await call_next(request)
 
 

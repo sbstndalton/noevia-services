@@ -16,6 +16,11 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     # #1334: the section switch is wired in the image, and its default stays python.
     assert "ENV MODEL_MANAGER_SECTIONS_IMPL=python" in source
     assert not re.search(r"^ENV .*MODEL_MANAGER_SECTIONS_IMPL=rust", source, re.M)
+    # #1318: the model-updates read is compiled in and advertised, and its switch defaults to python.
+    assert "noevia-model-manager/native-model-updates" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-updates >/dev/null" in source
+    assert "ENV MODEL_MANAGER_MODEL_UPDATES_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_MODEL_UPDATES_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):
