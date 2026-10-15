@@ -178,6 +178,19 @@
    }
   },
   {
+   "name": "operator .bak copies are never pruned (#1783)",
+   "input": "{\"file\":\"models.ini\",\"baseRevision\":\"578ddda33e85d0a07fbf37bbceec004e3198a65ff0ed2ca222ac62d8063ac3c5\",\"rotatingName\":\"models.ini.bak-20261015-120000\",\"existing\":[{\"name\":\"models.ini.bak-20260901-000000\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-20260902-000000\",\"mtimeNs\":2},{\"name\":\"models.ini.bak-20260903-000000\",\"mtimeNs\":3},{\"name\":\"models.ini.bak-20260904-000000\",\"mtimeNs\":4},{\"name\":\"models.ini.bak-20260905-000000\",\"mtimeNs\":5},{\"name\":\"models.ini.bak-20260906-000000\",\"mtimeNs\":6},{\"name\":\"models.ini.bak-20260907-000000\",\"mtimeNs\":7},{\"name\":\"models.ini.bak-20260908-000000\",\"mtimeNs\":8},{\"name\":\"models.ini.bak-20260909-000000\",\"mtimeNs\":9},{\"name\":\"models.ini.bak-20260910-000000\",\"mtimeNs\":10},{\"name\":\"models.ini.bak-20260911-000000\",\"mtimeNs\":11},{\"name\":\"models.ini.bak-20260912-000000\",\"mtimeNs\":12},{\"name\":\"models.ini.bak-2026-10-15\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-1731-before-preset-removal\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-20261015\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-20261015-1200\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-20261015-120000-x\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-0\",\"mtimeNs\":1},{\"name\":\"models.ini.bak-operator\",\"mtimeNs\":1}]}",
+   "expect": {
+    "rotating": "models.ini.bak-20261015-120000",
+    "revision": "models.ini.noevia-backup-578ddda33e85d0a07fbf37bbceec004e3198a65ff0ed2ca222ac62d8063ac3c5",
+    "prune": [
+     "models.ini.bak-20260901-000000",
+     "models.ini.bak-20260902-000000",
+     "models.ini.bak-20260903-000000"
+    ]
+   }
+  },
+  {
    "name": "another preset file name",
    "input": "{\"file\":\"presets.ini\",\"baseRevision\":\"578ddda33e85d0a07fbf37bbceec004e3198a65ff0ed2ca222ac62d8063ac3c5\",\"rotatingName\":\"presets.ini.bak-1\",\"keepRevisions\":1,\"existing\":[{\"name\":\"presets.ini.noevia-backup-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mtimeNs\":3},{\"name\":\"models.ini.noevia-backup-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"mtimeNs\":1}]}",
    "expect": {
@@ -432,8 +445,7 @@
     "revision": "presets.ini.noevia-backup-aa8e5c942b7ec0f1dffa182e329b894d06baa21f0299cd034b9ea4dcc31224dc",
     "prune": [
      "presets.ini.bak-20260108-081433-2",
-     "presets.ini.bak-20260111-199382",
-     "presets.ini.bak-20260118-202193-1"
+     "presets.ini.bak-20260111-199382"
     ]
    }
   },
@@ -654,9 +666,7 @@
    "expect": {
     "rotating": null,
     "revision": null,
-    "prune": [
-     "presets.ini.bak-20260102-060605"
-    ]
+    "prune": []
    }
   },
   {
@@ -1133,7 +1143,6 @@
     "rotating": "models.ini.bak-20261007-130403",
     "revision": "models.ini.noevia-backup-69200e9ce2809ee858a84bb1485031d5d3b97e039aa0f204f35f2cf44fe8d2fa",
     "prune": [
-     "models.ini.bak-20260211-012432",
      "models.ini.noevia-backup-659cfd144004f893c5ba92def8fbb924c951d805cf54f704c859601aac9b8fc8",
      "models.ini.noevia-backup-791cd26b0a0ee428e0f6f95db55965aa9c4c00750db5326f78eafea23f29dcc8",
      "models.ini.noevia-backup-99664e193cca7fb50e583db9174bc0589a0cd021d7ea49ccd14ad0fa5945eec4",
@@ -1242,7 +1251,6 @@
     "rotating": "models.ini.bak-20261007-001583",
     "revision": "models.ini.noevia-backup-c9e3af5cfbb7a4c045c2acfbea4419374f2e922b8ccb6063ea91fbc543062742",
     "prune": [
-     "models.ini.bak-20260102-009887-1",
      "models.ini.noevia-backup-1ae511200426b487d0e7bd422b3e18ce52b328118ff6ed400aadd260b55e6abd",
      "models.ini.noevia-backup-715fc43cc50a99bd924096654d4fe3e6dadcd754c39fdc8ddaf73ed13275db6f",
      "models.ini.noevia-backup-8796a5f982d94ff3c514ff43bb75a7ad81ee507910d30fbe6bd73cbfe8ec67b4",
@@ -1309,8 +1317,7 @@
     "prune": [
      "models.ini.bak-20260209-212966-2",
      "models.ini.bak-20260407-092308",
-     "models.ini.bak-20260422-217608-1",
-     "models.ini.bak-20260609-201840"
+     "models.ini.bak-20260422-217608-1"
     ]
    }
   },
@@ -1330,7 +1337,6 @@
     "rotating": null,
     "revision": "presets.ini.noevia-backup-f010459a4875cc0cb28498e2593497a1d53c2483dcc272068fdfc6418454f573",
     "prune": [
-     "presets.ini.bak-20260106-097206-1",
      "presets.ini.noevia-backup-38f39505ba9385795e62aebf114afc69ddaba7c0dad1dbbb4c26fb1cb01d9c06",
      "presets.ini.noevia-backup-45d6f3a2ba1821f8c72ad0b32961526bdd1e0d0976f3e71bdc04c04cb496c1f0",
      "presets.ini.noevia-backup-47c6e0ef9f55611300e1ed8ac7fd0b7ed576e6cedc725550f057589b28bab440",
@@ -1543,9 +1549,7 @@
    "expect": {
     "rotating": null,
     "revision": null,
-    "prune": [
-     "presets.ini.bak-20260115-159275"
-    ]
+    "prune": []
    }
   },
   {
@@ -1724,7 +1728,6 @@
     "rotating": "presets.ini.bak-20261007-078732",
     "revision": "presets.ini.noevia-backup-7923299078ab6fbf92717d83634e1f6ec4145fce904e06fe5141d73dbe90930e",
     "prune": [
-     "presets.ini.bak-20260319-079120-1",
      "presets.ini.noevia-backup-979719eee18c6b62fba9879d1b615ad950c4f283dc2db72258109050af65354b",
      "presets.ini.noevia-backup-9be56936883d08b69b3445a7b50d427728e65fa09e631222232fd2bbfbcb51c3",
      "presets.ini.noevia-backup-a7c63c651b205892adfc6c2843e5dd248a95bc9e412d5f38228c5982c7bc6ad2"
@@ -1810,7 +1813,6 @@
     "prune": [
      "presets.ini.bak-20260211-050087-2",
      "presets.ini.bak-20260215-207537-1",
-     "presets.ini.bak-20260219-211177",
      "presets.ini.noevia-backup-0601cc68502ce3490766d0910ee0e10c6e8006a167c6436d3d52ebb420b1ae43",
      "presets.ini.noevia-backup-2d3a1732aeaf3436495c0afad62e6b302bf8d1ec7a6c3d58074d94f947ff45f4",
      "presets.ini.noevia-backup-3e40463fecd74844874518f250ef5b1e89201365692a6a06b553fb7bcfeb45a4",
