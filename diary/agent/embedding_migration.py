@@ -89,7 +89,8 @@ class EmbeddingMigration:
                  load_vec: Optional[Callable[[sqlite3.Connection], bool]] = None,
                  skip_user: Callable[[str], bool] = lambda _u: False,
                  sleep: Optional[Callable[[float], None]] = None, now: Callable[[], float] = time.monotonic,
-                 retry_s: float = 60.0):
+                 retry_s: float = 60.0, cooldown_s: float = 600.0, max_cooldown_s: float = 86400.0,
+                 active_budget: int = 64):
         self.config = shared.config
         self.embedder = shared.embedder
         self.service_db = Path(service_db)
@@ -101,6 +102,14 @@ class EmbeddingMigration:
         self._sleep = sleep or (lambda s: self._stop.wait(s))
         self._now = now
         self._retry_s = retry_s
+        # #1768: a chunk the server refuses in the ACTIVE slot is retried by the regular pass, but
+        # never in a hot loop: each refusal doubles its cooldown (cooldown_s .. max_cooldown_s), and a
+        # pass attempts at most active_budget chunks of the active model.
+        self._cooldown_s = max(1.0, float(cooldown_s))
+        self._max_cooldown_s = max(self._cooldown_s, float(max_cooldown_s))
+        self._active_budget = max(1, int(active_budget))
+        self._refusals: Dict[tuple, tuple] = {}  # (file, chunk id, content hash) -> (refusals, retry-not-before)
+        self._recheck_timer: Optional[threading.Timer] = None
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._again = False
@@ -176,9 +185,24 @@ class EmbeddingMigration:
             out.extend(self._embed_rows(target, [row], refused))
         return out
 
-    def _fill(self, path: Path, target: Target, version: int) -> Dict[str, object]:
+    def _cooling(self, path: Path) -> set:
+        """Ids of this file's chunks still inside their refusal cooldown."""
+        now = self._now()
+        key = str(path)
+        return {k[1] for k, (_n, until) in list(self._refusals.items()) if k[0] == key and until > now}
+
+    def _note_refused(self, path: Path, rows: List[tuple], refused: set) -> None:
+        now, key = self._now(), str(path)
+        for cid, _body, h in rows:
+            if cid in refused:
+                n = self._refusals.get((key, cid, h), (0, 0.0))[0] + 1
+                self._refusals[(key, cid, h)] = (n, now + min(self._cooldown_s * 2 ** (n - 1), self._max_cooldown_s))
+
+    def _fill(self, path: Path, target: Target, version: int, budget: Optional[List[int]] = None) -> Dict[str, object]:
         embedded = 0
         refused: set = set()
+        active = target == self.config.active()
+        cooling = self._cooling(path) if active else set()
         while True:
             if self._stop.is_set() or self.config.version != version:
                 return {"embedded": embedded, "aborted": True}
@@ -186,11 +210,20 @@ class EmbeddingMigration:
             if conn is None:
                 return {"embedded": embedded, "unavailable": True}
             try:
-                rows = slots.missing_chunks(conn, slots.find_slot(conn, target), self.batch, exclude=refused)
+                limit = self.batch if budget is None else min(self.batch, budget[0])
+                if limit <= 0:
+                    return {"embedded": embedded, "more": True, **({"refused": len(refused)} if refused else {})}
+                rows = slots.missing_chunks(conn, slots.find_slot(conn, target), limit, exclude=refused | cooling)
                 if not rows:
                     return {"embedded": embedded, **({"refused": len(refused)} if refused else {})}
+                if budget is not None:
+                    budget[0] -= len(rows)
                 started = self._now()
                 done = self._embed_rows(target, rows, refused)
+                if active:
+                    self._note_refused(path, rows, refused)
+                    for cid, h, _v in done:
+                        self._refusals.pop((str(path), cid, h), None)
                 if self._stop.is_set() or self.config.version != version:
                     return {"embedded": embedded, "aborted": True}
                 n = 0
@@ -223,11 +256,13 @@ class EmbeddingMigration:
         version = self.config.version
         embedded = failed = refused = 0
         error = None
+        more = False
         targets = [t for t in (self.config.active(), self.config.next()) if t is not None]
+        budget = [self._active_budget]
         for f in self._files():
             for target in targets:
                 try:
-                    r = self._fill(f, target, version)
+                    r = self._fill(f, target, version, budget if target == self.config.active() else None)
                 except Exception as exc:  # noqa: BLE001 — one file or server down does not stop the rest
                     failed += 1
                     error = f"{type(exc).__name__}: {str(exc)[:160]}"
@@ -238,9 +273,10 @@ class EmbeddingMigration:
                 # Chunks the server refuses (e.g. longer than its context) are reported, not retried
                 # in a loop: they stay without a vector, as they were before.
                 refused += int(r.get("refused") or 0)
+                more = more or bool(r.get("more"))
                 if r.get("aborted"):
                     return {"embedded": embedded, "failed": failed, "refused": refused, "error": error, "aborted": True}
-        return {"embedded": embedded, "failed": failed, "refused": refused, "error": error}
+        return {"embedded": embedded, "failed": failed, "refused": refused, "error": error, "more": more}
 
     def _run(self) -> None:
         while True:
@@ -259,9 +295,35 @@ class EmbeddingMigration:
                     self._retry_timer = threading.Timer(self._retry_s, self._retry)
                     self._retry_timer.daemon = True
                     self._retry_timer.start()
+                if not self._stop.is_set():
+                    self._schedule_recheck(bool(r.get("more")))
                 if not self._again or self._stop.is_set():
                     self._thread = None
                     return
+
+    def _schedule_recheck(self, more: bool) -> None:
+        """Caller holds the lock. Wakes the regular pass for the budget left over or the soonest cooldown end."""
+        if self._recheck_timer is not None:
+            return
+        now = self._now()
+        waits = [self._retry_s] if more else []
+        waits += [max(until - now, 0.0) for (_n, until) in self._refusals.values() if until > now]
+        if not waits:
+            return
+        self._recheck_timer = threading.Timer(max(min(waits), 1.0), self._recheck)
+        self._recheck_timer.daemon = True
+        self._recheck_timer.start()
+
+    def _recheck(self) -> None:
+        with self._lock:
+            self._recheck_timer = None
+        self.kick()
+
+    def retry_missing(self) -> dict:
+        """Admin: retry every chunk without a vector in the active (and next) slot now, cooldowns cleared."""
+        self._refusals.clear()
+        self.kick()
+        return self.status()
 
     def _retry(self) -> None:
         with self._lock:
@@ -290,6 +352,9 @@ class EmbeddingMigration:
             if self._retry_timer is not None:
                 self._retry_timer.cancel()
                 self._retry_timer = None
+            if self._recheck_timer is not None:
+                self._recheck_timer.cancel()
+                self._recheck_timer = None
 
     # ---------------- actions ----------------
 
