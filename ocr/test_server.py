@@ -58,6 +58,216 @@ class RealEngineTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn('error', server.process(self.fixtures[name].read_bytes(), [1])[0])
 
+    def test_a_retry_really_renders_finer(self):
+        # #1867: X-OCR-DPI 400 must reach pdftoppm, and the page it writes must be larger, not the
+        # same 300 dpi pass again. Each rendered PNG's size is read from its IHDR before tesseract runs.
+        import struct
+        real, sizes = subprocess.run, {}
+
+        def run(args, **kwargs):
+            if args[0] == 'tesseract':
+                with open(args[1], 'rb') as png:
+                    width, height = struct.unpack('>II', png.read(24)[16:24])
+                sizes.setdefault('current', []).append((width, height))
+            return real(args, **kwargs)
+        with patch('subprocess.run', side_effect=run):
+            base = server.process(self.fixtures['scanned.pdf'].read_bytes(), [1])[0]
+            finer = server.process(self.fixtures['scanned.pdf'].read_bytes(), [1], dpi=400)[0]
+        (w300, h300), (w400, h400) = sizes['current']
+        self.assertNotIn('error', base)
+        self.assertNotIn('error', finer)
+        self.assertEqual(max(w300, h300), 3500, '-scale-to sets the longest side: 3500 px at 300 dpi')
+        self.assertEqual(max(w400, h400), 4700, '4700 px at 400 dpi')
+        self.assertGreater(w400 * h400, w300 * h300 * 1.7)
+
+    def test_ranged_ocr_of_an_image_only_page_inside_a_pdf_over_25_mib(self):
+        # #1867: the owner-shaped case, synthetic: a >25 MiB PDF whose third page is only an image of
+        # text. Sent whole over HTTP, only page 3 is rendered and read.
+        import http.client
+        import json
+        import threading
+        from http.server import ThreadingHTTPServer
+        path = Path(self._directory.name) / 'large.pdf'
+        size = synthetic_pdfs.write_ballast_pdf(path, 27 * 1024 * 1024)
+        self.assertGreater(size, 25 * 1024 * 1024)
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            connection = http.client.HTTPConnection('127.0.0.1', httpd.server_address[1], timeout=300)
+            with open(path, 'rb') as body:
+                connection.request('POST', '/extract', body=body, headers={'Content-Length': str(size), 'X-OCR-Pages': '[3]'})
+                response = connection.getresponse()
+                status, reply = response.status, json.loads(response.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(status, 200)
+        [page] = reply['pages']
+        self.assertEqual(page['number'], 3)
+        self.assertNotIn('error', page)
+        for value in synthetic_pdfs.ROWS:
+            self.assertIn(value, page['text'], f'OCR output was: {page["text"]!r}')
+
+    @unittest.skipUnless(Path('/proc/self/status').exists(), 'peak RSS is read from /proc (Linux)')
+    def test_peak_memory_of_a_90_mib_ranged_ocr_is_bounded(self):
+        # #1867 (#697: DaServer has no swap): the 90 MiB body is streamed to the temp file, so the
+        # worker's own peak stays near its idle size; the engines' peak is one rendered page.
+        import json
+        import os
+        import socket
+        import sys
+        path = Path(self._directory.name) / 'ninety.pdf'
+        size = synthetic_pdfs.write_ballast_pdf(path, 90 * 1024 * 1024)
+        self.assertGreater(size, 90 * 1024 * 1024)
+        loader = ("import sys,threading\nfrom http.server import ThreadingHTTPServer\nimport server\n"
+                  "h=ThreadingHTTPServer(('127.0.0.1',0),server.Handler)\nprint(h.server_address[1],flush=True)\n"
+                  "threading.Thread(target=h.serve_forever,daemon=True).start()\nsys.stdin.read()\n")
+        child = subprocess.Popen([sys.executable, '-c', loader], cwd=Path(server.__file__).parent,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            port = int(child.stdout.readline())
+            hwm = lambda: int(next(l for l in Path(f'/proc/{child.pid}/status').read_text().splitlines()
+                                   if l.startswith('VmHWM:')).split()[1])
+            idle = hwm()
+            with socket.create_connection(('127.0.0.1', port), timeout=300) as sock, open(path, 'rb') as body:
+                sock.sendall(b'POST /extract HTTP/1.0\r\nContent-Length: %d\r\nX-OCR-Pages: [3]\r\n\r\n' % size)
+                while chunk := body.read(1024 * 1024):
+                    sock.sendall(chunk)
+                reply = sock.makefile('rb').read()
+            worker = hwm()
+        finally:
+            child.stdin.close()
+        _, _, usage = os.wait4(child.pid, 0)
+        tree = usage.ru_maxrss  # KiB on Linux: the worker or any engine it waited for, whichever peaked
+        self.assertIn(b'REF-2042', reply)
+        report = f'OCR (Python) 90 MiB ranged /extract: worker idle {idle} KiB, worker peak {worker} KiB, engines+worker peak {tree} KiB'
+        print(report)
+        if os.environ.get('GITHUB_STEP_SUMMARY'):
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                summary.write(report + '\n')
+        self.assertLess(worker - idle, 16 * 1024, 'the body must not be held in memory')
+        self.assertLess(tree, 512 * 1024, 'one rendered page, not the file')
+
+    def test_a_retry_at_400_dpi_still_reads_the_scan(self):
+        # #1865: the finer render of a retry reads the same synthetic rows.
+        out = server.process(self.fixtures['scanned.pdf'].read_bytes(), [1], dpi=400)[0]
+        self.assertNotIn('error', out)
+        for value in synthetic_pdfs.ROWS:
+            self.assertIn(value, out['text'], f'OCR output was: {out["text"]!r}')
+
+
+class RangeAndDpiTests(unittest.TestCase):
+    """#1864/#1865: the HTTP surface, with the engines stubbed."""
+
+    def setUp(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+        self.calls = []
+        patcher = patch.object(server, 'process_file', side_effect=lambda pdf, d, pages, dpi=300: (
+            self.calls.append({'pages': pages, 'dpi': dpi, 'bytes': Path(pdf).read_bytes()}) or [{'number': p, 'text': f'page {p}', 'truncated': False} for p in pages]))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def post(self, body, path='/extract', headers=None):
+        import json
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(f'http://127.0.0.1:{self.httpd.server_address[1]}{path}', data=body, method='POST')
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read())
+
+    def test_default_request_is_unchanged_300_dpi(self):
+        status, body = self.post(b'%PDF-1.4 fake', headers={'X-OCR-Pages': '[1]'})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls, [{'pages': [1], 'dpi': 300, 'bytes': b'%PDF-1.4 fake'}])
+        self.assertEqual(body['pages'][0]['number'], 1)
+
+    def test_a_retry_asks_for_a_finer_render(self):
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[2]', 'X-OCR-DPI': '400'})[0], 200)
+        self.assertEqual(self.calls[0]['dpi'], 400)
+        for bad in ['72', '1200', 'x']:
+            with self.subTest(dpi=bad):
+                self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[2]', 'X-OCR-DPI': bad})[0], 400)
+
+    def test_pages_past_300_of_a_long_document_are_accepted(self):
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[301, 999]'})[0], 200)
+        self.assertEqual(self.calls[0]['pages'], [301, 999])
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': f'[{server.MAX_PAGE + 1}]'})[0], 400)
+
+    def test_extract_accepts_more_than_25_mib_streamed_and_other_routes_keep_the_cap(self):
+        body = b'%PDF-1.4 ' + b'z' * 40
+        with patch.object(server, 'LIMIT', 16), patch.object(server, 'EXTRACT_LIMIT', 64), patch.object(server, 'CHUNK', 7):
+            self.assertEqual(self.post(body, headers={'X-OCR-Pages': '[1]'})[0], 200)
+            self.assertEqual(self.calls[0]['bytes'], body, 'streamed in chunks, received whole')
+            self.assertEqual(self.post(body, path='/extract-docx')[0], 400)
+            self.assertEqual(self.post(b'%PDF-1.4 ' + b'z' * 80, headers={'X-OCR-Pages': '[1]'})[0], 400)
+
+
+    def test_health_advertises_ranges_body_cap_and_dpis(self):
+        # #1867: what core reads before it sends a body over 25 MB or a finer retry.
+        import json
+        import urllib.request
+        port = self.httpd.server_address[1]
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=10) as response:
+            self.assertEqual(json.loads(response.read()),
+                             {'service': 'ocr', 'ranges': True, 'maxBytes': server.EXTRACT_LIMIT, 'dpis': [300, 400, 600]})
+        self.assertEqual(server.EXTRACT_LIMIT, 96 * 1024 * 1024)
+
+    def test_the_dpi_header_is_exact_and_only_read_by_extract(self):
+        for raw, expected in [(None, 300), ('', 300), (' 400\t', 400), ('600', 600), ('300', 300)]:
+            self.assertEqual(server.dpi_of(raw), expected)
+        for raw in ['+400', '4_00', '0400', '400.0', '٤٠٠', '72', '1200']:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                server.dpi_of(raw)
+        # /extract-docx never renders: a DPI header there is not a reason to refuse it.
+        status, _ = self.post(b'x', path='/extract-docx', headers={'X-OCR-DPI': 'junk'})
+        self.assertEqual(status, 422)
+
+    def test_a_stalled_or_short_body_is_incomplete_and_frees_the_slot(self):
+        import socket
+        port = self.httpd.server_address[1]
+        with patch.object(server, 'BODY_SECONDS', 0.3):
+            with socket.create_connection(('127.0.0.1', port), timeout=10) as sock:
+                sock.sendall(b'POST /extract HTTP/1.0\r\nContent-Length: 100\r\nX-OCR-Pages: [1]\r\n\r\n%PDF')
+                reply = sock.makefile('rb').read()
+        self.assertIn(b' 400 ', reply.split(b'\r\n', 1)[0])
+        self.assertIn(b'Incomplete document body.', reply)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[1]'})[0], 200, 'slot released')
+
+
+class RenderTests(unittest.TestCase):
+    def test_the_render_uses_the_dpi_and_its_larger_side(self):
+        seen = []
+
+        def run(args, **kwargs):
+            seen.append((args, kwargs.get('timeout')))
+            if args[0] == 'pdftoppm':
+                Path(args[-1] + '.png').write_bytes(b'png')
+            return subprocess.CompletedProcess(args, 0, stdout=b'SYN TEXT', stderr=b'')
+        with patch('subprocess.run', side_effect=run):
+            default = server.process(b'%PDF', [1])
+            finer = server.process(b'%PDF', [1], dpi=400)
+        self.assertEqual(default, [{'number': 1, 'text': 'SYN TEXT', 'truncated': False}])
+        self.assertEqual(finer, default)
+        (render_default, t1), _, (render_finer, t2), _ = seen
+        self.assertEqual(render_default[render_default.index('-scale-to') + 1], '3500')
+        self.assertEqual(render_default[render_default.index('-r') + 1], '300')
+        self.assertEqual(render_finer[render_finer.index('-scale-to') + 1], '4700')
+        self.assertEqual(render_finer[render_finer.index('-r') + 1], '400')
+        self.assertLessEqual(t1, 60)
+        self.assertGreater(t2, 60)
+
+
 class StartupTests(unittest.TestCase):
     def run_selector(self, selector=None, features='native-ocr', feature_status=0):
         with tempfile.TemporaryDirectory() as directory:

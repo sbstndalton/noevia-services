@@ -45,6 +45,10 @@ PAGE_CAP = 300
 # any length of book. The wall-clock limit lives in server.py/isolation.py.
 FILE_SIZE_CAP = 25 * 1024 * 1024
 NON_PDF_MAX_PAGES = 1000
+# #1864: a page-range conversion of a PDF (server.py X-Document-Pages) may come from a larger file; only
+# the range is converted. Defence in depth behind server.py's RANGED_LIMIT (same variable, same default;
+# assigned below, once _env_int exists).
+RANGED_FILE_SIZE_CAP = 96 * 1024 * 1024
 
 
 def _env_int(name, default):
@@ -63,6 +67,7 @@ def _env_int(name, default):
 # running heads and stray glyphs a picture-only page can carry in its text
 # layer, well below a page of prose.
 NATIVE_FALLBACK_MIN_CHARS = _env_int("DOCLING_NATIVE_FALLBACK_MIN_CHARS", 200)
+RANGED_FILE_SIZE_CAP = _env_int("DOCLING_RANGED_MAX_BYTES", RANGED_FILE_SIZE_CAP)
 # "Near-empty": Docling kept less than this share of the native text. Docling
 # normally recovers the text layer nearly in full on a native page, so a page
 # under 10% has lost its body, not trimmed a header.
@@ -133,7 +138,7 @@ def _build_converter(figures=False):
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
 
 
-def _convert(path, figures=False):
+def _convert(path, figures=False, pages=None):
     """Convert, bounded to PAGE_CAP pages of actual work.
 
     `page_range` matters more than it looks. Without it Docling converts every
@@ -156,10 +161,11 @@ def _convert(path, figures=False):
         if _converter is None:
             _converter = _build_converter()
         converter = _converter
-    limits = {"max_file_size": FILE_SIZE_CAP}
+    # #1864: `pages` converts only that range (absolute page numbers), from a file up to RANGED_FILE_SIZE_CAP.
+    limits = {"max_file_size": RANGED_FILE_SIZE_CAP if pages else FILE_SIZE_CAP}
     if not str(path).lower().endswith(".pdf"):
         limits["max_num_pages"] = NON_PDF_MAX_PAGES
-    result = converter.convert(path, page_range=(1, PAGE_CAP), **limits)
+    result = converter.convert(path, page_range=tuple(pages) if pages else (1, PAGE_CAP), **limits)
     source_pages = getattr(getattr(result, "input", None), "page_count", None)
     if not isinstance(source_pages, bool) and isinstance(source_pages, int) and source_pages > 0:
         return Converted(result.document, source_pages)
@@ -299,15 +305,20 @@ def _clean_native(text):
 
 
 def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_native_page_text,
-            figures=False, pictures_from=_pictures_from, encode_png=_encode_png):
+            figures=False, pictures_from=_pictures_from, encode_png=_encode_png, pages=None):
     """Convert one document. `convert`/`pages_from`/`native_text`/`pictures_from`/`encode_png` are
     injectable for tests. `figures` (#1726) also returns the document's figures and marks each page
-    read by OCR (`"ocr": true`); without it the result is exactly what it always was."""
+    read by OCR (`"ocr": true`); without it the result is exactly what it always was. `pages` (#1864,
+    PDFs only) is a (first, last) range: only those pages are converted and returned, `total` is still
+    the whole document's page count, and `truncatedPages` says whether pages follow the range."""
     suffix = "." + str(name).rsplit(".", 1)[-1].lower() if "." in str(name) else ""
     if suffix not in SUPPORTED:
         raise ValueError("unsupported format")
+    if pages and suffix != ".pdf":
+        raise ValueError("page ranges are for PDFs only")
 
-    converted = convert(path, figures=True) if figures else convert(path)
+    kwargs = {**({"figures": True} if figures else {}), **({"pages": tuple(pages)} if pages else {})}
+    converted = convert(path, **kwargs) if kwargs else convert(path)
     # Tolerant of both shapes: the real `_convert` returns a Converted, while a
     # test may inject a bare document.
     document = getattr(converted, "document", converted)
@@ -319,10 +330,13 @@ def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_n
     # that were actually converted, which _convert caps at PAGE_CAP.
     declared = source_pages
     if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
-        declared = len(getattr(document, "pages", {}) or {})
+        converted_pages = getattr(document, "pages", {}) or {}
+        # A range's converted pages are numbered absolutely (#1864): the highest is the most we know.
+        declared = max((int(n) for n in converted_pages), default=0) if pages else len(converted_pages)
     total = declared or (max(grouped) if grouped else 1)
 
-    numbers = range(1, min(total, PAGE_CAP) + 1)
+    first, last = (int(pages[0]), int(pages[1])) if pages else (1, PAGE_CAP)
+    numbers = range(first, min(total, last) + 1)
     docling_text = {n: "\n\n".join(grouped.get(n, [])) for n in numbers}
 
     # Native-text fallback (#700), PDFs only. Why this rather than also walking
@@ -382,7 +396,7 @@ def extract(path, name, convert=_convert, pages_from=_pages_from, native_text=_n
         if reason:
             page["reason"] = reason
         results.append(page)
-    out = {"pages": results, "total": total, "truncatedPages": total > PAGE_CAP}
+    out = {"pages": results, "total": total, "truncatedPages": total > last}
     if figures:
         out["figures"] = _figures(path, suffix, document, results, docling_text, fallback, native_text, pictures_from, encode_png)
     return out

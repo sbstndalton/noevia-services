@@ -140,11 +140,12 @@ class IsolatedExtractor:
             buffer += chunk
         return buffer
 
-    def run(self, path, name, timeout, gone=lambda: False, figures=False):
+    def run(self, path, name, timeout, gone=lambda: False, figures=False, pages=None):
         """Convert `path`; return the target's result or raise one of the four above.
 
         Not re-entrant: callers hold the worker's single slot. `figures` (#1726) asks the target for
-        the document's figures too; without it the request line is exactly what it always was.
+        the document's figures too; without it the request line is exactly what it always was. `pages`
+        (#1864) is a (first, last) page range, sent only when given.
         """
         deadline = time.monotonic() + timeout
         if self._proc is not None and self._proc.poll() is not None:
@@ -153,7 +154,8 @@ class IsolatedExtractor:
             self._start(gone)
         try:
             try:
-                request = {"path": path, "name": name, **({"figures": True} if figures else {})}
+                request = {"path": path, "name": name, **({"figures": True} if figures else {}),
+                           **({"pages": [int(pages[0]), int(pages[1])]} if pages else {})}
                 self._proc.stdin.write(json.dumps(request).encode() + b"\n")
                 self._proc.stdin.flush()
             except OSError:

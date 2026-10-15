@@ -264,6 +264,46 @@ def oversized_text_pdf():
     return pdf([{"text": ["SYNTHETIC NATIVE TEXT FOR REDUCTION"]}], padding=OVERSIZE_PADDING)
 
 
+def write_ballast_pdf(path, ballast_bytes, chunk=1024 * 1024):
+    """#1867: a large synthetic PDF, written to `path` a chunk at a time (never held whole).
+
+    Page 1 is native text, page 2 carries `ballast_bytes` of an uncompressed gray image (flat
+    mid-gray, so the file is big but says nothing), and page 3 is the scan of ROWS with no text
+    layer. Rendering page 3 must not need page 2's bytes: that is what a ranged OCR relies on.
+    Returns the file size.
+    """
+    width = 4096
+    height = max(1, ballast_bytes // width)
+    objects = build([{"text": ["NATIVE PAGE ONE"]}, {"text": ["BALLAST PAGE"]}, {"scan": ROWS}])
+    ballast = max(objects) + 1
+    # Page 2 is objects 6 (page) and 7 (content): draw the ballast image on it.
+    objects[6] = objects[6].replace(b"/Font << /F1 3 0 R >>", b"/Font << /F1 3 0 R >> /XObject << /Im2 %d 0 R >>" % ballast)
+    objects[7] = _stream(b"", b"q 612 0 0 792 0 0 cm /Im2 Do Q")
+    head = (b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /DeviceGray "
+            b"/BitsPerComponent 8 /Length %d >>\nstream\n" % (width, height, width * height))
+    offsets = {}
+    with open(path, "wb") as out:
+        written = out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        for key in sorted(objects):
+            offsets[key] = written
+            written += out.write(b"%d 0 obj\n" % key + objects[key] + b"\nendobj\n")
+        offsets[ballast] = written
+        written += out.write(b"%d 0 obj\n" % ballast + head)
+        row = b"\x80" * chunk
+        left = width * height
+        while left:
+            written += out.write(row[:min(chunk, left)])
+            left -= min(chunk, left)
+        written += out.write(b"\nendstream\nendobj\n")
+        xref = written
+        size = ballast + 1
+        written += out.write(b"xref\n0 %d\n0000000000 65535 f \n" % size)
+        for key in range(1, size):
+            written += out.write(b"%010d 00000 n \n" % offsets[key])
+        written += out.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref))
+    return written
+
+
 def write_all(directory):
     """Write every fixture into `directory` (created if needed); returns {name: Path}."""
     directory = Path(directory)
