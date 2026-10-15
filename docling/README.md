@@ -221,6 +221,16 @@ document reported ready. Non-PDF inputs also get `max_num_pages=1000` (sheets, s
 document over it is rejected before any work) and every input `max_file_size=25 MB`. A PDF is still
 converted up to `PAGE_CAP` pages of any length.
 
+### Page ranges (#1864)
+
+With `X-Document-Pages: first-last` (PDFs only, at most 200 pages, `first >= 1`) only that range is
+converted, and the reply holds only those pages; `total` is still the whole document's page count and
+`truncatedPages` says whether pages follow the range. Such a request may carry a file up to
+`DOCLING_RANGED_MAX_BYTES` (default 256 MiB) instead of 25 MB, streamed to `/tmp` in chunks. `/health`
+answers `"ranges": true`; noevia-core asks before it sends a range, so a worker without this is never
+sent one. noevia-core reads a PDF over 25 MB, and the pages of any PDF past the first 300, this way.
+The native (Rust) worker does not read ranges yet; with `NOEVIA_DOCLING_IMPL=rust` large PDFs wait.
+
 `status` ∈ `native | blank | truncated | degraded`. A `degraded` page also
 carries `"reason": "native-fallback"` and `"method": "pdfium"` (see below). 415 = format this worker cannot read,
 422 = document could not be read or exceeded its time limit, 503 = busy. The client

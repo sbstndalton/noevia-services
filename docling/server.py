@@ -22,6 +22,36 @@ import extract as extractor
 import isolation
 
 LIMIT = 25 * 1024 * 1024
+# #1864: a request for a page range of a PDF (X-Document-Pages: first-last) may carry a larger file: only
+# the range is converted, so the cost is the range's pages, not the file's bytes. The body is streamed to
+# the temp file in chunks, never held whole. 256 MiB matches noevia-core's PROJECT_DOCUMENT_READ_BYTES
+# default and fits the 1 GiB /tmp tmpfs; DOCLING_RANGED_MAX_BYTES overrides it.
+CHUNK = 1024 * 1024
+MAX_RANGE_PAGES = 200
+
+
+def _bytes(name, default):
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+RANGED_LIMIT = _bytes("DOCLING_RANGED_MAX_BYTES", 256 * 1024 * 1024)
+
+
+def page_range(raw):
+    """(first, last) from an X-Document-Pages value "first-last"; None when absent; ValueError when invalid."""
+    if raw is None or raw == "":
+        return None
+    first, sep, last = raw.partition("-")
+    if not sep or not first.isdigit() or not last.isdigit() or len(raw) > 13:
+        raise ValueError()
+    first, last = int(first), int(last)
+    if not 1 <= first <= last or last - first >= MAX_RANGE_PAGES:
+        raise ValueError()
+    return first, last
 
 
 def _seconds(name, default):
@@ -95,7 +125,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self.reply(200, {"service": "docling", "formats": sorted(extractor.SUPPORTED)})
+            # `ranges` (#1864): this worker reads X-Document-Pages; noevia-core asks before it sends a range.
+            return self.reply(200, {"service": "docling", "formats": sorted(extractor.SUPPORTED), "ranges": True})
         self.reply(404, {"service": "docling"})
 
     def do_POST(self):
@@ -106,17 +137,21 @@ class Handler(BaseHTTPRequestHandler):
             name = self.headers.get("X-Document-Name", "")
             # #1726: multimodal RAG asks for the figures too (noevia-core docling.cjs).
             figures = self.headers.get("X-Document-Figures", "") == "1"
+            # #1864: a page range, PDFs only.
+            pages = page_range(self.headers.get("X-Document-Pages"))
+            if pages and not name.lower().endswith(".pdf"):
+                raise ValueError()
             # The name decides the parser, so it is validated like a name and
             # never used as a path: only the suffix is read, and the bytes are
             # written to a generated temp filename.
-            if not 0 < size <= LIMIT or not name or len(name) > 200 or "/" in name or "\\" in name:
+            if not 0 < size <= (RANGED_LIMIT if pages else LIMIT) or not name or len(name) > 200 or "/" in name or "\\" in name:
                 raise ValueError()
         except (ValueError, TypeError):
             return self.reply(400, {"error": "Invalid document size or name."})
         if not slot.acquire(blocking=False):
             return self.reply(503, {"error": "Document extraction is busy; refresh to retry."})
         try:
-            outcome = self.convert(size, name, figures)
+            outcome = self.convert(size, name, figures, pages)
         finally:
             # Released BEFORE the answer is written: a client that retries the
             # instant it reads a 422 must find the slot free, not a 503.
@@ -124,22 +159,28 @@ class Handler(BaseHTTPRequestHandler):
         if outcome:
             self.reply(*outcome)
 
-    def convert(self, size, name, figures=False):
+    def convert(self, size, name, figures=False, pages=None):
         """Read the body and convert it; returns (status, body), or None when nobody is left to answer."""
         self.connection.settimeout(30)
-        data = self.rfile.read(size)
-        if len(data) != size:
-            return 400, {"error": "Incomplete document body."}
         suffix = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        if suffix not in extractor.SUPPORTED:
-            return 415, {"error": f"This worker cannot read {suffix or 'files without an extension'}."}
         with tempfile.TemporaryDirectory(prefix="noevia-docling-") as directory:
             path = Path(directory) / ("input" + suffix)
-            path.write_bytes(data)
+            # Streamed to the temp file a chunk at a time (#1864), so a large ranged body is never held whole.
+            received = 0
+            with open(path, "wb") as out:
+                while received < size:
+                    chunk = self.rfile.read(min(CHUNK, size - received))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    received += len(chunk)
+            if received != size:
+                return 400, {"error": "Incomplete document body."}
+            if suffix not in extractor.SUPPORTED:
+                return 415, {"error": f"This worker cannot read {suffix or 'files without an extension'}."}
+            extra = {**({"figures": True} if figures else {}), **({"pages": pages} if pages else {})}
             try:
-                if figures:
-                    return 200, runner.run(str(path), name, timeout_for(suffix), self.client_gone, figures=True)
-                return 200, runner.run(str(path), name, timeout_for(suffix), self.client_gone)
+                return 200, runner.run(str(path), name, timeout_for(suffix), self.client_gone, **extra)
             except isolation.ClientGone:
                 # Nobody is listening; the conversion process is already killed.
                 return None

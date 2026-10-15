@@ -19,7 +19,7 @@ from pathlib import Path
 SECRET = "PATIENT NAME: REDACTED-CANARY"
 
 
-def extract(path, name, figures=False):
+def extract(path, name, figures=False, pages=None):
     directive = Path(path).read_bytes().decode("latin-1").split()
     word = directive[0] if directive else ""
     if word == "SLEEP":
@@ -37,6 +37,11 @@ def extract(path, name, figures=False):
            "total": 1, "truncatedPages": False, "pid": os.getpid()}
     if figures:
         out["figures"] = []  # #1726: the caller asked for figures; this stand-in has none
+    if pages:
+        # #1864: a range is echoed back, one page per number, out of a 1000-page document.
+        out["pages"] = [{"number": n, "text": f"page {n}", "status": "native", "method": "docling", "truncated": False}
+                        for n in range(pages[0], pages[1] + 1)]
+        out["total"], out["truncatedPages"] = 1000, pages[1] < 1000
     return out
 
 

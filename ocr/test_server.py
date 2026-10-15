@@ -58,6 +58,93 @@ class RealEngineTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn('error', server.process(self.fixtures[name].read_bytes(), [1])[0])
 
+    def test_a_retry_at_400_dpi_still_reads_the_scan(self):
+        # #1865: the finer render of a retry reads the same synthetic rows.
+        out = server.process(self.fixtures['scanned.pdf'].read_bytes(), [1], dpi=400)[0]
+        self.assertNotIn('error', out)
+        for value in synthetic_pdfs.ROWS:
+            self.assertIn(value, out['text'], f'OCR output was: {out["text"]!r}')
+
+
+class RangeAndDpiTests(unittest.TestCase):
+    """#1864/#1865: the HTTP surface, with the engines stubbed."""
+
+    def setUp(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+        self.calls = []
+        patcher = patch.object(server, 'process_file', side_effect=lambda pdf, d, pages, dpi=300: (
+            self.calls.append({'pages': pages, 'dpi': dpi, 'bytes': Path(pdf).read_bytes()}) or [{'number': p, 'text': f'page {p}', 'truncated': False} for p in pages]))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def post(self, body, path='/extract', headers=None):
+        import json
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(f'http://127.0.0.1:{self.httpd.server_address[1]}{path}', data=body, method='POST')
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read())
+
+    def test_default_request_is_unchanged_300_dpi(self):
+        status, body = self.post(b'%PDF-1.4 fake', headers={'X-OCR-Pages': '[1]'})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls, [{'pages': [1], 'dpi': 300, 'bytes': b'%PDF-1.4 fake'}])
+        self.assertEqual(body['pages'][0]['number'], 1)
+
+    def test_a_retry_asks_for_a_finer_render(self):
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[2]', 'X-OCR-DPI': '400'})[0], 200)
+        self.assertEqual(self.calls[0]['dpi'], 400)
+        for bad in ['72', '1200', 'x']:
+            with self.subTest(dpi=bad):
+                self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[2]', 'X-OCR-DPI': bad})[0], 400)
+
+    def test_pages_past_300_of_a_long_document_are_accepted(self):
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': '[301, 999]'})[0], 200)
+        self.assertEqual(self.calls[0]['pages'], [301, 999])
+        self.assertEqual(self.post(b'%PDF', headers={'X-OCR-Pages': f'[{server.MAX_PAGE + 1}]'})[0], 400)
+
+    def test_extract_accepts_more_than_25_mib_streamed_and_other_routes_keep_the_cap(self):
+        body = b'%PDF-1.4 ' + b'z' * 40
+        with patch.object(server, 'LIMIT', 16), patch.object(server, 'EXTRACT_LIMIT', 64), patch.object(server, 'CHUNK', 7):
+            self.assertEqual(self.post(body, headers={'X-OCR-Pages': '[1]'})[0], 200)
+            self.assertEqual(self.calls[0]['bytes'], body, 'streamed in chunks, received whole')
+            self.assertEqual(self.post(body, path='/extract-docx')[0], 400)
+            self.assertEqual(self.post(b'%PDF-1.4 ' + b'z' * 80, headers={'X-OCR-Pages': '[1]'})[0], 400)
+
+
+class RenderTests(unittest.TestCase):
+    def test_the_render_uses_the_dpi_and_its_larger_side(self):
+        seen = []
+
+        def run(args, **kwargs):
+            seen.append((args, kwargs.get('timeout')))
+            if args[0] == 'pdftoppm':
+                Path(args[-1] + '.png').write_bytes(b'png')
+            return subprocess.CompletedProcess(args, 0, stdout=b'SYN TEXT', stderr=b'')
+        with patch('subprocess.run', side_effect=run):
+            default = server.process(b'%PDF', [1])
+            finer = server.process(b'%PDF', [1], dpi=400)
+        self.assertEqual(default, [{'number': 1, 'text': 'SYN TEXT', 'truncated': False}])
+        self.assertEqual(finer, default)
+        (render_default, t1), _, (render_finer, t2), _ = seen
+        self.assertEqual(render_default[render_default.index('-scale-to') + 1], '3500')
+        self.assertEqual(render_default[render_default.index('-r') + 1], '300')
+        self.assertEqual(render_finer[render_finer.index('-scale-to') + 1], '4700')
+        self.assertEqual(render_finer[render_finer.index('-r') + 1], '400')
+        self.assertLessEqual(t1, 60)
+        self.assertGreater(t2, 60)
+
+
 class StartupTests(unittest.TestCase):
     def run_selector(self, selector=None, features='native-ocr', feature_status=0):
         with tempfile.TemporaryDirectory() as directory:

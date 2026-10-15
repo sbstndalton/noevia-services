@@ -392,3 +392,69 @@ def test_the_request_line_is_unchanged_without_figures(monkeypatch):
             runner.run("/unused", "doc.pdf", 1, figures=figures)
     assert json.loads(lines[0]) == {"path": "/unused", "name": "doc.pdf"}
     assert json.loads(lines[1]) == {"path": "/unused", "name": "doc.pdf", "figures": True}
+
+
+# ── #1864: page ranges ───────────────────────────────────────────────────────────────────────────
+def test_health_says_the_worker_reads_page_ranges(worker):
+    with urllib.request.urlopen(f"{worker}/health", timeout=10) as response:
+        assert json.loads(response.read())["ranges"] is True
+
+
+def test_a_page_range_is_passed_to_the_conversion_and_only_those_pages_come_back(worker):
+    status, body = post(worker, b"%PDF-1.4 fake", headers={"X-Document-Pages": "26-50"})
+    assert status == 200
+    assert [p["number"] for p in body["pages"]] == list(range(26, 51))
+    assert body["total"] == 1000
+
+
+@pytest.mark.parametrize("value", ["0-5", "5-4", "1-201", "a-b", "7", "-3", "1-2-3", "99999999999999-1"])
+def test_an_invalid_page_range_is_refused(worker, value):
+    status, _ = post(worker, b"%PDF-1.4 fake", headers={"X-Document-Pages": value})
+    assert status == 400
+
+
+def test_a_page_range_is_for_pdfs_only(worker):
+    status, _ = post(worker, b"fake", name="sheet.xlsx", headers={"X-Document-Pages": "1-2"})
+    assert status == 400
+
+
+def test_a_ranged_request_may_carry_more_than_the_whole_document_limit(worker, monkeypatch):
+    # Over LIMIT (25 MiB) is refused for a whole document but read for a range, up to RANGED_LIMIT.
+    monkeypatch.setattr(server, "LIMIT", 16)
+    monkeypatch.setattr(server, "RANGED_LIMIT", 64)
+    body = b"%PDF-1.4 " + b"x" * 30
+    assert post(worker, body)[0] == 400
+    status, reply = post(worker, body, headers={"X-Document-Pages": "1-2"})
+    assert status == 200 and [p["number"] for p in reply["pages"]] == [1, 2]
+    assert post(worker, b"%PDF-1.4 " + b"x" * 80, headers={"X-Document-Pages": "1-2"})[0] == 400
+
+
+def test_the_ranged_body_is_streamed_in_chunks(worker, monkeypatch):
+    monkeypatch.setattr(server, "CHUNK", 7)
+    status, reply = post(worker, b"%PDF-1.4 " + b"y" * 50, headers={"X-Document-Pages": "3-4"})
+    assert status == 200 and [p["number"] for p in reply["pages"]] == [3, 4]
+
+
+def test_the_request_line_carries_a_range_only_when_given(monkeypatch):
+    runner = isolation.IsolatedExtractor("fake_converter:extract")
+    lines = []
+
+    class Pipe:
+        def write(self, data):
+            lines.append(data)
+
+        def flush(self):
+            pass
+
+    class Proc:
+        stdin = Pipe()
+
+        def poll(self):
+            return None
+
+    runner._proc = Proc()
+    monkeypatch.setattr(runner, "_read_exact", lambda *a: (_ for _ in ()).throw(isolation.ConversionFailed()))
+    monkeypatch.setattr(runner, "kill", lambda: None)
+    with pytest.raises(isolation.ConversionFailed):
+        runner.run("/unused", "doc.pdf", 1, pages=(3, 9))
+    assert json.loads(lines[0]) == {"path": "/unused", "name": "doc.pdf", "pages": [3, 9]}
