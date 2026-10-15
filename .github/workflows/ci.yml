@@ -89,9 +89,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
-      - name: Build tenant-assertion
+      - name: Build tenant-assertion and workspace-restore-verify
         working-directory: ${{ runner.temp }}/noevia-rs
-        run: cargo build --release --locked -p tenant-assertion-cli
+        run: cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli
       - name: Differential test (tenant-assertion vs Python reference)
         env:
           TENANT_ASSERTION_BIN: ${{ runner.temp }}/noevia-rs/target/release/tenant-assertion
@@ -99,6 +99,16 @@ jobs:
           cmp tests/fixtures/tenant-assertion.v1.json "$RUNNER_TEMP/noevia-rs/crates/tenant-assertion/tests/fixtures/tenant-assertion.v1.json"
           python -m pytest -q -rs tests/test_tenant_assertion_differential.py tests/test_tenant_assertion_switch.py
           TENANT_ASSERTION_IMPL=rust python -m pytest -q tests/test_tenant_assertion.py
+      # workspace-restore-verify (WORKSPACE_RESTORE_VERIFY_IMPL=rust, noevia#982): same contract: the
+      # fixture table is byte-identical to noevia-rs' copy, and the binary agrees with the live Python
+      # module through the switch; the restore and import suites also pass with the switch on.
+      - name: Differential test (workspace-restore-verify vs Python reference)
+        env:
+          WORKSPACE_RESTORE_VERIFY_BIN: ${{ runner.temp }}/noevia-rs/target/release/workspace-restore-verify
+        run: |
+          cmp tests/fixtures/workspace-restore.v1.json "$RUNNER_TEMP/noevia-rs/crates/workspace-restore-verify/tests/fixtures/workspace-restore.v1.json"
+          python -m pytest -q -rs tests/test_workspace_restore_differential.py tests/test_workspace_restore_switch.py
+          WORKSPACE_RESTORE_VERIFY_IMPL=rust python -m pytest -q tests/test_workspace_restore.py tests/test_workspace_import.py tests/test_workspace_trash.py
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
