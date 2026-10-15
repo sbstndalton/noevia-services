@@ -24,13 +24,15 @@ sha256 of its exact body bytes (empty body: sha256 of ""). Any other media type
 covered: in-flight tampering of such bodies is out of scope (see
 docs/spec-managed-diary.md). A JSON call can never be signed as "stream".
 
-Checks: constant-time signature compare, |now - ts| <= SKEW_S, and each nonce
+Checks: constant-time signature compare, |now - ts| <= SKEW_S, ts not before process start - RESTART_SKEW_S (the cache is
+memory-only; this closes the post-restart replay window), and each nonce
 accepted once while its timestamp is inside the window (in-process cache; the
 sidecar runs one uvicorn worker). The cache is bucketed by the SIGNED timestamp
 and bounded (_nonce_cap). A bucket leaves the cache when its second is outside
-the clock window, or, when the cache is full, oldest second first (#1680: the
+the clock window, or, when the cache is full, the second farthest from now first (#1680: the
 old cache refused every new request with 503 above ~833 signed req/s). Either
-way a floor rises to that second and any assertion with ts <= floor is refused,
+way a past second raises a floor and any assertion with ts <= floor is refused
+(a future second is remembered exactly instead, so it cannot raise the floor),
 so a replay of an evicted nonce, or one after the clock steps back, is still
 caught; a fresh request (ts at the newest second) is never refused, so the
 bound is _nonce_cap plus one second of throughput. Under
@@ -67,6 +69,11 @@ from typing import Dict, List, Mapping, Optional, Set
 HEADER = "X-Cowork-Tenant-Assertion"
 LABEL = "cowork-diary-tenant-v2"
 SKEW_S = 60
+# Refuse assertions signed before this process started (minus RESTART_SKEW_S): the nonce cache is
+# memory-only, so without this a restart would let a captured assertion from the last SKEW_S seconds
+# be replayed once (#1811). Web signs a fresh assertion per request, so a legitimate ts is >= the
+# second this process started in; 1 s covers ts truncation and rounding, the containers share a clock.
+RESTART_SKEW_S = 1
 STREAM = "stream"
 _nonce_cap = 100_000
 _ASSERTION_RE = re.compile(r"v2\.(\d{1,12})\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})")
@@ -77,6 +84,10 @@ _seen: Dict[int, Set[str]] = {}
 _seconds: List[int] = []
 _count = 0
 _floor = -1
+# Future seconds whose bucket was evicted under overload: a ts equal to one is refused (they cannot
+# be represented by the floor). At most SKEW_S entries; pruned when outside the window.
+_lost: Set[int] = set()
+_started_at: Optional[float] = time.time()
 _seen_lock = threading.Lock()
 
 
@@ -125,22 +136,32 @@ def sign(key: str, user_id: str, method: str, path: str, headers: Mapping[str, s
     return f"v2.{ts}.{nonce}.{sig}"
 
 
-def _drop_oldest_second() -> None:
+def _drop_second(second: int, now: float) -> None:
+    """Drop one bucket. A past/current second raises the floor to it (ts <= floor is refused); a
+    FUTURE second is remembered in _lost instead, so a flood of future-dated assertions cannot raise
+    the floor above `now` and lock out legitimate traffic (#1811)."""
     global _count, _floor
-    second = _seconds.pop(0)
+    _seconds.remove(second)
     _count -= len(_seen.pop(second))
-    _floor = max(_floor, second)
+    if second > now:
+        _lost.add(second)
+    else:
+        _floor = max(_floor, second)
 
 
 def _remember_nonce(nonce: str, ts: int, now: float) -> Optional[str]:
     """None the first time (nonce, ts) is seen inside the window, else a reason. Never refuses
-    a fresh request for capacity: when full it drops the oldest second and raises the floor."""
+    a fresh request for capacity: when full it drops the bucket farthest from `now` (never the one
+    just written), so a future-dated flood evicts itself rather than live traffic."""
+    global _count
     with _seen_lock:
         # Seconds that can no longer pass |now - ts| <= SKEW_S are dead; dropping them raises the
         # floor too, so a backwards clock step cannot revive their nonces.
         while _seconds and _seconds[0] < now - SKEW_S:
-            _drop_oldest_second()
-        if ts <= _floor:
+            _drop_second(_seconds[0], now)
+        for second in [x for x in _lost if x < now - SKEW_S]:
+            _lost.discard(second)
+        if ts <= _floor or ts in _lost:
             return "replayed or older than the replay cache"
         bucket = _seen.get(ts)
         if bucket is None:
@@ -148,14 +169,14 @@ def _remember_nonce(nonce: str, ts: int, now: float) -> Optional[str]:
             bisect.insort(_seconds, ts)
         elif nonce in bucket:
             return "replayed"
-        global _count
         bucket.add(nonce)
         _count += 1
-        # The newest second is never dropped: the signed ts has one-second resolution, so dropping
-        # it would refuse the rest of that second's fresh requests. The cache is therefore bounded
-        # by _nonce_cap plus one second of throughput (entries need the key to be created).
+        # The farthest second is always the oldest or the newest. The bucket just written is kept:
+        # the signed ts has one-second resolution, so dropping it would refuse the rest of that
+        # second's fresh requests. The cache is therefore bounded by _nonce_cap plus one second.
         while _count > _nonce_cap and len(_seconds) > 1:
-            _drop_oldest_second()
+            ends = [x for x in (_seconds[0], _seconds[-1]) if x != ts]
+            _drop_second(max(ends, key=lambda x: abs(x - now)), now)
         return None
 
 
@@ -289,6 +310,8 @@ def _check(key: str, headers: Mapping[str, str], method: str, path: str, now: fl
         return "bad signature"
     if abs(now - ts) > SKEW_S:
         return "outside clock window"
+    if _started_at is not None and ts < int(_started_at) - RESTART_SKEW_S:
+        return "signed before this process started"
     return None
 
 
@@ -341,9 +364,13 @@ def secret_ref_matches(key: str, user_id: str, secret: str, ref: str) -> bool:
     return True
 
 
-def _reset_for_tests() -> None:
-    global _count, _floor
+def _reset_for_tests(started_at: Optional[float] = None) -> None:
+    """Clear the cache. The restart guard is off unless `started_at` is given (tests sign with
+    synthetic clocks)."""
+    global _count, _floor, _started_at
     with _seen_lock:
+        _lost.clear()
+        _started_at = started_at
         _seen.clear()
         _seconds.clear()
         _count = 0

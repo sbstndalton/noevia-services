@@ -94,17 +94,24 @@ def impl_choice():
 
 
 def _rust_binary():
-    # A fixed absolute path by default (never a PATH lookup); WORKSPACE_RESTORE_VERIFY_BIN is for tests.
-    configured = (os.environ.get('WORKSPACE_RESTORE_VERIFY_BIN') or DEFAULT_BIN).strip() or DEFAULT_BIN
-    if os.sep in configured:
-        return configured if os.path.isfile(configured) and os.access(configured, os.X_OK) else None
-    return shutil.which(configured)
+    # A fixed absolute path by default (never a PATH lookup). WORKSPACE_RESTORE_VERIFY_BIN (tests,
+    # operators) is honoured only as an absolute path to an existing, executable regular file;
+    # anything else, including a bare name, is ignored with one warning and the default is used (#1813).
+    configured = (os.environ.get('WORKSPACE_RESTORE_VERIFY_BIN') or '').strip()
+    binary = DEFAULT_BIN
+    if configured:
+        if os.path.isabs(configured) and os.path.isfile(configured) and os.access(configured, os.X_OK):
+            binary = configured
+        else:
+            _log_once('rust:bad_override', 'WORKSPACE_RESTORE_VERIFY_BIN is not an absolute path to an executable file; ignoring it')
+    return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
 
 
 def _rust_verdict(body):
-    body = bytes(body)
     """The Rust leaf's listing digest for an accepted archive. Raises ValueError with Python's
     message for a refusal, or UNAVAILABLE for any fault (fails closed)."""
+    if type(body) is not bytes:  # bytes is already immutable: no 272 MiB copy
+        body = bytes(body)
     binary = _rust_binary()
     if binary is None:
         _log_once('rust:missing_binary', 'workspace-restore-verify binary not found; refusing archives (WORKSPACE_RESTORE_VERIFY_IMPL=rust)')

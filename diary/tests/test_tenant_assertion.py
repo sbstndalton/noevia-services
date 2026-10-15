@@ -336,3 +336,80 @@ def test_real_cap_sustains_2000_signed_requests_per_second_for_a_full_window():
         assert ta._remember_nonce(f'{i:032x}', int(t), t) is None, f'request {i} refused'
     assert ta._nonce_count() <= ta._nonce_cap + 2000
     assert ta._remember_nonce(f'{119_999:032x}', int(now + 59.9995), now + 60) is not None
+
+
+# ── replay-cache hardening (#1811) ──────────────────────────────────────────
+
+def test_future_dated_flood_does_not_lock_out_legitimate_traffic(monkeypatch):
+    monkeypatch.setattr(ta, '_nonce_cap', 20)
+    now = 1_000_000.0
+    # A flood across every future second the clock window accepts overflows the cap many times over.
+    for i in range(400):
+        ts = int(now) + 1 + i % ta.SKEW_S
+        ta.verify(KEY, signed(A, 'GET', '/x', ts=ts), 'GET', '/x', now=now)
+    assert ta._floor < int(now), 'a future flood must not raise the floor above now'
+    for _ in range(5):
+        assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now)), 'GET', '/x', now=now) is None
+    assert ta._nonce_count() <= 20 + 6
+
+
+def test_flood_at_exactly_now_plus_skew_then_legitimate_now(monkeypatch):
+    monkeypatch.setattr(ta, '_nonce_cap', 10)
+    now = 1_000_000.0
+    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) - 1), 'GET', '/x', now=now) is None
+    for _ in range(50):
+        ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + ta.SKEW_S), 'GET', '/x', now=now)
+    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now)), 'GET', '/x', now=now) is None
+    assert ta._nonce_count() <= 10 + 2
+    # The evicted future second is still refused, not silently reopened for replay.
+    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + ta.SKEW_S), 'GET', '/x', now=now) is not None
+
+
+def test_assertion_signed_before_process_start_is_refused_but_a_fresh_one_is_not():
+    start = 1_000_000.4
+    ta._reset_for_tests(started_at=start)
+    old = signed(A, 'GET', '/x', ts=1_000_000 - ta.RESTART_SKEW_S - 1)  # inside the replay window, signed pre-restart
+    assert ta.verify(KEY, old, 'GET', '/x', now=start + 0.1) == 'signed before this process started'
+    assert ta.verify(KEY, old, 'GET', '/x', now=start + 30) == 'signed before this process started'
+    # Web signs per request with a truncated ts: the first request right after the start is accepted,
+    # even one signed in the second the process started in (and the RESTART_SKEW_S allowance).
+    for ts in (1_000_000 - ta.RESTART_SKEW_S, 1_000_000, 1_000_001):
+        assert ta.verify(KEY, signed(A, 'GET', '/x', ts=ts), 'GET', '/x', now=start + 0.6) is None
+    assert ta.RESTART_SKEW_S <= 2
+
+
+def test_real_process_start_does_not_refuse_current_traffic():
+    ta._reset_for_tests(started_at=time.time())
+    assert ta.verify(KEY, signed(A, 'GET', '/x'), 'GET', '/x') is None
+
+
+def test_concurrent_verify_accepts_each_nonce_exactly_once(monkeypatch):
+    import threading
+    monkeypatch.setattr(ta, '_nonce_cap', 50)  # also exercises eviction under contention
+    now = time.time()
+    ts = int(now)
+    unique = [signed(A, 'GET', '/x', ts=ts) for _ in range(300)]
+    dup = signed(A, 'GET', '/x', ts=ts)
+    results, errors = [], []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def work(slice_):
+        try:
+            barrier.wait()
+            local = [('u', ta.verify(KEY, h, 'GET', '/x', now=now)) for h in slice_]
+            local += [('d', ta.verify(KEY, dup, 'GET', '/x', now=now)) for _ in range(40)]
+            with lock:
+                results.extend(local)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(unique[i::8],)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert sum(1 for k, r in results if k == 'd' and r is None) == 1
+    assert sum(1 for k, r in results if k == 'u' and r is None) == 300
+    assert ta._nonce_count() <= 50 + 301
