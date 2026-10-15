@@ -106,3 +106,48 @@ def test_directory_mode_without_directory_path_refused(bundle):
             dest.writestr(info, data)
     with pytest.raises(ValueError, match='type does not match'):
         preview(output.getvalue())
+
+
+def _member_data_offset(body, name):
+    import struct
+    with zipfile.ZipFile(io.BytesIO(body)) as z:
+        info = z.getinfo(name)
+    n, e = struct.unpack('<HH', body[info.header_offset + 26:info.header_offset + 30])
+    return info.header_offset + 30 + n + e
+
+
+def test_corrupt_deflate_is_a_validation_error_not_a_server_error(tmp_path):
+    # noevia#982: zlib.error used to escape verify() and become an HTTP 500.
+    backend = ManagedCorpusBackend(tmp_path / 'deflate', B)
+    backend.activate({'big.md': b'lorem ipsum ' * 4000}, {}, [])
+    body = mutate(archive(backend, '', {}), lambda rows: None)
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(body)) as source, zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as dest:
+        for info in source.infolist():
+            dest.writestr(info.filename, source.read(info))
+    deflated = bytearray(output.getvalue())
+    at = _member_data_offset(bytes(deflated), 'workspace/big.md')
+    deflated[at:at + 2] = b'\xff\xff'
+    with pytest.raises(ValueError, match='Invalid workspace archive'):
+        preview(bytes(deflated))
+
+
+def test_newer_zip_version_is_a_validation_error(bundle):
+    # noevia#982: NotImplementedError ("zip file version") used to escape verify().
+    body = bytearray(bundle)
+    central = body.find(b'PK\x01\x02')
+    body[central + 6] = 99
+    with pytest.raises(ValueError, match='Invalid workspace archive'):
+        preview(bytes(body))
+
+
+def test_deeply_nested_manifest_is_a_validation_error(bundle):
+    # noevia#982: RecursionError used to escape verify().
+    nested = b'[' * 100000 + b']' * 100000
+    with pytest.raises(ValueError, match='Invalid workspace archive'):
+        preview(mutate(bundle, lambda rows: rows.update({'manifest.json': nested})))
+
+
+def test_archive_over_272_mib_is_refused_before_parsing():
+    with pytest.raises(ValueError, match='272 MiB'):
+        preview(b'\0' * (272 * 1024 * 1024 + 1))

@@ -55,8 +55,13 @@ def test_changed_destination_and_archive_refused(setup):
     reviewed = prepare(target, body, 'Copy')[2]['fingerprint']
     with pytest.raises(ValueError, match='changed'):
         apply(target, body, 'Other', reviewed)
-    with pytest.raises(ValueError, match='changed'):
+    # Trailing bytes: Python's zipfile tolerates them and the fingerprint refuses; under
+    # WORKSPACE_RESTORE_VERIFY_IMPL=rust the leaf refuses the container first (noevia#982).
+    from agent.workspace_restore import impl_choice
+    expected = 'Invalid workspace archive' if impl_choice() == 'rust' else 'changed'
+    with pytest.raises(ValueError, match=expected):
         apply(target, body + b'changed', 'Copy', reviewed)
+    assert target.get('Imports/Copy/image.bin')[0] is None
 
 
 def test_mid_transaction_failure_rolls_back_everything(setup):
