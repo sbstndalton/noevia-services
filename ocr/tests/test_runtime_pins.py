@@ -6,8 +6,8 @@ from pathlib import Path
 def test_native_sidecar_runtime_defaults_match_merged_s4():
     root = Path(__file__).resolve().parents[2]
     expected = {
-        "NOEVIA_RS_REF": "0c65e73b4a718cf8b8aad708fd6772fd6aded026",
-        "NOEVIA_RS_SHA256": "bd85d9778cd64e2a6fb8f8d8e02a7c8ad2b4114c2d392d53bbd6e7f9048868a0",
+        "NOEVIA_RS_REF": "909af78f8e1b1ee317bab8de94bb789a4329012b",
+        "NOEVIA_RS_SHA256": "d0f93ac46446515acff49e82581adf9303f385af02f9b5ef9c0c37d946e1e89d",
     }
     for service in ("ocr", "diary", "model-manager", "docling", "laya"):
         text = (root / service / "Dockerfile").read_text()
