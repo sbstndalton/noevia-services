@@ -206,3 +206,51 @@ def test_import_and_restore_callers_fail_closed_under_rust(bundle, tmp_path, mon
     with pytest.raises(ValueError, match='unavailable'):
         wr.restore(bundle, target, hashlib.sha256(bundle).hexdigest())
     assert not target.exists()
+
+
+def test_verify_bin_override_needs_an_absolute_executable_regular_file(tmp_path, monkeypatch, caplog):
+    # #1813: a bare name is never resolved through PATH; a relative path, a directory, a non-executable
+    # file and a missing path are all ignored (default used) with ONE warning.
+    path, _ = fake(tmp_path, 'print("accept " + "0" * 64)\n')
+    bindir = tmp_path / 'bindir'
+    bindir.mkdir()
+    monkeypatch.setenv('PATH', f'{tmp_path}:{__import__("os").environ["PATH"]}')
+    seen = []
+    monkeypatch.setattr(wr.os.path, 'isfile', lambda p, _f=wr.os.path.isfile: seen.append(p) or (False if p == wr.DEFAULT_BIN else _f(p)))
+    plain = tmp_path / 'plain'
+    plain.write_text('x')
+    with caplog.at_level(logging.WARNING):
+        for bad in (path.name, f'./{path.name}', str(bindir), str(plain), str(tmp_path / 'absent')):
+            monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', bad)
+            assert wr._rust_binary() is None, bad  # default is absent here, so nothing is honoured
+    assert sum('ignoring it' in r.getMessage() for r in caplog.records) == 1
+    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', str(path))
+    assert wr._rust_binary() == str(path)
+
+
+def test_bytes_body_reaches_the_child_without_a_copy(monkeypatch, tmp_path):
+    body = b'synthetic archive bytes'
+    written = []
+
+    class Proc:
+        class stdin:
+            write = staticmethod(written.append)
+            close = staticmethod(lambda: None)
+
+        class stdout:
+            read1 = staticmethod(lambda n: b'')
+            close = staticmethod(lambda: None)
+
+        def wait(self, timeout=None):
+            return 3
+
+    path, _ = fake(tmp_path, '')
+    use(monkeypatch, path)
+    monkeypatch.setattr(wr.subprocess, 'Popen', lambda *a, **k: Proc())
+    with pytest.raises(ValueError, match='unavailable'):
+        wr._rust_verdict(body)
+    assert written and written[0] is body
+    written.clear()
+    with pytest.raises(ValueError, match='unavailable'):
+        wr._rust_verdict(bytearray(body))
+    assert written[0] == body and type(written[0]) is bytes
