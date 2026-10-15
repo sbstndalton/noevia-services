@@ -26,10 +26,17 @@ docs/spec-managed-diary.md). A JSON call can never be signed as "stream".
 
 Checks: constant-time signature compare, |now - ts| <= SKEW_S, and each nonce
 accepted once while its timestamp is inside the window (in-process cache; the
-sidecar runs one uvicorn worker). When the cache is full of unexpired nonces a
-new request is refused (NonceCacheFull, answered 503) rather than evicting a
-live nonce, which would reopen replay. The key is read per call so an operator
-change takes effect on restart and tests can patch the environment.
+sidecar runs one uvicorn worker). The cache is bucketed by the SIGNED timestamp
+and bounded (_nonce_cap). A bucket leaves the cache when its second is outside
+the clock window, or, when the cache is full, oldest second first (#1680: the
+old cache refused every new request with 503 above ~833 signed req/s). Either
+way a floor rises to that second and any assertion with ts <= floor is refused,
+so a replay of an evicted nonce, or one after the clock steps back, is still
+caught; a fresh request (ts at the newest second) is never refused, so the
+bound is _nonce_cap plus one second of throughput. Under
+overload the floor only shortens how late a signed request may arrive. The key
+is read per call so an operator change takes effect on restart and tests can
+patch the environment.
 
 TENANT_ASSERTION_IMPL=rust additionally runs the same check in the bounded Rust leaf from
 sbstndalton/noevia-rs (`tenant-assertion check`, built into the image at the Dockerfile's pinned
@@ -44,6 +51,7 @@ contract between the two.
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import hmac
 import json
@@ -54,8 +62,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections import OrderedDict
-from typing import Mapping, Optional
+from typing import Dict, List, Mapping, Optional, Set
 
 HEADER = "X-Cowork-Tenant-Assertion"
 LABEL = "cowork-diary-tenant-v2"
@@ -64,7 +71,12 @@ STREAM = "stream"
 _nonce_cap = 100_000
 _ASSERTION_RE = re.compile(r"v2\.(\d{1,12})\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})")
 
-_seen: "OrderedDict[str, float]" = OrderedDict()
+# Signed second -> nonces seen with it; _seconds is the sorted key list. _floor: assertions
+# with ts <= _floor are refused (their nonces may have been dropped from the cache).
+_seen: Dict[int, Set[str]] = {}
+_seconds: List[int] = []
+_count = 0
+_floor = -1
 _seen_lock = threading.Lock()
 
 
@@ -78,7 +90,7 @@ _logged_lock = threading.Lock()
 
 
 class NonceCacheFull(Exception):
-    """Every cached nonce is still inside its window; refuse rather than evict."""
+    """No longer raised (#1680); kept so older callers that name it still import."""
 
 
 def tenant_key() -> str:
@@ -113,24 +125,43 @@ def sign(key: str, user_id: str, method: str, path: str, headers: Mapping[str, s
     return f"v2.{ts}.{nonce}.{sig}"
 
 
-def _remember_nonce(nonce: str, now: float) -> bool:
-    """False when the nonce was already used inside the window.
+def _drop_oldest_second() -> None:
+    global _count, _floor
+    second = _seconds.pop(0)
+    _count -= len(_seen.pop(second))
+    _floor = max(_floor, second)
 
-    Raises NonceCacheFull when no expired entry can make room."""
+
+def _remember_nonce(nonce: str, ts: int, now: float) -> Optional[str]:
+    """None the first time (nonce, ts) is seen inside the window, else a reason. Never refuses
+    a fresh request for capacity: when full it drops the oldest second and raises the floor."""
     with _seen_lock:
-        # Insertion order is expiry order (constant window), so expired entries are at the front.
-        while _seen:
-            oldest, expiry = next(iter(_seen.items()))
-            if expiry > now:
-                break
-            _seen.popitem(last=False)
-        if nonce in _seen:
-            return False
-        if len(_seen) >= _nonce_cap:
-            raise NonceCacheFull()
-        # Expire after the latest moment the same timestamp could still verify.
-        _seen[nonce] = now + 2 * SKEW_S
-        return True
+        # Seconds that can no longer pass |now - ts| <= SKEW_S are dead; dropping them raises the
+        # floor too, so a backwards clock step cannot revive their nonces.
+        while _seconds and _seconds[0] < now - SKEW_S:
+            _drop_oldest_second()
+        if ts <= _floor:
+            return "replayed or older than the replay cache"
+        bucket = _seen.get(ts)
+        if bucket is None:
+            bucket = _seen[ts] = set()
+            bisect.insort(_seconds, ts)
+        elif nonce in bucket:
+            return "replayed"
+        global _count
+        bucket.add(nonce)
+        _count += 1
+        # The newest second is never dropped: the signed ts has one-second resolution, so dropping
+        # it would refuse the rest of that second's fresh requests. The cache is therefore bounded
+        # by _nonce_cap plus one second of throughput (entries need the key to be created).
+        while _count > _nonce_cap and len(_seconds) > 1:
+            _drop_oldest_second()
+        return None
+
+
+def _nonce_count() -> int:
+    with _seen_lock:
+        return _count
 
 
 def _log_once(key: str, message: str) -> None:
@@ -267,7 +298,7 @@ def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Op
 
     `path` is the encoded wire path, `query` the raw query string, `body_hash`
     sha256 hex of the body or STREAM (see module doc). Reasons are for logs
-    only; callers answer every failure the same way. Raises NonceCacheFull.
+    only; callers answer every failure the same way.
     Under TENANT_ASSERTION_IMPL=rust the Rust check must accept as well (module doc)."""
     now = time.time() if now is None else now
     reason = _check(key, headers, method, path, now, query, body_hash)
@@ -282,10 +313,8 @@ def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Op
             "blocked": headers.get("X-Cowork-Storage-Blocked", ""), "now": repr(float(now))})
         if reason:
             return reason
-    nonce = _ASSERTION_RE.fullmatch(headers.get(HEADER, "") or "").group(2)
-    if not _remember_nonce(nonce, now):
-        return "replayed"
-    return None
+    match = _ASSERTION_RE.fullmatch(headers.get(HEADER, "") or "")
+    return _remember_nonce(match.group(2), int(match.group(1)), now)
 
 
 def wire_path(scope) -> str:
@@ -313,5 +342,9 @@ def secret_ref_matches(key: str, user_id: str, secret: str, ref: str) -> bool:
 
 
 def _reset_for_tests() -> None:
+    global _count, _floor
     with _seen_lock:
         _seen.clear()
+        _seconds.clear()
+        _count = 0
+        _floor = -1
