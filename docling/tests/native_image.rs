@@ -127,8 +127,9 @@ fn pid(reply: &Reply) -> Result<u32, Error> {
 }
 fn health_valid(reply: &Reply) -> Result<bool, Error> {
     let formats = r#"[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]"#;
-    let python = format!(r#"{{"service":"docling","formats":{formats}}}"#);
-    let native = format!(r#"{{"formats":{formats},"service":"docling"}}"#);
+    // noevia#1867: both owners advertise page ranges and the ranged body cap (default 96 MiB).
+    let python = format!(r#"{{"service":"docling","formats":{formats},"ranges":true,"rangedMaxBytes":100663296}}"#);
+    let native = format!(r#"{{"formats":{formats},"rangedMaxBytes":100663296,"ranges":true,"service":"docling"}}"#);
     let body = compact_json(&reply.body)?;
     Ok(reply.status == 200 && (body == python || body == native))
 }
@@ -436,7 +437,10 @@ mod tests {
     fn fixed_shapes_and_resource_bounds_refuse_partial_proofs() {
         assert!(cpu_valid("100000 100000\n"));
         assert_eq!(pid(&Reply { status: 200, body: r#"{"pages":[{"number":1,"text":"ok","status":"native","method":"docling","truncated":false}],"total":1,"truncatedPages":false,"pid":42}"#.into() }).expect("complete extraction"), 42);
-        assert!(health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("complete health"));
+        assert!(health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"],"ranges":true,"rangedMaxBytes":100663296}"#.into() }).expect("complete health"));
+        assert!(health_valid(&Reply { status: 200, body: r#"{"formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"],"rangedMaxBytes":100663296,"ranges":true,"service":"docling"}"#.into() }).expect("native health"));
+        // noevia#1867: an image that does not advertise page ranges is stale.
+        assert!(!health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("pre-range health"));
         // #1711: .md is no longer advertised; an image still listing it is stale.
         assert!(!health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".md",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("stale health"));
         for bad in ["", "max 100000", "0 0", "100000 200000", "1 1 extra"] {
