@@ -633,8 +633,8 @@ def _start_embedding() -> None:
     try:
         config = embedding_mod.shared_for(_base_cfg).config
         embedding_mod.guard_seeded_addresses(config)
-        if config.next() is not None:
-            embedding_migration().kick()
+        # #1768: always, not only for a re-index: chunks refused or pending in the active slot are retried.
+        embedding_migration().kick()
     except Exception:  # noqa: BLE001 — retrieval is optional; never take the service down
         log.exception("embedding start-up check failed")
 
@@ -693,7 +693,7 @@ def check_auth(request: Request) -> bool:
     return bool(supplied) and secrets.compare_digest(supplied, st.auth_token)
 
 
-_EMBEDDING_ACTIONS = ("set-next", "clear-next", "switch", "rollback", "finish")
+_EMBEDDING_ACTIONS = ("set-next", "clear-next", "switch", "rollback", "finish", "reindex")
 
 
 def _embedding_guard(request: Request, mutating: bool) -> Optional[JSONResponse]:
@@ -738,6 +738,8 @@ async def embedding_action(request: Request) -> JSONResponse:
             return mig.switch(force=body.get("force") is True)
         if action == "rollback":
             return mig.rollback()
+        if action == "reindex":
+            return mig.retry_missing()
         return mig.finish()
 
     try:
