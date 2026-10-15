@@ -2,7 +2,8 @@
 
 Protocol, deliberately tiny so it cannot be confused by anything Docling prints:
   * requests arrive on stdin, one JSON object per line: {"path": ..., "name": ...}, plus
-    "figures": true when the caller wants the document's figures too (#1726)
+    "figures": true when the caller wants the document's figures too (#1726), and
+    "pages": [first, last] when only that page range is wanted (#1864)
   * replies go to a dedicated pipe (the fd given on the command line), each as a
     4-byte big-endian length followed by that many bytes of JSON:
         {"ok": <result>}   the target returned
@@ -49,6 +50,10 @@ def main(argv):
         try:
             request = json.loads(line)
             extra = {"figures": True} if request.get("figures") is True else {}
+            # #1864: a page range, two positive integers, first <= last.
+            pages = request.get("pages")
+            if isinstance(pages, list) and len(pages) == 2 and all(type(n) is int and n >= 1 for n in pages) and pages[0] <= pages[1]:
+                extra["pages"] = (pages[0], pages[1])
             payload = {"ok": function(request["path"], request["name"], **extra)}
         except BaseException:
             payload = {"error": True}

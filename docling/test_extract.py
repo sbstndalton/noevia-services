@@ -442,3 +442,59 @@ def test_encode_png_downscales_and_skips_tiny_images():
     again = pil.open(io.BytesIO(data))
     assert again.format == "PNG" and max(again.size) == extractor.FIGURE_MAX_SIDE
     assert extractor._encode_png(pil.new("RGB", (20, 400))) is None
+
+
+# ── #1864: page ranges ───────────────────────────────────────────────────────────────────────────
+def test_a_page_range_converts_and_returns_only_that_range_with_the_true_total():
+    seen = []
+    document = type("Doc", (), {"pages": {n: None for n in range(26, 51)}})()
+
+    def convert(path, **kwargs):
+        seen.append(kwargs)
+        return extractor.Converted(document, 1000)
+
+    items = [FakeText(f"SYN-RANGE-{n}", n) for n in range(26, 51)]
+    out = extractor.extract("/unused", "big.pdf", convert=convert, pages_from=fake_pages_from(items),
+                            native_text=lambda *_: {}, pages=(26, 50))
+    assert seen == [{"pages": (26, 50)}]
+    assert [p["number"] for p in out["pages"]] == list(range(26, 51))
+    assert out["pages"][0]["text"] == "SYN-RANGE-26"
+    assert out["total"] == 1000 and out["truncatedPages"] is True
+
+
+def test_the_last_range_stops_at_the_document_end_and_says_nothing_follows():
+    document = type("Doc", (), {"pages": {n: None for n in range(51, 61)}})()
+    out = extractor.extract("/unused", "big.pdf", convert=lambda _p, **_k: extractor.Converted(document, 60),
+                            pages_from=fake_pages_from([FakeText("end", 60)]), native_text=lambda *_: {}, pages=(51, 75))
+    assert [p["number"] for p in out["pages"]] == list(range(51, 61))
+    assert out["total"] == 60 and out["truncatedPages"] is False
+
+
+def test_a_range_without_a_known_total_counts_from_its_absolute_page_numbers():
+    document = type("Doc", (), {"pages": {n: None for n in range(26, 31)}})()
+    out = extractor.extract("/unused", "big.pdf", convert=lambda _p, **_k: document,
+                            pages_from=fake_pages_from([]), native_text=lambda *_: {}, pages=(26, 30))
+    assert [p["number"] for p in out["pages"]] == list(range(26, 31))
+
+
+def test_page_ranges_are_for_pdfs_only():
+    with pytest.raises(ValueError):
+        extractor.extract("/unused", "sheet.xlsx", convert=lambda *_a, **_k: None, pages=(1, 2))
+
+
+def test_a_ranged_conversion_passes_the_range_and_the_larger_file_cap():
+    seen = []
+
+    class FakeConverter:
+        def convert(self, path, **kwargs):
+            seen.append(kwargs)
+            return type("R", (), {"document": StrictDoc({}), "input": type("In", (), {"page_count": 900})()})()
+
+    extractor._converter = FakeConverter()
+    try:
+        converted = extractor._convert("/x/big.pdf", pages=(301, 325))
+    finally:
+        extractor._converter = None
+    assert seen == [{"page_range": (301, 325), "max_file_size": extractor.RANGED_FILE_SIZE_CAP}]
+    assert converted.page_count == 900
+    assert extractor.RANGED_FILE_SIZE_CAP > extractor.FILE_SIZE_CAP
