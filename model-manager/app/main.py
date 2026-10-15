@@ -45,6 +45,10 @@ async def _require_token(request: Request, call_next):
         parts = path.split("/")
         if (path == "/api/v1/prompts" and request.method in {"GET", "POST"}) or (request.method == "DELETE" and len(parts) == 5 and parts[:4] == ["", "api", "v1", "prompts"] and parts[4]):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent owns only the read; PUT (the single writer) stays here.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SETTINGS_CONFIRMED") == "1" and request.method == "GET"
+            and request.url.path == "/api/v1/settings"):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     return await call_next(request)
 
 
