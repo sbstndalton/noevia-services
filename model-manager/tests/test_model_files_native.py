@@ -1,7 +1,8 @@
-"""MODEL_FILES_IMPL switch (#964): python stays the default and never spawns anything; rust runs
-the model-files binary and FAILS CLOSED (ModelFilesError, answered as 502) on every failure.
-A fake binary (a small script) stands in for model-files; the real one is covered by
-test_model_files_differential.py. Synthetic listings only."""
+"""model-files is the only listing implementation (#964; noevia#1071 retired MODEL_FILES_IMPL and
+removed the Python reference). It FAILS CLOSED (ModelFilesError, answered as 502) on every
+failure, and the app refuses to start without the binary. A fake binary (a small script) stands
+in for model-files; the real one is covered by test_model_files_differential.py. Synthetic
+listings only."""
 from __future__ import annotations
 
 import json
@@ -26,10 +27,8 @@ LISTING = [
 
 
 @pytest.fixture(autouse=True)
-def _fresh_switch_state(monkeypatch):
+def _fresh_log_state():
     model_files._LOGGED.clear()
-    monkeypatch.setattr(config.settings, "model_files_impl", "python")
-    monkeypatch.setattr(config.settings, "model_files_bin", "model-files")
     yield
     model_files._LOGGED.clear()
 
@@ -57,48 +56,68 @@ def _calls(tmp_path) -> list:
 
 
 def _use_rust(monkeypatch, binary: str) -> None:
-    monkeypatch.setattr(config.settings, "model_files_impl", "rust")
     monkeypatch.setattr(config.settings, "model_files_bin", binary)
 
 
-# A fake that answers with the Python reference's own result, marked so tests can tell.
-_ECHO_PYTHON = f"""
-    sys.path.insert(0, {str(__import__("pathlib").Path(__file__).resolve().parents[1])!r})
-    from app.model_files import files_from_tree_py
-    files = files_from_tree_py(listing)
-    for f in files:
-        f["quant"] = "FROM-RUST"
-    print(json.dumps({{"files": files}}))
+# A fake that answers the GGUF entries of a listing in model-files' shape, marked so tests can tell.
+_ECHO = """
+    import re
+    files = []
+    for e in listing:
+        if e.get("type") != "file" or not e["path"].endswith(".gguf"):
+            continue
+        m = re.search(r"-(\\d{5})-of-(\\d{5})\\.gguf$", e["path"])
+        files.append({"path": e["path"], "size": (e.get("lfs") or {}).get("size") or e.get("size") or 0,
+                      "quant": "FROM-RUST", "shard_base": e["path"][:m.start()] if m else e["path"],
+                      "shard_index": int(m.group(1)) if m else None,
+                      "shard_total": int(m.group(2)) if m else None})
+    print(json.dumps({"files": files}))
 """
 
 
-def test_default_is_python_and_never_spawns(tmp_path, monkeypatch):
-    monkeypatch.setattr(config.settings, "model_files_bin", _fake_bin(tmp_path, _ECHO_PYTHON))
-    assert model_files.impl_choice() == "python"
-    assert model_files.files_from_tree(LISTING) == model_files.files_from_tree_py(LISTING)
-    assert _calls(tmp_path) == []
+def test_there_is_no_python_fallback_and_the_retired_switch_is_ignored(tmp_path, monkeypatch):
+    # noevia#1071: the reference and the selector are gone; a leftover MODEL_FILES_IMPL=python in
+    # the environment still goes through the binary.
+    for gone in ("files_from_tree_py", "impl_choice", "IMPLS"):
+        assert not hasattr(model_files, gone), gone
+    assert "model_files_impl" not in config.Settings.model_fields
+    monkeypatch.setenv("MODEL_FILES_IMPL", "python")
+    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO))
+    assert {f["quant"] for f in model_files.files_from_tree(LISTING)} == {"FROM-RUST"}
+    assert len(_calls(tmp_path)) == 1
 
 
-def test_python_path_keeps_python_errors(monkeypatch):
-    with pytest.raises(ValueError):
-        model_files.files_from_tree([{"type": "file", "path": "a.gguf", "size": "nope"}])
-    with pytest.raises(AttributeError):
-        model_files.files_from_tree([5])
+def test_startup_refuses_without_the_binary_before_any_other_hook(tmp_path, monkeypatch):
+    # noevia#1071: fail closed at startup, not on the first listing or models.ini write.
+    from app import db, main
+    hooks = []
+    monkeypatch.setattr(db, "init", lambda: hooks.append("db"))
+    for missing in (str(tmp_path / "nowhere" / "model-files"), "model-files-not-on-path"):
+        _use_rust(monkeypatch, missing)
+        with pytest.raises(model_files.ModelFilesError, match="missing_binary"):
+            with TestClient(app):
+                pass
+        with pytest.raises(model_files.ModelFilesError, match="missing_binary"):
+            main._startup()
+    assert hooks == []
+    not_executable = tmp_path / "model-files"
+    not_executable.write_text("#!/bin/sh\n")
+    _use_rust(monkeypatch, str(not_executable))
+    with pytest.raises(model_files.ModelFilesError, match="missing_binary"):
+        model_files.require_binary()
+    assert hooks == []
 
 
-def test_invalid_setting_means_python_with_one_warning(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(config.settings, "model_files_impl", "fortran")
-    monkeypatch.setattr(config.settings, "model_files_bin", _fake_bin(tmp_path, _ECHO_PYTHON))
-    with caplog.at_level("WARNING"):
-        model_files.files_from_tree(LISTING)
-        model_files.files_from_tree(LISTING)
-    assert model_files.impl_choice() == "python"
-    assert sum("MODEL_FILES_IMPL" in r.message for r in caplog.records) == 1
-    assert _calls(tmp_path) == []
+def test_startup_proceeds_with_the_binary(tmp_path, monkeypatch):
+    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO))
+    model_files.require_binary()
+    with TestClient(app) as client:
+        assert client.get("/api/v1/sections").status_code == 200
+    assert _calls(tmp_path) == [], "the startup check does not run the binary"
 
 
 def test_rust_result_is_used_and_input_is_projected(tmp_path, monkeypatch):
-    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO_PYTHON))
+    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO))
     files = model_files.files_from_tree(LISTING)
     assert [f["quant"] for f in files] == ["FROM-RUST", "FROM-RUST"]
     assert [f["shard_index"] for f in files] == [1, 2]
@@ -108,23 +127,6 @@ def test_rust_result_is_used_and_input_is_projected(tmp_path, monkeypatch):
     # Only the fields the function reads cross the boundary; the 10 KB commit title does not.
     assert sent[0] == {"type": "file", "path": "m-Q4_K_M-00001-of-00002.gguf", "lfs": {"size": 5}}
     assert "lastCommit" not in raw and len(raw) < 1000
-
-
-def test_projection_is_faithful():
-    odd = [5, "x", None, [], {"type": "file", "path": "a.gguf", "lfs": "str"},
-           {"type": "file", "path": "b.gguf", "lfs": {"oid": "x"}, "size": 3},
-           {"type": "file", "path": "c.gguf", "lfs": [], "size": 4}, {}]
-    for e in odd:
-        a = _try(lambda: model_files.files_from_tree_py([e]))
-        b = _try(lambda: model_files.files_from_tree_py([model_files._project(e)]))
-        assert a == b, e
-
-
-def _try(fn):
-    try:
-        return fn()
-    except Exception as e:  # noqa: BLE001
-        return type(e).__name__
 
 
 @pytest.mark.parametrize("reason,body", [
@@ -159,7 +161,7 @@ def test_missing_binary_fails_closed(tmp_path, monkeypatch):
 
 
 def test_oversized_and_unencodable_input_fail_closed(tmp_path, monkeypatch):
-    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO_PYTHON))
+    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO))
     monkeypatch.setattr(model_files, "MODEL_FILES_STDIN_CAP", 100)
     with pytest.raises(model_files.ModelFilesError, match="input_too_large"):
         model_files.files_from_tree(LISTING)
@@ -181,24 +183,23 @@ def _hub(monkeypatch, listing):
 
 
 @pytest.mark.asyncio
-async def test_repo_detail_goes_through_the_switch(tmp_path, monkeypatch):
+async def test_repo_detail_goes_through_the_binary(tmp_path, monkeypatch):
     from app import db
     db.init()  # repo_detail reads the saved hub token
     _hub(monkeypatch, LISTING)
-    py = await hf.repo_detail("synthetic/repo-GGUF")
-    assert [f.path for f in py.files] == ["m-Q4_K_M-00001-of-00002.gguf", "m-Q4_K_M-00002-of-00002.gguf"]
-    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO_PYTHON))
+    _use_rust(monkeypatch, _fake_bin(tmp_path, _ECHO))
     rs = await hf.repo_detail("synthetic/repo-GGUF")
-    assert [(f.path, f.size, f.shard_base) for f in rs.files] == [(f.path, f.size, f.shard_base) for f in py.files]
+    assert [(f.path, f.size, f.shard_index) for f in rs.files] == [
+        ("m-Q4_K_M-00001-of-00002.gguf", 5, 1), ("m-Q4_K_M-00002-of-00002.gguf", 6, 2)]
     assert {f.quant for f in rs.files} == {"FROM-RUST"}
 
 
 def test_api_answers_502_when_rust_refuses(tmp_path, monkeypatch):
     _hub(monkeypatch, LISTING)
-    _use_rust(monkeypatch, _fake_bin(tmp_path, "sys.exit(1)"))
     from app import api
     queued = []
     monkeypatch.setattr(api.manager, "enqueue", lambda **kw: queued.append(kw))
+    _use_rust(monkeypatch, _fake_bin(tmp_path, "sys.exit(1)"))
     with TestClient(app) as client:
         r = client.post("/api/v1/downloads", json={"repo": "synthetic/repo-GGUF",
                                                    "path": "m-Q4_K_M-00001-of-00002.gguf"})
@@ -230,15 +231,15 @@ async def test_a_slow_binary_does_not_block_the_event_loop(tmp_path, monkeypatch
     import time
     from app import db
     db.init()
-    health = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+    other = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
     _hub(monkeypatch, LISTING)
     _use_rust(monkeypatch, _fake_bin(tmp_path, "time.sleep(2)\n" + textwrap.dedent(_ECHO_PYTHON)))
     slow = asyncio.create_task(hf.repo_detail("synthetic/repo-GGUF"))
     await asyncio.sleep(0.2)  # the listing is now waiting on the binary
     t0 = time.monotonic()
-    r = await health.get("/api/v1/health")
+    r = await other.get("/api/v1/sections")
     assert r.status_code == 200 and time.monotonic() - t0 < 2.0
     assert not slow.done()
     detail = await slow
     assert {f.quant for f in detail.files} == {"FROM-RUST"}
-    await health.aclose()
+    await other.aclose()

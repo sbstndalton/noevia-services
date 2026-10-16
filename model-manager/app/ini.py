@@ -16,7 +16,7 @@ from . import discover, gguf_meta
 from .config import settings
 
 BACKUPS_TO_KEEP = 10
-# #1783: the only names `_backup_current` makes (`.bak-<YYYYMMDD-HHMMSS>[-n]`). Pruning touches
+# #1783: the only rotating names this manager makes (`.bak-<YYYYMMDD-HHMMSS>[-n]`). Pruning touches
 # these and the revision copies only; any other `.bak-*` beside models.ini is an operator's.
 _OWN_ROTATING = r"\.bak-\d{8}-\d{6}(?:-\d+)?"
 _OWN_REVISION = r"\.noevia-backup-[0-9a-f]{64}"
@@ -26,7 +26,7 @@ def _is_own_copy(path, name: str) -> bool:
     """Whether `name` is a recovery copy of `path` this manager made (and may remove)."""
     prefix = re.escape(path.name)
     return any(re.fullmatch(prefix + own, name) for own in (_OWN_ROTATING, _OWN_REVISION))
-# #1021: noevia-backup-<revision> copies kept (MODEL_FILES_IMPL=rust decides which).
+# #1021: noevia-backup-<revision> copies kept (`model-files backups` decides which).
 REVISION_BACKUPS_TO_KEEP = 10
 
 # One process-wide lock for every models.ini read-modify-write. FastAPI runs sync handlers in a
@@ -919,18 +919,6 @@ def _rename_section(old: str, new: str) -> bool:
     return True
 
 
-def _backup_current(path) -> None:
-    """Rotating `.bak-<ts>` copy of the current file. A failed copy aborts the write."""
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    backup = path.with_suffix(path.suffix + f".bak-{ts}")
-    n = 1
-    while backup.exists():
-        backup = path.with_suffix(path.suffix + f".bak-{ts}-{n}")
-        n += 1
-    shutil.copy(path, backup)  # not copy2: preserve creation-time mtime, not original
-    _prune_backups()
-
-
 def _immutable_backup(path, base_revision: str) -> None:
     """`models.ini.noevia-backup-<baseRevision>` (0600, never pruned or overwritten): the
     pre-write copy web used to make, named by the revision the caller replaced."""
@@ -956,7 +944,7 @@ def _fsync_dir(directory) -> None:
 
 
 def _rotating_name(path):
-    """The next free `.bak-<ts>[-n]` name (the one `_backup_current` would use)."""
+    """The next free `.bak-<ts>[-n]` name for this write's rotating copy."""
     ts = time.strftime("%Y%m%d-%H%M%S")
     backup = path.with_suffix(path.suffix + f".bak-{ts}")
     n = 1
@@ -967,7 +955,7 @@ def _rotating_name(path):
 
 
 def _rust_backups(path, base_revision: str | None, backup: bool):
-    """#1021 (MODEL_FILES_IMPL=rust): make the copies `model-files backups` decides on; return
+    """#1021: make the copies `model-files backups` decides on; return
     the names to remove once the new file is in place. Fails closed: any failure raises before
     models.ini is touched (OSError, so the API says nothing was changed)."""
     from . import model_files
@@ -999,20 +987,15 @@ def _replace_file(path, text: str, *, base_revision: str | None = None, backup: 
     crash. Any backup failure raises before the file is touched.
 
     `backup=False` is noevia-core's hint (#1003: auto-tune keeps one copy per run): no copies.
-    With MODEL_FILES_IMPL=rust the copies and their retention are `model-files backups`'
-    decision (#1021); otherwise the behaviour before #1021, less the hinted copies."""
+    The copies and their retention are always `model-files backups`' decision (#1021; the
+    Python fallback was removed in noevia#1071), so a missing or failing binary refuses the
+    write before models.ini is touched."""
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = 0o644
     prune = []
     if path.exists():
         mode = path.stat().st_mode & 0o777
-        from .model_files import impl_choice
-        if impl_choice() == "rust":
-            prune = _rust_backups(path, base_revision, backup)
-        elif backup:
-            if base_revision is not None:
-                _immutable_backup(path, base_revision)
-            _backup_current(path)
+        prune = _rust_backups(path, base_revision, backup)
     tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{time.monotonic_ns()}")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -1231,22 +1214,6 @@ def write_raw_text(text: str, base_revision: str | None = None, backup: bool = T
     as the rotating `.bak-<ts>` copy."""
     with WRITE_LOCK:
         _replace_file(settings.models_ini_path, text, base_revision=base_revision, backup=backup)
-
-
-def _prune_backups() -> None:
-    """Keep the newest BACKUPS_TO_KEEP of this manager's own rotating copies (by name, which is
-    their time order); operator files such as `models.ini.bak-before-upgrade` are never touched."""
-    path = settings.models_ini_path
-    try:
-        backups = sorted((p for p in path.parent.glob(f"{path.name}.bak-*")
-                          if re.fullmatch(re.escape(path.name) + _OWN_ROTATING, p.name)), reverse=True)
-    except OSError:
-        return
-    for old in backups[BACKUPS_TO_KEEP:]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
 
 
 def list_backups() -> list[tuple[str, float, int]]:

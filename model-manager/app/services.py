@@ -1194,19 +1194,3 @@ async def test_prompt(container_name: str, prompt: str, max_tokens: int = 256) -
         "tokens_per_s": tps,
     }
 
-
-def container_logs(name: str, tail: int = 200) -> tuple[bool, str]:
-    client = _docker_client()
-    if client is None:
-        return False, "docker unreachable"
-    try:
-        c = client.containers.get(name)
-    except NotFound:
-        return False, "container not found"
-    except DockerException as e:
-        return False, f"docker error: {e}"
-    try:
-        raw = c.logs(tail=tail, stdout=True, stderr=True, timestamps=False)
-    except DockerException as e:
-        return False, f"log fetch failed: {e}"
-    return True, raw.decode("utf-8", errors="replace")

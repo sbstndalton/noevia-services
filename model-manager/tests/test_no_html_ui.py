@@ -42,7 +42,7 @@ def test_every_route_is_json_api_or_a_fastapi_builtin():
     paths = {r.path for r in app.routes}
     extra = {p for p in paths if not p.startswith("/api/v1") and p not in {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}}
     assert not extra, f"non-API routes are back: {sorted(extra)}"
-    assert any(isinstance(r, APIRoute) and r.path == "/api/v1/health" for r in app.routes)
+    assert any(isinstance(r, APIRoute) and r.path == "/api/v1/overview" for r in app.routes)
 
 
 @pytest.mark.parametrize("method,path", REMOVED_PAGES)
