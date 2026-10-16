@@ -603,7 +603,7 @@ jobs:
       - name: Build helpers and native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview
           native_features=$(./target/release/noevia-model-manager --features)
           printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
@@ -619,6 +619,7 @@ jobs:
           printf '%s\n' "$native_features" | grep -Fx native-section-writes >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-settings-write >/dev/null
           printf '%s\n' "$native_features" | grep -Fx native-backend-control >/dev/null
+          printf '%s\n' "$native_features" | grep -Fx native-benchmark-overview >/dev/null
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
       - name: Check out immutable prompt oracle
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -728,3 +729,5 @@ jobs:
           [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SETTINGS_WRITE_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-backend-control
           [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BACKEND_CONTROL_IMPL)" = python ]
+          printf '%s\n' "$native_features" | grep -Fx native-benchmark-overview
+          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL)" = python ]

@@ -62,6 +62,13 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent reads the benchmark overview and asks this app only for the
+    # runner's live job state (the runner thread lives here). The job controls stay here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCHMARK_OVERVIEW_CONFIRMED") == "1":
+        if request.method == "GET" and request.url.path == "/api/v1/benchmark":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == BENCH_JOB_PATH:
+            return await _bench_job_call(request)
     # #1318: the native parent restarts and tests backends; restart errors stay recorded here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKEND_CONTROL_CONFIRMED") == "1":
         if request.method == "POST" and _native_backend_control(request):
@@ -209,6 +216,21 @@ async def _safe_defaults_plan(request: Request):
             return {"status": e.status_code, "detail": e.detail}
         return {"status": 200, "values": values, "mtp": mtp}
     return JSONResponse(await run_in_threadpool(compute))
+
+
+# #1318: the parent's private call for the benchmark runner's live state (`job` in GET /benchmark);
+# 404 unless the native parent owns that read. The parent never forwards this path.
+BENCH_JOB_PATH = "/api/v1/internal/bench-job"
+
+
+async def _bench_job_call(request: Request):
+    """`api._bench_job()` exactly as GET /benchmark embeds it."""
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    from . import api
+    return JSONResponse(jsonable_encoder(api._bench_job()))
 
 
 # #1318: the parent's private call for the benchmark run charts' live values; 404 unless the native
