@@ -975,11 +975,42 @@ def benchmark_run(run_id: int) -> dict:
             "badges": {v["alias"]: [_row(b) for b in db.badges_for(v["alias"])] for v in variants}}
 
 
+_INT_TEXT = re.compile(r"[+-]?[0-9]+(?:_[0-9]+)*")
+
+
+def _body_int(value, field: str) -> int | None:
+    """noevia#1905: `int(value or 0)` without the 500s and silent truncation. A falsy value is 0;
+    an int, an integral float or an integer string (ASCII digits) is its value; `True`, a
+    fraction, a list or other text is a 400. None means a huge integer (Python reads it, the
+    store cannot): a rating then fails the 1-5 check, a run id is refused."""
+    if not value:
+        return 0
+    if isinstance(value, bool):
+        raise HTTPException(400, f"{field} must be a number")
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")) or not value.is_integer():
+            raise HTTPException(400, f"{field} must be a number")
+        value = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not _INT_TEXT.fullmatch(text):
+            raise HTTPException(400, f"{field} must be a number")
+        value = int(text)
+    elif not isinstance(value, int):
+        raise HTTPException(400, f"{field} must be a number")
+    return value if -2**63 <= value < 2**63 else None
+
+
 @router.put("/badges")
 def set_badge(body: dict = Body(...)) -> dict:
-    alias = str(body.get("alias") or "")
-    ok, err = db.badge_set(alias, str(body.get("category") or ""), int(body.get("rating") or 0),
-                           str(body.get("note") or ""), int(body.get("runId") or 0) or None)
+    # noevia#1905: the alias is stripped once, so the answer lists what was written.
+    rating = _body_int(body.get("rating"), "rating")
+    run_id = _body_int(body.get("runId"), "runId")
+    if run_id is None:
+        raise HTTPException(400, "runId must be a number")
+    alias = str(body.get("alias") or "").strip()
+    ok, err = db.badge_set(alias, str(body.get("category") or ""), 6 if rating is None else rating,
+                           str(body.get("note") or ""), run_id or None)
     if not ok:
         raise HTTPException(400, err)
     return {"badges": [_row(b) for b in db.badges_for(alias)]}
@@ -987,5 +1018,6 @@ def set_badge(body: dict = Body(...)) -> dict:
 
 @router.delete("/badges")
 def clear_badge(alias: str = Query(...), category: str = Query(...)) -> dict:
+    alias = alias.strip()  # noevia#1905: as stored by badge_set
     db.badge_clear(alias, category)
     return {"badges": [_row(b) for b in db.badges_for(alias)]}
