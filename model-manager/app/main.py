@@ -62,6 +62,10 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent runs the Hugging Face update check and writes update_check itself.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_CHECK_UPDATES_CONFIRMED") == "1" and request.method == "POST"
+            and request.url.path == "/api/v1/models/check-updates"):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     # #1318: the native parent reads the benchmark overview and asks this app only for the
     # runner's live job state (the runner thread lives here). The job controls stay here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCHMARK_OVERVIEW_CONFIRMED") == "1":
