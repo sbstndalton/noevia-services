@@ -62,6 +62,13 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent reads canonical benchmark runs itself and asks this app only for the
+    # live chart values (capacity_gb, vram_predicted). Other id spellings stay here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCH_RUNS_CONFIRMED") == "1":
+        if request.method == "GET" and _canonical_bench_run(request):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == BENCH_RUN_RUNTIME_PATH:
+            return await _bench_run_runtime(request)
     # #1318: the native parent owns this read and asks this app only for its live fields.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DETAIL_CONFIRMED") == "1":
         if request.method == "GET" and request.url.path == "/api/v1/models/detail":
@@ -91,6 +98,49 @@ async def _model_detail_runtime(request: Request):
     from . import api, services
     loaded = await api._loaded_map()
     return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
+
+
+# #1318: the parent's private call for the benchmark run charts' live values; 404 unless the native
+# parent owns the read. The parent never forwards this path.
+BENCH_RUN_RUNTIME_PATH = "/api/v1/internal/bench-run-runtime"
+_BENCH_RUN_PREFIX = b"/api/v1/benchmark/runs/"
+
+
+def _canonical_bench_run(request: Request) -> bool:
+    """The ids the native parent answers: `-?[0-9]+` inside i64, judged on the raw path so a
+    percent-encoded id (which the parent forwards) is still served here."""
+    raw = request.scope.get("raw_path") or request.url.path.encode()
+    if not raw.startswith(_BENCH_RUN_PREFIX):
+        return False
+    seg = raw[len(_BENCH_RUN_PREFIX):]
+    digits = seg[1:] if seg.startswith(b"-") else seg
+    if not digits or not digits.isdigit() or not all(48 <= c <= 57 for c in digits):
+        return False
+    return -2 ** 63 <= int(seg) < 2 ** 63
+
+
+async def _bench_run_runtime(request: Request):
+    """`capacity_gb` and `vram_predicted` exactly as `helpers._bench_charts` computes them, for the
+    aliases the parent names (its vram_labels, in order)."""
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    aliases = request.query_params.getlist("alias")
+    if len(aliases) > 1024:
+        return Response('{"detail":"invalid runtime query"}', status_code=422, media_type="application/json")
+
+    def compute() -> dict:
+        from . import helpers
+        capacity = 0.0
+        try:
+            for b in helpers._backend_list():
+                capacity = max(capacity, float(b.get("vram_gb") or 0))
+        except Exception:  # noqa: BLE001
+            capacity = 0.0
+        return {"capacity_gb": round(capacity, 2),
+                "predicted": {a: helpers._predicted_vram_gb(a) for a in aliases}}
+    return JSONResponse(await run_in_threadpool(compute))
 
 
 from . import api as _api  # noqa: E402

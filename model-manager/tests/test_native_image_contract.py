@@ -36,6 +36,11 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert "printf '%s\\n' \"$native_features\" | grep -Fx native-badges >/dev/null" in source
     assert "ENV MODEL_MANAGER_BADGES_IMPL=python" in source
     assert not re.search(r"^ENV .*MODEL_MANAGER_BADGES_IMPL=rust", source, re.M)
+    # #1318: the benchmark run read is compiled in and advertised, and its switch defaults to python.
+    assert "noevia-model-manager/native-bench-runs" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-bench-runs >/dev/null" in source
+    assert "ENV MODEL_MANAGER_BENCH_RUNS_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_BENCH_RUNS_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):

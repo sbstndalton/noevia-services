@@ -15,8 +15,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=746151a0361c4bac4225eceb65bfe9aad9b742b2
-ARG NOEVIA_RS_SHA256=f791112b3ca396558a7b70763eeacdd05bb0ba18a48e7fcb9d65808bf5d92155
+ARG NOEVIA_RS_REF=219b874b63f24ea1882514fd8bcabd5895045a98
+ARG NOEVIA_RS_SHA256=da511923e90364a63163fc720a85b7ec5fbf1cb125c8bfbf7a5dc90713b96de1
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -25,7 +25,7 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
@@ -37,6 +37,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-model-detail >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-download-targets >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-badges >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-bench-runs >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -57,6 +58,9 @@ ENV MODEL_MANAGER_MODEL_DETAIL_IMPL=python
 ENV MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL=python
 # #1318: native PUT/DELETE /api/v1/badges stay off by default; badge reads stay Python.
 ENV MODEL_MANAGER_BADGES_IMPL=python
+# #1318: native GET /api/v1/benchmark/runs/{id} stays off by default; its live chart values always
+# come from this Python app through its private runtime call.
+ENV MODEL_MANAGER_BENCH_RUNS_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
