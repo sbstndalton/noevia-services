@@ -277,6 +277,15 @@ def register_safe_defaults(name: str) -> dict:
 
 
 def _register_safe_defaults(name: str) -> dict:
+    values, mtp = _safe_defaults_plan(name)
+    ini.upsert_section(name, values, "")
+    return {"ok": True, "revision": revision(), "section": ini.get_section(name), "mtp": mtp}
+
+
+def _safe_defaults_plan(name: str) -> tuple[dict, bool]:
+    """Everything `register_safe_defaults` decides before it writes: the refusals (raised as
+    HTTPException) and the values, read-only. The native writer (noevia#1318) asks for this
+    through the private safe-defaults-plan call and writes the section itself."""
     if ini.get_section(name) is not None:
         raise HTTPException(409, "settings already exist for this model")
     gguf_path, _model_rel, rel = _resolve_section_gguf(name)
@@ -305,8 +314,7 @@ def _register_safe_defaults(name: str) -> dict:
         values["spec-draft-model"] = head
     elif builtin:
         values["spec-type"] = "draft-mtp"
-    ini.upsert_section(name, values, "")
-    return {"ok": True, "revision": revision(), "section": ini.get_section(name), "mtp": bool(head or builtin)}
+    return values, bool(head or builtin)
 
 
 def _builtin_mtp_layers(gguf_path) -> int:
