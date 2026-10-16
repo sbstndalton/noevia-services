@@ -582,11 +582,11 @@ def unregistered_gguf_stems() -> list[str]:
 
 # ---- writing ----
 
-_SECTION_NAME_RE = re.compile(r"^[A-Za-z0-9._\-+]+$")
+_SECTION_NAME_RE = re.compile(r"[A-Za-z0-9._\-+]+")
 
 
 def valid_section_name(name: str) -> bool:
-    return bool(_SECTION_NAME_RE.match(name))
+    return bool(_SECTION_NAME_RE.fullmatch(name))
 
 
 def suggest_defaults(summary: dict) -> tuple[dict[str, str], list[str]]:
@@ -909,7 +909,9 @@ def _rename_section(old: str, new: str) -> bool:
             _replace_file(settings.models_ini_path, renamed)
         _forget_role(old, new)
         return True
-    items = list(cp.items(old))
+    # #1921: the section's own keys only; inherited [DEFAULT] keys stay inherited, as they do
+    # when only the header line is renamed.
+    items = list(cp._sections[old].items())
     cp.remove_section(old)
     cp.add_section(new)
     for k, v in items:
