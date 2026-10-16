@@ -4,8 +4,8 @@
 # (glibc 2.36), the same Debian as the runtime base below.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS docx-text
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=73d66b87dd432172a1e735901690710dc5662435
-ARG NOEVIA_RS_SHA256=d3cd698fcdef4f40d24edf00f3dc6cda4c26b59777f6549ce59ad48dc21d37ff
+ARG NOEVIA_RS_REF=5c9f2da22078bb753c5b35f6f463646cb2cee485
+ARG NOEVIA_RS_SHA256=ba40b63dee5d08af75b7f88083a9ad6b863d0fafdddf87f4e8a6d14602d3bd49
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never

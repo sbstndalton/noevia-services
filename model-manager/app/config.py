@@ -43,10 +43,8 @@ class Settings(BaseSettings):
     gguf_parser: str = "python"
     # The gguf-meta binary: a name looked up on PATH, or an absolute path.
     gguf_meta_bin: str = "gguf-meta"
-    # #964: which implementation turns a Hugging Face tree listing into file entries: "python"
-    # (default) or "rust" (the model-files binary baked into the image; fails closed).
-    model_files_impl: str = "python"
-    # The model-files binary: a name looked up on PATH, or an absolute path.
+    # #964/#1071: the model-files binary (the only implementation; fails closed and is required
+    # at startup): a name looked up on PATH, or an absolute path.
     model_files_bin: str = "model-files"
     # Autoconfig's input prep, size core and values assembly: "python" (default) or "rust" (the
     # model-autoconfig binary checks the Python answer, which stays authoritative; a disagreement

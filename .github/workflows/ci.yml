@@ -513,9 +513,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pytest==9.1.1 pytest-asyncio==1.4.0
-      - name: Host ownership and remaining Python backend sampler
-        run: python -m pytest -q tests/test_api_contract.py -k "backend_sampler_skips_only_confirmed_native_host or confirmed_host_refuses_direct_python_after_token_gate or default_python_host_contract_remains_available"
-      - run: python -m pytest -q -k "not backend_sampler_skips_only_confirmed_native_host and not confirmed_host_refuses_direct_python_after_token_gate and not default_python_host_contract_remains_available"
       # gguf-meta (sbstndalton/noevia-rs) at the Dockerfile's pinned ref, checksum-verified, then
       # compared with the Python parser (#909).
       - name: Fetch noevia-rs at the pinned ref
@@ -534,6 +531,17 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
+      # noevia#1071: model-files is the only repo-listing/backup implementation and the app refuses
+      # to start without it, so every later step (the whole suite included) runs with it.
+      - name: Build model-files for the app's startup check
+        working-directory: ${{ runner.temp }}/noevia-rs
+        run: |
+          cargo build --release --locked -p model-files-cli
+          ./target/release/model-files --help 2>&1 | grep -q usage
+          echo "MODEL_FILES_BIN=$RUNNER_TEMP/noevia-rs/target/release/model-files" >> "$GITHUB_ENV"
+      - name: Host ownership and remaining Python backend sampler
+        run: python -m pytest -q tests/test_api_contract.py -k "backend_sampler_skips_only_confirmed_native_host or confirmed_host_refuses_direct_python_after_token_gate or default_python_host_contract_remains_available"
+      - run: python -m pytest -q -k "not backend_sampler_skips_only_confirmed_native_host and not confirmed_host_refuses_direct_python_after_token_gate and not default_python_host_contract_remains_available"
       - name: Rust-owned actual prompt guards and startup seed ownership
         env:
           PROMPTS_TEST_PYTHON: python
@@ -658,15 +666,15 @@ jobs:
           GGUF_META_FIXTURES: ${{ runner.temp }}/noevia-rs/crates/gguf/tests/fixtures
         run: python -m pytest -q -rs tests/test_gguf_meta_differential.py tests/test_gguf_parser_switch.py
       # #964: the shared fixture table must be byte-identical in both repos, and the binary must
-      # agree with the Python reference on it and on a seeded random corpus.
-      - name: Differential test (model-files vs Python reference)
+      # reproduce its recorded expectations (the Python reference is at services 9c4bd37).
+      - name: Recorded-oracle test (model-files vs the recorded Python expectations)
         env:
           MODEL_FILES_BIN: ${{ runner.temp }}/noevia-rs/target/release/model-files
         run: |
           cmp tests/fixtures/model-files.v1.json "$RUNNER_TEMP/noevia-rs/crates/model-files/tests/fixtures/model-files.v1.json"
-          # #1021: model-files backups decides models.ini's recovery copies (MODEL_FILES_IMPL=rust).
+          # #1021: model-files backups decides models.ini's recovery copies (always, noevia#1071).
           cmp tests/fixtures/model-backups.v1.json "$RUNNER_TEMP/noevia-rs/crates/model-files/tests/fixtures/model-backups.v1.json"
-          python -m pytest -q -rs tests/test_model_files_differential.py tests/test_model_files_switch.py tests/test_model_backups.py
+          python -m pytest -q -rs tests/test_model_files_differential.py tests/test_model_files_native.py tests/test_model_backups.py
       # MODEL_AUTOCONFIG: the shared fixtures (size core; input prep and values; slices 3-6) must be
       # byte-identical in both repos, and the binary must agree with the Python reference on them,
       # on seeded random corpora, and through analyze() (never an answer other than Python's).

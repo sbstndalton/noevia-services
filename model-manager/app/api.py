@@ -91,11 +91,6 @@ async def _loaded_map() -> dict[str, list[str]]:
     return out
 
 
-@router.get("/health")
-def health() -> dict:
-    return {"ok": True}
-
-
 @router.get("/overview")
 async def overview() -> dict:
     snap = services.snapshot_models_dir()
@@ -501,29 +496,6 @@ def redact_log_line(line: str) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         line = pattern.sub(replacement, line)
     return line
-
-
-@router.get("/backends/{name}/logs")
-def backend_logs(name: str, q: str = "", level: str = "", tail: int = 400) -> dict:
-    if name not in services._effective_container_names():
-        raise HTTPException(404, "unknown backend")
-    ok, text = services.container_logs(name, tail=max(20, min(int(tail or 400), 2000)))
-    if not ok:
-        return {"ok": False, "error": text, "lines": []}
-    needle = q.lower()
-    lines = []
-    for raw_line in text.splitlines():
-        # Redact first, so a filter can never be used to probe a secret's value.
-        line = redact_log_line(raw_line)
-        low = line.lower()
-        if needle and needle not in low:
-            continue
-        if level == "error" and not any(t in low for t in ("err", "fatal")):
-            continue
-        if level == "warn" and not any(t in low for t in ("err", "warn", "wrn", "fatal")):
-            continue
-        lines.append(line)
-    return {"ok": True, "lines": lines}
 
 
 @router.post("/backends/{name}/test")
