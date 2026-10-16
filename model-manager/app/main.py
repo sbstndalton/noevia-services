@@ -62,6 +62,13 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent writes the Hugging Face token; it asks this app only for the token
+    # test (which calls Hugging Face). GET /settings follows its own switch.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SETTINGS_WRITE_CONFIRMED") == "1":
+        if request.method == "PUT" and request.url.path == "/api/v1/settings":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == HF_TOKEN_TEST_PATH:
+            return await _hf_token_test(request)
     # #1318: the native parent is the only models.ini writer; it asks this app only for the safe
     # defaults plan (read-only). Any other method or path shape stays here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTION_WRITES_CONFIRMED") == "1":
@@ -105,6 +112,23 @@ async def _model_detail_runtime(request: Request):
     from . import api, services
     loaded = await api._loaded_map()
     return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
+
+
+# #1318: the parent's private call for `PUT /settings`'s token test: `put_settings`' own test of the
+# stored token, `{"ok": bool, "message": str}`; 404 unless the native writer owns the PUT.
+HF_TOKEN_TEST_PATH = "/api/v1/internal/hf-token-test"
+
+
+async def _hf_token_test(request: Request):
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    from . import hf
+    try:
+        ok, message = await hf.validate_token(db.get_setting("hf_token", ""))
+    except Exception as e:  # noqa: BLE001 - the same answer put_settings gives
+        ok, message = False, f"Test failed: {e}"
+    return JSONResponse({"ok": ok, "message": message})
 
 
 # #1318: the parent's private call for safe defaults (the values register_safe_defaults would
