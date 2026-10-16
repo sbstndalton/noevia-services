@@ -58,6 +58,10 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_DOWNLOAD_TARGETS_CONFIRMED") == "1" and request.method == "GET"
             and request.url.path == "/api/v1/download-targets"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent owns both badge writers; badge reads (benchmark runs, models) stay here.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
+            and request.url.path == "/api/v1/badges"):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     # #1318: the native parent owns this read and asks this app only for its live fields.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DETAIL_CONFIRMED") == "1":
         if request.method == "GET" and request.url.path == "/api/v1/models/detail":
