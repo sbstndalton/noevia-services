@@ -25,7 +25,7 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
@@ -43,6 +43,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-backend-control >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-benchmark-overview >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-check-updates >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-benchmark-runner >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -77,6 +78,8 @@ ENV MODEL_MANAGER_BACKEND_CONTROL_IMPL=python
 ENV MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL=python
 # #1318: the native Hugging Face update check stays off by default.
 ENV MODEL_MANAGER_CHECK_UPDATES_IMPL=python
+# #1318: the native benchmark runner (the whole job slot, sweeps included) stays off by default.
+ENV MODEL_MANAGER_BENCHMARK_RUNNER_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
