@@ -62,6 +62,30 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent runs the Hugging Face update check and writes update_check itself.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_CHECK_UPDATES_CONFIRMED") == "1" and request.method == "POST"
+            and request.url.path == "/api/v1/models/check-updates"):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent reads the benchmark overview and asks this app only for the
+    # runner's live job state (the runner thread lives here). The job controls stay here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCHMARK_OVERVIEW_CONFIRMED") == "1":
+        if request.method == "GET" and request.url.path == "/api/v1/benchmark":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == BENCH_JOB_PATH:
+            return await _bench_job_call(request)
+    # #1318: the native parent restarts and tests backends; restart errors stay recorded here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKEND_CONTROL_CONFIRMED") == "1":
+        if request.method == "POST" and _native_backend_control(request):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == BACKEND_RESTART_ERROR_PATH:
+            return await _backend_restart_error(request)
+    # #1318: the native parent writes the Hugging Face token; it asks this app only for the token
+    # test (which calls Hugging Face). GET /settings follows its own switch.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SETTINGS_WRITE_CONFIRMED") == "1":
+        if request.method == "PUT" and request.url.path == "/api/v1/settings":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == HF_TOKEN_TEST_PATH:
+            return await _hf_token_test(request)
     # #1318: the native parent is the only models.ini writer; it asks this app only for the safe
     # defaults plan (read-only). Any other method or path shape stays here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTION_WRITES_CONFIRMED") == "1":
@@ -107,6 +131,60 @@ async def _model_detail_runtime(request: Request):
     return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
 
 
+# #1318: the parent's private call that keeps `GET /backends`' last_restart_error: PUT
+# {"name": str, "error": str | null} sets or clears it. 404 unless the parent owns restarts.
+BACKEND_RESTART_ERROR_PATH = "/api/v1/internal/backend-restart-error"
+_BACKENDS_PREFIX = b"/api/v1/backends/"
+
+
+def _native_backend_control(request: Request) -> bool:
+    """`POST /api/v1/backends/{name}/restart|test` with a plain ASCII name (no `%`): the shapes the
+    parent answers, judged on the raw path."""
+    raw = request.scope.get("raw_path") or request.url.path.encode()
+    if not raw.startswith(_BACKENDS_PREFIX):
+        return False
+    name, _, action = raw[len(_BACKENDS_PREFIX):].partition(b"/")
+    return (action in (b"restart", b"test") and 0 < len(name) <= 256 and name.isascii()
+            and b"%" not in name)
+
+
+async def _backend_restart_error(request: Request):
+    import json as _json
+    if request.method != "PUT":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    try:
+        body = _json.loads(await request.body())
+        name, error = body["name"], body.get("error")
+        if not isinstance(name, str) or not (error is None or isinstance(error, str)):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        return Response('{"detail":"invalid restart error"}', status_code=422, media_type="application/json")
+    from . import services
+    with services._restart_errors_lock:
+        if error is None:
+            services._restart_errors.pop(name, None)
+        else:
+            services._restart_errors[name] = error
+    return Response('{"ok":true}', media_type="application/json")
+
+
+# #1318: the parent's private call for `PUT /settings`'s token test: `put_settings`' own test of the
+# stored token, `{"ok": bool, "message": str}`; 404 unless the native writer owns the PUT.
+HF_TOKEN_TEST_PATH = "/api/v1/internal/hf-token-test"
+
+
+async def _hf_token_test(request: Request):
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    from . import hf
+    try:
+        ok, message = await hf.validate_token(db.get_setting("hf_token", ""))
+    except Exception as e:  # noqa: BLE001 - the same answer put_settings gives
+        ok, message = False, f"Test failed: {e}"
+    return JSONResponse({"ok": ok, "message": message})
+
+
 # #1318: the parent's private call for safe defaults (the values register_safe_defaults would
 # write, or its refusal); 404 unless the native writer owns models.ini writes.
 SAFE_DEFAULTS_PLAN_PATH = "/api/v1/internal/safe-defaults-plan"
@@ -142,6 +220,21 @@ async def _safe_defaults_plan(request: Request):
             return {"status": e.status_code, "detail": e.detail}
         return {"status": 200, "values": values, "mtp": mtp}
     return JSONResponse(await run_in_threadpool(compute))
+
+
+# #1318: the parent's private call for the benchmark runner's live state (`job` in GET /benchmark);
+# 404 unless the native parent owns that read. The parent never forwards this path.
+BENCH_JOB_PATH = "/api/v1/internal/bench-job"
+
+
+async def _bench_job_call(request: Request):
+    """`api._bench_job()` exactly as GET /benchmark embeds it."""
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    from . import api
+    return JSONResponse(jsonable_encoder(api._bench_job()))
 
 
 # #1318: the parent's private call for the benchmark run charts' live values; 404 unless the native
