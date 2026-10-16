@@ -233,7 +233,7 @@ async def test_a_slow_binary_does_not_block_the_event_loop(tmp_path, monkeypatch
     db.init()
     other = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
     _hub(monkeypatch, LISTING)
-    _use_rust(monkeypatch, _fake_bin(tmp_path, "time.sleep(2)\n" + textwrap.dedent(_ECHO_PYTHON)))
+    _use_rust(monkeypatch, _fake_bin(tmp_path, "time.sleep(2)\n" + textwrap.dedent(_ECHO)))
     slow = asyncio.create_task(hf.repo_detail("synthetic/repo-GGUF"))
     await asyncio.sleep(0.2)  # the listing is now waiting on the binary
     t0 = time.monotonic()
