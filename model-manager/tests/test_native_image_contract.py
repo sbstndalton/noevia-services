@@ -41,6 +41,11 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert "printf '%s\\n' \"$native_features\" | grep -Fx native-bench-runs >/dev/null" in source
     assert "ENV MODEL_MANAGER_BENCH_RUNS_IMPL=python" in source
     assert not re.search(r"^ENV .*MODEL_MANAGER_BENCH_RUNS_IMPL=rust", source, re.M)
+    # #1318: the native models.ini writers are compiled in and advertised, and default to python.
+    assert "noevia-model-manager/native-section-writes" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-section-writes >/dev/null" in source
+    assert "ENV MODEL_MANAGER_SECTION_WRITES_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_SECTION_WRITES_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):

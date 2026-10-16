@@ -62,6 +62,13 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent is the only models.ini writer; it asks this app only for the safe
+    # defaults plan (read-only). Any other method or path shape stays here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTION_WRITES_CONFIRMED") == "1":
+        if _native_section_write(request.method, request.url.path):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == SAFE_DEFAULTS_PLAN_PATH:
+            return await _safe_defaults_plan(request)
     # #1318: the native parent reads canonical benchmark runs itself and asks this app only for the
     # live chart values (capacity_gb, vram_predicted). Other id spellings stay here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCH_RUNS_CONFIRMED") == "1":
@@ -98,6 +105,43 @@ async def _model_detail_runtime(request: Request):
     from . import api, services
     loaded = await api._loaded_map()
     return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
+
+
+# #1318: the parent's private call for safe defaults (the values register_safe_defaults would
+# write, or its refusal); 404 unless the native writer owns models.ini writes.
+SAFE_DEFAULTS_PLAN_PATH = "/api/v1/internal/safe-defaults-plan"
+
+
+def _native_section_write(method: str, path: str) -> bool:
+    """The five models.ini writers, matched on the decoded path as FastAPI routes them."""
+    if method == "PUT" and path == "/api/v1/models-ini":
+        return True
+    parts = path.split("/")
+    if len(parts) < 5 or parts[:4] != ["", "api", "v1", "sections"] or not parts[4]:
+        return False
+    if len(parts) == 5:
+        return method in {"PUT", "DELETE"}
+    return len(parts) == 6 and method == "POST" and parts[5] in {"rename", "safe-defaults"}
+
+
+async def _safe_defaults_plan(request: Request):
+    """`{"status": 200, "values": {...}, "mtp": bool}`, or the refusal as
+    `{"status": <code>, "detail": "..."}`. Nothing is written."""
+    from fastapi import HTTPException
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    name = request.query_params.get("name", "")
+
+    def compute() -> dict:
+        from . import api
+        try:
+            values, mtp = api._safe_defaults_plan(name)
+        except HTTPException as e:
+            return {"status": e.status_code, "detail": e.detail}
+        return {"status": 200, "values": values, "mtp": mtp}
+    return JSONResponse(await run_in_threadpool(compute))
 
 
 # #1318: the parent's private call for the benchmark run charts' live values; 404 unless the native
