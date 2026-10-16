@@ -62,6 +62,12 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BADGES_CONFIRMED") == "1" and request.method in {"PUT", "DELETE"}
             and request.url.path == "/api/v1/badges"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent restarts and tests backends; restart errors stay recorded here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKEND_CONTROL_CONFIRMED") == "1":
+        if request.method == "POST" and _native_backend_control(request):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == BACKEND_RESTART_ERROR_PATH:
+            return await _backend_restart_error(request)
     # #1318: the native parent writes the Hugging Face token; it asks this app only for the token
     # test (which calls Hugging Face). GET /settings follows its own switch.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SETTINGS_WRITE_CONFIRMED") == "1":
@@ -112,6 +118,43 @@ async def _model_detail_runtime(request: Request):
     from . import api, services
     loaded = await api._loaded_map()
     return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
+
+
+# #1318: the parent's private call that keeps `GET /backends`' last_restart_error: PUT
+# {"name": str, "error": str | null} sets or clears it. 404 unless the parent owns restarts.
+BACKEND_RESTART_ERROR_PATH = "/api/v1/internal/backend-restart-error"
+_BACKENDS_PREFIX = b"/api/v1/backends/"
+
+
+def _native_backend_control(request: Request) -> bool:
+    """`POST /api/v1/backends/{name}/restart|test` with a plain ASCII name (no `%`): the shapes the
+    parent answers, judged on the raw path."""
+    raw = request.scope.get("raw_path") or request.url.path.encode()
+    if not raw.startswith(_BACKENDS_PREFIX):
+        return False
+    name, _, action = raw[len(_BACKENDS_PREFIX):].partition(b"/")
+    return (action in (b"restart", b"test") and 0 < len(name) <= 256 and name.isascii()
+            and b"%" not in name)
+
+
+async def _backend_restart_error(request: Request):
+    import json as _json
+    if request.method != "PUT":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    try:
+        body = _json.loads(await request.body())
+        name, error = body["name"], body.get("error")
+        if not isinstance(name, str) or not (error is None or isinstance(error, str)):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        return Response('{"detail":"invalid restart error"}', status_code=422, media_type="application/json")
+    from . import services
+    with services._restart_errors_lock:
+        if error is None:
+            services._restart_errors.pop(name, None)
+        else:
+            services._restart_errors[name] = error
+    return Response('{"ok":true}', media_type="application/json")
 
 
 # #1318: the parent's private call for `PUT /settings`'s token test: `put_settings`' own test of the
