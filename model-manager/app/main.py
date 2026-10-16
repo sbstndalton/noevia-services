@@ -53,7 +53,35 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_UPDATES_CONFIRMED") == "1" and request.method == "GET"
             and request.url.path == "/api/v1/models/updates"):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent owns this read and asks this app only for its live fields.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DETAIL_CONFIRMED") == "1":
+        if request.method == "GET" and request.url.path == "/api/v1/models/detail":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == MODEL_DETAIL_RUNTIME_PATH:
+            return await _model_detail_runtime(request)
     return await call_next(request)
+
+
+# #1318: the parent's private call, never a public route (so not in the API contract, and 404 when
+# the native parent does not own the detail read). The native parent never forwards this path.
+MODEL_DETAIL_RUNTIME_PATH = "/api/v1/internal/model-detail-runtime"
+
+
+async def _model_detail_runtime(request: Request):
+    """The live fields of GET /api/v1/models/detail, exactly as `api._entry` places them:
+    `loadedOn` is `loaded[modelId]` (Docker discovery plus llama-server probes) and `fit` is
+    `vram_fit_chips(bytes)` for a non-companion (the GPU sampler and host RAM). The parent reads
+    the files itself and splices these in; the chips text is kept as rendered here."""
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    size, fit = request.query_params.get("bytes", ""), request.query_params.get("fit", "")
+    # #1889: at most 39 digits (enough for any 128-bit total the parent sends), so a hostile value never becomes a huge int.
+    if not (size.isascii() and size.isdigit() and len(size) <= 39) or fit not in ("0", "1"):
+        return Response('{"detail":"invalid runtime query"}', status_code=422, media_type="application/json")
+    from . import api, services
+    loaded = await api._loaded_map()
+    return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
 
 
 from . import api as _api  # noqa: E402
