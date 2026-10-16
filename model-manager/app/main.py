@@ -81,6 +81,15 @@ async def _require_token(request: Request, call_next):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
         if request.url.path == BENCH_OBSERVE_PATH:
             return await _bench_observe(request)
+    # #1318: the native parent owns the download job table (start, draft-head download, list,
+    # cancel, clear) and runs the transfers. A start is still planned here, on the parent's
+    # private request: the same route runs with its validation and Hugging Face lookups, queues
+    # nothing, and the files it would have queued go back to the parent with its answer.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_DOWNLOADS_CONFIRMED") == "1":
+        if _native_downloads(request.method, request.url.path):
+            if request.headers.get(DOWNLOAD_PLAN_HEADER) == "1" and _download_start(request.method, request.url.path):
+                return await _download_plan(request, call_next)
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     # #1318: the native parent restarts and tests backends; restart errors stay recorded here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKEND_CONTROL_CONFIRMED") == "1":
         if request.method == "POST" and _native_backend_control(request):
@@ -252,6 +261,46 @@ _BENCHMARK_RUNNER_ROUTES = {("POST", "/api/v1/benchmark/start"), ("POST", "/api/
 
 def _native_benchmark_runner(method: str, path: str) -> bool:
     return (method, path) in _BENCHMARK_RUNNER_ROUTES
+
+
+# #1318: the parent's private planning request carries this header (never forwarded from a
+# client: the parent copies only the content type and the token).
+DOWNLOAD_PLAN_HEADER = "x-noevia-download-plan"
+
+
+def _download_start(method: str, path: str) -> bool:
+    parts = path.split("/")
+    return method == "POST" and (
+        path == "/api/v1/downloads"
+        or (len(parts) == 7 and parts[:4] == ["", "api", "v1", "sections"] and parts[4] != ""
+            and parts[5:] == ["draft-heads", "download"]))
+
+
+def _native_downloads(method: str, path: str) -> bool:
+    parts = path.split("/")
+    return (_download_start(method, path) or (method, path) in {("GET", "/api/v1/downloads"),
+                                                                ("POST", "/api/v1/downloads/clear")}
+            or (method == "POST" and len(parts) == 6 and parts[:4] == ["", "api", "v1", "downloads"]
+                and parts[4] != "" and parts[5] == "cancel"))
+
+
+async def _download_plan(request: Request, call_next):
+    """Run the start route without queueing: `{"status", "body", "jobs"}` where status and body
+    are the route's own answer (byte for byte) and jobs are the files it would have queued, in
+    order, as `{"repo_id", "filename", "url", "total_bytes"}`. An exception in the route is this
+    app's 500, as it would be for the public route."""
+    from fastapi.responses import JSONResponse
+
+    from . import downloader
+    planned: list[dict] = []
+    token = downloader.PLANNING.set(planned)
+    try:
+        response = await call_next(request)
+    finally:
+        downloader.PLANNING.reset(token)
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    return JSONResponse({"status": response.status_code, "body": body.decode("utf-8"),
+                         "jobs": planned if response.status_code == 200 else []})
 
 
 # #1318: the parent's private call for one prompt-suite request's observations, which need this

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import re
 import time
@@ -238,6 +239,12 @@ def _drop_validator(job: "DownloadJob") -> None:
         pass
 
 
+# #1318: set while the native parent asks this app to plan a download start. The route runs as
+# usual (validation, Hugging Face lookups, destination checks) but queues nothing: each file it
+# would queue is recorded here, and the parent, which owns the job table, queues it.
+PLANNING: contextvars.ContextVar[list | None] = contextvars.ContextVar("download_planning", default=None)
+
+
 class DownloadManager:
     def __init__(self) -> None:
         self.jobs: dict[str, DownloadJob] = {}
@@ -257,6 +264,10 @@ class DownloadManager:
 
     def _make_job(self, *, repo_id: str, filename: str, url: str, total_bytes: int) -> DownloadJob:
         dest = safe_dest(filename)
+        planned = PLANNING.get()
+        if planned is not None:
+            planned.append({"repo_id": repo_id, "filename": filename, "url": url, "total_bytes": total_bytes})
+            return None  # type: ignore[return-value]  # no caller uses the job
         for j in self.jobs.values():
             if j.dest_path == dest and j.status in ("queued", "downloading"):
                 return j
