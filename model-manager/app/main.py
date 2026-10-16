@@ -76,7 +76,8 @@ async def _model_detail_runtime(request: Request):
     if request.method != "GET":
         return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
     size, fit = request.query_params.get("bytes", ""), request.query_params.get("fit", "")
-    if not (size.isascii() and size.isdigit()) or fit not in ("0", "1"):
+    # #1889: at most 39 digits (enough for any 128-bit total the parent sends), so a hostile value never becomes a huge int.
+    if not (size.isascii() and size.isdigit() and len(size) <= 39) or fit not in ("0", "1"):
         return Response('{"detail":"invalid runtime query"}', status_code=422, media_type="application/json")
     from . import api, services
     loaded = await api._loaded_map()

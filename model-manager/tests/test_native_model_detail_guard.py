@@ -128,11 +128,15 @@ def test_runtime_call_is_exactly_what_the_python_detail_places(monkeypatch, clie
 
 def test_runtime_call_validates_its_query(monkeypatch, client):
     monkeypatch.setenv(ENV, "1")
-    for query in ("", "?bytes=1", "?fit=1", "?bytes=-1&fit=1", "?bytes=x&fit=1", "?bytes=1&fit=maybe"):
+    for query in ("", "?bytes=1", "?fit=1", "?bytes=-1&fit=1", "?bytes=x&fit=1", "?bytes=1&fit=maybe",
+                  "?bytes=%s&fit=1" % ("9" * 40), "?bytes=%s&fit=1" % ("1" * 5000), "?bytes=%D9%A1&fit=1"):
         assert client.get(RUNTIME + query, headers=auth()).status_code == 422, query
     assert client.post(RUNTIME + "?bytes=1&fit=1", headers=auth()).status_code == 405
     assert client.get(RUNTIME + "?bytes=0&fit=0", headers=auth()).json()["fit"] == []
     assert client.chip_calls == []
+    # #1889: 39 digits (any 128-bit total) is still accepted.
+    assert client.get(RUNTIME + "?bytes=%s&fit=1" % ("9" * 39), headers=auth()).status_code == 200
+    assert client.chip_calls == [int("9" * 39)]
 
 
 def test_model_detail_guard_does_not_touch_other_native_guards(monkeypatch, client):
