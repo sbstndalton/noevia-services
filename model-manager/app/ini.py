@@ -582,11 +582,11 @@ def unregistered_gguf_stems() -> list[str]:
 
 # ---- writing ----
 
-_SECTION_NAME_RE = re.compile(r"^[A-Za-z0-9._\-+]+$")
+_SECTION_NAME_RE = re.compile(r"[A-Za-z0-9._\-+]+")
 
 
 def valid_section_name(name: str) -> bool:
-    return bool(_SECTION_NAME_RE.match(name))
+    return bool(_SECTION_NAME_RE.fullmatch(name))
 
 
 def suggest_defaults(summary: dict) -> tuple[dict[str, str], list[str]]:

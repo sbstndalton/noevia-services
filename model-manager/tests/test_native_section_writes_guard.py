@@ -96,3 +96,11 @@ def test_1921_rename_fallback_keeps_default_keys_inherited(client):
     rev = client.get("/api/v1/sections", headers=auth()).json()["revision"]
     assert client.post("/api/v1/sections/b/rename", headers=auth(), json={"baseRevision": rev, "newName": "b2"}).status_code == 200
     assert settings.models_ini_path.read_text() == "[DEFAULT]\nd = 1\n\n[b2]\nk = v\n\n"
+
+
+def test_1934_section_name_with_a_trailing_newline_is_refused_and_models_ini_is_unchanged(client):
+    before = settings.models_ini_path.read_bytes()
+    rev = client.get("/api/v1/sections", headers=auth()).json()["revision"]
+    assert client.put("/api/v1/sections/foo%0A", headers=auth(), json={"baseRevision": rev, "values": {"k": "v"}}).status_code == 400
+    assert settings.models_ini_path.read_bytes() == before
+    assert not list(settings.models_ini_path.parent.glob("models.ini.*"))
