@@ -21,6 +21,11 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-updates >/dev/null" in source
     assert "ENV MODEL_MANAGER_MODEL_UPDATES_IMPL=python" in source
     assert not re.search(r"^ENV .*MODEL_MANAGER_MODEL_UPDATES_IMPL=rust", source, re.M)
+    # #1318: the model-detail read is compiled in and advertised, and its switch defaults to python.
+    assert "noevia-model-manager/native-model-detail" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-detail >/dev/null" in source
+    assert "ENV MODEL_MANAGER_MODEL_DETAIL_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_MODEL_DETAIL_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):

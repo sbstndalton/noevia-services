@@ -15,8 +15,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=0c540008b171df2e26f1893805d5e84f03dc277e
-ARG NOEVIA_RS_SHA256=b5a5e2ed36ac196f2ad3d136b87ac503434b4fb648992ac7db96fa67e50aab07
+ARG NOEVIA_RS_REF=132fe7f769cd071c721847132c739df8a97d696e
+ARG NOEVIA_RS_SHA256=4ef7495f96c4f0bc236cac42843559daf03845f21f02ea42cfde2f11cfb7210e
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -25,7 +25,7 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
@@ -34,6 +34,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-diagnose >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-settings >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-model-updates >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-model-detail >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -47,6 +48,9 @@ ENV MODEL_MANAGER_SECTIONS_IMPL=python
 ENV MODEL_MANAGER_SETTINGS_IMPL=python
 # #1318: native GET /api/v1/models/updates stays off by default; every update_check writer stays Python.
 ENV MODEL_MANAGER_MODEL_UPDATES_IMPL=python
+# #1318: native GET /api/v1/models/detail stays off by default; rust also needs TZ=UTC, and the live
+# loadedOn/fit fields always come from this Python app through its private runtime call.
+ENV MODEL_MANAGER_MODEL_DETAIL_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
