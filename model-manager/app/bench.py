@@ -823,10 +823,14 @@ def _free_gpu(backend: str, base_url: str) -> None:
         return
     from . import services
     _log("freeing GPU: restarting the backend so the sweep has the cards to itself")
+    # wait=True: the restart must have happened before the router is polled, or the old backend
+    # (still up, still holding the cards) answers 200 and the sweep starts too early (#1940).
     try:
-        services.restart_llama_backend(backend)
+        ok, msg = services.restart_llama_backend(backend, wait=True)
     except Exception as e:  # noqa: BLE001
-        _log(f"could not restart {backend}: {e}")
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    if not ok:
+        _log(f"could not restart {backend}: {msg}")
         return
     # Wait for the router to answer again, so the rest of the app is not left talking to a
     # container that is still coming up.

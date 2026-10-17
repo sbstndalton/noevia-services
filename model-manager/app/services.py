@@ -1039,8 +1039,14 @@ async def snapshot_llama_backends() -> list[LlamaBackend]:
     return out
 
 
-def restart_llama_backend(name: str) -> tuple[bool, str]:
-    """Fire-and-forget restart. Errors captured in _restart_errors."""
+def restart_llama_backend(name: str, wait: bool = False) -> tuple[bool, str]:
+    """Restart a backend container. Errors are captured in _restart_errors.
+
+    By default this is fire-and-forget: the restart is queued on a daemon thread and the call
+    returns at once. With wait=True the restart runs inline, so the caller knows the container
+    has actually been restarted when this returns; a failure is returned as (False, message)
+    (and recorded in _restart_errors, as the threaded path does).
+    """
     if name not in _effective_container_names():
         return False, "container not in configured list"
     client = _docker_client()
@@ -1062,6 +1068,16 @@ def restart_llama_backend(name: str) -> tuple[bool, str]:
         except (DockerException, APIError) as e:
             with _restart_errors_lock:
                 _restart_errors[name] = f"{type(e).__name__}: {e}"
+
+    if wait:
+        try:
+            c.restart(timeout=15)
+        except Exception as e:  # noqa: BLE001 - any failure is reported to the waiting caller
+            msg = f"{type(e).__name__}: {e}"
+            with _restart_errors_lock:
+                _restart_errors[name] = msg
+            return False, msg
+        return True, "restarted"
 
     threading.Thread(target=_do, daemon=True, name=f"restart-{name}").start()
     return True, "restart queued"
