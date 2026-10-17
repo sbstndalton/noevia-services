@@ -588,6 +588,15 @@ def _model_folder(match: "GgufEntry") -> str:
     return hf.group(1) if hf else (match.subdir or "")
 
 
+def delete_reservation(match: "GgufEntry") -> list[str]:
+    """noevia#1972: models-relative paths a delete of `match` may remove, held against new
+    downloads while it runs: the folder it may remove whole, or a flat model's own files."""
+    folder = _model_folder(match)
+    if folder:
+        return [folder]
+    return [p.name for p in list(match.parts) + list(match.companion_parts)]
+
+
 def download_blockers(match: "GgufEntry", jobs=None) -> list[str]:
     """noevia#1966: models-relative destinations of queued or running downloads that land on one of
     this model's files or anywhere inside its folder. Deleting then would remove a partial
