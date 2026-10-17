@@ -79,6 +79,15 @@ def test_a_failed_restart_is_logged_recorded_and_the_router_is_never_polled(monk
 def test_the_restart_has_happened_before_the_router_is_first_polled(monkeypatch):
     backend = FakeBackend()
     monkeypatch.setattr(services, "_docker_client", lambda: FakeClient(backend))
+
+    class _NoThread:        # a queued (fire-and-forget) restart never runs: only an inline one can
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(services.threading, "Thread", _NoThread)
     seen = []
 
     def fake_get(url, timeout=None):
