@@ -7,7 +7,7 @@ import re
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from . import db, hw, ini, model_files
+from . import db, downloader, hw, ini, model_files
 from .config import settings
 
 log = logging.getLogger(__name__)
@@ -456,6 +456,13 @@ async def _duplicate_sections(_request: Request, exc: ini.DuplicateSectionsError
     """A write hit a models.ini with repeated [sections]; nothing was changed."""
     from fastapi.responses import JSONResponse
     return JSONResponse({"detail": f"{exc}. Repair the file (remove the repeated section) before saving."}, status_code=409)
+
+
+@app.exception_handler(downloader.DeleteInProgress)
+async def _delete_in_progress(_request: Request, exc: downloader.DeleteInProgress):
+    """noevia#1972: a download start whose destination a running delete may remove."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse({"detail": str(exc)}, status_code=409)
 
 
 @app.exception_handler(model_files.ModelFilesError)

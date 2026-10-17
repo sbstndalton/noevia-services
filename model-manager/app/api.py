@@ -11,6 +11,7 @@ own preset editor, a calibration run or an operator is never silently overwritte
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import logging
@@ -144,6 +145,13 @@ def delete_models(body: dict = Body(...)) -> dict:
     # Check every requested file first: a running container that holds one of them (the embed
     # sidecar's --model, EMBEDDING_MODEL / RERANK_MODEL) refuses the whole request with 409 and
     # nothing is deleted, even if the web-side guard was bypassed (#336).
+    # noevia#1972: each model's folder is reserved before its download check and until the
+    # request ends, so a download cannot start into a folder this request is removing.
+    with contextlib.ExitStack() as reserved:
+        return _delete_models(body, reserved)
+
+
+def _delete_models(body: dict, reserved: contextlib.ExitStack) -> dict:
     results = []
     todo = []
     containers = None
@@ -161,6 +169,7 @@ def delete_models(body: dict = Body(...)) -> dict:
         holders = services.model_holders(g, containers)
         if holders:
             raise HTTPException(409, services.in_use_message(g, holders))
+        reserved.enter_context(manager.reserve(services.delete_reservation(g)))
         # noevia#1966: a queued or running download into this model's folder refuses the same way.
         downloads = services.download_blockers(g)
         if downloads:
@@ -870,8 +879,9 @@ def _enqueue_all(repo: str, plan: list[dict]) -> None:
             safe_dest(p["filename"])
     except ValueError:
         raise HTTPException(400, "That download would land outside the models folder") from None
-    for p in plan:
-        manager.enqueue(repo_id=repo, **p)
+    with manager.starting([p["filename"] for p in plan]):
+        for p in plan:
+            manager.enqueue(repo_id=repo, **p)
 
 
 @router.post("/downloads/{job_id}/cancel")
