@@ -82,6 +82,14 @@ async def _require_token(request: Request, call_next):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
         if request.url.path == BENCH_JOB_PATH:
             return await _bench_job_call(request)
+    # #1318: the native parent owns the benchmark job slot (prompt runs, sweeps, the startup
+    # cleanup of leftover sweep containers). It asks this app only for the per-request
+    # observations that need the GPU sampler and the backend logs, which live here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCHMARK_RUNNER_CONFIRMED") == "1":
+        if _native_benchmark_runner(request.method, request.url.path):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == BENCH_OBSERVE_PATH:
+            return await _bench_observe(request)
     # #1318: the native parent restarts and tests backends; restart errors stay recorded here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKEND_CONTROL_CONFIRMED") == "1":
         if request.method == "POST" and _native_backend_control(request):
@@ -246,6 +254,44 @@ async def _bench_job_call(request: Request):
     return JSONResponse(jsonable_encoder(api._bench_job()))
 
 
+# #1318: the four job routes the native benchmark runner answers.
+_BENCHMARK_RUNNER_ROUTES = {("POST", "/api/v1/benchmark/start"), ("POST", "/api/v1/benchmark/sweep"),
+                            ("GET", "/api/v1/benchmark/progress"), ("POST", "/api/v1/benchmark/cancel")}
+
+
+def _native_benchmark_runner(method: str, path: str) -> bool:
+    return (method, path) in _BENCHMARK_RUNNER_ROUTES
+
+
+# #1318: the parent's private call for one prompt-suite request's observations, which need this
+# app's GPU sampler and backend log parser: `{"peak_vram_json": json.dumps(bench._peak_vram(b)),
+# "contended": bench._other_traffic(b, aliases, since), "load_ms": bench._read_load_ms(b, alias)
+# when cold, else null}`. 404 unless the native runner owns the job slot.
+BENCH_OBSERVE_PATH = "/api/v1/internal/bench-observe"
+
+
+async def _bench_observe(request: Request):
+    import json as _json
+
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    q = request.query_params
+    backend, alias = q.get("backend", ""), q.get("alias", "")
+    try:
+        since = float(q.get("since", ""))
+    except ValueError:
+        return Response('{"detail":"invalid since"}', status_code=422, media_type="application/json")
+    cold = q.get("cold") == "1"
+    if not backend:
+        return Response('{"detail":"invalid backend"}', status_code=422, media_type="application/json")
+    from . import bench
+    peak = bench._peak_vram(backend)
+    contended = bool(bench._other_traffic(backend, set(q.getlist("aliases")), since))
+    load_ms = bench._read_load_ms(backend, alias) if cold else None
+    return JSONResponse({"peak_vram_json": _json.dumps(peak), "contended": contended, "load_ms": load_ms})
+
+
 # #1318: the parent's private call for the benchmark run charts' live values; 404 unless the native
 # parent owns the read. The parent never forwards this path.
 BENCH_RUN_RUNTIME_PATH = "/api/v1/internal/bench-run-runtime"
@@ -318,7 +364,10 @@ def _startup() -> None:
     hw.start_sampler()
     try:
         from . import bench
-        bench.reap_orphans()
+        # #1318: the native runner owns the job slot and cleans up leftover sweep containers
+        # itself; two owners would race over the same containers and state.
+        if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BENCHMARK_RUNNER_CONFIRMED") != "1":
+            bench.reap_orphans()
     except Exception as e:  # noqa: BLE001 - recovery is best effort; startup continues
         log.warning("benchmark orphan check failed: %s", type(e).__name__)
     if settings.migrate_cache_ram_on_start:
