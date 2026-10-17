@@ -25,6 +25,11 @@ def _native_owned(path: str) -> bool:
         len(parts) == 6 and parts[:4] == ["", "api", "v1", "backends"] and parts[4] and parts[5] == "logs")
 
 
+def _draft_heads_path(path: str) -> bool:
+    parts = path.split("/")
+    return len(parts) == 6 and parts[:4] == ["", "api", "v1", "sections"] and parts[4] != "" and parts[5] == "draft-heads"
+
+
 @app.middleware("http")
 async def _require_token(request: Request, call_next):
     import hmac
@@ -99,6 +104,12 @@ async def _require_token(request: Request, call_next):
             if request.headers.get(DOWNLOAD_PLAN_HEADER) == "1" and _download_start(request.method, request.url.path):
                 return await _download_plan(request, call_next)
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent reads GET /api/v1/sections/{name}/draft-heads (the section's model file,
+    # its local and built-in heads, the download history and the Hugging Face listing). Other
+    # methods keep FastAPI's 405 here; a name that decodes to a slash never matches the route.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_DRAFT_HEADS_CONFIRMED") == "1" and request.method == "GET"
+            and _draft_heads_path(request.url.path)):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     # #1318: the native parent owns model deletion (the container check and every file removal).
     # Other methods keep FastAPI's 405 here.
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DELETE_CONFIRMED") == "1" and request.method == "POST"
