@@ -1,0 +1,298 @@
+{
+  "format": "delete-reservation-cases.v1",
+  "about": "Shared by noevia-rs (model_delete reservation) and noevia-services (services.delete_reservation). Each case is a synthetic models folder (files, models-relative) and, for every model the listing shows there, the models-relative paths a delete of it reserves against new downloads (noevia#1972). The canonical copy is in noevia-rs; services keeps an identical copy, pinned by sha256 in its test. Refresh both together.",
+  "cases": [
+    {
+      "name": "flat model reserves its own file",
+      "files": [
+        "flat.gguf"
+      ],
+      "entries": [
+        {
+          "base": "flat.gguf",
+          "subdir": "",
+          "reserved": [
+            "flat.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "flat main model next to a flat projector",
+      "files": [
+        "m.gguf",
+        "mmproj-m.gguf"
+      ],
+      "entries": [
+        {
+          "base": "m.gguf",
+          "subdir": "",
+          "reserved": [
+            "m.gguf"
+          ]
+        },
+        {
+          "base": "mmproj-m.gguf",
+          "subdir": "",
+          "reserved": [
+            "mmproj-m.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "flat shards reserve every shard",
+      "files": [
+        "s-00001-of-00002.gguf",
+        "s-00002-of-00002.gguf"
+      ],
+      "entries": [
+        {
+          "base": "s.gguf",
+          "subdir": "",
+          "reserved": [
+            "s-00001-of-00002.gguf",
+            "s-00002-of-00002.gguf"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "subfolder model reserves its folder",
+      "files": [
+        "sub/a.gguf"
+      ],
+      "entries": [
+        {
+          "base": "a.gguf",
+          "subdir": "sub",
+          "reserved": [
+            "sub"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "subfolder model with a projector reserves the folder once",
+      "files": [
+        "sub/a.gguf",
+        "sub/mmproj-a.gguf"
+      ],
+      "entries": [
+        {
+          "base": "a.gguf",
+          "subdir": "sub",
+          "reserved": [
+            "sub"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "nested folder",
+      "files": [
+        "a/b/c.gguf"
+      ],
+      "entries": [
+        {
+          "base": "c.gguf",
+          "subdir": "a/b",
+          "reserved": [
+            "a/b"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "folder name with a dot",
+      "files": [
+        "sub.d/x.gguf"
+      ],
+      "entries": [
+        {
+          "base": "x.gguf",
+          "subdir": "sub.d",
+          "reserved": [
+            "sub.d"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hugging face snapshot reserves the repository folder",
+      "files": [
+        "models--o--r/snapshots/rev/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--o--r/snapshots/rev",
+          "reserved": [
+            "models--o--r"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hugging face snapshot subfolder reserves the repository folder",
+      "files": [
+        "models--o--r/snapshots/rev/sub/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--o--r/snapshots/rev/sub",
+          "reserved": [
+            "models--o--r"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hugging face repository below another folder",
+      "files": [
+        "org/models--o--r/snapshots/rev/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "org/models--o--r/snapshots/rev",
+          "reserved": [
+            "org/models--o--r"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hugging face shards reserve the repository folder",
+      "files": [
+        "models--o--r/snapshots/rev/s-00001-of-00002.gguf",
+        "models--o--r/snapshots/rev/s-00002-of-00002.gguf"
+      ],
+      "entries": [
+        {
+          "base": "s.gguf",
+          "subdir": "models--o--r/snapshots/rev",
+          "reserved": [
+            "models--o--r"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "models-- with nothing after it is not a repository",
+      "files": [
+        "models--/snapshots/rev/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--/snapshots/rev",
+          "reserved": [
+            "models--/snapshots/rev"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "repository without a snapshots folder",
+      "files": [
+        "models--x/other/rev/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--x/other/rev",
+          "reserved": [
+            "models--x/other/rev"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "snapshots folder without a revision",
+      "files": [
+        "models--x/snapshots/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--x/snapshots",
+          "reserved": [
+            "models--x/snapshots"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "first repository folder wins when snapshots nest another",
+      "files": [
+        "models--a/snapshots/models--b/snapshots/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--a/snapshots/models--b/snapshots",
+          "reserved": [
+            "models--a"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "repository folder prefix is case sensitive",
+      "files": [
+        "Models--o--r/snapshots/rev/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "Models--o--r/snapshots/rev",
+          "reserved": [
+            "Models--o--r/snapshots/rev"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "an earlier models-- folder without snapshots is part of the path",
+      "files": [
+        "models--y/models--x/snapshots/rev/q.gguf"
+      ],
+      "entries": [
+        {
+          "base": "q.gguf",
+          "subdir": "models--y/models--x/snapshots/rev",
+          "reserved": [
+            "models--y/models--x"
+          ]
+        }
+      ]
+    }
+  ],
+  "downloadBlockedByDelete": {
+    "status": 409,
+    "detail": "A delete is removing that folder right now; nothing was queued. Try again when it has finished."
+  },
+  "deleteBlockedByDownload": [
+    {
+      "name": "one blocking download",
+      "base": "a.gguf",
+      "rels": [
+        "sub/b.gguf"
+      ],
+      "status": 409,
+      "detail": "a.gguf has a download queued or running in its folder: sub/b.gguf. Wait for it to finish or cancel it first; nothing was deleted."
+    },
+    {
+      "name": "several blocking downloads",
+      "base": "q.gguf",
+      "rels": [
+        "models--o--r/blobs/x.gguf",
+        "models--o--r/snapshots/rev/y.gguf"
+      ],
+      "status": 409,
+      "detail": "q.gguf has a download queued or running in its folder: models--o--r/blobs/x.gguf; models--o--r/snapshots/rev/y.gguf. Wait for it to finish or cancel it first; nothing was deleted."
+    }
+  ]
+}
