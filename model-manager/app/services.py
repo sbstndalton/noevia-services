@@ -427,10 +427,10 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
     if snap.error and not snap.ggufs:
         return False, snap.error, 0
     # match by display_name AND subdir (allows same base filename to exist both flat and in a subdir)
+    # noevia#1964: exactly this folder. A flat name never falls back to a same-named model in
+    # another folder: the JSON API always passes the entry's own subdir, so that fallback could
+    # only ever delete a model nobody asked for.
     match = next((g for g in snap.ggufs if g.display_name == display_name and g.subdir == subdir), None)
-    if match is None and subdir == "":
-        # fall back: match any subdir if only display_name given (bulk-delete callers pass just display_name)
-        match = next((g for g in snap.ggufs if g.display_name == display_name), None)
     if match is None:
         return False, f"not found: {display_name}", 0
     # Backstop for callers other than the JSON API (which checks up front and answers 409).
@@ -440,6 +440,9 @@ def delete_gguf(display_name: str, subdir: str = "") -> tuple[bool, str, int]:
         return False, str(e), 0
     if holders:
         return False, in_use_message(match, holders), 0
+    downloads = download_blockers(match)
+    if downloads:
+        return False, downloading_message(match, downloads), 0
     freed = 0
     removed: list[str] = []
 
@@ -573,6 +576,48 @@ def _is_gguf_name(name: str) -> bool:
     return name.lower().endswith(".gguf")
 
 
+def _is_partial_gguf_name(name: str) -> bool:
+    """noevia#1966: a download's partial file (`x.gguf.download`) is another model on its way."""
+    return name.lower().endswith(".gguf.download")
+
+
+def _model_folder(match: "GgufEntry") -> str:
+    """The folder a delete of `match` may remove whole: its Hugging Face repository folder for the
+    cache layout, else its own subdir ("" for a flat model, which is only ever deleted per file)."""
+    hf = _HF_CACHE_RE.match(match.subdir or "")
+    return hf.group(1) if hf else (match.subdir or "")
+
+
+def download_blockers(match: "GgufEntry", jobs=None) -> list[str]:
+    """noevia#1966: models-relative destinations of queued or running downloads that land on one of
+    this model's files or anywhere inside its folder. Deleting then would remove a partial
+    transfer, or a queued download would bring the deleted file back afterwards."""
+    if jobs is None:
+        from .downloader import manager
+        jobs = manager.snapshot()
+    root = Path(settings.models_dir)
+    own = {posixpath.join(match.subdir, p.name) if match.subdir else p.name
+           for p in list(match.parts) + list(match.companion_parts)}
+    folder = _model_folder(match)
+    found: list[str] = []
+    for j in jobs:
+        if j.status not in ("queued", "downloading"):
+            continue
+        try:
+            # `safe_dest` keeps the path as joined (models_dir / filename), checked but unresolved.
+            rel = posixpath.normpath(Path(j.dest_path).relative_to(root).as_posix())
+        except ValueError:
+            continue
+        if (rel in own or (folder and rel.startswith(folder + "/"))) and rel not in found:
+            found.append(rel)
+    return found
+
+
+def downloading_message(match: "GgufEntry", rels: list[str]) -> str:
+    return (f"{match.display_name} has a download queued or running in its folder: {'; '.join(rels)}. "
+            "Wait for it to finish or cancel it first; nothing was deleted.")
+
+
 def _other_models_below(folder: Path, own: set[Path]) -> bool:
     """True if any GGUF under `folder` (any depth) is not this model's own file.
 
@@ -590,6 +635,8 @@ def _other_models_below(folder: Path, own: set[Path]) -> bool:
             if nested and _is_mount_point(dirpath, mounts):
                 return True   # a filesystem mounted inside: rmtree would empty it
             for name in filenames:
+                if _is_partial_gguf_name(name):
+                    return True   # noevia#1966: a download in progress here is another model
                 if not _is_gguf_name(name):
                     continue
                 q = here / name
