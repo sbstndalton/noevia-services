@@ -114,7 +114,6 @@ fn call(root: &Root, confirmation: Option<&str>, cases: &str) -> Result<Vec<Stri
         .env("DOCKER_HOST", "unix:///absent-synthetic.sock")
         .env("MIGRATE_CACHE_RAM_ON_START", "false")
         .env("GGUF_PARSER", "python")
-        .env("MODEL_FILES_IMPL", "python")
         .env("MODEL_AUTOCONFIG", "python")
         .env_remove("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED")
         .env_remove("NOEVIA_NATIVE_MODEL_MANAGER_HOST_CONFIRMED")

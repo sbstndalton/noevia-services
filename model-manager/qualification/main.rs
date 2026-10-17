@@ -329,11 +329,8 @@ fn prepare() -> Result<()> {
     Ok(())
 }
 fn probe(mode: &str) -> Result<()> {
-    wait_ready(
-        8090,
-        (mode == "rust").then_some(8091),
-        Path::new(&format!("{ROOT}/child.json")),
-    )?;
+    // noevia#1071: the native parent always supervises the private child.
+    wait_ready(8090, Some(8091), Path::new(&format!("{ROOT}/child.json")))?;
     let marker = fs::read_to_string(format!("{ROOT}/child.json"))?;
     require(marker.len() < 1024, "child marker cap")?;
     probe_ready(mode, &marker)
@@ -381,12 +378,14 @@ fn probe_ready(mode: &str, marker: &str) -> Result<()> {
         check(8091, "HEAD", "/api/v1/sections/tiny", true, 405, Some(""))?;
         check(8091, "PUT", "/api/v1/sections/tiny", true, 422, None)?;
     } else {
+        // Sections off (noevia#1071: under the always-native parent): stale confirmations
+        // are replaced with "0" and health/logs stay native ("1").
         require(
-            marker.contains("\"sections\": null")
-                && marker.contains("\"native\": null")
-                && marker.contains("\"host\": null")
-                && marker.contains("0.0.0.0")
-                && marker.contains("8090"),
+            marker.contains("\"sections\": \"0\"")
+                && marker.contains("\"native\": \"1\"")
+                && marker.contains("\"host\": \"0\"")
+                && marker.contains("127.0.0.1")
+                && marker.contains("8091"),
             "default clears stale confirmations",
         )?;
     }
@@ -471,7 +470,6 @@ fn images(image: &str) -> Result<()> {
         "expected fixed qualification image",
     )?;
     for mode in ["python", "rust"] {
-        let selected = format!("MODEL_MANAGER_IMPL={mode}");
         let sections = format!("MODEL_MANAGER_SECTIONS_IMPL={mode}");
         let mut args = vec![
             "--network",
@@ -522,9 +520,8 @@ fn images(image: &str) -> Result<()> {
             "-e",
             "MODEL_LOADER_TOKEN=synthetic-image-token-0000000000000000000",
         ];
-        if mode == "rust" {
-            args.extend(["-e", &selected, "-e", &sections]);
-        }
+        // noevia#1071: the parent is native in both modes; only the sections selector differs.
+        args.extend(["-e", "MODEL_MANAGER_IMPL=rust", "-e", &sections]);
         args.extend(["--entrypoint", "sections-image-probe", image, "serve"]);
         let owned = Container::acquire(&args)?;
         require(command(&["start", &owned.id])?, "owned image start")?;
@@ -548,7 +545,7 @@ fn images(image: &str) -> Result<()> {
         }
         drop(owned);
     }
-    for mode in ["omission", "refuse-mismatch", "refuse-invalid"] {
+    for mode in ["omission", "refuse-invalid"] {
         let owned = Container::acquire(&[
             "--network",
             "none",
@@ -595,12 +592,6 @@ fn main() -> Result<()> {
             result
         }
         ("omission", None) => omission(),
-        ("refuse-mismatch", None) => refusal(
-            "/usr/local/bin/noevia-model-manager",
-            "python",
-            "rust",
-            "native-sections requires rust model manager and compiled native-sections feature",
-        ),
         ("refuse-invalid", None) => refusal(
             "/usr/local/bin/noevia-model-manager",
             "rust",

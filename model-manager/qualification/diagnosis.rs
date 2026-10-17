@@ -83,7 +83,6 @@ fn call(value: Option<&str>, composed: bool, cases: &str) -> Result<Vec<String>>
         .env("DOCKER_HOST", "unix:///absent-synthetic.sock")
         .env("MIGRATE_CACHE_RAM_ON_START", "false")
         .env("GGUF_PARSER", "python")
-        .env("MODEL_FILES_IMPL", "python")
         .env("MODEL_AUTOCONFIG", "python")
         .env_remove(KEY);
     for key in [

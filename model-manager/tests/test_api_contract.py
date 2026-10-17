@@ -34,7 +34,8 @@ def _documented() -> set[str]:
 
 
 def _served() -> set[str]:
-    out = set()
+    # noevia#1071: health and logs are served by the native parent only; this app refuses them.
+    out = {f"{m} {_norm(p)}" for m, p in main.NATIVE_OWNED_ROUTES}
     for r in app.routes:
         if isinstance(r, APIRoute) and r.path.startswith("/api/v1"):
             out.update(f"{m} {_norm(r.path)}" for m in r.methods if m not in {"HEAD", "OPTIONS"})
@@ -51,7 +52,8 @@ def test_doc_lists_every_served_route_and_nothing_else():
 def test_only_health_is_unauthenticated(monkeypatch):
     monkeypatch.setattr(settings, "model_loader_token", "fixture-token")
     with TestClient(app) as c:
-        assert c.get("/api/v1/health").status_code == 200
+        # Not 401: health skips the token check, then the native-owned refusal answers.
+        assert c.get("/api/v1/health").status_code == 503
         for path in ("/api/v1/models", "/api/v1/sections"):
             r = c.get(path)
             assert r.status_code == 401 and r.json() == {"error": "unauthorized"}
@@ -59,9 +61,16 @@ def test_only_health_is_unauthenticated(monkeypatch):
         assert c.get("/api/v1/sections", headers={"X-Model-Loader-Token": "fixture-token"}).status_code == 200
 
 
-def test_native_owned_paths_refuse_without_python_fallback(monkeypatch):
-    monkeypatch.setenv("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED", "1")
+@pytest.mark.parametrize("confirmed", [None, "0", "1", "python"])
+def test_native_owned_paths_refuse_unconditionally_without_python_fallback(monkeypatch, confirmed):
+    # noevia#1071: the confirmation no longer decides anything for health and logs.
+    if confirmed is None:
+        monkeypatch.delenv("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED", raising=False)
+    else:
+        monkeypatch.setenv("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED", confirmed)
     monkeypatch.setattr(settings, "model_loader_token", "fixture-token")
+    assert not any(isinstance(r, APIRoute) and (r.path == "/api/v1/health" or r.path.endswith("/logs"))
+                   for r in app.routes)
     with TestClient(app) as c:
         assert c.get("/api/v1/health").status_code == 503
         assert c.get("/api/v1/backends/synthetic/logs").status_code == 401

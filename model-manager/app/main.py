@@ -13,6 +13,17 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(title="Model Loader")
 
+# noevia#1071: the native parent (noevia-rs bins/noevia-model-manager) always owns these; this app
+# has no handler for them and refuses them unconditionally (the API contract still lists them).
+NATIVE_OWNED_ROUTES = frozenset({("GET", "/api/v1/health"), ("GET", "/api/v1/backends/{name}/logs")})
+_NATIVE_OWNED = '{"detail":"Native model manager owns this endpoint"}'
+
+
+def _native_owned(path: str) -> bool:
+    parts = path.split("/")
+    return path == "/api/v1/health" or (
+        len(parts) == 6 and parts[:4] == ["", "api", "v1", "backends"] and parts[4] and parts[5] == "logs")
+
 
 @app.middleware("http")
 async def _require_token(request: Request, call_next):
@@ -22,13 +33,11 @@ async def _require_token(request: Request, call_next):
         sent = request.headers.get("x-model-loader-token", "")
         if not hmac.compare_digest(sent.encode(), token.encode()):
             return Response('{"error":"unauthorized"}', status_code=401, media_type="application/json")
-    # Native selector's supervised loopback child keeps ONLY unported routes. Refuse
-    # native-owned paths even if the Rust handler fails; never silently serve them twice.
-    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_CONFIRMED") == "1":
-        path = request.url.path
-        parts = path.split("/")
-        if path == "/api/v1/health" or (len(parts) == 6 and parts[:4] == ["", "api", "v1", "backends"] and parts[4] and parts[5] == "logs"):
-            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # This app only ever runs as the native parent's supervised loopback child (noevia#1071), so
+    # health and logs are refused whatever the environment says, even if the Rust handler fails;
+    # never silently serve them twice.
+    if _native_owned(request.url.path):
+        return Response(_NATIVE_OWNED, status_code=503, media_type="application/json")
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_HOST_CONFIRMED") == "1" and request.url.path == "/api/v1/host":
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_DIAGNOSE_CONFIRMED") == "1" and request.method == "GET":
@@ -393,7 +402,7 @@ async def _duplicate_sections(_request: Request, exc: ini.DuplicateSectionsError
 
 @app.exception_handler(model_files.ModelFilesError)
 async def _model_files_refused(_request: Request, exc: model_files.ModelFilesError):
-    """MODEL_FILES_IMPL=rust could not check a repository listing; nothing was served from it."""
+    """model-files could not check a repository listing; nothing was served from it."""
     from fastapi.responses import JSONResponse
     return JSONResponse({"detail": "The repository file list could not be checked, so it was not used. "
                                    "See the model manager log."}, status_code=502)
@@ -401,6 +410,8 @@ async def _model_files_refused(_request: Request, exc: model_files.ModelFilesErr
 
 @app.on_event("startup")
 def _startup() -> None:
+    # noevia#1071: model-files is the only listing/backup implementation; refuse to start without it.
+    model_files.require_binary()
     db.init()
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") != "1":
         db.seed_bench_prompts()
