@@ -90,6 +90,11 @@ async def _require_token(request: Request, call_next):
             if request.headers.get(DOWNLOAD_PLAN_HEADER) == "1" and _download_start(request.method, request.url.path):
                 return await _download_plan(request, call_next)
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent owns model deletion (the container check and every file removal).
+    # Other methods keep FastAPI's 405 here.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DELETE_CONFIRMED") == "1" and request.method == "POST"
+            and request.url.path == "/api/v1/models/delete"):
+        return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
     # #1318: the native parent restarts and tests backends; restart errors stay recorded here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKEND_CONTROL_CONFIRMED") == "1":
         if request.method == "POST" and _native_backend_control(request):
