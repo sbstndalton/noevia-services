@@ -18,8 +18,10 @@ def reset_ini():
     (ROOT / "models" / "models.ini").write_text(INI)
 
 
-def test_health_models_and_sections(client):
-    assert client.get("/api/v1/health").json() == {"ok": True}
+def test_health_is_native_models_and_sections(client):
+    # noevia#1071: the native parent answers health; this app refuses it unconditionally.
+    r = client.get("/api/v1/health")
+    assert r.status_code == 503 and r.json() == {"detail": "Native model manager owns this endpoint"}
     models = client.get("/api/v1/models").json()
     [m] = models["models"]
     assert m["name"] == "tiny-Q4_K_M.gguf" and m["sections"] == ["tiny"] and m["shape"]["label"] == "dense"
@@ -273,24 +275,18 @@ def test_safe_defaults_never_touch_existing_or_unrelated_files(client):
 
 
 def test_engine_log_lines_are_scrubbed_before_leaving_the_server(client, monkeypatch):
+    # noevia#1071: the log endpoint is native (noevia-rs redacts it); this app refuses it and
+    # keeps the redaction only for diagnosis evidence.
     from app import api, services
-    leaked = "\n".join([
-        "srv  load_model: loading /models/q/Qwen.gguf",
-        "request headers: Authorization: Bearer abcdefghijklmnop123456",
-        "HF_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123",
-        'config {"api_key": "sk-live-abcdefghijklmnopqrstuv", "ctx": 8192}',
-        "remote https://admin:hunter2secret@nextcloud.example/remote.php",
-        "cookie cowork_session=deadbeefcafebabe1234 ok",
-    ])
     monkeypatch.setattr(services, "_effective_container_names", lambda: ["cowork-llama-1"])
-    monkeypatch.setattr(services, "container_logs", lambda name, tail=400: (True, leaked))
-    body = client.get("/api/v1/backends/cowork-llama-1/logs").json()
-    text = "\n".join(body["lines"])
-    for secret in ("abcdefghijklmnop123456", "hf_abcdefghijklmnopqrstuvwxyz0123", "sk-live-abcdefghijklmnopqrstuv", "hunter2secret", "deadbeefcafebabe1234"):
-        assert secret not in text
-    assert "loading /models/q/Qwen.gguf" in text and '"ctx": 8192' in text
-    # Filtering on a secret's value must not reveal that the line held it.
-    assert client.get("/api/v1/backends/cowork-llama-1/logs?q=hunter2").json()["lines"] == []
+    for method in (client.get, client.post):
+        r = method("/api/v1/backends/cowork-llama-1/logs")
+        assert r.status_code == 503 and r.json() == {"detail": "Native model manager owns this endpoint"}
+    assert not hasattr(services, "container_logs") and not hasattr(api, "backend_logs")
+    for line, secret in (("request headers: Authorization: Bearer abcdefghijklmnop123456", "abcdefghijklmnop123456"),
+                         ("HF_TOKEN=hf_abcdefghijklmnopqrstuvwxyz0123", "hf_abcdefghijklmnopqrstuvwxyz0123"),
+                         ("remote https://admin:hunter2secret@nextcloud.example/remote.php", "hunter2secret")):
+        assert secret not in api.redact_log_line(line)
     assert api.redact_log_line("token: abc123xyz") == "token: [redacted]"
     # Counters and numeric fields are not secrets.
     for line in ("n_tokens = 512", "prompt tokens: 40", "slot session: 3", "n_ctx_slot = 8192"):
@@ -374,7 +370,8 @@ def test_token_guards_every_route_except_health(client, monkeypatch):
     from app.config import settings
     token = "synthetic-loader-token-with-32-characters"
     monkeypatch.setattr(settings, "model_loader_token", token)
-    assert client.get("/api/v1/health").status_code == 200
+    # Health skips the token check and is then refused: the native parent owns it (noevia#1071).
+    assert client.get("/api/v1/health").status_code == 503
     for path in ("/api/v1/sections", "/api/v1/backends", "/api/v1/downloads", "/", "/containers"):
         assert client.get(path).status_code == 401, path
     assert client.post("/api/v1/backends/x/restart").status_code == 401

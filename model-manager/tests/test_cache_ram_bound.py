@@ -122,9 +122,7 @@ def test_startup_migration_bounds_chat_sections_zeroes_embed_rerank_and_keeps_a_
         "[reranker]\nmodel = /models/r.gguf\nreranking = true\n\n"
         "[laya_multilingual_f16]\nmodel = /models/laya_multilingual_f16/laya.gguf\n")
     path.write_text(original)
-    backed_up = []
-    real = ini._backup_current
-    monkeypatch.setattr(ini, "_backup_current", lambda p: (backed_up.append(p.read_text()), real(p)))
+    copies = set(path.parent.glob("models.ini.bak-*"))
     assert ini.migrate_cache_ram() == ["chat-a", "chat-b", "nomic-embed", "reranker"]
     assert ini.get_section("chat-a")["cache-ram"] == "1024"
     assert ini.get_section("chat-b")["cache-ram"] == "2048" and "LLAMA_ARG_CACHE_RAM" not in ini.get_section("chat-b")
@@ -132,7 +130,9 @@ def test_startup_migration_bounds_chat_sections_zeroes_embed_rerank_and_keeps_a_
     for non_chat in ("nomic-embed", "reranker"):
         assert ini.get_section(non_chat)["cache-ram"] == "0", non_chat
     assert "cache-ram" not in ini.get_section("laya_multilingual_f16")
-    assert backed_up == [original], "the normal writer backed up the file first"
+    [copy] = set(path.parent.glob("models.ini.bak-*")) - copies
+    assert copy.read_text() == original, "the normal writer backed up the file first"
+    copy.unlink()
     text = path.read_text()
     assert ini.migrate_cache_ram() == [] and path.read_text() == text, "idempotent: nothing rewritten"
 
