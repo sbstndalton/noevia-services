@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import string
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -210,11 +211,17 @@ async def _backend_stats(request: Request):
 async def _gpu_exec_probe(request: Request):
     from fastapi.concurrency import run_in_threadpool
     from fastapi.responses import JSONResponse
+    from . import services
     from .api import _plain
     if request.method != "GET":
         return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
     name, probe = request.query_params.get("name", ""), request.query_params.get("probe", "")
     if not _CONTAINER_NAME.fullmatch(name) or probe not in ("nvidia", "amd", "amd-nvidia"):
+        return Response('{"detail":"invalid probe query"}', status_code=422, media_type="application/json")
+    # #1986: `docker exec` only into an active backend, and never by an all-hex name, which Docker
+    # also resolves as an id prefix of a different container (as the native ScopedControl refuses).
+    # The same 422 as any other invalid probe query.
+    if all(c in string.hexdigits for c in name) or name not in await run_in_threadpool(services._effective_container_names):
         return Response('{"detail":"invalid probe query"}', status_code=422, media_type="application/json")
     gpu = await run_in_threadpool(hw.exec_probe, name, probe)
     return JSONResponse({"gpu": _plain(gpu)})
