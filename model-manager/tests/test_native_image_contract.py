@@ -72,6 +72,10 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert "printf '%s\\n' \"$native_features\" | grep -Fx native-benchmark-runner >/dev/null" in source
     assert "ENV MODEL_MANAGER_BENCHMARK_RUNNER_IMPL=python" in source
     assert not re.search(r"^ENV .*MODEL_MANAGER_BENCHMARK_RUNNER_IMPL=rust", source, re.M)
+    assert "noevia-model-manager/native-downloads" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-downloads >/dev/null" in source
+    assert "ENV MODEL_MANAGER_DOWNLOADS_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_DOWNLOADS_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):
