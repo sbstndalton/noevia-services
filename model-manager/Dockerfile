@@ -16,8 +16,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=5c9f2da22078bb753c5b35f6f463646cb2cee485
-ARG NOEVIA_RS_SHA256=ba40b63dee5d08af75b7f88083a9ad6b863d0fafdddf87f4e8a6d14602d3bd49
+ARG NOEVIA_RS_REF=4bb49e87b606d9dea7e86160d0badb8394a92a7c
+ARG NOEVIA_RS_SHA256=ec72b2da7fced8cc9c3b6d301dad75e5cc32e779d7bf344225c337f3a74a62b9
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
