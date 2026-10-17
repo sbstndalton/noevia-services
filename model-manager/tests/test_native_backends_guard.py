@@ -111,6 +111,7 @@ def test_exec_probe_call_runs_the_python_read(monkeypatch, client):
         return None if kind == "amd" else hw._gpu_from(GPU)
 
     monkeypatch.setattr(hw, "exec_probe", probe)
+    monkeypatch.setattr(services, "_effective_container_names", lambda: ["llama-a", "llama.b_2", "x"])
     assert client.get(PROBE, params={"name": "llama-a", "probe": "nvidia"}).status_code == 401
     answer = client.get(PROBE, headers=auth(), params={"name": "llama-a", "probe": "nvidia"})
     assert answer.status_code == 200 and answer.json() == {"gpu": GPU}
@@ -121,6 +122,37 @@ def test_exec_probe_call_runs_the_python_read(monkeypatch, client):
         assert client.get(PROBE, headers=auth(), params=params).status_code == 422, params
     assert client.put(PROBE, headers=auth()).status_code == 405
     assert seen == [("llama-a", "nvidia"), ("llama.b_2", "amd"), ("x", "amd-nvidia")]
+
+
+def test_exec_probe_call_allows_an_active_backend_only(monkeypatch, client):
+    """#1986: the private route execs only into an active backend, by name; every refusal is the
+    route's existing 422 and nothing reaches `docker exec`."""
+    monkeypatch.setenv(ENV, "1")
+    execs = []
+
+    class FakeContainer:
+        def exec_run(self, cmd, *args, **kwargs):
+            execs.append(cmd)
+            return type("R", (), {"exit_code": 1, "output": b""})()
+
+    class FakeClient:
+        def __init__(self):
+            self.containers = type("C", (), {"get": staticmethod(lambda name: FakeContainer())})()
+
+    monkeypatch.setattr(hw, "_client", FakeClient)
+    # "deadbeef" is in the list, so only the all-hex refusal can stop it.
+    monkeypatch.setattr(services, "_effective_container_names", lambda: ["llama-a", "deadbeef", "0123"])
+
+    allowed = client.get(PROBE, headers=auth(), params={"name": "llama-a", "probe": "nvidia"})
+    assert allowed.status_code == 200 and allowed.json() == {"gpu": None}
+    assert execs, "an active backend is probed with docker exec"
+
+    for name in ("other-app", "llama-a2", "LLAMA-A", "deadbeef", "0123", "DEADBEEF"):
+        execs.clear()
+        refused = client.get(PROBE, headers=auth(), params={"name": name, "probe": "nvidia"})
+        assert refused.status_code == 422, name
+        assert refused.content == b'{"detail":"invalid probe query"}', name
+        assert execs == [], name
 
 
 @pytest.mark.parametrize("value", [None, "0", "", "true", " 1", "1 "])
