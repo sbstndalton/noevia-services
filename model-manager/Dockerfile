@@ -16,8 +16,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=8c962ef8145a33807093711f50f5ca69033d0de9
-ARG NOEVIA_RS_SHA256=d2baa4dc5f6d954405eead7fd7b60ca56ef3d6a72787799909a165261018f4e4
+ARG NOEVIA_RS_REF=29534136cff8bf663c6884c5101a6ac22bd6a885
+ARG NOEVIA_RS_SHA256=6cf4c8889ab390f92eb9b427856f6fce8c60b71a9d78e2e04e22eb2885bb10d1
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -26,7 +26,7 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads,noevia-model-manager/native-model-delete \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
@@ -46,6 +46,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-check-updates >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-benchmark-runner >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-downloads >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-model-delete >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -87,6 +88,8 @@ ENV MODEL_MANAGER_CHECK_UPDATES_IMPL=python
 ENV MODEL_MANAGER_BENCHMARK_RUNNER_IMPL=python
 # #1318: the native download job table stays off by default.
 ENV MODEL_MANAGER_DOWNLOADS_IMPL=python
+# #1318: native model deletion stays off by default.
+ENV MODEL_MANAGER_MODEL_DELETE_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
