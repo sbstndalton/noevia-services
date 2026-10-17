@@ -2,6 +2,7 @@
 another folder), and never a folder a queued or running download writes into. Every file and job
 is synthetic and lives under the test's temporary models folder; no download starts."""
 import shutil
+import threading
 import uuid
 
 import pytest
@@ -9,11 +10,11 @@ from fastapi.testclient import TestClient
 
 from conftest import INI, ROOT, _gguf
 from app import services
-from app.downloader import DownloadJob, manager, safe_dest
+from app.downloader import DELETE_IN_PROGRESS, DeleteInProgress, DownloadJob, manager, safe_dest
 from app.main import app
 
 MODELS = ROOT / "models"
-MADE = ["dup.gguf", "dupsub", "dlq", "dlpart", "models--acme--queued-GGUF"]
+MADE = ["dup.gguf", "dupsub", "dlq", "dlpart", "dlr", "models--acme--queued-GGUF"]
 
 
 @pytest.fixture()
@@ -105,8 +106,10 @@ def test_a_flat_model_is_only_blocked_by_its_own_files(client):
 
 def test_finished_or_failed_jobs_do_not_block(client):
     a = _model("dlq/a.gguf")
-    _job("dlq/b.gguf", status="completed")
-    _job("dlq/c.gguf", status="failed")
+    # The job table's finished states (`done`, `error`, `canceled`), as `download_blockers` reads them.
+    _job("dlq/b.gguf", status="done")
+    _job("dlq/c.gguf", status="error")
+    _job("dlq/d.gguf", status="canceled")
     assert _delete(client, "dlq/a.gguf").json()["results"][0]["ok"] is True and not a.exists()
 
 
@@ -133,3 +136,80 @@ def test_partial_download_left_in_the_folder_keeps_the_folder(client):
     r = _delete(client, "dlpart/a.gguf")
     assert r.json()["results"][0]["ok"] is True
     assert not a.exists() and partial.exists()
+
+
+# ---------- #1972 ----------
+
+def _held_delete(client, monkeypatch, key):
+    """Start deleting `key` in a thread and stop it inside the folder removal."""
+    entered, release = threading.Event(), threading.Event()
+    real = shutil.rmtree
+
+    def held(path, *a, **kw):
+        entered.set()
+        assert release.wait(30), "the test never released the delete"
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(services.shutil, "rmtree", held)
+    out = {}
+    worker = threading.Thread(target=lambda: out.setdefault("r", _delete(client, key)))
+    worker.start()
+    assert entered.wait(30), "the delete never reached the folder removal"
+    return release, worker, out
+
+
+def test_download_start_into_a_folder_being_deleted_is_refused(client, monkeypatch):
+    a = _model("dlr/dlr.gguf")
+    release, worker, out = _held_delete(client, monkeypatch, "dlr/dlr.gguf")
+    try:
+        before = dict(manager.jobs)
+        # The start route (a URL download lands in `<stem>/<name>`, here the folder being removed).
+        r = client.post("/api/v1/downloads", json={"url": "http://127.0.0.1:9/dlr.gguf", "target": ""})
+        assert r.status_code == 409 and r.json() == {"detail": DELETE_IN_PROGRESS}
+        # `_make_job` itself (the draft-head route and every other caller), for another file there.
+        with pytest.raises(DeleteInProgress):
+            manager.enqueue_url(url="http://127.0.0.1:9/b.gguf", filename="dlr/b.gguf")
+        assert manager.jobs == before, "a refused start must not record a job"
+    finally:
+        release.set()
+        worker.join(30)
+    assert out["r"].status_code == 200 and out["r"].json()["results"][0]["ok"] is True
+    assert not a.exists() and not (MODELS / "dlr").exists(), "the delete finished whole"
+    assert manager._reserved == []
+
+
+def test_reservation_covers_only_the_folder_being_deleted(client, monkeypatch):
+    _model("dlr/a.gguf")
+    release, worker, out = _held_delete(client, monkeypatch, "dlr/a.gguf")
+    try:
+        assert manager._reserved_for(safe_dest("dlr/x.gguf"))
+        assert manager._reserved_for(safe_dest("dlr/sub/x.gguf"))
+        assert not manager._reserved_for(safe_dest("dlr2/x.gguf"))
+        assert not manager._reserved_for(safe_dest("dlq/x.gguf"))
+    finally:
+        release.set()
+        worker.join(30)
+    assert out["r"].json()["results"][0]["ok"] is True
+    assert manager._reserved == []
+
+
+def test_a_refused_delete_releases_its_reservation(client):
+    a = _model("dlq/a.gguf")
+    _job("dlq/b.gguf")
+    assert _delete(client, "dlq/a.gguf").status_code == 409 and a.exists()
+    assert manager._reserved == []
+
+
+def test_flat_models_reserve_their_own_files():
+    flat = _model("dup.gguf")
+    try:
+        g = next(g for g in services.snapshot_models_dir().ggufs if g.display_name == "dup.gguf" and not g.subdir)
+        assert services.delete_reservation(g) == ["dup.gguf"]
+        with manager.reserve(services.delete_reservation(g)):
+            assert manager._reserved_for(safe_dest("dup.gguf"))
+            assert not manager._reserved_for(safe_dest("dup/dup.gguf"))
+            with pytest.raises(DeleteInProgress), manager.starting(["dup.gguf"]):
+                pass
+        assert manager._reserved == []
+    finally:
+        flat.unlink()
