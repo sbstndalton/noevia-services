@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import os
+import posixpath
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -245,10 +248,64 @@ def _drop_validator(job: "DownloadJob") -> None:
 PLANNING: contextvars.ContextVar[list | None] = contextvars.ContextVar("download_planning", default=None)
 
 
+DELETE_IN_PROGRESS = ("A delete is removing that folder right now; nothing was queued. "
+                      "Try again when it has finished.")
+
+
+class DeleteInProgress(Exception):
+    """noevia#1972: a download would land in a folder a running delete may remove."""
+
+    def __init__(self) -> None:
+        super().__init__(DELETE_IN_PROGRESS)
+
+
+def _models_rel(dest: Path) -> str | None:
+    """`dest` relative to the models folder, as `download_blockers` compares it."""
+    try:
+        return posixpath.normpath(Path(dest).relative_to(settings.models_dir).as_posix())
+    except ValueError:
+        return None
+
+
 class DownloadManager:
     def __init__(self) -> None:
         self.jobs: dict[str, DownloadJob] = {}
         self._sema: asyncio.Semaphore | None = None
+        # noevia#1972: models-relative folders and files a running delete may remove. A delete
+        # (a threadpool route) adds its entries before it looks for blocking jobs; a start (the
+        # event loop) checks them under the same lock it creates the job under, so either the
+        # delete sees the job and refuses, or the start sees the reservation and refuses.
+        self._lock = threading.RLock()
+        self._reserved: list[str] = []
+
+    def _reserved_for(self, dest: Path) -> bool:
+        rel = _models_rel(dest)
+        if rel is None:
+            return False
+        with self._lock:
+            return any(r and (rel == r or rel.startswith(r + "/")) for r in self._reserved)
+
+    @contextlib.contextmanager
+    def reserve(self, rels: list[str]):
+        """Hold `rels` (models-relative) against new downloads while a delete runs."""
+        rels = [posixpath.normpath(r) for r in rels if r]
+        with self._lock:
+            self._reserved.extend(rels)
+        try:
+            yield
+        finally:
+            with self._lock:
+                for r in rels:
+                    self._reserved.remove(r)
+
+    @contextlib.contextmanager
+    def starting(self, filenames: list[str]):
+        """Queue several files as one step: refused (DeleteInProgress) before the first starts
+        when a delete holds any destination, and no delete can start in between."""
+        with self._lock:
+            if any(self._reserved_for(safe_dest(f)) for f in filenames):
+                raise DeleteInProgress()
+            yield
 
     def _semaphore(self) -> asyncio.Semaphore:
         if self._sema is None:
@@ -268,19 +325,22 @@ class DownloadManager:
         if planned is not None:
             planned.append({"repo_id": repo_id, "filename": filename, "url": url, "total_bytes": total_bytes})
             return None  # type: ignore[return-value]  # no caller uses the job
-        for j in self.jobs.values():
-            if j.dest_path == dest and j.status in ("queued", "downloading"):
-                return j
-        job = DownloadJob(
-            id=uuid.uuid4().hex[:12],
-            repo_id=repo_id,
-            filename=filename,
-            url=url,
-            dest_path=dest,
-            temp_path=dest.with_suffix(dest.suffix + ".download"),
-            total_bytes=total_bytes,
-        )
-        self.jobs[job.id] = job
+        with self._lock:
+            if self._reserved_for(dest):
+                raise DeleteInProgress()
+            for j in self.jobs.values():
+                if j.dest_path == dest and j.status in ("queued", "downloading"):
+                    return j
+            job = DownloadJob(
+                id=uuid.uuid4().hex[:12],
+                repo_id=repo_id,
+                filename=filename,
+                url=url,
+                dest_path=dest,
+                temp_path=dest.with_suffix(dest.suffix + ".download"),
+                total_bytes=total_bytes,
+            )
+            self.jobs[job.id] = job
         job._task = asyncio.create_task(self._run(job))
         return job
 
