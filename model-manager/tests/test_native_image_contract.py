@@ -13,8 +13,10 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     for capability in ("native-logs", "native-host", "native-sections"):
         assert f"printf '%s\\n' \"$native_features\" | grep -Fx {capability} >/dev/null" in source
     assert "COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager" in source
-    # noevia#1071: the image always runs the native parent (pinned for older binaries).
-    assert re.findall(r"^ENV MODEL_MANAGER_IMPL=(.*)$", source, re.M) == ["rust"]
+    # noevia#1071/#2011: the native parent is permanent and MODEL_MANAGER_IMPL is retired, so the
+    # image never sets it (the pinned binary has no reader for it).
+    assert not re.search(r"^ENV .*\bMODEL_MANAGER_IMPL=", source, re.M)
+    assert "MODEL_MANAGER_IMPL=" not in source
     assert "MODEL_FILES_IMPL" not in source
     # #1334: the section switch is wired in the image, and its default stays python.
     assert "ENV MODEL_MANAGER_SECTIONS_IMPL=python" in source

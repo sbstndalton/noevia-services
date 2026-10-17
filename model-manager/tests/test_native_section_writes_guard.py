@@ -104,3 +104,51 @@ def test_1934_section_name_with_a_trailing_newline_is_refused_and_models_ini_is_
     assert client.put("/api/v1/sections/foo%0A", headers=auth(), json={"baseRevision": rev, "values": {"k": "v"}}).status_code == 400
     assert settings.models_ini_path.read_bytes() == before
     assert not list(settings.models_ini_path.parent.glob("models.ini.*"))
+
+
+# noevia#2010: a section the startup cache-ram migration would rewrite (no explicit cache-ram).
+NEEDS_MIGRATION = "[chat-a]\nmodel = /models/a.gguf\n\n[my-embed]\nmodel = /models/e.gguf\n"
+
+
+def _startup_spies(monkeypatch):
+    from app import bench, main as main_module
+    migrations = []
+    real = main_module.ini.migrate_cache_ram
+    monkeypatch.setattr(main_module.ini, "migrate_cache_ram", lambda: migrations.append(1) or real())
+    monkeypatch.setattr(main_module.model_files, "require_binary", lambda: None)
+    monkeypatch.setattr(main_module.db, "init", lambda: None)
+    monkeypatch.setattr(main_module.db, "seed_bench_prompts", lambda: None)
+    monkeypatch.setattr(main_module.hw, "start_sampler", lambda: None)
+    monkeypatch.setattr(bench, "reap_orphans", lambda: {"reaped": 0, "stuck": 0})
+    monkeypatch.setattr(settings, "migrate_cache_ram_on_start", True)
+    return main_module, migrations
+
+
+def _listing(folder):
+    return {p.name: p.read_bytes() for p in folder.iterdir() if p.is_file()}
+
+
+def test_confirmed_child_startup_never_writes_models_ini(monkeypatch, client):
+    """The native parent runs the cache-ram migration itself, so the child does not, even when
+    the file needs it: models.ini, its backups and the roles file stay exactly as they were."""
+    main_module, migrations = _startup_spies(monkeypatch)
+    monkeypatch.setenv(ENV, "1")
+    settings.models_ini_path.write_text(NEEDS_MIGRATION)
+    before = _listing(settings.models_ini_path.parent)
+    main_module._startup()
+    assert migrations == []
+    assert _listing(settings.models_ini_path.parent) == before
+
+
+@pytest.mark.parametrize("value", [None, "0", "true"])
+def test_unconfirmed_child_startup_still_migrates(monkeypatch, client, value):
+    """Without the native writer the child stays the writer and migrates as before."""
+    main_module, migrations = _startup_spies(monkeypatch)
+    if value is not None:
+        monkeypatch.setenv(ENV, value)
+    settings.models_ini_path.write_text(NEEDS_MIGRATION)
+    main_module._startup()
+    assert migrations == [1]
+    text = settings.models_ini_path.read_text()
+    assert "[chat-a]\nmodel = /models/a.gguf\ncache-ram = 1024\n" in text
+    assert "[my-embed]\nmodel = /models/e.gguf\ncache-ram = 0\n" in text

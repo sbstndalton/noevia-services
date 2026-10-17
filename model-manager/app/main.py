@@ -496,8 +496,13 @@ def _startup() -> None:
             bench.reap_orphans()
     except Exception as e:  # noqa: BLE001 - recovery is best effort; startup continues
         log.warning("benchmark orphan check failed: %s", type(e).__name__)
+    # noevia#2010: under native section writes the parent is the only models.ini writer, and it
+    # runs this migration itself, once, at its own startup under its write lock.
     if settings.migrate_cache_ram_on_start:
-        _migrate_cache_ram()
+        if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTION_WRITES_CONFIRMED") == "1":
+            log.info("cache-ram migration: left to the native models.ini writer")
+        else:
+            _migrate_cache_ram()
 
 
 def _migrate_cache_ram() -> None:

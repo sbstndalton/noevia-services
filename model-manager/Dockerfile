@@ -55,9 +55,6 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
 
 FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
-# noevia#1071: the native parent is permanent. Binaries before noevia-rs#142 still read this retired
-# selector (their default was a Python-only mode), so the image pins it; newer binaries ignore it.
-ENV MODEL_MANAGER_IMPL=rust
 # #1334: native section reads stay off by default (python answers them).
 # Compose must pass ${MODEL_MANAGER_SECTIONS_IMPL:-python}, never an empty value.
 ENV MODEL_MANAGER_SECTIONS_IMPL=python
