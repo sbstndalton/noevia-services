@@ -7,8 +7,8 @@
 # overlaid image carries the binaries at the same paths without a pip install.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS tenant-assertion
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=b5af45938f2347f348aa20f43ab7fbd72cea8dc4
-ARG NOEVIA_RS_SHA256=47bcfc3ef70fcbbf643995bfd7c3c186a61d5bb7662866b38f5e4c130de2ffc0
+ARG NOEVIA_RS_REF=af34a4a3b77edde5e6fe865c2f4cbd51f925686d
+ARG NOEVIA_RS_SHA256=c2166adfa33399bc677a2f432c9db920d9f3cdf11fb9d5b114e1b558e630c30e
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz

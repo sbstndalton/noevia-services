@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 
 import docker
 from docker.errors import DockerException, NotFound
@@ -562,10 +562,30 @@ def stats_for(name: str) -> BackendStats:
     return BackendStats(ok=False, error="warming up…")
 
 
+def backends_native() -> bool:
+    """#1318: the native parent samples the backends (Docker discovery, container stats, sysfs) and
+    pushes the results here (`load_pushed`), so this app's consumers (fit chips, autoconfig, the
+    benchmark observer) read the same cache; GPU probes that need `docker exec` still run here, on
+    the parent's request (`exec_probe`)."""
+    return os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKENDS_CONFIRMED") == "1"
+
+
+def _host_native() -> bool:
+    return os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_HOST_CONFIRMED") == "1"
+
+
 def _sample_loop() -> None:
     # Local import to avoid circulars at module load
     from . import services
     while True:
+        if backends_native():
+            # Only the host sampler can still be this app's; the backends are pushed.
+            host = None if _host_native() else _read_host()
+            if host is not None:
+                with _LOCK:
+                    _HOST_HISTORY.append(host)
+            time.sleep(_SAMPLE_INTERVAL_S)
+            continue
         discovery_ok = True
         try:
             names = services._effective_container_names()
@@ -606,9 +626,76 @@ def start_sampler() -> None:
     global _sampler_started
     if _sampler_started:
         return
+    if backends_native() and _host_native():
+        return  # #1318: the native parent samples both; nothing is left to sample here.
     _sampler_started = True
     t = threading.Thread(target=_sample_loop, daemon=True, name="hw-sampler")
     t.start()
+
+
+_PROBES = {"nvidia", "amd", "amd-nvidia"}
+
+
+def exec_probe(name: str, probe: str) -> GpuStats | None:
+    """#1318: the GPU reads that need `docker exec` (nvidia-smi, rocm-smi), for the native sampler:
+    `nvidia` is `_read_nvidia`, `amd` is `_read_amd`, `amd-nvidia` is the Vulkan fallback
+    `_read_amd(...) or _read_nvidia(...)`. None where `_collect` would get no reading."""
+    if probe not in _PROBES:
+        raise ValueError(probe)
+    client = _client()
+    if client is None:
+        return None
+    try:
+        c = client.containers.get(name)
+    except DockerException:
+        return None
+    if probe == "nvidia":
+        return _read_nvidia(c)
+    if probe == "amd":
+        return _read_amd(c, name)
+    return _read_amd(c, name) or _read_nvidia(c)
+
+
+def _strict(cls, data: dict, nested: dict | None = None):
+    """A dataclass from exactly its own fields (no extra, no missing), nested ones rebuilt."""
+    names = [f.name for f in fields(cls)]
+    if not isinstance(data, dict) or sorted(data) != sorted(names):
+        raise ValueError(cls.__name__)
+    values = dict(data)
+    for key, build in (nested or {}).items():
+        values[key] = build(values[key])
+    return cls(**values)
+
+
+def _gpu_from(data):
+    if data is None:
+        return None
+    return _strict(GpuStats, data, {"cards": lambda cards: [_strict(GpuCard, c) for c in _list(cards)]})
+
+
+def _list(value) -> list:
+    if not isinstance(value, list):
+        raise ValueError("list")
+    return value
+
+
+def _stats_from(data) -> BackendStats:
+    return _strict(BackendStats, data, {
+        "gpu": _gpu_from,
+        "container": lambda c: None if c is None else _strict(ContainerRuntimeStats, c),
+    })
+
+
+def load_pushed(backends: dict) -> None:
+    """#1318: replace the backend cache with the native sampler's (`{name: BackendStats as JSON}`,
+    every effective backend it sampled). Raises ValueError for a payload of the wrong shape, and
+    then nothing changes."""
+    if not isinstance(backends, dict):
+        raise ValueError("backends")
+    fresh = {str(name): _stats_from(stats) for name, stats in backends.items()}
+    with _LOCK:
+        _CACHE.clear()
+        _CACHE.update(fresh)
 
 
 def host_ram_gb() -> float:
