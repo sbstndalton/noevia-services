@@ -4,13 +4,14 @@
 
 # gguf-meta (#909) and model-files (#964): bounded Rust leaves from sbstndalton/noevia-rs,
 # pinned to a merged NOEVIA_RS_REF and fetched as an anonymous tarball whose
-# sha256 is checked before anything is built. gguf-meta is used only when GGUF_PARSER=rust,
-# model-files only when MODEL_FILES_IMPL=rust (both default python; since #1021 also models.ini backups),
-# model-autoconfig only when MODEL_AUTOCONFIG=rust (default python; it only ever confirms the Python answer).
-# Native health/logs/host (#1319, #1330): MODEL_MANAGER_IMPL defaults to python; the entrypoint
-# execs the unchanged uvicorn command unless explicitly selected as rust.
-# Native section GET reads require MODEL_MANAGER_SECTIONS_IMPL=rust and the
-# Rust manager. Both selectors default to python; Python retains all INI writers.
+# sha256 is checked before anything is built. gguf-meta is used only when GGUF_PARSER=rust (default
+# python). model-files is always used (noevia#1071: repo file lists and models.ini backups; the app
+# refuses to start without it). model-autoconfig only when MODEL_AUTOCONFIG=rust (default python;
+# it only ever confirms the Python answer).
+# Native health/logs (#1319, noevia#1071): the noevia-model-manager entrypoint always owns them and
+# supervises the Python app on private loopback 8091; there is no Python-only mode.
+# Native section GET reads require MODEL_MANAGER_SECTIONS_IMPL=rust (default python); Python
+# retains all INI writers.
 # Built on bookworm (glibc 2.36); the runtime base below is Debian bookworm or newer, and glibc
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
@@ -51,8 +52,11 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
 
 FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
-# #1334: native section reads stay off by default (python answers them); rust needs MODEL_MANAGER_IMPL=rust
-# too and is refused otherwise. Compose must pass ${MODEL_MANAGER_SECTIONS_IMPL:-python}, never an empty value.
+# noevia#1071: the native parent is permanent. Binaries before noevia-rs#142 still read this retired
+# selector (their default was a Python-only mode), so the image pins it; newer binaries ignore it.
+ENV MODEL_MANAGER_IMPL=rust
+# #1334: native section reads stay off by default (python answers them).
+# Compose must pass ${MODEL_MANAGER_SECTIONS_IMPL:-python}, never an empty value.
 ENV MODEL_MANAGER_SECTIONS_IMPL=python
 # #1318: native GET /api/v1/settings stays off by default; PUT always stays Python (single writer).
 ENV MODEL_MANAGER_SETTINGS_IMPL=python

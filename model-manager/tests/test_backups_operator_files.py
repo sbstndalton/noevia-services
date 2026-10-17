@@ -1,6 +1,6 @@
 """sbstndalton/noevia#1783: the model manager only rotates the `.bak-<YYYYMMDD-HHMMSS>[-n]` copies it
 makes itself; an operator's own `models.ini.bak-*` file beside models.ini is never removed, under
-either MODEL_FILES_IMPL. Every models.ini write route, section DELETE included, leaves one rotating
+every `model-files backups` plan. Every models.ini write route, section DELETE included, leaves one rotating
 pre-change copy. Synthetic files only."""
 from __future__ import annotations
 
@@ -19,12 +19,6 @@ OPERATOR = ("models.ini.bak-operator", "models.ini.bak-2026-10-15", "models.ini.
 OWN = re.compile(r"models\.ini\.bak-\d{8}-\d{6}(-\d+)?")
 
 
-@pytest.fixture(autouse=True)
-def _python_by_default(monkeypatch):
-    monkeypatch.setattr(config.settings, "model_files_impl", "python")
-    monkeypatch.setattr(config.settings, "model_files_bin", "model-files")
-
-
 def _seed(d):
     d.mkdir(exist_ok=True)
     (d / "models.ini").write_text("version = 1\n")
@@ -38,7 +32,8 @@ def _own(d):
     return sorted(p.name for p in d.iterdir() if OWN.fullmatch(p.name))
 
 
-def test_python_save_keeps_operator_bak_files_and_rotates_its_own(tmp_path, monkeypatch):
+@pytest.mark.skipif(not os.environ.get("MODEL_FILES_BIN"), reason="MODEL_FILES_BIN not set: no model-files binary")
+def test_save_keeps_operator_bak_files_and_rotates_its_own(tmp_path, monkeypatch):
     d = tmp_path / "cfg"
     _seed(d)
     monkeypatch.setattr(config.settings, "models_ini_path", d / "models.ini")

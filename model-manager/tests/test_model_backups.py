@@ -1,7 +1,7 @@
-"""models.ini recovery copies (#1021): python (default) keeps the behaviour before #1021 except
-that a write with noevia-core's `backup: false` hint (#1003) makes no copies; MODEL_FILES_IMPL=rust
-lets `model-files backups` decide which copies to make and which old ones to remove, and fails
-closed. The shared table (tests/fixtures/model-backups.v1.json, byte-identical to noevia-rs's
+"""models.ini recovery copies (#1021): `model-files backups` always decides which copies to make
+and which old ones to remove (noevia#1071 removed the Python fallback and MODEL_FILES_IMPL), and
+every failure fails closed before models.ini is touched. A write with noevia-core's
+`backup: false` hint (#1003) makes no copies. The shared table (tests/fixtures/model-backups.v1.json, byte-identical to noevia-rs's
 crates/model-files/tests/fixtures/) is replayed through the real binary when MODEL_FILES_BIN
 points at one (CI builds it at the Dockerfile's NOEVIA_RS_REF). Synthetic files only."""
 from __future__ import annotations
@@ -25,10 +25,8 @@ BASE = "a" * 64
 
 
 @pytest.fixture(autouse=True)
-def _python_by_default(monkeypatch):
+def _fresh_log_state():
     model_files._LOGGED.clear()
-    monkeypatch.setattr(config.settings, "model_files_impl", "python")
-    monkeypatch.setattr(config.settings, "model_files_bin", "model-files")
     yield
     model_files._LOGGED.clear()
 
@@ -54,24 +52,40 @@ def _revisions(d: Path) -> set[str]:
     return {n for n in _names(d) if n.startswith("models.ini.noevia-backup-") and len(n) == len("models.ini.noevia-backup-") + 64}
 
 
-def test_python_default_keeps_both_copies_as_before(tmp_path):
-    d = _dir(tmp_path, revisions=12)
+def test_a_leftover_python_selector_still_goes_through_the_binary(tmp_path, monkeypatch):
+    # noevia#1071: no Python fallback; MODEL_FILES_IMPL=python is ignored.
+    monkeypatch.setenv("MODEL_FILES_IMPL", "python")
+    d = _dir(tmp_path, revisions=1)
+    before = {n: (d / n).read_bytes() for n in _names(d)}
+    _rust(monkeypatch, _fake(tmp_path, "", 1))
+    with pytest.raises(OSError):
+        ini._replace_file(d / "models.ini", "version = 2\n", base_revision=BASE)
+    assert {n: (d / n).read_bytes() for n in _names(d)} == before
+    assert not hasattr(ini, "_backup_current") and not hasattr(ini, "_prune_backups")
+
+
+@needs_bin
+def test_default_write_keeps_both_copies(tmp_path, monkeypatch):
+    d = _dir(tmp_path, revisions=2)
+    _rust(monkeypatch, BIN)
     ini._replace_file(d / "models.ini", "version = 2\n", base_revision=BASE)
     assert (d / "models.ini").read_text() == "version = 2\n"
-    assert len(_revisions(d)) == 13, "python does not prune revision copies"
     assert (d / f"models.ini.noevia-backup-{BASE}").read_text() == "version = 1\n"
     assert any(n.startswith("models.ini.bak-") for n in _names(d))
 
 
-def test_python_honours_the_hint_with_no_copies(tmp_path):
+@needs_bin
+def test_the_hint_with_few_copies_makes_and_removes_nothing(tmp_path, monkeypatch):
     d = _dir(tmp_path, revisions=2)
     before = _names(d)
+    _rust(monkeypatch, BIN)
     ini._replace_file(d / "models.ini", "version = 2\n", base_revision=BASE, backup=False)
     assert (d / "models.ini").read_text() == "version = 2\n"
     assert _names(d) == before
 
 
-def test_api_threads_only_an_explicit_false(monkeypatch):
+def test_api_threads_only_an_explicit_false(tmp_path, monkeypatch):
+    _rust(monkeypatch, _fake(tmp_path, "{}"))  # never run: write_raw_text is replaced
     seen = []
     monkeypatch.setattr(ini, "write_raw_text", lambda text, base_revision=None, backup=True: seen.append(backup))
     from fastapi.testclient import TestClient
@@ -101,7 +115,6 @@ def _fake(tmp_path, reply: str, code: int = 0) -> str:
 
 
 def _rust(monkeypatch, binary: str) -> None:
-    monkeypatch.setattr(config.settings, "model_files_impl", "rust")
     monkeypatch.setattr(config.settings, "model_files_bin", binary)
 
 
@@ -158,7 +171,7 @@ def test_rust_hinted_write_makes_no_copy_but_prunes(tmp_path, monkeypatch):
 
 
 @needs_bin
-def test_rust_refuses_a_bad_base_revision_like_python(tmp_path, monkeypatch):
+def test_rust_refuses_a_bad_base_revision(tmp_path, monkeypatch):
     d = _dir(tmp_path)
     _rust(monkeypatch, BIN)
     with pytest.raises(ValueError):

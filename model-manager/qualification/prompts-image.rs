@@ -335,7 +335,7 @@ fn refusal(mode: &str) -> Result<()> {
     } else {
         "/usr/local/bin/noevia-model-manager"
     };
-    let manager = if mode == "mismatch" { "python" } else { "rust" };
+    let manager = "rust";
     let selected = if mode == "invalid" { "invalid" } else { "rust" };
     let expected = if mode == "invalid" {
         "MODEL_MANAGER_PROMPTS_IMPL must be python or rust"
@@ -493,12 +493,10 @@ impl Drop for Container {
 }
 fn images(image: &str) -> Result<()> {
     require(image == IMAGE, "fixed qualification image")?;
-    for mode in ["python", "rust", "off"] {
-        let manager = if mode == "python" {
-            "MODEL_MANAGER_IMPL=python"
-        } else {
-            "MODEL_MANAGER_IMPL=rust"
-        };
+    // noevia#1071: no Python-only parent any more; "off" is the default (native parent,
+    // this selector python).
+    for mode in ["rust", "off"] {
+        let manager = "MODEL_MANAGER_IMPL=rust";
         let prompts = if mode == "rust" {
             "MODEL_MANAGER_PROMPTS_IMPL=rust"
         } else {
@@ -564,7 +562,7 @@ fn images(image: &str) -> Result<()> {
         docker(&["start", &owned.id])?;
         docker(&["exec", &owned.id, "prompts-image-probe", "probe", mode])?;
     }
-    for mode in ["omission", "mismatch", "invalid"] {
+    for mode in ["omission", "invalid"] {
         let owned = Container::acquire(&[
             "--network",
             "none",
@@ -610,7 +608,7 @@ fn main() -> Result<()> {
     require(args.next().is_none(), "unexpected image arguments")?;
     match (mode.as_str(), value.as_deref()) {
         ("serve", None) => serve(),
-        (mode @ ("omission" | "mismatch" | "invalid"), None) => refusal(mode),
+        (mode @ ("omission" | "invalid"), None) => refusal(mode),
         ("probe", Some(mode)) => probe(mode),
         ("images", Some(image)) => images(image),
         _ => Err("invalid image mode".into()),

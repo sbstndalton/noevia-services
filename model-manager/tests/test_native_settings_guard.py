@@ -65,5 +65,5 @@ def test_settings_guard_does_not_touch_other_native_guards(monkeypatch, store):
                   "NOEVIA_NATIVE_MODEL_MANAGER_SECTIONS_CONFIRMED", "NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED",
                   "NOEVIA_NATIVE_MODEL_MANAGER_DIAGNOSE_CONFIRMED"):
         monkeypatch.delenv(other, raising=False)
-    assert store.get("/api/v1/health").json() == {"ok": True}
+    assert store.get("/api/v1/health").status_code == 503  # always native (noevia#1071)
     assert store.get("/api/v1/prompts", headers=auth()).status_code == 200
