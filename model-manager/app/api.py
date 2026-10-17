@@ -161,6 +161,10 @@ def delete_models(body: dict = Body(...)) -> dict:
         holders = services.model_holders(g, containers)
         if holders:
             raise HTTPException(409, services.in_use_message(g, holders))
+        # noevia#1966: a queued or running download into this model's folder refuses the same way.
+        downloads = services.download_blockers(g)
+        if downloads:
+            raise HTTPException(409, services.downloading_message(g, downloads))
         todo.append((key, g))
     for key, g in todo:
         ok, msg, freed = services.delete_gguf(g.display_name, g.subdir)
