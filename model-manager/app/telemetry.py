@@ -27,6 +27,7 @@ no measurements, never to breaking the page that asked for them.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -416,7 +417,13 @@ def ingest(container_names: list[str], *, force: bool = False) -> int:
     decides what is stored; it only tells parse_log whether the tail overlaps the last pass, so
     that a request whose spawn line has scrolled away may be attributed to the stored instance
     (#904) only when no respawn can have gone unseen in between.
+
+    noevia#1318 step 3d: under exact NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED=1 the native
+    parent ingests and is the only writer of the telemetry tables and keys, so this never reads a
+    log or touches SQLite.
     """
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED") == "1":
+        return 0
     now = time.time()
     if not force:
         try:

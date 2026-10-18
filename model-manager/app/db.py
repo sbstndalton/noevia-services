@@ -352,8 +352,10 @@ def record_timings(backend: str, samples: list) -> int:
     INSERT OR IGNORE against UNIQUE(backend, instance, task) is what lets the scraper re-read
     the same log tail on every pass without either duplicating rows or having to remember how
     far it got last time.
+
+    noevia#1318 step 3d: under the telemetry confirmation the native parent is the only writer.
     """
-    if not samples:
+    if not samples or os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED") == "1":
         return 0
     rows = [(s.ts, backend, s.instance, s.task, s.model_path, s.alias, s.spec_type,
              s.prompt_tokens, s.prompt_tps, s.gen_tokens, s.gen_tps,
@@ -420,8 +422,8 @@ def recent_timings(*, model_path: str = "", alias: str = "",
 def record_server_configs(backend: str, configs: list) -> int:
     """Upsert the argv of each spawned instance. Re-ingest overwrites, because a later pass
     over the log may have seen the full argv block where an earlier one caught only the
-    announcement line."""
-    if not configs:
+    announcement line. Never written here under the telemetry confirmation (noevia#1318 step 3d)."""
+    if not configs or os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED") == "1":
         return 0
     import json as _json
     rows = [(backend, c.instance, c.alias, c.model_path,
