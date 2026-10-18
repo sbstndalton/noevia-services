@@ -392,6 +392,8 @@ def test_concurrent_verify_accepts_each_nonce_exactly_once(monkeypatch):
     verifying, so eviction (past and future seconds) and _lost pruning run under contention."""
     import threading
     monkeypatch.setattr(ta, '_nonce_cap', 6)
+    # This test is about the cache under contention, not about the bound on leaf children (switch tests): let every thread through.
+    monkeypatch.setattr(ta, '_slots', threading.BoundedSemaphore(64))
     now = time.time()
     base = int(now)
     # Past seconds, the current one and future ones (future evictions land in _lost).

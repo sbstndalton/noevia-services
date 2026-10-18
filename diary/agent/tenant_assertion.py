@@ -92,6 +92,13 @@ _seen_lock = threading.Lock()
 
 
 RUST_TIMEOUT_S = 0.5
+# At most this many leaf children run at once, process-wide. A request that finds every slot taken is refused at
+# once (the refusal a bad signature gets), never queued: the leaf now decides every signature, so without a bound a
+# flood of bad ones would spawn without limit (each costs a few ms and lives at most RUST_TIMEOUT_S).
+MAX_CONCURRENT_LEAVES = 4
+_slots = threading.BoundedSemaphore(MAX_CONCURRENT_LEAVES)
+_busy_refusals = 0
+_busy_lock = threading.Lock()
 DEFAULT_BIN = "/usr/local/bin/tenant-assertion"
 _RUST_STDOUT_CAP = 256
 _log = logging.getLogger(__name__)
@@ -218,12 +225,34 @@ def _rust_binary() -> Optional[str]:
     return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
 
 
+def _busy_refusal() -> str:
+    """Every slot is taken: refuse at once, logged at the 1st, 10th, 100th, 1000th ... refusal, with no input."""
+    global _busy_refusals
+    with _busy_lock:
+        _busy_refusals += 1
+        n = _busy_refusals
+    if n == 1 or (n >= 10 and re.fullmatch(r"10*", str(n))):
+        _log.warning("tenant-assertion: all %d leaf slots are busy; refusing the request%s", MAX_CONCURRENT_LEAVES,
+                     f" ({n} times so far)" if n > 1 else "")
+    return "rust refused"
+
+
 def _rust_decision(payload: dict) -> Optional[str]:
     """None when `tenant-assertion check` accepts `payload`, else a reason code. Fails closed:
-    every fault is a refusal. The payload (key included) goes to the child on stdin only."""
+    every fault is a refusal, and so is finding every slot taken (MAX_CONCURRENT_LEAVES). The payload
+    (key included) goes to the child on stdin only."""
+    if not _slots.acquire(blocking=False):
+        return _busy_refusal()
+    try:
+        return _run_leaf(payload)
+    finally:
+        _slots.release()
+
+
+def _run_leaf(payload: dict) -> Optional[str]:
     binary = _rust_binary()
     if binary is None:
-        _log_once("rust:missing_binary", "tenant-assertion binary not found; refusing tenant requests (TENANT_ASSERTION_IMPL=rust)")
+        _log_once("rust:missing_binary", "tenant-assertion binary not found; refusing tenant requests")
         return "rust unavailable"
     try:
         data = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
@@ -358,6 +387,13 @@ def secret_ref_matches(key: str, user_id: str, secret: str, ref: str) -> bool:
     """app.py's secretRef check: `ref` equals the derivation (storage_secret_ref), decided by the Rust leaf
     alone; any fault is a mismatch (a non-ASCII `ref` is a mismatch too, not an error)."""
     return _rust_decision({"op": "secret_ref", "key": key, "user_id": user_id, "secret": secret, "ref": ref}) is None
+
+
+def _reset_busy_for_tests() -> None:
+    global _busy_refusals, _slots
+    with _busy_lock:
+        _busy_refusals = 0
+    _slots = threading.BoundedSemaphore(MAX_CONCURRENT_LEAVES)
 
 
 def _reset_for_tests(started_at: Optional[float] = None) -> None:

@@ -23,6 +23,7 @@ SECRET = 'synthetic-storage-secret'
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
     ta._reset_for_tests()
+    ta._reset_busy_for_tests()
     ta._logged.clear()
     for k in ('TENANT_ASSERTION_IMPL', 'TENANT_ASSERTION_BIN', 'DIARY_TENANT_KEY'):
         monkeypatch.delenv(k, raising=False)
@@ -345,3 +346,81 @@ def test_middleware_fails_closed_without_the_leaf_and_keeps_the_guards_with_it(k
     assert keyed.get('/api/storage-status', headers={**h, ta.HEADER: 'v2.garbage'}).status_code == 401
     assert keyed.get('/api/storage-status', headers=h).status_code == 200
     assert keyed.get('/api/storage-status', headers=h).status_code == 401
+
+
+# ── the bound on concurrent leaf children ──────────────────────────────────────────────────────────
+
+def gated(tmp_path, go, name='gated'):
+    """A leaf that records its start, then waits for the `go` file before it accepts."""
+    return fake(tmp_path, f'import time\nopen({str(tmp_path / "started-")!r} + str(os.getpid()), "w").write("x")\n'
+                          f'while not os.path.exists({str(go)!r}):\n    time.sleep(0.02)\nsys.stdout.write("accept\\n")\n', name=name)
+
+
+def started(tmp_path):
+    return len(list(tmp_path.glob('started-*')))
+
+
+def wait_for(cond, seconds=5.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_a_burst_over_the_cap_is_refused_at_once_not_queued_and_a_free_slot_lets_a_valid_request_through(tmp_path, monkeypatch, caplog):
+    import threading
+    go = tmp_path / 'go'
+    path, _ = gated(tmp_path, go)
+    use(monkeypatch, path)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 10.0)
+    monkeypatch.setattr(ta, '_slots', threading.BoundedSemaphore(2))
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(verify(signed(A, 'GET', '/api/day')))) for _ in range(2)]
+    for t in threads:
+        t.start()
+    assert wait_for(lambda: started(tmp_path) == 2), 'two leaves are running'
+    # The burst: every further request is refused immediately with the refusal a bad signature gets, and spawns nothing.
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        t0 = time.monotonic()
+        burst = [verify(signed(A, 'GET', '/api/day')) for _ in range(150)]
+        elapsed = time.monotonic() - t0
+    assert burst == ['rust refused'] * 150
+    assert elapsed < 2.0, elapsed
+    assert started(tmp_path) == 2, 'nothing beyond the cap was spawned'
+    assert ta._seen == {} or all(not v for v in ta._seen.values()), 'a refused request is never remembered as accepted'
+    # Logged at the 1st, 10th and 100th refusal, without any input.
+    lines = [r.getMessage() for r in caplog.records if 'slots are busy' in r.getMessage()]
+    assert [l.split('(')[-1] if 'times so far' in l else '1' for l in lines] == ['1', '10 times so far)', '100 times so far)']
+    assert all(KEY not in l for l in lines)
+    # A slot frees: a valid request goes through, and the two that were running were not harmed.
+    go.write_text('go')
+    for t in threads:
+        t.join(timeout=10)
+    assert results == [None, None]
+    assert verify(signed(A, 'GET', '/api/day')) is None
+    assert started(tmp_path) == 3
+
+
+def test_a_slot_is_freed_after_a_timeout_a_fault_or_a_refusal(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.setattr(ta, '_slots', threading.BoundedSemaphore(1))
+    slow, _ = fake(tmp_path, 'import time; time.sleep(30)\n', name='slow')
+    use(monkeypatch, slow)
+    assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'   # killed at RUST_TIMEOUT_S
+    for body, want in (('sys.exit(2)\n', 'rust unavailable'), (REJECT, 'rust refused'), (ACCEPT, None)):
+        path, _ = fake(tmp_path, body, name=f'next{abs(hash(body))}')
+        use(monkeypatch, path)
+        assert verify(signed(A, 'GET', '/api/day')) == want
+    use(monkeypatch, tmp_path / 'absent')
+    assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'   # no binary: the slot is not leaked either
+    path, _ = fake(tmp_path, ACCEPT, name='last')
+    use(monkeypatch, path)
+    assert verify(signed(A, 'GET', '/api/day')) is None
+    assert ta._slots.acquire(blocking=False)
+    ta._slots.release()
+
+
+def test_the_cap_defaults_to_four_and_the_timeout_stays_half_a_second():
+    assert ta.MAX_CONCURRENT_LEAVES == 4 and ta.RUST_TIMEOUT_S == 0.5
