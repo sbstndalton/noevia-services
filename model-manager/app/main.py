@@ -127,9 +127,11 @@ async def _require_token(request: Request, call_next):
     # header and the analysis) and asks this app only for the live inputs: the telemetry measurements
     # and the backend inventory. Other methods keep FastAPI's 405 here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTION_AUTOCONFIG_CONFIRMED") == "1":
-        if request.method == "GET" and _section_autoconfig_path(request.url.path):
+        # The decoded scope path, as FastAPI routes it: `request.url.path` would cut a name with
+        # %3F or %23 short at the re-parsed query or fragment.
+        if request.method == "GET" and _section_autoconfig_path(request.scope["path"]):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
-        if request.url.path == SECTION_AUTOCONFIG_RUNTIME_PATH:
+        if request.scope["path"] == SECTION_AUTOCONFIG_RUNTIME_PATH:
             return await _section_autoconfig_runtime(request)
     # #1318: the native parent writes the Hugging Face token; it asks this app only for the token
     # test (which calls Hugging Face). GET /settings follows its own switch.

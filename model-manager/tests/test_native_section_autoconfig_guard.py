@@ -55,7 +55,7 @@ BACKENDS = [{"name": "synthetic-gpu", "vendor": "unknown", "vram_gb": 16.0, "gpu
 def world(monkeypatch, tmp_path):
     models = tmp_path / "models"
     models.mkdir()
-    (models / "synthetic-m.gguf").write_bytes(_gguf("llama"))
+    (models / "synthetic-m.gguf").write_bytes(_gguf("synth"))
     monkeypatch.setattr(settings, "model_loader_token", TOKEN)
     monkeypatch.setattr(settings, "models_dir", models)
     monkeypatch.setattr(settings, "models_ini_path", models / "models.ini")
@@ -104,6 +104,7 @@ def test_confirmed_child_refuses_the_read_and_serves_the_runtime(monkeypatch, wo
     answer = client.get(PATH, headers=auth())
     assert answer.status_code == 503 and answer.content == REFUSED
     for path in ("/api/v1/sections/a%20b/autoconfig", "/api/v1/sections/%C3%BC/autoconfig",
+                 "/api/v1/sections/a%3Fb/autoconfig", "/api/v1/sections/a%23b/autoconfig",
                  PATH + "?sessions=x"):
         assert client.get(path, headers=auth()).content == REFUSED
     assert client.post(PATH, headers=auth()).status_code == 405
