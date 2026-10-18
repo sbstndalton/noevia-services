@@ -141,10 +141,15 @@ another tenant or delete one. With neither `DIARY_AUTH_TOKEN` nor
 `DIARY_TENANT_KEY` set the service refuses to start unless `DIARY_ALLOW_OPEN=1`.
 Keep the service internal regardless.
 
-`TENANT_ASSERTION_IMPL=rust` (default `python`; any other value is `python` with
-one warning) also runs the check in the bounded Rust leaf `tenant-assertion`
-(sbstndalton/noevia-rs, baked into the image at `/usr/local/bin`). It only adds
-refusals: a request is accepted when Python and Rust both accept, and a missing
-binary, crash, timeout or odd output refuses it (401). The key and headers reach
-the child on stdin only, with a `PATH`-only environment. `TENANT_ASSERTION_BIN`
-overrides the binary path (tests).
+The signature, the clock window and the bounds on every field are checked by the bounded Rust leaf
+`tenant-assertion` (sbstndalton/noevia-rs, baked into the image at `/usr/local/bin`) and by nothing else: since
+noevia#1071 there is no Python copy of those rules and `TENANT_ASSERTION_IMPL` is retired (`rust` and empty are
+silent, any other value is ignored with one warning at start). A request is accepted only when the leaf accepts;
+a missing binary, crash, timeout or odd output refuses it (401). This module keeps what the stateless leaf cannot
+know: the shape of the header, the restart guard (an assertion signed before this process started is refused, as
+the nonce cache is in memory) and the nonce cache (each nonce is accepted once). The leaf also refuses some inputs
+the Python check used to accept: a tenant id that is not ASCII or is over-long, whitespace or newlines in the
+storage headers, over-long fields (the tenant ids web signs are UUIDs). A `secretRef` that does not match is a
+mismatch (400), a non-ASCII one no longer an error. The key and headers reach the child on stdin only, with a
+`PATH`-only environment. With `DIARY_TENANT_KEY` set and no usable binary the service logs an error at start and
+refuses every tenant request. `TENANT_ASSERTION_BIN` overrides the binary path (tests).

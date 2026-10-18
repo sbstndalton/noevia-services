@@ -1,5 +1,6 @@
-# tenant-assertion and workspace-restore-verify: the bounded Rust leaves from sbstndalton/noevia-rs
-# behind TENANT_ASSERTION_IMPL and WORKSPACE_RESTORE_VERIFY_IMPL (both default python), pinned to
+# tenant-assertion and workspace-restore-verify: the bounded Rust leaves from sbstndalton/noevia-rs.
+# tenant-assertion is the only tenant signature check (TENANT_ASSERTION_IMPL is retired, noevia#1071);
+# workspace-restore-verify is behind WORKSPACE_RESTORE_VERIFY_IMPL (default python). Pinned to
 # release/versions.lock's NOEVIA_RS_REF like the OCR and model-manager
 # images, fetched as an anonymous tarball whose sha256 is checked before anything is built. Built on
 # bookworm (glibc 2.36); the runtime base is the same or newer Debian. The release's Diary overlay

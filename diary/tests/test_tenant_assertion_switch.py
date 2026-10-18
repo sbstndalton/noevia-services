@@ -1,5 +1,6 @@
-"""TENANT_ASSERTION_IMPL switch: python stays the default and never spawns anything; rust is
-AND-composed with Python and fails closed on every fault; the key reaches the child on stdin only.
+"""The Rust leaf is the only signature check (TENANT_ASSERTION_IMPL, retired in #1071): every fault is a refusal, the
+key reaches the child on stdin only, and the cheap checks that need no secret (the header shape, the restart guard) and
+the nonce cache stay in Python and never reach, or follow, a refused request.
 
 Fake `tenant-assertion` binaries stand in for the Rust leaf here; the real binary is exercised by
 test_tenant_assertion_differential.py when TENANT_ASSERTION_BIN is set. Synthetic keys only."""
@@ -22,8 +23,9 @@ SECRET = 'synthetic-storage-secret'
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
     ta._reset_for_tests()
+    ta._reset_busy_for_tests()
     ta._logged.clear()
-    for k in ('TENANT_ASSERTION_IMPL', 'TENANT_ASSERTION_BIN'):
+    for k in ('TENANT_ASSERTION_IMPL', 'TENANT_ASSERTION_BIN', 'DIARY_TENANT_KEY'):
         monkeypatch.delenv(k, raising=False)
     yield
     ta._reset_for_tests()
@@ -48,7 +50,6 @@ REJECT = 'sys.stdout.write("reject: bad signature\\n"); sys.exit(1)\n'
 
 
 def use(monkeypatch, path):
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'rust')
     monkeypatch.setenv('TENANT_ASSERTION_BIN', str(path))
 
 
@@ -56,31 +57,47 @@ def verify(h, path='/api/day', method='GET', **kw):
     return ta.verify(KEY, h, method, path, **kw)
 
 
-def test_default_is_python_and_never_spawns(monkeypatch):
-    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('spawned under python'))
-    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned under python'))
-    assert ta.impl_choice() == 'python'
-    assert verify(signed(A, 'GET', '/api/day')) is None
-    assert ta.secret_ref_matches(KEY, A, SECRET, ta.storage_secret_ref(KEY, A, SECRET))
+def test_the_selector_is_gone_and_a_leftover_setting_warns_once_at_start(monkeypatch, caplog):
+    assert not hasattr(ta, 'impl_choice') and not hasattr(ta, 'IMPLS')
+    for value in (None, '', ' RUST ', 'rust'):
+        if value is None:
+            monkeypatch.delenv('TENANT_ASSERTION_IMPL', raising=False)
+        else:
+            monkeypatch.setenv('TENANT_ASSERTION_IMPL', value)
+        with caplog.at_level(logging.WARNING, logger=ta.__name__):
+            ta.startup_checks()
+        assert not caplog.records, value
+    for value in ('python', 'fortran', ' Python '):
+        monkeypatch.setenv('TENANT_ASSERTION_IMPL', value)
+        caplog.clear()
+        ta._logged.clear()
+        with caplog.at_level(logging.WARNING, logger=ta.__name__):
+            for _ in range(3):
+                ta.startup_checks()
+        assert [r.getMessage() for r in caplog.records] == [f"TENANT_ASSERTION_IMPL={value.strip().lower()!r} is retired; Rust is always used"], value
 
 
-def test_unknown_value_is_python_with_one_warning(monkeypatch, caplog):
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'fortran')
-    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned for an unknown value'))
+def test_a_tenant_key_without_a_usable_binary_is_an_error_at_start(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv('TENANT_ASSERTION_BIN', str(tmp_path / 'absent'))
+    monkeypatch.setattr(ta, 'DEFAULT_BIN', str(tmp_path / 'absent-default'))
     with caplog.at_level(logging.WARNING, logger=ta.__name__):
-        for _ in range(3):
-            assert ta.impl_choice() == 'python'
-        assert verify(signed(A, 'GET', '/api/day')) is None
-    assert sum('TENANT_ASSERTION_IMPL' in r.getMessage() for r in caplog.records) == 1
+        ta.startup_checks()
+        assert not [r for r in caplog.records if 'not usable' in r.getMessage()], 'no key set: nothing to say'
+        monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+        ta.startup_checks()
+        ta.startup_checks()
+    messages = [r.getMessage() for r in caplog.records if 'not usable' in r.getMessage()]
+    assert len(messages) == 1 and KEY not in messages[0]
+    path, _ = fake(tmp_path, ACCEPT)
+    use(monkeypatch, path)
+    ta._logged.clear()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        ta.startup_checks()
+    assert not caplog.records
 
 
-@pytest.mark.parametrize('value', ['rust', ' RUST ', 'Rust'])
-def test_rust_values_select_rust(monkeypatch, value):
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', value)
-    assert ta.impl_choice() == 'rust'
-
-
-def test_rust_accept_and_python_accept_accepts_once(tmp_path, monkeypatch):
+def test_rust_accept_accepts_once(tmp_path, monkeypatch):
     path, record = fake(tmp_path, ACCEPT)
     use(monkeypatch, path)
     h = signed(A, 'POST', '/api/file', {'Content-Type': 'application/json'}, query=b'x=1', body=b'{}')
@@ -256,14 +273,44 @@ def test_slow_rust_check_does_not_block_the_event_loop(volume, tmp_path, monkeyp
     assert slow_code == 200
 
 
-def test_python_refusal_never_consults_rust(tmp_path, monkeypatch):
+def test_cheap_refusals_never_consult_rust(tmp_path, monkeypatch):
+    """No tenant, a malformed or missing assertion and one signed before this process started are refused
+    without spawning the child; what only the secret can tell (a bad signature, the clock window) is the leaf's."""
     path, record = fake(tmp_path, ACCEPT)
     use(monkeypatch, path)
     h = signed(A, 'GET', '/api/day')
-    assert verify({**h, 'X-Cowork-User-ID': B}) == 'bad signature'
-    assert verify(h, now=0.0) == 'outside clock window'
-    assert not ta.secret_ref_matches(KEY, A, SECRET, 'a' * 32)
+    assert verify({k: v for k, v in h.items() if k != 'X-Cowork-User-ID'}) == 'missing tenant'
+    assert verify({**h, ta.HEADER: 'v2.1.2.3'}) == 'missing or malformed assertion'
+    assert verify({**h, ta.HEADER: h[ta.HEADER] + ' '}) == 'missing or malformed assertion'
+    assert verify({k: v for k, v in h.items() if k != ta.HEADER}) == 'missing or malformed assertion'
+    ta._reset_for_tests(started_at=time.time() + 3600)
+    assert verify(h) == 'signed before this process started'
     assert not record.exists()
+    # The same shape reaches the leaf, whose answer is final: a wrong tenant or a stale clock is its refusal.
+    ta._reset_for_tests()
+    path, record = fake(tmp_path, REJECT, name='reject-bin')
+    use(monkeypatch, path)
+    assert verify({**h, 'X-Cowork-User-ID': B}) == 'rust refused'
+    assert verify(h, now=0.0) == 'rust refused'
+    assert not ta.secret_ref_matches(KEY, A, SECRET, 'a' * 32)
+    assert record.exists()
+
+
+def test_the_restart_guard_and_the_nonce_cache_still_run_after_the_leaf_accepts(tmp_path, monkeypatch):
+    """The leaf is stateless and knows nothing of the process start: it accepts a replay and an assertion signed
+    before this process started, and the Python guard and cache refuse them."""
+    path, record = fake(tmp_path, ACCEPT)
+    use(monkeypatch, path)
+    h = signed(A, 'GET', '/api/day')
+    assert verify(h) is None
+    assert verify(h) == 'replayed'
+    old = signed(A, 'GET', '/api/day', ts=int(time.time()) - 30)
+    ta._reset_for_tests(started_at=time.time())
+    assert verify(old) == 'signed before this process started'
+    ta._reset_for_tests()
+    assert verify(old) is None
+    assert verify(old) == 'replayed'
+    assert verify(signed(A, 'GET', '/api/day')) is None
 
 
 def test_rust_refusal_does_not_reach_the_nonce_cache(tmp_path, monkeypatch):
@@ -288,12 +335,185 @@ def test_no_secret_in_logs_on_any_failure(tmp_path, monkeypatch, caplog):
     assert text and KEY not in text and SECRET not in text
 
 
-def test_middleware_fails_closed_under_rust(keyed, tmp_path, monkeypatch):  # noqa: F811
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'rust')
+def test_middleware_fails_closed_without_the_leaf_and_keeps_the_guards_with_it(keyed, tmp_path, monkeypatch):  # noqa: F811
     monkeypatch.setenv('TENANT_ASSERTION_BIN', str(tmp_path / 'absent'))
     assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 401
     path, _ = fake(tmp_path, ACCEPT)
     monkeypatch.setenv('TENANT_ASSERTION_BIN', str(path))
     assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 200
-    # Rust accepting can never rescue what Python refuses.
-    assert keyed.get('/api/storage-status', headers={**signed(B, 'GET', '/api/storage-status'), 'X-Cowork-User-ID': A}).status_code == 401
+    # An accepting leaf cannot rescue what needs no secret to refuse: a malformed assertion, a replay.
+    h = signed(B, 'GET', '/api/storage-status')
+    assert keyed.get('/api/storage-status', headers={**h, ta.HEADER: 'v2.garbage'}).status_code == 401
+    assert keyed.get('/api/storage-status', headers=h).status_code == 200
+    assert keyed.get('/api/storage-status', headers=h).status_code == 401
+
+
+# ── the bound on concurrent leaf children ──────────────────────────────────────────────────────────
+
+def gated(tmp_path, go, name='gated'):
+    """A leaf that records its start, then waits for the `go` file before it accepts."""
+    return fake(tmp_path, f'import time\nopen({str(tmp_path / "started-")!r} + str(os.getpid()), "w").write("x")\n'
+                          f'while not os.path.exists({str(go)!r}):\n    time.sleep(0.02)\nsys.stdout.write("accept\\n")\n', name=name)
+
+
+def started(tmp_path):
+    return len(list(tmp_path.glob('started-*')))
+
+
+def wait_for(cond, seconds=5.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_a_burst_over_the_cap_is_refused_at_once_not_queued_and_a_free_slot_lets_a_valid_request_through(tmp_path, monkeypatch, caplog):
+    import threading
+    go = tmp_path / 'go'
+    path, _ = gated(tmp_path, go)
+    use(monkeypatch, path)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 10.0)
+    monkeypatch.setattr(ta, '_slots', threading.BoundedSemaphore(2))
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(verify(signed(A, 'GET', '/api/day')))) for _ in range(2)]
+    for t in threads:
+        t.start()
+    assert wait_for(lambda: started(tmp_path) == 2), 'two leaves are running'
+    # The burst: every further request is refused immediately with the refusal a bad signature gets, and spawns nothing.
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        t0 = time.monotonic()
+        burst = [verify(signed(A, 'GET', '/api/day')) for _ in range(150)]
+        elapsed = time.monotonic() - t0
+    assert burst == [ta.BUSY_REFUSAL] * 150
+    assert elapsed < 2.0, elapsed
+    assert started(tmp_path) == 2, 'nothing beyond the cap was spawned'
+    assert ta._seen == {} or all(not v for v in ta._seen.values()), 'a refused request is never remembered as accepted'
+    # Logged at the 1st, 10th and 100th refusal, without any input.
+    lines = [r.getMessage() for r in caplog.records if 'slots are busy' in r.getMessage()]
+    assert [l.split('(')[-1] if 'times so far' in l else '1' for l in lines] == ['1', '10 times so far)', '100 times so far)']
+    assert all(KEY not in l for l in lines)
+    # A slot frees: a valid request goes through, and the two that were running were not harmed.
+    go.write_text('go')
+    for t in threads:
+        t.join(timeout=10)
+    assert results == [None, None]
+    assert verify(signed(A, 'GET', '/api/day')) is None
+    assert started(tmp_path) == 3
+
+
+def test_a_slot_is_freed_after_a_timeout_a_fault_or_a_refusal(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.setattr(ta, '_slots', threading.BoundedSemaphore(1))
+    slow, _ = fake(tmp_path, 'import time; time.sleep(30)\n', name='slow')
+    use(monkeypatch, slow)
+    assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'   # killed at RUST_TIMEOUT_S
+    for body, want in (('sys.exit(2)\n', 'rust unavailable'), (REJECT, 'rust refused'), (ACCEPT, None)):
+        path, _ = fake(tmp_path, body, name=f'next{abs(hash(body))}')
+        use(monkeypatch, path)
+        assert verify(signed(A, 'GET', '/api/day')) == want
+    use(monkeypatch, tmp_path / 'absent')
+    assert verify(signed(A, 'GET', '/api/day')) == 'rust unavailable'   # no binary: the slot is not leaked either
+    path, _ = fake(tmp_path, ACCEPT, name='last')
+    use(monkeypatch, path)
+    assert verify(signed(A, 'GET', '/api/day')) is None
+    assert ta._slots.acquire(blocking=False)
+    ta._slots.release()
+
+
+def test_the_cap_defaults_to_four_and_the_timeout_stays_half_a_second():
+    assert ta.MAX_CONCURRENT_LEAVES == 4 and ta.RUST_TIMEOUT_S == 0.5
+
+
+@pytest.mark.parametrize('burst_size', [1, 4])
+def test_asgi_valid_bursts_within_the_default_cap_are_accepted_and_recover(tmp_path, monkeypatch, burst_size):
+    """Exercise real concurrent middleware requests, holding each leaf so the burst actually overlaps."""
+    import asyncio
+    import httpx
+    from starlette.responses import JSONResponse
+    from agent.app import TenantAssertionMiddleware
+
+    go = tmp_path / 'go'
+    path, _ = gated(tmp_path, go)
+    use(monkeypatch, path)
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 10.0)
+
+    async def downstream(scope, receive, send):
+        assert scope['state']['tenant_asserted'] is True
+        await JSONResponse({'ok': True})(scope, receive, send)
+
+    async def run():
+        transport = httpx.ASGITransport(app=TenantAssertionMiddleware(downstream))
+        async with httpx.AsyncClient(transport=transport, base_url='http://qa') as client:
+            jobs = [asyncio.create_task(client.get('/api/qa', headers=signed(A, 'GET', '/api/qa')))
+                    for _ in range(burst_size)]
+            try:
+                deadline = time.monotonic() + 5.0
+                while started(tmp_path) < burst_size and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert started(tmp_path) == burst_size
+                assert not any(job.done() for job in jobs)
+            finally:
+                go.write_text('go')
+            responses = await asyncio.wait_for(asyncio.gather(*jobs), timeout=10.0)
+            assert [r.status_code for r in responses] == [200] * burst_size
+            assert all(r.json() == {'ok': True} for r in responses)
+            assert (await client.get('/api/qa', headers=signed(A, 'GET', '/api/qa'))).status_code == 200
+            assert started(tmp_path) == burst_size + 1
+
+    asyncio.run(run())
+
+
+def test_asgi_saturation_keeps_wire_refusal_throttles_logs_and_accepts_retry(tmp_path, monkeypatch, caplog):
+    import asyncio
+    import httpx
+    from starlette.responses import JSONResponse
+    from agent.app import TenantAssertionMiddleware
+
+    go = tmp_path / 'go'
+    path, _ = gated(tmp_path, go)
+    use(monkeypatch, path)
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 10.0)
+    downstream_calls = []
+
+    async def downstream(scope, receive, send):
+        assert scope['state']['tenant_asserted'] is True
+        downstream_calls.append(scope['path'])
+        await JSONResponse({'ok': True})(scope, receive, send)
+
+    async def run():
+        transport = httpx.ASGITransport(app=TenantAssertionMiddleware(downstream))
+        async with httpx.AsyncClient(transport=transport, base_url='http://qa') as client:
+            jobs = [asyncio.create_task(client.get('/api/qa', headers=signed(A, 'GET', '/api/qa')))
+                    for _ in range(ta.MAX_CONCURRENT_LEAVES)]
+            retry_headers = signed(A, 'GET', '/api/qa')
+            try:
+                deadline = time.monotonic() + 5.0
+                while started(tmp_path) < ta.MAX_CONCURRENT_LEAVES and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert started(tmp_path) == ta.MAX_CONCURRENT_LEAVES
+                responses = await asyncio.wait_for(asyncio.gather(*[
+                    client.get('/api/qa', headers=retry_headers) for _ in range(150)
+                ]), timeout=5.0)
+                assert all(r.status_code == 401 and r.json() == {'detail': 'invalid tenant assertion'} for r in responses)
+                assert started(tmp_path) == ta.MAX_CONCURRENT_LEAVES
+                assert downstream_calls == []
+                assert ta._nonce_count() == 0
+                warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+                assert len(warnings) == 3, warnings
+                assert all('leaf slots are busy' in message for message in warnings)
+                assert all(KEY not in message and retry_headers[ta.HEADER] not in message for message in warnings)
+            finally:
+                go.write_text('go')
+            admitted = await asyncio.wait_for(asyncio.gather(*jobs), timeout=10.0)
+            assert [r.status_code for r in admitted] == [200] * ta.MAX_CONCURRENT_LEAVES
+            # Saturation did not cache the assertion. Its identical retry succeeds, then replay fails.
+            assert (await client.get('/api/qa', headers=retry_headers)).status_code == 200
+            assert (await client.get('/api/qa', headers=retry_headers)).status_code == 401
+            assert any('tenant assertion rejected: replayed' in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
