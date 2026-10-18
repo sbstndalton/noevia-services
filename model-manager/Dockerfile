@@ -16,8 +16,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=b4c855edbb16a2653063b5a3c1d2878862e9e7fd
-ARG NOEVIA_RS_SHA256=16be1e5a3be2a50e7e09664c56594aa0fbf182226c973909ccfda5fb8ff63e5b
+ARG NOEVIA_RS_REF=44cabf25ca5c8d59b81be255bf8613029be01430
+ARG NOEVIA_RS_SHA256=cab6585266cf2eab782e52437c5f198c4202db2d08e3491bf7fd36d98b28d217
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -26,7 +26,7 @@ ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /t
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
- && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads,noevia-model-manager/native-model-delete,noevia-model-manager/native-draft-heads,noevia-model-manager/native-backends,noevia-model-manager/native-model-list,noevia-model-manager/native-search \
+ && cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads,noevia-model-manager/native-model-delete,noevia-model-manager/native-draft-heads,noevia-model-manager/native-backends,noevia-model-manager/native-model-list,noevia-model-manager/native-search,noevia-model-manager/native-section-autoconfig \
  && native_features=$(./target/release/noevia-model-manager --features) \
  && printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null \
@@ -51,6 +51,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-backends >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-model-list >/dev/null \
  && printf '%s\n' "$native_features" | grep -Fx native-search >/dev/null \
+ && printf '%s\n' "$native_features" | grep -Fx native-section-autoconfig >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
  && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
@@ -102,6 +103,9 @@ ENV MODEL_MANAGER_OVERVIEW_IMPL=python
 # #1318 slice 14: GET /api/v1/search and /api/v1/search/repo stay with Python by default; the
 # live state (GPU budget, downloaded files, fit chips) always comes from this app.
 ENV MODEL_MANAGER_SEARCH_IMPL=python
+# #1318: native GET /api/v1/sections/{name}/autoconfig stays off by default; the telemetry and the
+# backend inventory always come from this app through its private runtime call.
+ENV MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL=python
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install -r requirements.txt
