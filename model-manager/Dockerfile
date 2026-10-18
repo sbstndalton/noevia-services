@@ -16,8 +16,8 @@
 # is backward compatible, so the dynamically linked binary runs there.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=204e6a2ed4c348a80f8c188416929e2b2128226d
-ARG NOEVIA_RS_SHA256=e1f54f2a7c0801f5f1d4d9b692d9fa2f02adaa1bbe8e52aeb560873daa21dbbd
+ARG NOEVIA_RS_REF=ef69770ea829d4665f95530ee2f0daa4d0d65825
+ARG NOEVIA_RS_SHA256=ef1a244c8c59bfc5535787f8edf6838c9f59683bb1dd31b268d180180228352b
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
@@ -55,9 +55,6 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
 
 FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
-# noevia#1071: the native parent is permanent. Binaries before noevia-rs#142 still read this retired
-# selector (their default was a Python-only mode), so the image pins it; newer binaries ignore it.
-ENV MODEL_MANAGER_IMPL=rust
 # #1334: native section reads stay off by default (python answers them).
 # Compose must pass ${MODEL_MANAGER_SECTIONS_IMPL:-python}, never an empty value.
 ENV MODEL_MANAGER_SECTIONS_IMPL=python
