@@ -12,6 +12,8 @@ from .config import settings
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="Model Loader")
+app.state.model_manager_startup_ready = False
+STARTUP_READY_PATH = "/api/v1/internal/startup-ready"
 
 # noevia#1071: the native parent (noevia-rs bins/noevia-model-manager) always owns these; this app
 # has no handler for them and refuses them unconditionally (the API contract still lists them).
@@ -41,6 +43,14 @@ async def _require_token(request: Request, call_next):
         sent = request.headers.get("x-model-loader-token", "")
         if not hmac.compare_digest(sent.encode(), token.encode()):
             return Response('{"error":"unauthorized"}', status_code=401, media_type="application/json")
+    # #2044: readiness is separate from public health, which the native parent owns.
+    # This flag is set only after all startup work finishes successfully.
+    if request.url.path == STARTUP_READY_PATH:
+        if request.method != "GET":
+            return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+        if not app.state.model_manager_startup_ready:
+            return Response('{"detail":"Startup is incomplete"}', status_code=503, media_type="application/json")
+        return Response('{"startup_ready":1}', media_type="application/json")
     # This app only ever runs as the native parent's supervised loopback child (noevia#1071), so
     # health and logs are refused whatever the environment says, even if the Rust handler fails;
     # never silently serve them twice.
@@ -696,6 +706,7 @@ async def _model_files_refused(_request: Request, exc: model_files.ModelFilesErr
 
 @app.on_event("startup")
 def _startup() -> None:
+    app.state.model_manager_startup_ready = False
     # noevia#1071: model-files is the only listing/backup implementation; refuse to start without it.
     model_files.require_binary()
     db.init()
@@ -717,6 +728,13 @@ def _startup() -> None:
             log.info("cache-ram migration: left to the native models.ini writer")
         else:
             _migrate_cache_ram()
+
+    app.state.model_manager_startup_ready = True
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    app.state.model_manager_startup_ready = False
 
 
 def _migrate_cache_ram() -> None:

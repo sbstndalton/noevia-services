@@ -344,3 +344,5 @@ No frontend build step. No JS bundler. Everything ships from CDN or Jinja. Total
 MIT — see [LICENSE](LICENSE). Use it, fork it, ship it.
 
 Keeping it off the public internet is a **security** note, not a licence term: there is no auth and it mounts the Docker socket. See [Security posture](#security-posture).
+
+The parent checks private `GET /api/v1/internal/startup-ready` for exact `{"startup_ready":1}` after successful application startup. It uses the existing shared-token gate, returns 503 before startup completes, and resets on shutdown. Public child health remains refused; older images without this advertisement cannot satisfy the parent startup barrier (#2044). Deploy this service change before the matching native parent.
