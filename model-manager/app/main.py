@@ -123,6 +123,14 @@ async def _require_token(request: Request, call_next):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
         if request.url.path == BACKEND_RESTART_ERROR_PATH:
             return await _backend_restart_error(request)
+    # #1318: the native parent answers GET /api/v1/sections/{name}/autoconfig (the section's file, its
+    # header and the analysis) and asks this app only for the live inputs: the telemetry measurements
+    # and the backend inventory. Other methods keep FastAPI's 405 here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SECTION_AUTOCONFIG_CONFIRMED") == "1":
+        if request.method == "GET" and _section_autoconfig_path(request.url.path):
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == SECTION_AUTOCONFIG_RUNTIME_PATH:
+            return await _section_autoconfig_runtime(request)
     # #1318: the native parent writes the Hugging Face token; it asks this app only for the token
     # test (which calls Hugging Face). GET /settings follows its own switch.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SETTINGS_WRITE_CONFIRMED") == "1":
@@ -279,6 +287,67 @@ async def _hf_token_test(request: Request):
     except Exception as e:  # noqa: BLE001 - the same answer put_settings gives
         ok, message = False, f"Test failed: {e}"
     return JSONResponse({"ok": ok, "message": message})
+
+
+# #1318: the parent's private call for the live inputs of GET /api/v1/sections/{name}/autoconfig;
+# 404 unless the native parent owns that read. The parent never forwards this path.
+SECTION_AUTOCONFIG_RUNTIME_PATH = "/api/v1/internal/section-autoconfig-runtime"
+_SECTION_AUTOCONFIG_RUNTIME_BODY = 256 * 1024
+
+
+def _section_autoconfig_path(path: str) -> bool:
+    """`/api/v1/sections/{name}/autoconfig` on the decoded path, as FastAPI routes it."""
+    parts = path.split("/")
+    return len(parts) == 6 and parts[:4] == ["", "api", "v1", "sections"] and parts[4] != "" and parts[5] == "autoconfig"
+
+
+async def _section_autoconfig_runtime(request: Request):
+    """POST {"section": name, "model": model_rel} -> {"measured": ..., "history": [...],
+    "promptTps": "...", "backends": "[...]"}: what `api.section_autoconfig` reads from live state, in
+    its order. First the telemetry ingest and the section's measurements (any failure there gives the
+    empty ones, as in the route), then `helpers._backend_list()` (a failure there is this app's 500,
+    as it is for the route). `measured` and `history` are rendered as the route's `-> dict` answer
+    renders them (pydantic's JSON mode, then the JSON response class), so the parent places them
+    verbatim. The analysis inputs keep every float, non-finite ones included: `promptTps` is
+    `repr(float(measured.prompt_p50 or 0))` and `backends` is the list as JSON text (NaN and Infinity
+    allowed), each carried as a string."""
+    import json as _json
+
+    from fastapi.concurrency import run_in_threadpool
+    if request.method != "POST":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    raw = await request.body()
+    try:
+        if len(raw) > _SECTION_AUTOCONFIG_RUNTIME_BODY:
+            raise ValueError("body")
+        body = _json.loads(raw)
+        if (not isinstance(body, dict) or set(body) != {"section", "model"}
+                or not all(isinstance(body[k], str) for k in body)):
+            raise ValueError("body")
+    except ValueError:
+        return Response('{"detail":"invalid runtime body"}', status_code=422, media_type="application/json")
+
+    def compute() -> str:
+        from pydantic import TypeAdapter
+
+        from . import services, telemetry
+        from .api import _plain
+        from .helpers import _backend_list
+        try:
+            telemetry.ingest(services._effective_container_names())
+            measured = telemetry.stats_for(model_path=body["model"], alias=body["section"])
+            history = telemetry.config_history(model_path=body["model"], alias=body["section"])
+        except Exception:  # noqa: BLE001 - measurements are optional, as in the route
+            measured, history = telemetry.Stats(), []
+        backends = _backend_list()
+        shown = TypeAdapter(dict).dump_python({"measured": _plain(measured), "history": _plain(history)},
+                                              mode="json")
+        return _json.dumps({"measured": shown["measured"], "history": shown["history"],
+                            "promptTps": repr(float(getattr(measured, "prompt_p50", 0) or 0)),
+                            "backends": _json.dumps(backends, ensure_ascii=False, allow_nan=True,
+                                                    separators=(",", ":"))},
+                           ensure_ascii=False, separators=(",", ":"))
+    return Response(await run_in_threadpool(compute), media_type="application/json")
 
 
 # #1318: the parent's private call for safe defaults (the values register_safe_defaults would
