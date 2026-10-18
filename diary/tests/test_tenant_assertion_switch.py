@@ -386,7 +386,7 @@ def test_a_burst_over_the_cap_is_refused_at_once_not_queued_and_a_free_slot_lets
         t0 = time.monotonic()
         burst = [verify(signed(A, 'GET', '/api/day')) for _ in range(150)]
         elapsed = time.monotonic() - t0
-    assert burst == ['rust refused'] * 150
+    assert burst == [ta.BUSY_REFUSAL] * 150
     assert elapsed < 2.0, elapsed
     assert started(tmp_path) == 2, 'nothing beyond the cap was spawned'
     assert ta._seen == {} or all(not v for v in ta._seen.values()), 'a refused request is never remembered as accepted'
@@ -424,3 +424,96 @@ def test_a_slot_is_freed_after_a_timeout_a_fault_or_a_refusal(tmp_path, monkeypa
 
 def test_the_cap_defaults_to_four_and_the_timeout_stays_half_a_second():
     assert ta.MAX_CONCURRENT_LEAVES == 4 and ta.RUST_TIMEOUT_S == 0.5
+
+
+@pytest.mark.parametrize('burst_size', [1, 4])
+def test_asgi_valid_bursts_within_the_default_cap_are_accepted_and_recover(tmp_path, monkeypatch, burst_size):
+    """Exercise real concurrent middleware requests, holding each leaf so the burst actually overlaps."""
+    import asyncio
+    import httpx
+    from starlette.responses import JSONResponse
+    from agent.app import TenantAssertionMiddleware
+
+    go = tmp_path / 'go'
+    path, _ = gated(tmp_path, go)
+    use(monkeypatch, path)
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 10.0)
+
+    async def downstream(scope, receive, send):
+        assert scope['state']['tenant_asserted'] is True
+        await JSONResponse({'ok': True})(scope, receive, send)
+
+    async def run():
+        transport = httpx.ASGITransport(app=TenantAssertionMiddleware(downstream))
+        async with httpx.AsyncClient(transport=transport, base_url='http://qa') as client:
+            jobs = [asyncio.create_task(client.get('/api/qa', headers=signed(A, 'GET', '/api/qa')))
+                    for _ in range(burst_size)]
+            try:
+                deadline = time.monotonic() + 5.0
+                while started(tmp_path) < burst_size and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert started(tmp_path) == burst_size
+                assert not any(job.done() for job in jobs)
+            finally:
+                go.write_text('go')
+            responses = await asyncio.wait_for(asyncio.gather(*jobs), timeout=10.0)
+            assert [r.status_code for r in responses] == [200] * burst_size
+            assert all(r.json() == {'ok': True} for r in responses)
+            assert (await client.get('/api/qa', headers=signed(A, 'GET', '/api/qa'))).status_code == 200
+            assert started(tmp_path) == burst_size + 1
+
+    asyncio.run(run())
+
+
+def test_asgi_saturation_keeps_wire_refusal_throttles_logs_and_accepts_retry(tmp_path, monkeypatch, caplog):
+    import asyncio
+    import httpx
+    from starlette.responses import JSONResponse
+    from agent.app import TenantAssertionMiddleware
+
+    go = tmp_path / 'go'
+    path, _ = gated(tmp_path, go)
+    use(monkeypatch, path)
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    monkeypatch.setattr(ta, 'RUST_TIMEOUT_S', 10.0)
+    downstream_calls = []
+
+    async def downstream(scope, receive, send):
+        assert scope['state']['tenant_asserted'] is True
+        downstream_calls.append(scope['path'])
+        await JSONResponse({'ok': True})(scope, receive, send)
+
+    async def run():
+        transport = httpx.ASGITransport(app=TenantAssertionMiddleware(downstream))
+        async with httpx.AsyncClient(transport=transport, base_url='http://qa') as client:
+            jobs = [asyncio.create_task(client.get('/api/qa', headers=signed(A, 'GET', '/api/qa')))
+                    for _ in range(ta.MAX_CONCURRENT_LEAVES)]
+            retry_headers = signed(A, 'GET', '/api/qa')
+            try:
+                deadline = time.monotonic() + 5.0
+                while started(tmp_path) < ta.MAX_CONCURRENT_LEAVES and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert started(tmp_path) == ta.MAX_CONCURRENT_LEAVES
+                responses = await asyncio.wait_for(asyncio.gather(*[
+                    client.get('/api/qa', headers=retry_headers) for _ in range(150)
+                ]), timeout=5.0)
+                assert all(r.status_code == 401 and r.json() == {'detail': 'invalid tenant assertion'} for r in responses)
+                assert started(tmp_path) == ta.MAX_CONCURRENT_LEAVES
+                assert downstream_calls == []
+                assert ta._nonce_count() == 0
+                warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+                assert len(warnings) == 3, warnings
+                assert all('leaf slots are busy' in message for message in warnings)
+                assert all(KEY not in message and retry_headers[ta.HEADER] not in message for message in warnings)
+            finally:
+                go.write_text('go')
+            admitted = await asyncio.wait_for(asyncio.gather(*jobs), timeout=10.0)
+            assert [r.status_code for r in admitted] == [200] * ta.MAX_CONCURRENT_LEAVES
+            # Saturation did not cache the assertion. Its identical retry succeeds, then replay fails.
+            assert (await client.get('/api/qa', headers=retry_headers)).status_code == 200
+            assert (await client.get('/api/qa', headers=retry_headers)).status_code == 401
+            assert any('tenant assertion rejected: replayed' in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())

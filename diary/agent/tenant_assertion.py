@@ -96,6 +96,8 @@ RUST_TIMEOUT_S = 0.5
 # once (the refusal a bad signature gets), never queued: the leaf now decides every signature, so without a bound a
 # flood of bad ones would spawn without limit (each costs a few ms and lives at most RUST_TIMEOUT_S).
 MAX_CONCURRENT_LEAVES = 4
+# Internal only: the middleware suppresses its redundant warning for this already-throttled refusal.
+BUSY_REFUSAL = "rust busy"
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT_LEAVES)
 _busy_refusals = 0
 _busy_lock = threading.Lock()
@@ -234,7 +236,7 @@ def _busy_refusal() -> str:
     if n == 1 or (n >= 10 and re.fullmatch(r"10*", str(n))):
         _log.warning("tenant-assertion: all %d leaf slots are busy; refusing the request%s", MAX_CONCURRENT_LEAVES,
                      f" ({n} times so far)" if n > 1 else "")
-    return "rust refused"
+    return BUSY_REFUSAL
 
 
 def _rust_decision(payload: dict) -> Optional[str]:

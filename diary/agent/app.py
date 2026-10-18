@@ -350,7 +350,9 @@ class TenantAssertionMiddleware:
                     # cache never refuses a fresh request (#1680).
                     reason = await run_in_threadpool(tenant_assertion.verify, *args, **kwargs)
                     if reason:
-                        log.warning("tenant assertion rejected: %s", reason)
+                        # Busy refusals already have a throttled, input-free warning in the verifier.
+                        if reason != tenant_assertion.BUSY_REFUSAL:
+                            log.warning("tenant assertion rejected: %s", reason)
                         await JSONResponse({"detail": "invalid tenant assertion"}, status_code=401)(scope, receive, send)
                         return
                     scope.setdefault("state", {})["tenant_asserted"] = True
