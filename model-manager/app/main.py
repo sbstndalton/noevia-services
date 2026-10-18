@@ -27,6 +27,9 @@ def _native_owned(path: str) -> bool:
         len(parts) == 6 and parts[:4] == ["", "api", "v1", "backends"] and parts[4] and parts[5] == "logs")
 
 
+_SEARCH_PATHS = frozenset({"/api/v1/search", "/api/v1/search/repo"})
+
+
 def _draft_heads_path(path: str) -> bool:
     parts = path.split("/")
     return len(parts) == 6 and parts[:4] == ["", "api", "v1", "sections"] and parts[4] != "" and parts[5] == "draft-heads"
@@ -112,6 +115,17 @@ async def _require_token(request: Request, call_next):
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_DRAFT_HEADS_CONFIRMED") == "1" and request.method == "GET"
             and _draft_heads_path(request.url.path)):
         return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+    # #1318: the native parent owns GET /api/v1/search and GET /api/v1/search/repo (the Hugging Face
+    # lookups, the ranking rules, the owner avatar cache) and asks this app only for live state: the
+    # GPU budget and the downloaded files (search), the fit chips and the context estimates
+    # (search/repo). Other methods and the slash variants keep FastAPI's 405 and redirect here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_SEARCH_CONFIRMED") == "1":
+        if request.method == "GET" and request.url.path in _SEARCH_PATHS:
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == SEARCH_RUNTIME_PATH:
+            return await _search_runtime(request)
+        if request.url.path == SEARCH_REPO_RUNTIME_PATH:
+            return await _search_repo_runtime(request)
     # #1318: the native parent owns model deletion (the container check and every file removal).
     # Other methods keep FastAPI's 405 here.
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DELETE_CONFIRMED") == "1" and request.method == "POST"
@@ -519,6 +533,81 @@ async def _bench_run_runtime(request: Request):
             capacity = 0.0
         return {"capacity_gb": round(capacity, 2),
                 "predicted": {a: helpers._predicted_vram_gb(a) for a in aliases}}
+    return JSONResponse(await run_in_threadpool(compute))
+
+
+# #1318: the parent's private calls while it answers GET /api/v1/search and /api/v1/search/repo
+# (404 unless it does; the parent never forwards these paths). Only live state is asked of this app:
+# the GPU budget and the downloaded files for the search, and for one repository the fit chips
+# (`services.vram_fit_chips`) and the context estimates (`helpers._preset_estimates_with_reason`,
+# the autoconfig fit math) of the groups the parent listed.
+SEARCH_RUNTIME_PATH = "/api/v1/internal/search-runtime"
+SEARCH_REPO_RUNTIME_PATH = "/api/v1/internal/search-repo-runtime"
+# One repository listing never has more file groups than this (the parent refuses a longer one).
+SEARCH_REPO_MAX_GROUPS = 4096
+
+
+async def _search_runtime(request: Request):
+    """`{"budget": repr(max VRAM GiB over the backends, 0.0 without one), "downloaded":
+    {repo: [file, ...]}, "quantisers": [...], "labs": [...]}`: the `budget` and `have` that
+    `api.search` computes, and the trusted publisher sets of `discover` (which stay defined here).
+    The budget travels as Python's `repr` so a non-finite value survives the JSON."""
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import JSONResponse
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+
+    def compute() -> dict:
+        from . import discover
+        from .helpers import _backend_list, _downloaded_and_still_present
+        budget = max((float(b.get("vram_gb") or 0) for b in _backend_list()), default=0.0)
+        return {"budget": repr(budget), "downloaded": _downloaded_and_still_present(),
+                "quantisers": sorted(discover.TRUSTED_QUANTISERS), "labs": sorted(discover.TRUSTED_LABS)}
+    return JSONResponse(await run_in_threadpool(compute))
+
+
+async def _search_repo_runtime(request: Request):
+    """POST `{"groups": [{"bytes": int, "estimate": bool}], "mmprojBytes": int | null, "summary":
+    dict | null}` answers `{"groups": [{"fit", ["estimates", "reason", "nativeCtx"]}]}`: for each
+    group `services.vram_fit_chips(bytes)` and, when asked and a header summary is given,
+    `_preset_estimates_with_reason(summary, bytes, smallest projector in GiB)` with the model's
+    native context, as `api.search_repo` computes them."""
+    import json as _json
+
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import JSONResponse
+    if request.method != "POST":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    invalid = Response('{"detail":"invalid runtime request"}', status_code=422, media_type="application/json")
+    try:
+        body = _json.loads(await request.body())
+        groups, mm_bytes, summary = body["groups"], body["mmprojBytes"], body["summary"]
+
+        def count(x) -> bool:
+            return isinstance(x, int) and not isinstance(x, bool) and x >= 0
+        if (not isinstance(body, dict) or set(body) != {"groups", "mmprojBytes", "summary"}
+                or not isinstance(groups, list) or len(groups) > SEARCH_REPO_MAX_GROUPS
+                or not all(isinstance(g, dict) and set(g) == {"bytes", "estimate"} and count(g["bytes"])
+                           and isinstance(g["estimate"], bool) for g in groups)
+                or not (mm_bytes is None or count(mm_bytes))
+                or not (summary is None or isinstance(summary, dict))):
+            return invalid
+    except (ValueError, TypeError, KeyError):
+        return invalid
+
+    def compute() -> dict:
+        from . import helpers, services
+        mm_gb = (mm_bytes / 1024 ** 3) if mm_bytes is not None else 0.0
+        out = []
+        for g in groups:
+            item = {"fit": services.vram_fit_chips(g["bytes"])}
+            if summary and g["estimate"]:
+                estimates, reason = helpers._preset_estimates_with_reason(summary, g["bytes"], mm_gb)
+                item["estimates"] = estimates
+                item["reason"] = reason
+                item["nativeCtx"] = (summary.get("model") or {}).get("context_length") or 0
+            out.append(item)
+        return {"groups": out}
     return JSONResponse(await run_in_threadpool(compute))
 
 

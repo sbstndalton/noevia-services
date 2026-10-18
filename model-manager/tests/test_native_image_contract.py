@@ -102,6 +102,11 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     for selector in ("MODEL_MANAGER_MODELS_IMPL", "MODEL_MANAGER_OVERVIEW_IMPL"):
         assert f"ENV {selector}=python" in source
         assert not re.search(rf"^ENV .*{selector}=rust", source, re.M)
+    # #1318 slice 14: the native search is compiled in and advertised, and defaults to python.
+    assert "noevia-model-manager/native-search" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-search >/dev/null" in source
+    assert "ENV MODEL_MANAGER_SEARCH_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_SEARCH_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):
@@ -118,3 +123,16 @@ def test_services_share_a_verified_rust_source_pin():
         assert 'echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c -' in source
         pins.append((ref[0], digest[0]))
     assert len(set(pins)) == 1
+
+
+def test_the_runtime_image_carries_the_unicode_database_the_native_search_follows():
+    # The native search judges names by Python's Unicode-aware patterns and follows the 15.0
+    # database (noevia-rs: `PYTHON_UNICODE`, with the list of later characters it refuses). That
+    # holds for every 3.12 release, which is what the runtime image is: a base image on another
+    # line, or a test interpreter on another database, fails here, not in a user's search.
+    import unicodedata
+
+    source = (ROOT / "model-manager" / "Dockerfile").read_text()
+    runtime = re.findall(r"^FROM (\S+) AS runtime$", source, re.M)
+    assert len(runtime) == 1 and re.match(r"python:3\.12(\.\d+)?-", runtime[0]), runtime
+    assert unicodedata.unidata_version == "15.0.0"
