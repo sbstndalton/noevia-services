@@ -149,7 +149,7 @@ def runtime_stubs(monkeypatch, client):
 
 def test_repo_runtime_answers_chips_estimates_and_native_context(runtime_stubs):
     client = runtime_stubs
-    summary = {"model": {"context_length": 8192}, "architecture": "llama"}
+    summary = {"model": {"context_length": 8192}, "architecture": "testarch"}
     body = {"groups": [{"bytes": 5 * GIB, "estimate": True}, {"bytes": 7, "estimate": False},
                        {"bytes": 3, "estimate": True}], "mmprojBytes": GIB // 2, "summary": summary}
     answer = client.post(REPO_RUNTIME, headers=auth(), json=body)
