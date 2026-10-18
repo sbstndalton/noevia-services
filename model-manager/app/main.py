@@ -90,6 +90,14 @@ async def _require_token(request: Request, call_next):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
         if request.url.path == BENCH_JOB_PATH:
             return await _bench_job_call(request)
+    # #1318 step 3d: the parent asks, before it ingests the backend logs itself, whether this child
+    # carries the telemetry guard (telemetry.ingest and the record_* writers refuse under the
+    # confirmation). A child without it answers 404, and the parent then keeps Python ownership.
+    if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED") == "1"
+            and request.url.path == TELEMETRY_GUARD_PATH):
+        if request.method != "GET":
+            return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+        return Response('{"telemetry_guard":1}', status_code=200, media_type="application/json")
     # #1318: the native parent owns the benchmark job slot (prompt runs, sweeps, the startup
     # cleanup of leftover sweep containers). It asks this app only for the per-request
     # observations that need the GPU sampler and the backend logs, which live here.
@@ -449,6 +457,9 @@ async def _safe_defaults_plan(request: Request):
 # #1318: the parent's private call for the benchmark runner's live state (`job` in GET /benchmark);
 # 404 unless the native parent owns that read. The parent never forwards this path.
 BENCH_JOB_PATH = "/api/v1/internal/bench-job"
+
+# #1318 step 3d: the telemetry guard advertisement (see the middleware); 404 unless confirmed.
+TELEMETRY_GUARD_PATH = "/api/v1/internal/telemetry-guard"
 
 
 async def _bench_job_call(request: Request):

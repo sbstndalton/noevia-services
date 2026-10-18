@@ -6,8 +6,11 @@ name and figure is synthetic; no Docker daemon is touched.
 import sqlite3
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app import db, services, telemetry
+from app.config import settings
+from app.main import app
 
 ENV = "NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED"
 LOG = (
@@ -75,3 +78,27 @@ def test_confirmed_child_never_reads_a_log_nor_writes(docker, monkeypatch):
     assert docker == [] and held() == (0, 0, 0)
     # The readers keep working over whatever the native parent stored.
     assert telemetry.stats_for(model_path="/models/syn/a.gguf", alias="syn-a").n == 0
+
+
+GUARD = "/api/v1/internal/telemetry-guard"
+TOKEN = "synthetic-telemetry-guard-token"
+
+
+@pytest.fixture()
+def client(monkeypatch):
+    monkeypatch.setattr(settings, "model_loader_token", TOKEN)
+    monkeypatch.delenv(ENV, raising=False)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_the_guard_is_advertised_only_under_the_exact_confirmation(client, monkeypatch):
+    auth = {"x-model-loader-token": TOKEN}
+    # Unconfirmed (or a child without the guard): no such route, so the parent keeps Python's ingest.
+    assert client.get(GUARD, headers=auth).status_code == 404
+    monkeypatch.setenv(ENV, "true")
+    assert client.get(GUARD, headers=auth).status_code == 404
+    monkeypatch.setenv(ENV, "1")
+    assert client.get(GUARD).status_code == 401
+    answer = client.get(GUARD, headers=auth)
+    assert answer.status_code == 200 and answer.content == b'{"telemetry_guard":1}'
+    assert client.post(GUARD, headers=auth).status_code == 405
