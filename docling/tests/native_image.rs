@@ -348,9 +348,9 @@ mod tests {
     }
     #[test]
     fn all_four_immutable_runtime_pins_match() {
-        let expected_ref = "ARG NOEVIA_RS_REF=23dd7db08a5869a4d5292a2c211a000e128ecb22";
+        let expected_ref = "ARG NOEVIA_RS_REF=b4c855edbb16a2653063b5a3c1d2878862e9e7fd";
         let expected_hash =
-            "ARG NOEVIA_RS_SHA256=128b88f96a14ff4e9d32fe5839d0c6969c29ce1ed70b2bd6b522294b9f8f429c";
+            "ARG NOEVIA_RS_SHA256=16be1e5a3be2a50e7e09664c56594aa0fbf182226c973909ccfda5fb8ff63e5b";
         let valid = |docker: &str| {
             docker.lines().any(|l| l == expected_ref)
                 && docker.lines().any(|l| l == expected_hash)
