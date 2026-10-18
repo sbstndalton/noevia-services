@@ -565,8 +565,8 @@ def stats_for(name: str) -> BackendStats:
 def backends_native() -> bool:
     """#1318: the native parent samples the backends (Docker discovery, container stats, sysfs) and
     pushes the results here (`load_pushed`), so this app's consumers (fit chips, autoconfig, the
-    benchmark observer) read the same cache; GPU probes that need `docker exec` still run here, on
-    the parent's request (`exec_probe`)."""
+    benchmark observer) read the same cache. GPU reads that need `docker exec` are not made for it
+    (noevia#1318 step 2 dropped them natively)."""
     return os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKENDS_CONFIRMED") == "1"
 
 
@@ -631,29 +631,6 @@ def start_sampler() -> None:
     _sampler_started = True
     t = threading.Thread(target=_sample_loop, daemon=True, name="hw-sampler")
     t.start()
-
-
-_PROBES = {"nvidia", "amd", "amd-nvidia"}
-
-
-def exec_probe(name: str, probe: str) -> GpuStats | None:
-    """#1318: the GPU reads that need `docker exec` (nvidia-smi, rocm-smi), for the native sampler:
-    `nvidia` is `_read_nvidia`, `amd` is `_read_amd`, `amd-nvidia` is the Vulkan fallback
-    `_read_amd(...) or _read_nvidia(...)`. None where `_collect` would get no reading."""
-    if probe not in _PROBES:
-        raise ValueError(probe)
-    client = _client()
-    if client is None:
-        return None
-    try:
-        c = client.containers.get(name)
-    except DockerException:
-        return None
-    if probe == "nvidia":
-        return _read_nvidia(c)
-    if probe == "amd":
-        return _read_amd(c, name)
-    return _read_amd(c, name) or _read_nvidia(c)
 
 
 def _strict(cls, data: dict, nested: dict | None = None):
