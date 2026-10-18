@@ -1,5 +1,6 @@
-"""TENANT_ASSERTION_IMPL switch: python stays the default and never spawns anything; rust is
-AND-composed with Python and fails closed on every fault; the key reaches the child on stdin only.
+"""The Rust leaf is the only signature check (TENANT_ASSERTION_IMPL, retired in #1071): every fault is a refusal, the
+key reaches the child on stdin only, and the cheap checks that need no secret (the header shape, the restart guard) and
+the nonce cache stay in Python and never reach, or follow, a refused request.
 
 Fake `tenant-assertion` binaries stand in for the Rust leaf here; the real binary is exercised by
 test_tenant_assertion_differential.py when TENANT_ASSERTION_BIN is set. Synthetic keys only."""
@@ -23,7 +24,7 @@ SECRET = 'synthetic-storage-secret'
 def clean(monkeypatch):
     ta._reset_for_tests()
     ta._logged.clear()
-    for k in ('TENANT_ASSERTION_IMPL', 'TENANT_ASSERTION_BIN'):
+    for k in ('TENANT_ASSERTION_IMPL', 'TENANT_ASSERTION_BIN', 'DIARY_TENANT_KEY'):
         monkeypatch.delenv(k, raising=False)
     yield
     ta._reset_for_tests()
@@ -48,7 +49,6 @@ REJECT = 'sys.stdout.write("reject: bad signature\\n"); sys.exit(1)\n'
 
 
 def use(monkeypatch, path):
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'rust')
     monkeypatch.setenv('TENANT_ASSERTION_BIN', str(path))
 
 
@@ -56,31 +56,47 @@ def verify(h, path='/api/day', method='GET', **kw):
     return ta.verify(KEY, h, method, path, **kw)
 
 
-def test_default_is_python_and_never_spawns(monkeypatch):
-    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('spawned under python'))
-    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned under python'))
-    assert ta.impl_choice() == 'python'
-    assert verify(signed(A, 'GET', '/api/day')) is None
-    assert ta.secret_ref_matches(KEY, A, SECRET, ta.storage_secret_ref(KEY, A, SECRET))
+def test_the_selector_is_gone_and_a_leftover_setting_warns_once_at_start(monkeypatch, caplog):
+    assert not hasattr(ta, 'impl_choice') and not hasattr(ta, 'IMPLS')
+    for value in (None, '', ' RUST ', 'rust'):
+        if value is None:
+            monkeypatch.delenv('TENANT_ASSERTION_IMPL', raising=False)
+        else:
+            monkeypatch.setenv('TENANT_ASSERTION_IMPL', value)
+        with caplog.at_level(logging.WARNING, logger=ta.__name__):
+            ta.startup_checks()
+        assert not caplog.records, value
+    for value in ('python', 'fortran', ' Python '):
+        monkeypatch.setenv('TENANT_ASSERTION_IMPL', value)
+        caplog.clear()
+        ta._logged.clear()
+        with caplog.at_level(logging.WARNING, logger=ta.__name__):
+            for _ in range(3):
+                ta.startup_checks()
+        assert [r.getMessage() for r in caplog.records] == [f"TENANT_ASSERTION_IMPL={value.strip().lower()!r} is retired; Rust is always used"], value
 
 
-def test_unknown_value_is_python_with_one_warning(monkeypatch, caplog):
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'fortran')
-    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned for an unknown value'))
+def test_a_tenant_key_without_a_usable_binary_is_an_error_at_start(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv('TENANT_ASSERTION_BIN', str(tmp_path / 'absent'))
+    monkeypatch.setattr(ta, 'DEFAULT_BIN', str(tmp_path / 'absent-default'))
     with caplog.at_level(logging.WARNING, logger=ta.__name__):
-        for _ in range(3):
-            assert ta.impl_choice() == 'python'
-        assert verify(signed(A, 'GET', '/api/day')) is None
-    assert sum('TENANT_ASSERTION_IMPL' in r.getMessage() for r in caplog.records) == 1
+        ta.startup_checks()
+        assert not [r for r in caplog.records if 'not usable' in r.getMessage()], 'no key set: nothing to say'
+        monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+        ta.startup_checks()
+        ta.startup_checks()
+    messages = [r.getMessage() for r in caplog.records if 'not usable' in r.getMessage()]
+    assert len(messages) == 1 and KEY not in messages[0]
+    path, _ = fake(tmp_path, ACCEPT)
+    use(monkeypatch, path)
+    ta._logged.clear()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=ta.__name__):
+        ta.startup_checks()
+    assert not caplog.records
 
 
-@pytest.mark.parametrize('value', ['rust', ' RUST ', 'Rust'])
-def test_rust_values_select_rust(monkeypatch, value):
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', value)
-    assert ta.impl_choice() == 'rust'
-
-
-def test_rust_accept_and_python_accept_accepts_once(tmp_path, monkeypatch):
+def test_rust_accept_accepts_once(tmp_path, monkeypatch):
     path, record = fake(tmp_path, ACCEPT)
     use(monkeypatch, path)
     h = signed(A, 'POST', '/api/file', {'Content-Type': 'application/json'}, query=b'x=1', body=b'{}')
@@ -256,14 +272,44 @@ def test_slow_rust_check_does_not_block_the_event_loop(volume, tmp_path, monkeyp
     assert slow_code == 200
 
 
-def test_python_refusal_never_consults_rust(tmp_path, monkeypatch):
+def test_cheap_refusals_never_consult_rust(tmp_path, monkeypatch):
+    """No tenant, a malformed or missing assertion and one signed before this process started are refused
+    without spawning the child; what only the secret can tell (a bad signature, the clock window) is the leaf's."""
     path, record = fake(tmp_path, ACCEPT)
     use(monkeypatch, path)
     h = signed(A, 'GET', '/api/day')
-    assert verify({**h, 'X-Cowork-User-ID': B}) == 'bad signature'
-    assert verify(h, now=0.0) == 'outside clock window'
-    assert not ta.secret_ref_matches(KEY, A, SECRET, 'a' * 32)
+    assert verify({k: v for k, v in h.items() if k != 'X-Cowork-User-ID'}) == 'missing tenant'
+    assert verify({**h, ta.HEADER: 'v2.1.2.3'}) == 'missing or malformed assertion'
+    assert verify({**h, ta.HEADER: h[ta.HEADER] + ' '}) == 'missing or malformed assertion'
+    assert verify({k: v for k, v in h.items() if k != ta.HEADER}) == 'missing or malformed assertion'
+    ta._reset_for_tests(started_at=time.time() + 3600)
+    assert verify(h) == 'signed before this process started'
     assert not record.exists()
+    # The same shape reaches the leaf, whose answer is final: a wrong tenant or a stale clock is its refusal.
+    ta._reset_for_tests()
+    path, record = fake(tmp_path, REJECT, name='reject-bin')
+    use(monkeypatch, path)
+    assert verify({**h, 'X-Cowork-User-ID': B}) == 'rust refused'
+    assert verify(h, now=0.0) == 'rust refused'
+    assert not ta.secret_ref_matches(KEY, A, SECRET, 'a' * 32)
+    assert record.exists()
+
+
+def test_the_restart_guard_and_the_nonce_cache_still_run_after_the_leaf_accepts(tmp_path, monkeypatch):
+    """The leaf is stateless and knows nothing of the process start: it accepts a replay and an assertion signed
+    before this process started, and the Python guard and cache refuse them."""
+    path, record = fake(tmp_path, ACCEPT)
+    use(monkeypatch, path)
+    h = signed(A, 'GET', '/api/day')
+    assert verify(h) is None
+    assert verify(h) == 'replayed'
+    old = signed(A, 'GET', '/api/day', ts=int(time.time()) - 30)
+    ta._reset_for_tests(started_at=time.time())
+    assert verify(old) == 'signed before this process started'
+    ta._reset_for_tests()
+    assert verify(old) is None
+    assert verify(old) == 'replayed'
+    assert verify(signed(A, 'GET', '/api/day')) is None
 
 
 def test_rust_refusal_does_not_reach_the_nonce_cache(tmp_path, monkeypatch):
@@ -288,12 +334,14 @@ def test_no_secret_in_logs_on_any_failure(tmp_path, monkeypatch, caplog):
     assert text and KEY not in text and SECRET not in text
 
 
-def test_middleware_fails_closed_under_rust(keyed, tmp_path, monkeypatch):  # noqa: F811
-    monkeypatch.setenv('TENANT_ASSERTION_IMPL', 'rust')
+def test_middleware_fails_closed_without_the_leaf_and_keeps_the_guards_with_it(keyed, tmp_path, monkeypatch):  # noqa: F811
     monkeypatch.setenv('TENANT_ASSERTION_BIN', str(tmp_path / 'absent'))
     assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 401
     path, _ = fake(tmp_path, ACCEPT)
     monkeypatch.setenv('TENANT_ASSERTION_BIN', str(path))
     assert keyed.get('/api/storage-status', headers=signed(B, 'GET', '/api/storage-status')).status_code == 200
-    # Rust accepting can never rescue what Python refuses.
-    assert keyed.get('/api/storage-status', headers={**signed(B, 'GET', '/api/storage-status'), 'X-Cowork-User-ID': A}).status_code == 401
+    # An accepting leaf cannot rescue what needs no secret to refuse: a malformed assertion, a replay.
+    h = signed(B, 'GET', '/api/storage-status')
+    assert keyed.get('/api/storage-status', headers={**h, ta.HEADER: 'v2.garbage'}).status_code == 401
+    assert keyed.get('/api/storage-status', headers=h).status_code == 200
+    assert keyed.get('/api/storage-status', headers=h).status_code == 401

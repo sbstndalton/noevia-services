@@ -24,10 +24,11 @@ sha256 of its exact body bytes (empty body: sha256 of ""). Any other media type
 covered: in-flight tampering of such bodies is out of scope (see
 docs/spec-managed-diary.md). A JSON call can never be signed as "stream".
 
-Checks: constant-time signature compare, |now - ts| <= SKEW_S, ts not before process start - RESTART_SKEW_S (the cache is
-memory-only; this closes the post-restart replay window), and each nonce
-accepted once while its timestamp is inside the window (in-process cache; the
-sidecar runs one uvicorn worker). The cache is bucketed by the SIGNED timestamp
+Checks: the signature (constant-time), |now - ts| <= SKEW_S and the bounds on every field are the Rust leaf's
+(`tenant-assertion check`, below). This module keeps what the leaf cannot know: the shape of the header (its
+timestamp and nonce feed the next two checks), ts not before process start - RESTART_SKEW_S (the cache is
+memory-only; this closes the post-restart replay window), and each nonce accepted once while its timestamp is
+inside the window (in-process cache; the sidecar runs one uvicorn worker). The cache is bucketed by the SIGNED timestamp
 and bounded (_nonce_cap). A bucket leaves the cache when its second is outside
 the clock window, or, when the cache is full, the second farthest from now first (#1680: the
 old cache refused every new request with 503 above ~833 signed req/s). Either
@@ -40,15 +41,15 @@ overload the floor only shortens how late a signed request may arrive. The key
 is read per call so an operator change takes effect on restart and tests can
 patch the environment.
 
-TENANT_ASSERTION_IMPL=rust additionally runs the same check in the bounded Rust leaf from
-sbstndalton/noevia-rs (`tenant-assertion check`, built into the image at the Dockerfile's pinned
-NOEVIA_RS_REF). It is AND-composed and FAILS CLOSED: a request is accepted only when Python
-accepts AND Rust accepts; a Rust refusal, a missing binary, a nonzero exit, a timeout or any
-unexpected output rejects it. The default is python (no subprocess); any other value is python
-with one warning. The key, the headers and the secret travel to the child on stdin only, with a
-minimal environment; reasons and logs carry codes only. The shared differential fixtures
-(tests/fixtures/tenant-assertion.v1.json, generated in noevia-rs from this module) are the
-contract between the two.
+The signature, clock window and bounds are checked by the bounded Rust leaf from sbstndalton/noevia-rs
+(`tenant-assertion check`, built into the image at the Dockerfile's pinned NOEVIA_RS_REF) and by nothing else:
+since #1071 there is no Python copy of those rules and no TENANT_ASSERTION_IMPL switch (it is retired: `rust`
+and empty are silent, any other value gets one warning at start). It FAILS CLOSED: a request is accepted only when
+the leaf accepts; a refusal, a missing binary, a nonzero exit, a timeout or any unexpected output rejects it, and
+none of those is ever cached or remembered as accepted. The key, the headers and the secret travel to the child on
+stdin only, with a minimal environment; reasons and logs carry codes only. The shared differential fixtures
+(tests/fixtures/tenant-assertion.v1.json, generated in noevia-rs from the former Python module) and the frozen
+Python answers (tests/fixtures/tenant-assertion-py.v1.json) are the contract between the two.
 """
 from __future__ import annotations
 
@@ -90,7 +91,6 @@ _started_at: Optional[float] = time.time()
 _seen_lock = threading.Lock()
 
 
-IMPLS = ("python", "rust")
 RUST_TIMEOUT_S = 0.5
 DEFAULT_BIN = "/usr/local/bin/tenant-assertion"
 _RUST_STDOUT_CAP = 256
@@ -192,14 +192,15 @@ def _log_once(key: str, message: str) -> None:
     _log.warning(message)
 
 
-def impl_choice() -> str:
-    """The configured implementation: "python" (default) or "rust". Anything else is python."""
-    value = (os.environ.get("TENANT_ASSERTION_IMPL") or "python").strip().lower() or "python"
-    if value not in IMPLS:
-        # The value is an operator setting, never a secret; still, log only its length-bounded repr.
-        _log_once("invalid_setting", f"TENANT_ASSERTION_IMPL={value[:32]!r} is not one of {', '.join(IMPLS)}; using python")
-        return "python"
-    return value
+def startup_checks() -> None:
+    """Called once when the service starts: a leftover TENANT_ASSERTION_IMPL other than `rust` is ignored with one
+    warning (the Rust leaf is always used), and a tenant key with no usable binary is an error in the log (every
+    tenant request is refused until the binary is there)."""
+    value = (os.environ.get("TENANT_ASSERTION_IMPL") or "").strip().lower()
+    if value not in ("", "rust"):
+        _log_once("retired_setting", f"TENANT_ASSERTION_IMPL={value[:32]!r} is retired; Rust is always used")
+    if tenant_key() and _rust_binary() is None:
+        _log_once("rust:missing_binary_at_start", "DIARY_TENANT_KEY is set but the tenant-assertion binary is not usable; refusing every tenant request")
 
 
 def _rust_binary() -> Optional[str]:
@@ -302,7 +303,9 @@ def _rust_decision(payload: dict) -> Optional[str]:
 
 def _check(key: str, headers: Mapping[str, str], method: str, path: str, now: float, query: bytes,
            body_hash: Optional[str]) -> Optional[str]:
-    """Python's stateless decision: None when the assertion is valid, else a reason."""
+    """None when the assertion passes everything that needs no cache, else a reason. The shape and the
+    restart guard are this module's (they are cheap and need no secret, so they come before the child is
+    spawned); the signature, the clock window and the bounds are the Rust leaf's alone."""
     user_id = headers.get("X-Cowork-User-ID", "")
     raw = headers.get(HEADER, "")
     if not user_id:
@@ -310,15 +313,14 @@ def _check(key: str, headers: Mapping[str, str], method: str, path: str, now: fl
     match = _ASSERTION_RE.fullmatch(raw or "")
     if not match:
         return "missing or malformed assertion"
-    ts, nonce, _ = int(match.group(1)), match.group(2), match.group(3)
-    expected = sign(key, user_id, method, path, headers, ts, nonce, query, body_hash)
-    if not hmac.compare_digest(expected.encode(), raw.encode()):
-        return "bad signature"
-    if abs(now - ts) > SKEW_S:
-        return "outside clock window"
+    ts = int(match.group(1))
     if _started_at is not None and ts < int(_started_at) - RESTART_SKEW_S:
         return "signed before this process started"
-    return None
+    return _rust_decision({
+        "op": "verify", "key": key, "user_id": user_id, "assertion": raw, "method": method, "path": path,
+        "query_hex": bytes(query).hex(), "body_hash": sha256_hex(b"") if body_hash is None else body_hash,
+        "storage": headers.get("X-Cowork-Storage", ""), "legacy_owner": headers.get("X-Cowork-Legacy-Owner", ""),
+        "blocked": headers.get("X-Cowork-Storage-Blocked", ""), "now": repr(float(now))})
 
 
 def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Optional[float] = None,
@@ -327,21 +329,13 @@ def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Op
 
     `path` is the encoded wire path, `query` the raw query string, `body_hash`
     sha256 hex of the body or STREAM (see module doc). Reasons are for logs
-    only; callers answer every failure the same way.
-    Under TENANT_ASSERTION_IMPL=rust the Rust check must accept as well (module doc)."""
+    only; callers answer every failure the same way. The Rust leaf must accept
+    (module doc), then the nonce cache runs: a nonce is remembered only for an
+    assertion everything else accepted. Spawns a child: call from a thread."""
     now = time.time() if now is None else now
     reason = _check(key, headers, method, path, now, query, body_hash)
     if reason:
         return reason
-    if impl_choice() == "rust":
-        reason = _rust_decision({
-            "op": "verify", "key": key, "user_id": headers.get("X-Cowork-User-ID", ""),
-            "assertion": headers.get(HEADER, ""), "method": method, "path": path,
-            "query_hex": bytes(query).hex(), "body_hash": sha256_hex(b"") if body_hash is None else body_hash,
-            "storage": headers.get("X-Cowork-Storage", ""), "legacy_owner": headers.get("X-Cowork-Legacy-Owner", ""),
-            "blocked": headers.get("X-Cowork-Storage-Blocked", ""), "now": repr(float(now))})
-        if reason:
-            return reason
     match = _ASSERTION_RE.fullmatch(headers.get(HEADER, "") or "")
     return _remember_nonce(match.group(2), int(match.group(1)), now)
 
@@ -361,13 +355,9 @@ def storage_secret_ref(key: str, user_id: str, secret: str) -> str:
 
 
 def secret_ref_matches(key: str, user_id: str, secret: str, ref: str) -> bool:
-    """app.py's secretRef check: `ref` equals storage_secret_ref (constant time). Under
-    TENANT_ASSERTION_IMPL=rust the Rust check must agree as well; any fault is a mismatch."""
-    if not hmac.compare_digest(ref, storage_secret_ref(key, user_id, secret)):
-        return False
-    if impl_choice() == "rust":
-        return _rust_decision({"op": "secret_ref", "key": key, "user_id": user_id, "secret": secret, "ref": ref}) is None
-    return True
+    """app.py's secretRef check: `ref` equals the derivation (storage_secret_ref), decided by the Rust leaf
+    alone; any fault is a mismatch (a non-ASCII `ref` is a mismatch too, not an error)."""
+    return _rust_decision({"op": "secret_ref", "key": key, "user_id": user_id, "secret": secret, "ref": ref}) is None
 
 
 def _reset_for_tests(started_at: Optional[float] = None) -> None:

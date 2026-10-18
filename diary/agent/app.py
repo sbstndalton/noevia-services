@@ -346,12 +346,9 @@ class TenantAssertionMiddleware:
                         body_hash, downstream_receive = tenant_assertion.STREAM, receive
                     args = (key, headers, scope.get("method", "GET"), tenant_assertion.wire_path(scope))
                     kwargs = {"query": scope.get("query_string", b""), "body_hash": body_hash}
-                    if tenant_assertion.impl_choice() == "rust":
-                        # The Rust check spawns a child; keep the event loop free (#1144).
-                        reason = await run_in_threadpool(tenant_assertion.verify, *args, **kwargs)
-                    else:
-                        # The bounded replay cache never refuses a fresh request (#1680).
-                        reason = tenant_assertion.verify(*args, **kwargs)
+                    # The Rust check spawns a child; keep the event loop free (#1144). The bounded replay
+                    # cache never refuses a fresh request (#1680).
+                    reason = await run_in_threadpool(tenant_assertion.verify, *args, **kwargs)
                     if reason:
                         log.warning("tenant assertion rejected: %s", reason)
                         await JSONResponse({"detail": "invalid tenant assertion"}, status_code=401)(scope, receive, send)
@@ -636,6 +633,7 @@ def _start_embedding() -> None:
 async def lifespan(_app: FastAPI):
     st = get_state()
     enforce_open_mode_policy(st.auth_token)
+    tenant_assertion.startup_checks()
     # Replay is tenant-scoped in _tenant_state. Never replay the retired global
     # corpus after a tenant has explicitly moved into app storage.
     # #1636: a re-index configured at start (LLM_EMBED_NEXT_*, or saved) resumes in the background,

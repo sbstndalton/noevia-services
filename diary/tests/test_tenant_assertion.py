@@ -14,6 +14,10 @@ from starlette.requests import Request
 import agent.app as appmod
 from agent import tenant_assertion as ta
 from tests.test_dedicated_storage import volume, A, B  # noqa: F401
+from tests.tenant_binary import needs_binary
+
+# Since #1071 the signature, the clock window and the bounds are the Rust leaf's alone (reason: rust refused).
+pytestmark = needs_binary
 
 KEY = 'synthetic-tenant-key-for-tests'
 C = '33333333-3333-4333-8333-333333333333'  # deleted by one test; the tombstone is process-wide
@@ -74,16 +78,16 @@ def test_tampered_or_missing_assertion_is_refused(mutate):
 
 def test_assertion_is_bound_to_method_path_and_key():
     h = signed(A, 'GET', '/api/day')
-    assert ta.verify(KEY, h, 'DELETE', '/api/day') == 'bad signature'
-    assert ta.verify(KEY, h, 'GET', '/api/internal/tenant') == 'bad signature'
-    assert ta.verify('another-key', h, 'GET', '/api/day') == 'bad signature'
+    assert ta.verify(KEY, h, 'DELETE', '/api/day') == 'rust refused'
+    assert ta.verify(KEY, h, 'GET', '/api/internal/tenant') == 'rust refused'
+    assert ta.verify('another-key', h, 'GET', '/api/day') == 'rust refused'
 
 
 def test_assertion_is_bound_to_query_and_body():
     h = signed(A, 'POST', '/api/file', query=b'path=a', body=b'{"path":"a"}')
-    assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=b', body_hash=ta.sha256_hex(b'{"path":"a"}')) == 'bad signature'
-    assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=a', body_hash=ta.sha256_hex(b'{"path":"b"}')) == 'bad signature'
-    assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=a', body_hash=ta.STREAM) == 'bad signature'
+    assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=b', body_hash=ta.sha256_hex(b'{"path":"a"}')) == 'rust refused'
+    assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=a', body_hash=ta.sha256_hex(b'{"path":"b"}')) == 'rust refused'
+    assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=a', body_hash=ta.STREAM) == 'rust refused'
     assert ta.verify(KEY, h, 'POST', '/api/file', query=b'path=a', body_hash=ta.sha256_hex(b'{"path":"a"}')) is None
 
 
@@ -144,14 +148,14 @@ def test_path_is_signed_percent_encoded_as_on_the_wire():
     assert ta.wire_path({'path': '/api/a b', 'raw_path': b'/api/a%20b'}) == '/api/a%20b'
     assert ta.wire_path({'path': '/api/x'}) == '/api/x'
     h = signed(A, 'GET', '/api/a%20b')
-    assert ta.verify(KEY, h, 'GET', '/api/a b') == 'bad signature'
+    assert ta.verify(KEY, h, 'GET', '/api/a b') == 'rust refused'
     assert ta.verify(KEY, h, 'GET', ta.wire_path({'path': '/api/a b', 'raw_path': b'/api/a%20b'})) is None
 
 
 def test_clock_skew_window():
     now = time.time()
-    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) - ta.SKEW_S - 5), 'GET', '/x', now=now) == 'outside clock window'
-    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + ta.SKEW_S + 5), 'GET', '/x', now=now) == 'outside clock window'
+    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) - ta.SKEW_S - 5), 'GET', '/x', now=now) == 'rust refused'
+    assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + ta.SKEW_S + 5), 'GET', '/x', now=now) == 'rust refused'
     assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) - ta.SKEW_S + 5), 'GET', '/x', now=now) is None
 
 
