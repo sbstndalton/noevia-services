@@ -160,6 +160,18 @@ async def _require_token(request: Request, call_next):
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
         if request.url.path == MODEL_DETAIL_RUNTIME_PATH:
             return await _model_detail_runtime(request)
+    # #1318: the native parent reads the models list and the overview itself and asks this app only
+    # for their live fields. Each read has its own switch; other methods keep FastAPI's 405 here.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODELS_CONFIRMED") == "1":
+        if request.method == "GET" and request.url.path == "/api/v1/models":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == MODELS_RUNTIME_PATH:
+            return await _models_runtime(request)
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_OVERVIEW_CONFIRMED") == "1":
+        if request.method == "GET" and request.url.path == "/api/v1/overview":
+            return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
+        if request.url.path == OVERVIEW_RUNTIME_PATH:
+            return await _overview_runtime(request)
     return await call_next(request)
 
 
@@ -183,6 +195,62 @@ async def _model_detail_runtime(request: Request):
     from . import api, services
     loaded = await api._loaded_map()
     return JSONResponse({"loaded": loaded, "fit": services.vram_fit_chips(int(size)) if fit == "1" else []})
+
+
+# #1318: the parent's private calls for the live fields of GET /api/v1/models and
+# GET /api/v1/overview (404 unless the parent owns that read; it never forwards these paths).
+MODELS_RUNTIME_PATH = "/api/v1/internal/models-runtime"
+OVERVIEW_RUNTIME_PATH = "/api/v1/internal/overview-runtime"
+_MODELS_RUNTIME_LIMIT = 4096  # the parent lists at most this many models
+_MODELS_RUNTIME_BODY = 256 * 1024
+
+
+def _route_render(body: dict):
+    """What a `-> dict` route answers: pydantic's JSON mode (a non-finite float becomes null), then
+    the JSON response class. The parent places these values verbatim into the route's answer."""
+    from fastapi.responses import JSONResponse
+    from pydantic import TypeAdapter
+    return JSONResponse(TypeAdapter(dict).dump_python(body, mode="json"))
+
+
+async def _models_runtime(request: Request):
+    """POST {"bytes": [total per listed model]} -> {"loaded": api._loaded_map(),
+    "fit": [services.vram_fit_chips(b) for b in bytes]}: `loadedOn` is `loaded[modelId]` and each
+    `fit` the chips `api._entry` places for that model, in the order the parent listed them."""
+    import json as _json
+    if request.method != "POST":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    raw = await request.body()
+    try:
+        if len(raw) > _MODELS_RUNTIME_BODY:
+            raise ValueError("body")
+        body = _json.loads(raw)
+        if not isinstance(body, dict) or set(body) != {"bytes"} or not isinstance(body["bytes"], list):
+            raise ValueError("body")
+        sizes = body["bytes"]
+        # At most 39 digits (any 128-bit total), so a hostile value never becomes a huge int.
+        if len(sizes) > _MODELS_RUNTIME_LIMIT or not all(
+                type(b) is int and 0 <= b < 10 ** 39 for b in sizes):
+            raise ValueError("bytes")
+    except ValueError:  # also a JSON number past the integer digit limit
+        return Response('{"detail":"invalid runtime body"}', status_code=422, media_type="application/json")
+    from . import api, services
+    loaded = await api._loaded_map()
+    return _route_render({"loaded": loaded, "fit": [services.vram_fit_chips(b) for b in sizes]})
+
+
+async def _overview_runtime(request: Request):
+    """GET -> {"backends": [...], "activeDownloads": n}, exactly as `api.overview` computes them
+    (the backend snapshot, and the queued or downloading jobs of this app's download table)."""
+    if request.method != "GET":
+        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
+    from . import api, services
+    from .downloader import manager
+    backends = await services.snapshot_llama_backends()
+    return _route_render({
+        "backends": [api._plain(b) for b in backends],
+        "activeDownloads": sum(1 for j in manager.snapshot() if j.status in ("queued", "downloading")),
+    })
 
 
 # #1318: the parent's private calls while it samples the backends (404 unless it does).
