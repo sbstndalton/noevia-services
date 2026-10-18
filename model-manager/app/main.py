@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
-import string
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -169,15 +167,13 @@ async def _require_token(request: Request, call_next):
         if request.url.path == BENCH_RUN_RUNTIME_PATH:
             return await _bench_run_runtime(request)
     # #1318: the native parent samples the backends and answers GET /api/v1/backends; it pushes its
-    # samples here for this app's other readers and asks this app only for the GPU reads that
-    # need `docker exec`. Other methods keep FastAPI's 405 here.
+    # samples here for this app's other readers. It no longer asks for GPU reads (step 2: the
+    # vendor-tool reads are dropped). Other methods keep FastAPI's 405 here.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_BACKENDS_CONFIRMED") == "1":
         if request.method == "GET" and request.url.path == "/api/v1/backends":
             return Response('{"detail":"Native model manager owns this endpoint"}', status_code=503, media_type="application/json")
         if request.url.path == BACKEND_STATS_PATH:
             return await _backend_stats(request)
-        if request.url.path == GPU_EXEC_PROBE_PATH:
-            return await _gpu_exec_probe(request)
     # #1318: the native parent owns this read and asks this app only for its live fields.
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_MODEL_DETAIL_CONFIRMED") == "1":
         if request.method == "GET" and request.url.path == "/api/v1/models/detail":
@@ -277,13 +273,11 @@ async def _overview_runtime(request: Request):
     })
 
 
-# #1318: the parent's private calls while it samples the backends (404 unless it does).
+# #1318: the parent's private call while it samples the backends (404 unless it does).
 # PUT {"backends": {name: BackendStats}} replaces this app's backend cache (what `hw.stats_for`
-# answers to the fit chips, autoconfig and the benchmark observer); GET ?name=&probe= runs one
-# GPU read that needs `docker exec` and answers {"gpu": GpuStats | null}.
+# answers to the fit chips, autoconfig and the benchmark observer). The GPU read call
+# (`gpu-exec-probe`) is gone: noevia#1318 step 2 dropped the vendor-tool reads natively.
 BACKEND_STATS_PATH = "/api/v1/internal/backend-stats"
-GPU_EXEC_PROBE_PATH = "/api/v1/internal/gpu-exec-probe"
-_CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,255}")
 
 
 async def _backend_stats(request: Request):
@@ -298,25 +292,6 @@ async def _backend_stats(request: Request):
     except (ValueError, TypeError, KeyError):
         return Response('{"detail":"invalid backend stats"}', status_code=422, media_type="application/json")
     return Response('{"ok":true}', media_type="application/json")
-
-
-async def _gpu_exec_probe(request: Request):
-    from fastapi.concurrency import run_in_threadpool
-    from fastapi.responses import JSONResponse
-    from . import services
-    from .api import _plain
-    if request.method != "GET":
-        return Response('{"detail":"Method Not Allowed"}', status_code=405, media_type="application/json")
-    name, probe = request.query_params.get("name", ""), request.query_params.get("probe", "")
-    if not _CONTAINER_NAME.fullmatch(name) or probe not in ("nvidia", "amd", "amd-nvidia"):
-        return Response('{"detail":"invalid probe query"}', status_code=422, media_type="application/json")
-    # #1986: `docker exec` only into an active backend, and never by an all-hex name, which Docker
-    # also resolves as an id prefix of a different container (as the native ScopedControl refuses).
-    # The same 422 as any other invalid probe query.
-    if all(c in string.hexdigits for c in name) or name not in await run_in_threadpool(services._effective_container_names):
-        return Response('{"detail":"invalid probe query"}', status_code=422, media_type="application/json")
-    gpu = await run_in_threadpool(hw.exec_probe, name, probe)
-    return JSONResponse({"gpu": _plain(gpu)})
 
 
 # #1318: the parent's private call that keeps `GET /backends`' last_restart_error: PUT

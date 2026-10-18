@@ -102,57 +102,14 @@ def test_pushed_samples_replace_the_cache_its_readers_use(monkeypatch, client):
     assert hw._CACHE == {}
 
 
-def test_exec_probe_call_runs_the_python_read(monkeypatch, client):
+def test_the_gpu_read_call_is_gone(monkeypatch, client):
+    """noevia#1318 step 2: the native sampler no longer asks for vendor-tool GPU reads, so the
+    private call is gone even when the parent owns the backends: nothing here runs `docker exec`."""
     monkeypatch.setenv(ENV, "1")
-    seen = []
-
-    def probe(name, kind):
-        seen.append((name, kind))
-        return None if kind == "amd" else hw._gpu_from(GPU)
-
-    monkeypatch.setattr(hw, "exec_probe", probe)
-    monkeypatch.setattr(services, "_effective_container_names", lambda: ["llama-a", "llama.b_2", "x"])
-    assert client.get(PROBE, params={"name": "llama-a", "probe": "nvidia"}).status_code == 401
-    answer = client.get(PROBE, headers=auth(), params={"name": "llama-a", "probe": "nvidia"})
-    assert answer.status_code == 200 and answer.json() == {"gpu": GPU}
-    assert client.get(PROBE, headers=auth(), params={"name": "llama.b_2", "probe": "amd"}).json() == {"gpu": None}
-    assert client.get(PROBE, headers=auth(), params={"name": "x", "probe": "amd-nvidia"}).status_code == 200
-    for params in ({"name": "llama-a"}, {"name": "llama-a", "probe": "rocm"}, {"name": "", "probe": "amd"},
-                   {"name": "-x", "probe": "amd"}, {"name": "a/b", "probe": "amd"}, {"name": "a" * 257, "probe": "amd"}):
-        assert client.get(PROBE, headers=auth(), params=params).status_code == 422, params
-    assert client.put(PROBE, headers=auth()).status_code == 405
-    assert seen == [("llama-a", "nvidia"), ("llama.b_2", "amd"), ("x", "amd-nvidia")]
-
-
-def test_exec_probe_call_allows_an_active_backend_only(monkeypatch, client):
-    """#1986: the private route execs only into an active backend, by name; every refusal is the
-    route's existing 422 and nothing reaches `docker exec`."""
-    monkeypatch.setenv(ENV, "1")
-    execs = []
-
-    class FakeContainer:
-        def exec_run(self, cmd, *args, **kwargs):
-            execs.append(cmd)
-            return type("R", (), {"exit_code": 1, "output": b""})()
-
-    class FakeClient:
-        def __init__(self):
-            self.containers = type("C", (), {"get": staticmethod(lambda name: FakeContainer())})()
-
-    monkeypatch.setattr(hw, "_client", FakeClient)
-    # "deadbeef" is in the list, so only the all-hex refusal can stop it.
-    monkeypatch.setattr(services, "_effective_container_names", lambda: ["llama-a", "deadbeef", "0123"])
-
-    allowed = client.get(PROBE, headers=auth(), params={"name": "llama-a", "probe": "nvidia"})
-    assert allowed.status_code == 200 and allowed.json() == {"gpu": None}
-    assert execs, "an active backend is probed with docker exec"
-
-    for name in ("other-app", "llama-a2", "LLAMA-A", "deadbeef", "0123", "DEADBEEF"):
-        execs.clear()
-        refused = client.get(PROBE, headers=auth(), params={"name": name, "probe": "nvidia"})
-        assert refused.status_code == 422, name
-        assert refused.content == b'{"detail":"invalid probe query"}', name
-        assert execs == [], name
+    for method in ("GET", "PUT"):
+        answer = client.request(method, PROBE, headers=auth(), params={"name": "llama-a", "probe": "nvidia"})
+        assert answer.status_code == 404, method
+    assert not hasattr(hw, "exec_probe")
 
 
 @pytest.mark.parametrize("value", [None, "0", "", "true", " 1", "1 "])
@@ -219,61 +176,3 @@ def test_python_sampler_unchanged_without_confirmation(monkeypatch):
     finally:
         hw._CACHE.clear()
         hw._CACHE.update(saved)
-
-
-# ---------- exec_probe itself ----------
-
-class _Exec:
-    def __init__(self, exit_code, output):
-        self.exit_code, self.output = exit_code, output
-
-
-class _Container:
-    def __init__(self, answers):
-        self.answers, self.commands = answers, []
-
-    def exec_run(self, cmd, demux=False):
-        self.commands.append(cmd.split()[0])
-        return self.answers.get(cmd.split()[0], _Exec(1, b""))
-
-
-class _Client:
-    def __init__(self, container):
-        self.container = container
-
-    class _Containers:
-        def __init__(self, container):
-            self.container = container
-
-        def get(self, name):
-            if name != "llama-a":
-                raise hw.NotFound("synthetic")
-            return self.container
-
-    @property
-    def containers(self):
-        return self._Containers(self.container)
-
-
-def test_exec_probe_runs_the_same_reads_as_collect(monkeypatch):
-    nvidia = _Exec(0, b"50, 2048, 8192, 61, 120.5, Synthetic Card\n")
-    rocm = _Exec(0, b'{"card0": {"GPU use (%)": "7", "GPU Memory Allocated (VRAM%)": "25", '
-                    b'"Temperature (Sensor edge) (C)": "45.0", "Average Graphics Package Power (W)": "30.0"}}')
-    monkeypatch.setattr(settings, "gpu_vram", "llama-a:16")
-    for probe, answers, commands, vendor in (
-        ("nvidia", {"nvidia-smi": nvidia}, ["nvidia-smi"], "nvidia"),
-        ("amd", {"rocm-smi": rocm}, ["rocm-smi"], "amd"),
-        ("amd-nvidia", {"nvidia-smi": nvidia}, ["rocm-smi", "nvidia-smi"], "nvidia"),
-        ("amd-nvidia", {}, ["rocm-smi", "nvidia-smi"], None),
-    ):
-        c = _Container(answers)
-        monkeypatch.setattr(hw, "_client", lambda c=c: _Client(c))
-        got = hw.exec_probe("llama-a", probe)
-        assert c.commands == commands
-        assert (got.vendor if got else None) == vendor
-    monkeypatch.setattr(hw, "_client", lambda: _Client(_Container({"nvidia-smi": nvidia})))
-    assert hw.exec_probe("missing", "nvidia") is None
-    monkeypatch.setattr(hw, "_client", lambda: None)
-    assert hw.exec_probe("llama-a", "nvidia") is None
-    with pytest.raises(ValueError):
-        hw.exec_probe("llama-a", "rocm")

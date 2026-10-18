@@ -85,6 +85,15 @@ jobs:
           echo "$sum  /tmp/noevia-rs.tar.gz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/noevia-rs"
           tar -xzf /tmp/noevia-rs.tar.gz -C "$RUNNER_TEMP/noevia-rs" --strip-components=1
+      # noevia#1318 step 2: this repo no longer serves gpu-exec-probe, so the pinned native model
+      # manager must not ask for it (noevia-rs#192). All five Dockerfiles share this pin.
+      - name: Pinned noevia-rs does not call the removed GPU exec probe
+        run: |
+          set -euo pipefail
+          if grep -rn "gpu-exec-probe" "$RUNNER_TEMP/noevia-rs/bins/noevia-model-manager/src"; then
+            echo "::error::the pinned noevia-rs still calls gpu-exec-probe; pin a noevia-rs that contains noevia-rs#192"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
