@@ -143,7 +143,7 @@ Companion files fold into the model they belong to rather than listing as models
 
 The row also shows what each model actually is. **`in models.ini · as wheatley-voice`** means that file is served under an alias rather than its filename — one GGUF can back several sections with different settings, and each gets its own toggles. The **vision** chip reads `capable` or `text-only` depending on whether the section declares a projector, and that flag is pushed into OpenWebUI so the image-upload control only appears where it can work.
 
-## Security posture
+## Historical upstream security posture (not production)
 
 **This is a personal, LAN-only tool. There is no authentication.** It mounts `/var/run/docker.sock`, which is root-equivalent on the host — anyone who can reach the port can `docker exec` into any container. Do not expose port 8090 to the internet. Do not run this on a shared machine. If you need multi-user, add a reverse-proxy with auth in front, and understand that authenticated users still get docker-socket-level power.
 

@@ -746,24 +746,32 @@ jobs:
           printf '%s\n' "$native_features" | grep -Fx native-diagnose
           printf '%s\n' "$native_features" | grep -Fx native-settings
           printf '%s\n' "$native_features" | grep -Fx native-routing
-          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint /bin/sh noevia-model-manager:ci -ec '! command -v python; ! command -v python3; ! command -v uvicorn; test ! -e /srv/app; test ! -e /usr/local/bin/model-files; test ! -e /usr/local/bin/model-autoconfig'
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint /bin/sh noevia-model-manager:ci -ec '! command -v python && ! command -v python3 && ! command -v uvicorn && test ! -e /srv/app && test ! -e /usr/local/bin/model-files && test ! -e /usr/local/bin/model-autoconfig'
           printf '%s\n' "$native_features" | grep -Fx native-model-updates
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_MODEL_UPDATES_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-model-detail
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_MODEL_DETAIL_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-download-targets
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-badges
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BADGES_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-bench-runs
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BENCH_RUNS_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-section-writes
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SECTION_WRITES_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-settings-write
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SETTINGS_WRITE_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-backend-control
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BACKEND_CONTROL_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-benchmark-overview
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-check-updates
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_CHECK_UPDATES_IMPL)" = python ]
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /bin/sh noevia-model-manager:ci -ec '
+              for key do
+                if printenv "$key" >/dev/null; then
+                  echo "retired selector present in production image: $key" >&2
+                  exit 1
+                fi
+              done
+            ' -- \
+            MODEL_MANAGER_IMPL MODEL_FILES_IMPL MODEL_MANAGER_BACKENDS_IMPL MODEL_MANAGER_BACKEND_CONTROL_IMPL \
+            MODEL_MANAGER_BADGES_IMPL MODEL_MANAGER_BENCHMARK_OBSERVE_IMPL MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL MODEL_MANAGER_BENCHMARK_RUNNER_IMPL \
+            MODEL_MANAGER_BENCH_RUNS_IMPL MODEL_MANAGER_CHECK_UPDATES_IMPL MODEL_MANAGER_DB_INIT_IMPL MODEL_MANAGER_DIAGNOSE_IMPL \
+            MODEL_MANAGER_DOWNLOADS_IMPL MODEL_MANAGER_DOWNLOAD_PLAN_IMPL MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL MODEL_MANAGER_DRAFT_HEADS_IMPL \
+            MODEL_MANAGER_HOST_IMPL MODEL_MANAGER_MODELS_IMPL MODEL_MANAGER_MODEL_DELETE_IMPL MODEL_MANAGER_MODEL_DETAIL_IMPL \
+            MODEL_MANAGER_MODEL_UPDATES_IMPL MODEL_MANAGER_OVERVIEW_IMPL MODEL_MANAGER_PROMPTS_IMPL MODEL_MANAGER_ROUTING_IMPL \
+            MODEL_MANAGER_SAFE_DEFAULTS_IMPL MODEL_MANAGER_SEARCH_IMPL MODEL_MANAGER_SECTIONS_IMPL MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL \
+            MODEL_MANAGER_SECTION_WRITES_IMPL MODEL_MANAGER_SETTINGS_IMPL MODEL_MANAGER_SETTINGS_WRITE_IMPL MODEL_MANAGER_TELEMETRY_IMPL \
+            MODEL_MANAGER_TOKEN_TEST_IMPL GGUF_PARSER MODEL_AUTOCONFIG
