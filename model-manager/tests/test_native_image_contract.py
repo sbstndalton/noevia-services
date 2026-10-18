@@ -102,6 +102,11 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     for selector in ("MODEL_MANAGER_MODELS_IMPL", "MODEL_MANAGER_OVERVIEW_IMPL"):
         assert f"ENV {selector}=python" in source
         assert not re.search(rf"^ENV .*{selector}=rust", source, re.M)
+    # #1318: the native section autoconfig read is compiled in and advertised, and defaults to python.
+    assert "noevia-model-manager/native-section-autoconfig" in source
+    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-section-autoconfig >/dev/null" in source
+    assert "ENV MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL=python" in source
+    assert not re.search(r"^ENV .*MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL=rust", source, re.M)
     command = re.findall(r"^CMD (.+)$", source, re.M)
     assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):
