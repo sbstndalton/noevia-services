@@ -93,7 +93,7 @@ def client(monkeypatch):
 
 def test_the_guard_is_advertised_only_under_the_exact_confirmation(client, monkeypatch):
     auth = {"x-model-loader-token": TOKEN}
-    # Unconfirmed (or a child without the guard): no such route, so the parent keeps Python's ingest.
+    # Unconfirmed (or a child without the advertisement): no such route; this does not prove Python owns ingest.
     assert client.get(GUARD, headers=auth).status_code == 404
     monkeypatch.setenv(ENV, "true")
     assert client.get(GUARD, headers=auth).status_code == 404

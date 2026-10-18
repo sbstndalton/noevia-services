@@ -92,7 +92,7 @@ async def _require_token(request: Request, call_next):
             return await _bench_job_call(request)
     # #1318 step 3d: the parent asks, before it ingests the backend logs itself, whether this child
     # carries the telemetry guard (telemetry.ingest and the record_* writers refuse under the
-    # confirmation). A child without it answers 404, and the parent then keeps Python ownership.
+    # confirmation). A child without it answers 404; the parent must refuse native activation (noevia#2041).
     if (os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_TELEMETRY_CONFIRMED") == "1"
             and request.url.path == TELEMETRY_GUARD_PATH):
         if request.method != "GET":
