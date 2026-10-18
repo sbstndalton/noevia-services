@@ -12,7 +12,7 @@ ARG NOEVIA_RS_REF=76a8e682a8cb0f02f9df5363281bbe0ede381d5b
 ARG NOEVIA_RS_SHA256=f2725e2a564b0a920ac5645ed81d2427b08d927749a0e842e5784e4996a6dd5c
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
-ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=8
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
@@ -59,7 +59,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS legacy-builder
 ARG LEGACY_ORACLE_REF=76a8e682a8cb0f02f9df5363281bbe0ede381d5b
 ARG LEGACY_ORACLE_SHA256=f2725e2a564b0a920ac5645ed81d2427b08d927749a0e842e5784e4996a6dd5c
-ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=8
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${LEGACY_ORACLE_REF} /tmp/legacy-oracle.tar.gz
 RUN echo "${LEGACY_ORACLE_SHA256}  /tmp/legacy-oracle.tar.gz" | sha256sum -c - \
@@ -117,7 +117,22 @@ EXPOSE 8090
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["noevia-model-manager", "--healthcheck"]
 CMD ["noevia-model-manager"]
 
-# The separate native qualification target is added after the shipping-process
-# harness and mandatory service commit have passed independent review.
+# Compile the exact shipping-process contract against the same verified source.
+FROM gguf-meta AS native-qualification-builder
+RUN set -eu; \
+    cargo test --release --locked -p noevia-model-manager --features native-routing --test native_service --no-run; \
+    n=0; for artifact in target/release/deps/native_service-*; do \
+      if [ -f "$artifact" ] && [ -x "$artifact" ]; then \
+        cp "$artifact" /tmp/native-service-test; n=$((n+1)); \
+      fi; \
+    done; test "$n" = 1
+
+# Actual production rootfs plus an isolated Rust test driver; no Python oracle.
+FROM runtime AS native-qualification
+HEALTHCHECK NONE
+COPY --from=native-qualification-builder /tmp/native-service-test /usr/local/bin/native-service-test
+ENV MODEL_MANAGER_PRODUCTION_BIN=/usr/local/bin/noevia-model-manager
+CMD ["native-service-test", "--test-threads=1"]
+
 # Default builds always select the native production runtime.
 FROM runtime AS production

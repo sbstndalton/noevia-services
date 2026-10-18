@@ -713,6 +713,20 @@ jobs:
           load: true
           tags: noevia-model-manager-qualification:ci
           cache-from: type=gha,scope=model-manager
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: ws/services/model-manager
+          target: native-qualification
+          push: false
+          load: true
+          tags: noevia-model-manager-native-qualification:ci
+          cache-from: type=gha,scope=model-manager
+      - name: Actual native image process ownership and bounded shutdown
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --user 65534:65534 --memory 512m --cpus 1 --pids-limit 128 \
+            --tmpfs /tmp:rw,exec,size=67108864,mode=1777 \
+            noevia-model-manager-native-qualification:ci
       - name: Frozen supervisor image section oracle and ownership
         run: |
           rustfmt --edition 2021 --check qualification/main.rs
