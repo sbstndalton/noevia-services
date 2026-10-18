@@ -698,7 +698,10 @@ async def _model_files_refused(_request: Request, exc: model_files.ModelFilesErr
 def _startup() -> None:
     # noevia#1071: model-files is the only listing/backup implementation; refuse to start without it.
     model_files.require_binary()
-    db.init()
+    # The parent bootstraps the full schema under its existing prompt-store lock before spawning us.
+    # Exact confirmation only; other values keep the historical initializer.
+    if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_DB_INIT_CONFIRMED") != "1":
+        db.init()
     if os.environ.get("NOEVIA_NATIVE_MODEL_MANAGER_PROMPTS_CONFIRMED") != "1":
         db.seed_bench_prompts()
     hw.start_sampler()
