@@ -617,30 +617,29 @@ jobs:
           path: ${{ runner.temp }}/diagnosis-guard-evidence
           retention-days: 7
           if-no-files-found: warn
-      - name: Build helpers and native model-manager
+      - name: Build helpers and mandatory native model-manager
         working-directory: ${{ runner.temp }}/noevia-rs
         run: |
-          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads
-          native_features=$(./target/release/noevia-model-manager --features)
-          printf '%s\n' "$native_features" | grep -Fx native-logs >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-host >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-sections >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-prompts >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-diagnose >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-settings >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-model-updates >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-model-detail >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-download-targets >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-badges >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-bench-runs >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-section-writes >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-settings-write >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-backend-control >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-benchmark-overview >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-check-updates >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-benchmark-runner >/dev/null
-          printf '%s\n' "$native_features" | grep -Fx native-downloads >/dev/null
+          cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads,noevia-model-manager/native-model-delete,noevia-model-manager/native-draft-heads,noevia-model-manager/native-backends,noevia-model-manager/native-model-list,noevia-model-manager/native-search,noevia-model-manager/native-section-autoconfig,noevia-model-manager/native-telemetry,noevia-model-manager/native-bench-observe,noevia-model-manager/native-db-init,noevia-model-manager/native-token-test,noevia-model-manager/native-safe-defaults,noevia-model-manager/native-download-plan,noevia-model-manager/native-routing
+          ./target/release/noevia-model-manager --features | grep -Fx native-routing
+          cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-production"
+      - name: Fetch immutable test-only supervisor oracle
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ARG LEGACY_ORACLE_REF=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG LEGACY_ORACLE_SHA256=//p' Dockerfile)
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && [[ "$sum" =~ ^[0-9a-f]{64}$ ]]
+          curl -fsSL -o "$RUNNER_TEMP/supervisor-oracle.tar.gz" "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
+          echo "$sum  $RUNNER_TEMP/supervisor-oracle.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/noevia-rs-supervisor-oracle"
+          tar -xzf "$RUNNER_TEMP/supervisor-oracle.tar.gz" -C "$RUNNER_TEMP/noevia-rs-supervisor-oracle" --strip-components=1
+      - name: Build frozen supervisor for historical Python differential contracts
+        working-directory: ${{ runner.temp }}/noevia-rs-supervisor-oracle
+        run: |
+          cargo build --release --locked -p noevia-model-manager --features native-host,native-sections,native-prompts,native-diagnose
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-native"
+          cargo build --release --locked -p noevia-model-manager
+          cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-omission"
       - name: Check out immutable prompt oracle
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -661,16 +660,16 @@ jobs:
       - name: Sections capability omission preserves native host
         working-directory: ${{ runner.temp }}/noevia-rs
         run: cargo test --locked -p noevia-model-manager --features native-host --test lifecycle
-      - name: Build deliberately omitted native model-manager feature
-        working-directory: ${{ runner.temp }}/noevia-rs
-        run: |
-          cargo build --release --locked -p noevia-model-manager
-          cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-omission"
-      - name: Native binary and actual supervised Python runtime (synthetic peers only)
+      - name: Frozen supervisor and actual Python oracle (synthetic peers only)
         env:
           MODEL_MANAGER_BIN: ${{ runner.temp }}/model-manager-native
           MODEL_MANAGER_OMISSION_BIN: ${{ runner.temp }}/model-manager-omission
         run: python -m pytest -q -rs tests/test_native_runtime.py
+      - name: Shipping native process, real stores and bounded shutdown
+        env:
+          MODEL_MANAGER_PRODUCTION_BIN: ${{ runner.temp }}/model-manager-production
+        working-directory: ${{ runner.temp }}/noevia-rs
+        run: cargo test --release --locked -p noevia-model-manager --features native-routing --test native_service
       - name: Differential test (gguf-meta vs Python parser)
         env:
           GGUF_META_BIN: ${{ runner.temp }}/noevia-rs/target/release/gguf-meta
@@ -714,42 +713,65 @@ jobs:
           load: true
           tags: noevia-model-manager-qualification:ci
           cache-from: type=gha,scope=model-manager
-      - name: Rust-owned actual image section reads, private child and default ownership
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: ws/services/model-manager
+          target: native-qualification
+          push: false
+          load: true
+          tags: noevia-model-manager-native-qualification:ci
+          cache-from: type=gha,scope=model-manager
+      - name: Actual native image process ownership and bounded shutdown
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --user 65534:65534 --memory 512m --cpus 1 --pids-limit 128 \
+            --tmpfs /tmp:rw,exec,size=67108864,mode=1777 \
+            noevia-model-manager-native-qualification:ci
+      - name: Frozen supervisor image section oracle and ownership
         run: |
           rustfmt --edition 2021 --check qualification/main.rs
           clippy-driver --edition=2021 -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing qualification/main.rs -o "$RUNNER_TEMP/sections-image-probe"
           rustc --edition=2021 --test qualification/main.rs -o "$RUNNER_TEMP/sections-image-tests"
           "$RUNNER_TEMP/sections-image-tests"
           "$RUNNER_TEMP/sections-image-probe" images noevia-model-manager-qualification:ci
-      - name: Rust-owned actual image prompt writers, private child and default ownership
+      - name: Frozen supervisor image prompt oracle and ownership
         run: '"$RUNNER_TEMP/prompts-image-probe" images noevia-model-manager-qualification:ci'
-      - name: Rust-owned actual image diagnosis, private child, default and capability refusal
+      - name: Frozen supervisor image diagnosis oracle and capability refusal
         run: '"$RUNNER_TEMP/diagnosis-image-probe" images noevia-model-manager-qualification:ci'
-      - name: Actual production image advertises sections, prompts, diagnosis, settings and model updates
+      - name: Actual native production image advertises compiled owner capabilities
         run: |
           native_features=$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges noevia-model-manager:ci noevia-model-manager --features)
           printf '%s\n' "$native_features" | grep -Fx native-sections
           printf '%s\n' "$native_features" | grep -Fx native-prompts
           printf '%s\n' "$native_features" | grep -Fx native-diagnose
           printf '%s\n' "$native_features" | grep -Fx native-settings
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SETTINGS_IMPL)" = python ]
+          printf '%s\n' "$native_features" | grep -Fx native-routing
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint /bin/sh noevia-model-manager:ci -ec '! command -v python && ! command -v python3 && ! command -v uvicorn && test ! -e /srv/app && test ! -e /usr/local/bin/model-files && test ! -e /usr/local/bin/model-autoconfig'
           printf '%s\n' "$native_features" | grep -Fx native-model-updates
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_MODEL_UPDATES_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-model-detail
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_MODEL_DETAIL_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-download-targets
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-badges
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BADGES_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-bench-runs
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BENCH_RUNS_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-section-writes
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SECTION_WRITES_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-settings-write
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_SETTINGS_WRITE_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-backend-control
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BACKEND_CONTROL_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-benchmark-overview
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL)" = python ]
           printf '%s\n' "$native_features" | grep -Fx native-check-updates
-          [ "$(docker run --rm --network none --entrypoint printenv noevia-model-manager:ci MODEL_MANAGER_CHECK_UPDATES_IMPL)" = python ]
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /bin/sh noevia-model-manager:ci -ec '
+              for key do
+                if printenv "$key" >/dev/null; then
+                  echo "retired selector present in production image: $key" >&2
+                  exit 1
+                fi
+              done
+            ' -- \
+            MODEL_MANAGER_IMPL MODEL_FILES_IMPL MODEL_MANAGER_BACKENDS_IMPL MODEL_MANAGER_BACKEND_CONTROL_IMPL \
+            MODEL_MANAGER_BADGES_IMPL MODEL_MANAGER_BENCHMARK_OBSERVE_IMPL MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL MODEL_MANAGER_BENCHMARK_RUNNER_IMPL \
+            MODEL_MANAGER_BENCH_RUNS_IMPL MODEL_MANAGER_CHECK_UPDATES_IMPL MODEL_MANAGER_DB_INIT_IMPL MODEL_MANAGER_DIAGNOSE_IMPL \
+            MODEL_MANAGER_DOWNLOADS_IMPL MODEL_MANAGER_DOWNLOAD_PLAN_IMPL MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL MODEL_MANAGER_DRAFT_HEADS_IMPL \
+            MODEL_MANAGER_HOST_IMPL MODEL_MANAGER_MODELS_IMPL MODEL_MANAGER_MODEL_DELETE_IMPL MODEL_MANAGER_MODEL_DETAIL_IMPL \
+            MODEL_MANAGER_MODEL_UPDATES_IMPL MODEL_MANAGER_OVERVIEW_IMPL MODEL_MANAGER_PROMPTS_IMPL MODEL_MANAGER_ROUTING_IMPL \
+            MODEL_MANAGER_SAFE_DEFAULTS_IMPL MODEL_MANAGER_SEARCH_IMPL MODEL_MANAGER_SECTIONS_IMPL MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL \
+            MODEL_MANAGER_SECTION_WRITES_IMPL MODEL_MANAGER_SETTINGS_IMPL MODEL_MANAGER_SETTINGS_WRITE_IMPL MODEL_MANAGER_TELEMETRY_IMPL \
+            MODEL_MANAGER_TOKEN_TEST_IMPL GGUF_PARSER MODEL_AUTOCONFIG

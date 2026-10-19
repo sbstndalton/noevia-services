@@ -1,121 +1,117 @@
 """Production image wiring for the qualified native service binary."""
-import json
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
+NATIVE_CAPABILITIES = (
+    "native-logs", "native-host", "native-sections", "native-prompts",
+    "native-diagnose", "native-settings", "native-model-updates", "native-model-detail",
+    "native-download-targets", "native-badges", "native-bench-runs", "native-section-writes",
+    "native-settings-write", "native-backend-control", "native-benchmark-overview",
+    "native-check-updates", "native-benchmark-runner", "native-downloads", "native-model-delete",
+    "native-draft-heads", "native-backends", "native-model-list", "native-search",
+    "native-section-autoconfig", "native-telemetry", "native-bench-observe", "native-db-init",
+    "native-token-test", "native-safe-defaults", "native-download-plan", "native-routing",
+)
+
+# Frozen supervisor selectors kept only in the explicit legacy qualification stages.
+RETIRED_SELECTORS = (
+    "MODEL_MANAGER_IMPL", "MODEL_FILES_IMPL", "MODEL_MANAGER_BACKENDS_IMPL",
+    "MODEL_MANAGER_BACKEND_CONTROL_IMPL", "MODEL_MANAGER_BADGES_IMPL",
+    "MODEL_MANAGER_BENCHMARK_OBSERVE_IMPL", "MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL",
+    "MODEL_MANAGER_BENCHMARK_RUNNER_IMPL", "MODEL_MANAGER_BENCH_RUNS_IMPL",
+    "MODEL_MANAGER_CHECK_UPDATES_IMPL", "MODEL_MANAGER_DB_INIT_IMPL",
+    "MODEL_MANAGER_DIAGNOSE_IMPL", "MODEL_MANAGER_DOWNLOADS_IMPL",
+    "MODEL_MANAGER_DOWNLOAD_PLAN_IMPL", "MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL",
+    "MODEL_MANAGER_DRAFT_HEADS_IMPL", "MODEL_MANAGER_HOST_IMPL", "MODEL_MANAGER_MODELS_IMPL",
+    "MODEL_MANAGER_MODEL_DELETE_IMPL", "MODEL_MANAGER_MODEL_DETAIL_IMPL",
+    "MODEL_MANAGER_MODEL_UPDATES_IMPL", "MODEL_MANAGER_OVERVIEW_IMPL",
+    "MODEL_MANAGER_PROMPTS_IMPL", "MODEL_MANAGER_ROUTING_IMPL",
+    "MODEL_MANAGER_SAFE_DEFAULTS_IMPL", "MODEL_MANAGER_SEARCH_IMPL",
+    "MODEL_MANAGER_SECTIONS_IMPL", "MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL",
+    "MODEL_MANAGER_SECTION_WRITES_IMPL", "MODEL_MANAGER_SETTINGS_IMPL",
+    "MODEL_MANAGER_SETTINGS_WRITE_IMPL", "MODEL_MANAGER_TELEMETRY_IMPL",
+    "MODEL_MANAGER_TOKEN_TEST_IMPL", "GGUF_PARSER", "MODEL_AUTOCONFIG",
+)
+
+
+def docker_stage(source, name):
+    """Return one Docker stage body, bounded by its FROM and the next FROM."""
+    stages = list(re.finditer(r"^FROM .+ AS ([A-Za-z0-9_-]+)\s*$", source, re.M))
+    matches = [index for index, match in enumerate(stages) if match.group(1) == name]
+    assert len(matches) == 1, (name, [match.group(1) for match in stages])
+    index = matches[0]
+    start = stages[index].start()
+    end = stages[index + 1].start() if index + 1 < len(stages) else len(source)
+    return source[start:end]
+
 
 def test_native_image_build_copy_capability_and_default_entrypoint():
     source = (ROOT / "model-manager" / "Dockerfile").read_text()
-    assert "-p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections" in source
-    assert "native_features=$(./target/release/noevia-model-manager --features)" in source
-    for capability in ("native-logs", "native-host", "native-sections"):
-        assert f"printf '%s\\n' \"$native_features\" | grep -Fx {capability} >/dev/null" in source
-    assert "COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager" in source
-    # noevia#1071/#2011: the native parent is permanent and MODEL_MANAGER_IMPL is retired, so the
-    # image never names it, in any form (`ENV K=V`, `ENV K V`, ARG or a comment).
-    assert "MODEL_MANAGER_IMPL" not in source
-    assert "MODEL_FILES_IMPL" not in source
-    # #1334: the section switch is wired in the image, and its default stays python.
-    assert "ENV MODEL_MANAGER_SECTIONS_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_SECTIONS_IMPL=rust", source, re.M)
-    # #1318: the model-updates read is compiled in and advertised, and its switch defaults to python.
-    assert "noevia-model-manager/native-model-updates" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-updates >/dev/null" in source
-    assert "ENV MODEL_MANAGER_MODEL_UPDATES_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_MODEL_UPDATES_IMPL=rust", source, re.M)
-    # #1318: the model-detail read is compiled in and advertised, and its switch defaults to python.
-    assert "noevia-model-manager/native-model-detail" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-detail >/dev/null" in source
-    assert "ENV MODEL_MANAGER_MODEL_DETAIL_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_MODEL_DETAIL_IMPL=rust", source, re.M)
-    # #1318: the download-targets read is compiled in and advertised, and its switch defaults to python.
-    assert "noevia-model-manager/native-download-targets" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-download-targets >/dev/null" in source
-    assert "ENV MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_DOWNLOAD_TARGETS_IMPL=rust", source, re.M)
-    # #1318: the badge writes are compiled in and advertised, and their switch defaults to python.
-    assert "noevia-model-manager/native-badges" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-badges >/dev/null" in source
-    assert "ENV MODEL_MANAGER_BADGES_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_BADGES_IMPL=rust", source, re.M)
-    # #1318: the benchmark run read is compiled in and advertised, and its switch defaults to python.
-    assert "noevia-model-manager/native-bench-runs" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-bench-runs >/dev/null" in source
-    assert "ENV MODEL_MANAGER_BENCH_RUNS_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_BENCH_RUNS_IMPL=rust", source, re.M)
-    # #1318: the native models.ini writers are compiled in and advertised, and default to python.
-    assert "noevia-model-manager/native-section-writes" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-section-writes >/dev/null" in source
-    assert "ENV MODEL_MANAGER_SECTION_WRITES_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_SECTION_WRITES_IMPL=rust", source, re.M)
-    # #1318: the settings writer is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-settings-write" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-settings-write >/dev/null" in source
-    assert "ENV MODEL_MANAGER_SETTINGS_WRITE_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_SETTINGS_WRITE_IMPL=rust", source, re.M)
-    # #1318: native backend control is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-backend-control" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-backend-control >/dev/null" in source
-    assert "ENV MODEL_MANAGER_BACKEND_CONTROL_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_BACKEND_CONTROL_IMPL=rust", source, re.M)
-    # #1318: the native benchmark overview is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-benchmark-overview" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-benchmark-overview >/dev/null" in source
-    assert "ENV MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_BENCHMARK_OVERVIEW_IMPL=rust", source, re.M)
-    # #1318: the native update check is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-check-updates" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-check-updates >/dev/null" in source
-    assert "ENV MODEL_MANAGER_CHECK_UPDATES_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_CHECK_UPDATES_IMPL=rust", source, re.M)
-    # #1318: the native benchmark runner (the whole job slot) is compiled in and advertised, and
-    # defaults to python.
-    assert "noevia-model-manager/native-benchmark-runner" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-benchmark-runner >/dev/null" in source
-    assert "ENV MODEL_MANAGER_BENCHMARK_RUNNER_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_BENCHMARK_RUNNER_IMPL=rust", source, re.M)
-    assert "noevia-model-manager/native-downloads" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-downloads >/dev/null" in source
-    assert "ENV MODEL_MANAGER_DOWNLOADS_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_DOWNLOADS_IMPL=rust", source, re.M)
-    # #1318: native model deletion is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-model-delete" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-delete >/dev/null" in source
-    assert "ENV MODEL_MANAGER_MODEL_DELETE_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_MODEL_DELETE_IMPL=rust", source, re.M)
-    # #1318: the native draft-head read is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-draft-heads" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-draft-heads >/dev/null" in source
-    assert "ENV MODEL_MANAGER_DRAFT_HEADS_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_DRAFT_HEADS_IMPL=rust", source, re.M)
-    # #1318 slice 13: the native backend sampler is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-backends" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-backends >/dev/null" in source
-    assert "ENV MODEL_MANAGER_BACKENDS_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_BACKENDS_IMPL=rust", source, re.M)
-    # #1318: the native models list and overview reads are compiled in and advertised, and each
-    # defaults to python.
-    assert "noevia-model-manager/native-model-list" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-model-list >/dev/null" in source
-    for selector in ("MODEL_MANAGER_MODELS_IMPL", "MODEL_MANAGER_OVERVIEW_IMPL"):
-        assert f"ENV {selector}=python" in source
-        assert not re.search(rf"^ENV .*{selector}=rust", source, re.M)
-    # #1318 slice 14: the native search is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-search" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-search >/dev/null" in source
-    assert "ENV MODEL_MANAGER_SEARCH_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_SEARCH_IMPL=rust", source, re.M)
-    # #1318: the native section autoconfig read is compiled in and advertised, and defaults to python.
-    assert "noevia-model-manager/native-section-autoconfig" in source
-    assert "printf '%s\\n' \"$native_features\" | grep -Fx native-section-autoconfig >/dev/null" in source
-    assert "ENV MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL=python" in source
-    assert not re.search(r"^ENV .*MODEL_MANAGER_SECTION_AUTOCONFIG_IMPL=rust", source, re.M)
-    command = re.findall(r"^CMD (.+)$", source, re.M)
-    assert len(command) == 1 and json.loads(command[0]) == ["noevia-model-manager"]
+    builder = docker_stage(source, "gguf-meta")
+    legacy = docker_stage(source, "legacy-runtime")
+    qualification = docker_stage(source, "qualification")
+    runtime = docker_stage(source, "runtime")
+    production = docker_stage(source, "production")
+    assert production.strip() == "FROM runtime AS production"
+    assert len(NATIVE_CAPABILITIES) == len(set(NATIVE_CAPABILITIES)) == 31
+    assert len(RETIRED_SELECTORS) == len(set(RETIRED_SELECTORS)) == 35
+    native_qualification = docker_stage(source, "native-qualification")
+
+    # Verify the complete native build and its advertised capability inventory. native-logs is
+    # unconditional; each other marker is selected by an explicit Cargo feature.
+    assert "native_features=$(./target/release/noevia-model-manager --features)" in builder
+    build = next(line for line in builder.splitlines() if "cargo build --release --locked" in line)
+    assert "-p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager" in build
+    for capability in NATIVE_CAPABILITIES:
+        assert f"printf '%s\\n' \"$native_features\" | grep -Fx {capability} >/dev/null" in builder
+        if capability != "native-logs":
+            assert f"noevia-model-manager/{capability}" in builder
+
+    # The frozen Python supervisor and helpers are a test oracle, not the shipping runtime.
+    assert re.search(r"^FROM python:3\.12(?:\.\d+)?-slim AS legacy-runtime$", legacy, re.M)
+    assert "ENV MODEL_MANAGER_SECTIONS_IMPL=python MODEL_MANAGER_SETTINGS_IMPL=python" in legacy
+    assert "COPY requirements.txt ." in legacy
+    assert "COPY app ./app" in legacy
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):
-        assert f"COPY --from=gguf-meta /src/target/release/{helper} /usr/local/bin/{helper}" in source
+        assert f"COPY --from=legacy-builder /src/target/release/{helper} /usr/local/bin/{helper}" in legacy
+    assert 'HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c ' in legacy
+    assert 'CMD ["noevia-model-manager"]' in legacy
+
+    # Keep the frozen omission probes and native test-driver target explicit. Multiple CMDs and
+    # helper copies can exist in test stages without entering the production image.
+    assert "FROM legacy-runtime AS qualification" in qualification
+    for probe in ("sections-image-probe", "prompts-image-probe", "diagnosis-image-probe"):
+        assert f"COPY --from=qualification-builder /tmp/{probe} /usr/local/bin/{probe}" in qualification
+    for omission in (
+        "model-manager-sections-omission",
+        "model-manager-prompts-omission",
+        "model-manager-diagnosis-omission",
+    ):
+        assert f"/usr/local/bin/{omission}" in qualification
+    assert "FROM runtime AS native-qualification" in native_qualification
+    assert "COPY --from=native-qualification-builder /tmp/native-service-test /usr/local/bin/native-service-test" in native_qualification
+    assert 'CMD ["native-service-test", "--test-threads=1"]' in native_qualification
+    assert "ENV MODEL_MANAGER_PRODUCTION_BIN=/usr/local/bin/noevia-model-manager" in native_qualification
+
+    # Scope retired selectors and non-native runtime checks to the final shipping stage.
+    assert re.search(
+        r"^FROM debian:bookworm-slim@sha256:[0-9a-f]{64} AS runtime$", runtime, re.M
+    )
+    for selector in RETIRED_SELECTORS:
+        assert selector not in runtime
+    assert not re.search(
+        r"(?i)\bpython(?:[0-9]+(?:\.[0-9]+)*)?\b|uvicorn|/srv/app|/usr/local/bin/(?:gguf-meta|model-files|model-autoconfig)\b",
+        runtime,
+    )
+    assert "apt-get install -y --no-install-recommends ca-certificates libgcc-s1" in runtime
+    assert re.findall(r"^COPY .+$", runtime, re.M) == [
+        "COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager",
+        "COPY LICENSE ./",
+    ]
+    assert 'HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["noevia-model-manager", "--healthcheck"]' in runtime
+    assert 'CMD ["noevia-model-manager"]' in runtime
 
 
 def test_services_share_a_verified_rust_source_pin():
@@ -130,14 +126,17 @@ def test_services_share_a_verified_rust_source_pin():
     assert len(set(pins)) == 1
 
 
-def test_the_runtime_image_carries_the_unicode_database_the_native_search_follows():
-    # The native search judges names by Python's Unicode-aware patterns and follows the 15.0
-    # database (noevia-rs: `PYTHON_UNICODE`, with the list of later characters it refuses). That
-    # holds for every 3.12 release, which is what the runtime image is: a base image on another
-    # line, or a test interpreter on another database, fails here, not in a user's search.
+def test_native_search_unicode_oracle_and_shipping_base_are_pinned():
+    # Python 3.12 belongs to the frozen supervisor oracle, not the native Debian image. Keep
+    # checking the actual test interpreter's Unicode database because its differential fixtures
+    # reference the native search's pinned Unicode 15.0 behavior.
     import unicodedata
 
     source = (ROOT / "model-manager" / "Dockerfile").read_text()
-    runtime = re.findall(r"^FROM (\S+) AS runtime$", source, re.M)
-    assert len(runtime) == 1 and re.match(r"python:3\.12(\.\d+)?-", runtime[0]), runtime
+    legacy = docker_stage(source, "legacy-runtime")
+    runtime = docker_stage(source, "runtime")
+    assert re.search(r"^FROM python:3\.12(?:\.\d+)?-slim AS legacy-runtime$", legacy, re.M)
+    assert re.search(
+        r"^FROM debian:bookworm-slim@sha256:[0-9a-f]{64} AS runtime$", runtime, re.M
+    )
     assert unicodedata.unidata_version == "15.0.0"
