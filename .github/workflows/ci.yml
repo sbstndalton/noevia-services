@@ -94,16 +94,6 @@ jobs:
             echo "::error::the pinned noevia-rs still calls gpu-exec-probe; pin a noevia-rs that contains noevia-rs#192"
             exit 1
           fi
-      - name: Fetch immutable test-only supervisor oracle
-        run: |
-          set -euo pipefail
-          ref=$(sed -n 's/^ARG LEGACY_ORACLE_REF=//p' Dockerfile)
-          sum=$(sed -n 's/^ARG LEGACY_ORACLE_SHA256=//p' Dockerfile)
-          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && [[ "$sum" =~ ^[0-9a-f]{64}$ ]]
-          curl -fsSL -o "$RUNNER_TEMP/supervisor-oracle.tar.gz" "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
-          echo "$sum  $RUNNER_TEMP/supervisor-oracle.tar.gz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/noevia-rs-supervisor-oracle"
-          tar -xzf "$RUNNER_TEMP/supervisor-oracle.tar.gz" -C "$RUNNER_TEMP/noevia-rs-supervisor-oracle" --strip-components=1
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -633,6 +623,16 @@ jobs:
           cargo build --release --locked -p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager --features noevia-model-manager/native-host,noevia-model-manager/native-sections,noevia-model-manager/native-prompts,noevia-model-manager/native-diagnose,noevia-model-manager/native-settings,noevia-model-manager/native-model-updates,noevia-model-manager/native-model-detail,noevia-model-manager/native-download-targets,noevia-model-manager/native-badges,noevia-model-manager/native-bench-runs,noevia-model-manager/native-section-writes,noevia-model-manager/native-settings-write,noevia-model-manager/native-backend-control,noevia-model-manager/native-benchmark-overview,noevia-model-manager/native-check-updates,noevia-model-manager/native-benchmark-runner,noevia-model-manager/native-downloads,noevia-model-manager/native-model-delete,noevia-model-manager/native-draft-heads,noevia-model-manager/native-backends,noevia-model-manager/native-model-list,noevia-model-manager/native-search,noevia-model-manager/native-section-autoconfig,noevia-model-manager/native-telemetry,noevia-model-manager/native-bench-observe,noevia-model-manager/native-db-init,noevia-model-manager/native-token-test,noevia-model-manager/native-safe-defaults,noevia-model-manager/native-download-plan,noevia-model-manager/native-routing
           ./target/release/noevia-model-manager --features | grep -Fx native-routing
           cp target/release/noevia-model-manager "$RUNNER_TEMP/model-manager-production"
+      - name: Fetch immutable test-only supervisor oracle
+        run: |
+          set -euo pipefail
+          ref=$(sed -n 's/^ARG LEGACY_ORACLE_REF=//p' Dockerfile)
+          sum=$(sed -n 's/^ARG LEGACY_ORACLE_SHA256=//p' Dockerfile)
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]] && [[ "$sum" =~ ^[0-9a-f]{64}$ ]]
+          curl -fsSL -o "$RUNNER_TEMP/supervisor-oracle.tar.gz" "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref"
+          echo "$sum  $RUNNER_TEMP/supervisor-oracle.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/noevia-rs-supervisor-oracle"
+          tar -xzf "$RUNNER_TEMP/supervisor-oracle.tar.gz" -C "$RUNNER_TEMP/noevia-rs-supervisor-oracle" --strip-components=1
       - name: Build frozen supervisor for historical Python differential contracts
         working-directory: ${{ runner.temp }}/noevia-rs-supervisor-oracle
         run: |
