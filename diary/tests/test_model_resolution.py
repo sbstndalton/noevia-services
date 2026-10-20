@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from agent import llm as llm_mod
-from agent.llm import EngineUnreachable, LLMClient, LLMError
+from agent.llm import EngineUnreachable, LLMClient, LLMError, ModelNotServed
 from agent.streaming import exchange_stream
 
 BASE = "http://synthetic.invalid/v1"
@@ -55,26 +55,85 @@ def client_for(engine, configured, **kwargs):
     return client
 
 
-def test_configured_model_that_is_not_served_falls_back_to_the_loaded_served_model(caplog):
+def test_configured_model_that_is_not_served_is_refused_and_nothing_is_sent(caplog):
+    """#2099: never "first loaded" or "first listed": the router would load a model nobody chose."""
     engine = Engine([entry("served-a", "unloaded"), entry("served-b", "loaded")])
     client = client_for(engine, "Configured-GGUF")
     with caplog.at_level(logging.INFO, logger="agent.llm"):
-        assert str(client.chat([{"role": "user", "content": "Synthetic"}])) == "Synthetic answer"
-        client.chat([])
-    assert engine.chat_models == ["served-b", "served-b"]
-    assert client.resolve_chat_model() == ("served-b", "fallback")
-    chosen = [r for r in caplog.records if "chosen" in r.getMessage()]
-    assert len(chosen) == 1, "the choice is logged once, not per call"
-    assert chosen[0].levelno == logging.WARNING
-    assert "'served-b'" in chosen[0].getMessage() and "'Configured-GGUF'" in chosen[0].getMessage()
+        with pytest.raises(ModelNotServed) as refused:
+            client.chat([{"role": "user", "content": "Synthetic"}])
+        with pytest.raises(ModelNotServed):
+            client.chat_stream([], lambda e: None)
+    assert engine.chat_models == [], "no chat request without a served, explicit id"
+    assert refused.value.setting == "LLM_CHAT_MODEL"
+    assert "LLM_CHAT_MODEL" in str(refused.value) and "Configured-GGUF" not in str(refused.value)
+    assert "Configured-GGUF" not in caplog.text, "the setting key is named, never its value"
+    assert len([r for r in caplog.records if "LLM_CHAT_MODEL" in r.getMessage()]) == 1, "logged once, not per call"
     client.close()
 
 
-def test_the_placeholder_default_is_replaced_the_same_way():
+def test_a_refusal_is_not_remembered_so_a_fixed_setting_recovers_at_once():
+    engine = Engine([entry("served-a")])
+    client = client_for(engine, "Configured-GGUF")
+    with pytest.raises(ModelNotServed):
+        client.chat([])
+    engine.models = [entry("served-a"), entry("Configured-GGUF", "unloaded")]
+    client.chat([])
+    assert engine.chat_models == ["Configured-GGUF"]
+    client.close()
+
+
+def test_an_explicit_fallback_id_is_used_when_the_configured_one_is_not_served(caplog):
+    engine = Engine([entry("served-a", "loaded"), entry("served-b", "unloaded")])
+    client = client_for(engine, "Configured-GGUF", fallback_model="served-b")
+    with caplog.at_level(logging.INFO, logger="agent.llm"):
+        client.chat([])
+        client.chat([])
+    assert engine.chat_models == ["served-b", "served-b"], "the named fallback, not the loaded model"
+    assert client.resolve_chat_model() == ("served-b", "fallback")
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING and "LLM_CHAT_MODEL" in r.getMessage()]
+    assert len(warned) == 1 and "Configured-GGUF" not in caplog.text
+    client.close()
+
+
+def test_a_fallback_id_that_is_not_served_either_is_refused_naming_both_keys():
+    engine = Engine([entry("served-a", "loaded")])
+    client = client_for(engine, "Configured-GGUF", fallback_model="Also-missing")
+    with pytest.raises(ModelNotServed, match="LLM_CHAT_FALLBACK_MODEL") as refused:
+        client.chat([])
+    assert "Also-missing" not in str(refused.value) and "Configured-GGUF" not in str(refused.value)
+    assert engine.chat_models == []
+    client.close()
+
+
+def test_the_placeholder_default_is_refused_when_it_is_not_served():
     engine = Engine([entry("served-a")])
     client = client_for(engine, "default")
-    client.chat([])
-    assert engine.chat_models == ["served-a"]
+    with pytest.raises(ModelNotServed):
+        client.chat([])
+    assert engine.chat_models == []
+    client.close()
+
+
+def test_an_empty_model_setting_is_refused_with_or_without_model_listing():
+    for resolve in (True, False):
+        engine = Engine([entry("served-a")])
+        client = LLMClient(BASE, chat_model="  ", max_retries=1, resolve_served_model=resolve,
+                           setting_key="LLM_AUX_MODEL")
+        client._client.close()
+        client._client = httpx.Client(base_url=BASE, transport=httpx.MockTransport(engine))
+        with pytest.raises(ModelNotServed, match="LLM_AUX_MODEL"):
+            client.chat([])
+        assert engine.chat_models == []
+        client.close()
+
+
+def test_a_configured_id_that_is_only_an_embedding_section_is_not_a_chat_model():
+    engine = Engine([entry("embed-only", "loaded", args=["--embedding"]), entry("served-a")])
+    client = client_for(engine, "embed-only")
+    with pytest.raises(ModelNotServed):
+        client.chat([])
+    assert engine.chat_models == []
     client.close()
 
 
@@ -89,12 +148,12 @@ def test_configured_model_that_is_served_is_used_even_when_another_is_loaded():
     client.close()
 
 
-def test_streaming_chat_uses_the_resolved_model():
-    engine = Engine([entry("served-a")])
+def test_streaming_chat_uses_the_configured_served_model():
+    engine = Engine([entry("served-a"), entry("Configured-GGUF", "unloaded")])
     client = client_for(engine, "Configured-GGUF")
     events = []
     client.chat_stream([], events.append)
-    assert engine.chat_models == ["served-a"]
+    assert engine.chat_models == ["Configured-GGUF"]
     client.close()
 
 
@@ -110,8 +169,9 @@ def test_router_down_is_a_clear_logged_error_and_no_chat_is_attempted(caplog):
     assert "Synthetic secret diary text" not in caplog.text
     # recovery: the failure is not remembered
     engine.down = False
+    engine.models = [entry("Configured-GGUF")]
     client.chat([])
-    assert engine.chat_models == ["served-a"]
+    assert engine.chat_models == ["Configured-GGUF"]
     client.close()
 
 
@@ -119,45 +179,37 @@ def test_the_served_list_is_remembered_for_60_seconds_then_read_again(monkeypatc
     now = [1000.0]
     monkeypatch.setattr(llm_mod.time, "monotonic", lambda: now[0])
     engine = Engine([entry("served-a")])
-    client = client_for(engine, "Configured-GGUF")
+    client = client_for(engine, "served-a")
     client.chat([])
     now[0] += 59
     client.chat([])
     assert engine.listings == 1
     engine.models = [entry("served-b")]
     now[0] += 2
-    client.chat([])
+    with pytest.raises(ModelNotServed):
+        client.chat([])
     assert engine.listings == 2
-    assert engine.chat_models == ["served-a", "served-a", "served-b"]
+    assert engine.chat_models == ["served-a", "served-a"]
     client.close()
 
 
 def test_a_failed_chat_forgets_the_remembered_list():
     engine = Engine([entry("served-a")])
-    client = client_for(engine, "Configured-GGUF")
+    client = client_for(engine, "served-a")
     client.chat([])
     engine.models = [entry("served-b")]
-    engine.models_status = 200
     # the engine swaps its models; the stale choice is rejected once, then the next call re-reads
     with pytest.raises(LLMError):
         client.chat([])
-    client.chat([])
-    assert engine.chat_models[-1] == "served-b"
-    client.close()
-
-
-def test_embedding_sections_are_never_chosen_by_launch_flags_not_names():
-    engine = Engine([entry("any-name-1", "loaded", args=["llama-server", "--embedding"]),
-                     entry("any-name-2", "unloaded", args=["llama-server"])])
-    client = client_for(engine, "Configured-GGUF")
-    client.chat([])
-    assert engine.chat_models == ["any-name-2"], "none loaded among chat sections: first listed chat section"
+    with pytest.raises(ModelNotServed):
+        client.chat([])
+    assert engine.chat_models == ["served-a", "served-a"], "one stale send, then nothing once the list is re-read"
     client.close()
 
 
 def test_a_name_that_merely_looks_like_an_embedding_model_is_still_a_chat_candidate():
     engine = Engine([entry("nomic-embed-text-looking-name", "loaded", args=["llama-server"])])
-    client = client_for(engine, "Configured-GGUF")
+    client = client_for(engine, "nomic-embed-text-looking-name")
     client.chat([])
     assert engine.chat_models == ["nomic-embed-text-looking-name"]
     client.close()
@@ -198,6 +250,10 @@ def test_the_aux_client_follows_the_chat_models_choice_when_its_own_model_is_not
     aux = client_for(engine, "Configured-aux", prefer_model_from=main)
     aux.chat([])
     assert engine.chat_models == ["served-c"], "chat configured id is served, so aux follows it, not the loaded one"
+    aux.fallback_model = "served-a"
+    aux.invalidate_resolution()
+    aux.chat([])
+    assert engine.chat_models[-1] == "served-a", "its own explicit fallback comes before the chat model's id"
     main.close()
     aux.close()
 
@@ -206,7 +262,7 @@ def test_health_reports_the_resolved_model(monkeypatch):
     import agent.app as appmod
     from types import SimpleNamespace
     engine = Engine([entry("served-a")])
-    main = client_for(engine, "Configured-GGUF")
+    main = client_for(engine, "Configured-GGUF", fallback_model="served-a")
     monkeypatch.setattr(appmod, "get_state", lambda: SimpleNamespace(llm_main=main, auth_token=""))
     monkeypatch.setattr(appmod, "check_auth", lambda r: True)
     monkeypatch.delenv("DIARY_LEGACY_USER_ID", raising=False)
@@ -216,12 +272,42 @@ def test_health_reports_the_resolved_model(monkeypatch):
     assert body["model"] == "served-a"
     assert body["model_configured"] == appmod._base_cfg.get("llm.chat_model")
     assert body["model_source"] == "fallback"
+    assert body["model_warnings"] == ["LLM_CHAT_MODEL"], "a key, never the value"
     engine.down = True
     main.invalidate_resolution()
     r = TestClient(appmod.app).get("/api/health")
     assert r.status_code == 200, "a liveness probe never fails because the engine is down"
     assert r.json()["model_source"] == "unreachable"
     main.close()
+
+
+def test_health_and_startup_name_the_setting_key_of_an_unserved_id(monkeypatch, caplog):
+    import agent.app as appmod
+    from types import SimpleNamespace
+    engine = Engine([entry("served-a")])
+    main = client_for(engine, "Configured-GGUF")
+    aux = client_for(engine, "Configured-aux", setting_key="LLM_AUX_MODEL")
+    state = SimpleNamespace(llm_main=main, llm_aux=aux, auth_token="")
+    monkeypatch.setattr(appmod, "get_state", lambda: state)
+    monkeypatch.setattr(appmod, "check_auth", lambda r: True)
+    monkeypatch.delenv("DIARY_LEGACY_USER_ID", raising=False)
+    from fastapi.testclient import TestClient
+    body = TestClient(appmod.app).get("/api/health").json()
+    assert body["ok"] is True and body["model_source"] == "not_served"
+    assert body["model_warnings"] == ["LLM_CHAT_MODEL", "LLM_AUX_MODEL"]
+    with caplog.at_level(logging.WARNING):
+        appmod._model_startup_check()
+    startup = [r.getMessage() for r in caplog.records if "does not serve" in r.getMessage()]
+    assert any("LLM_CHAT_MODEL" in m for m in startup) and any("LLM_AUX_MODEL" in m for m in startup)
+    assert "Configured-GGUF" not in caplog.text and "Configured-aux" not in caplog.text
+    assert engine.chat_models == []
+    # a served id is warning-free
+    engine.models = [entry("Configured-GGUF"), entry("Configured-aux")]
+    main.invalidate_resolution()
+    aux.invalidate_resolution()
+    assert TestClient(appmod.app).get("/api/health").json()["model_warnings"] == []
+    main.close()
+    aux.close()
 
 
 def test_streamed_failure_is_logged_with_types_and_status_only(caplog):

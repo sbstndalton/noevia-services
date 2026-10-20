@@ -71,3 +71,29 @@ def test_both_unset_is_left_alone_rather_than_invented():
     cfg = Config({"llm": {"chat_model": "default", "aux": {"model": "default"}}})
     _resolve_aux_model(cfg)
     assert cfg.get("llm.aux.model") == "default"
+
+
+def test_explicit_fallback_model_environment_keys_2099(monkeypatch):
+    monkeypatch.setenv("LLM_CHAT_FALLBACK_MODEL", "synthetic-chat-fallback")
+    monkeypatch.setenv("LLM_AUX_FALLBACK_MODEL", "synthetic-aux-fallback")
+    cfg = Config({})
+    _apply_env(cfg)
+    assert cfg.get("llm.chat_fallback_model") == "synthetic-chat-fallback"
+    assert cfg.get("llm.aux.fallback_model") == "synthetic-aux-fallback"
+
+
+def test_app_state_gives_each_role_its_own_setting_keys_and_fallback_2099(monkeypatch, tmp_path):
+    import agent.app as appmod
+
+    cfg = appmod.load_config()
+    cfg.as_dict().setdefault("llm", {}).update({"chat_model": "synthetic-chat", "chat_fallback_model": "synthetic-chat-b"})
+    cfg.as_dict()["llm"].setdefault("aux", {}).update({"model": "synthetic-aux", "fallback_model": "synthetic-aux-b"})
+    cfg.as_dict().setdefault("retrieval", {})["db_path"] = str(tmp_path / "r.db")
+    cfg.as_dict().setdefault("corpus", {}).update({"backend": "local", "local": {"root": str(tmp_path / "c")}})
+    state = appmod.AppState(cfg)
+    try:
+        assert (state.llm_main.setting_key, state.llm_main.fallback_model) == ("LLM_CHAT_MODEL", "synthetic-chat-b")
+        assert (state.llm_aux.setting_key, state.llm_aux.fallback_model) == ("LLM_AUX_MODEL", "synthetic-aux-b")
+    finally:
+        state.llm_main.close()
+        state.llm_aux.close()

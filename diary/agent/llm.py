@@ -110,6 +110,16 @@ class EngineUnreachable(LLMError):
     """The model engine could not be contacted at all (transport failure)."""
 
 
+class ModelNotServed(LLMError):
+    """#2099: no model id the engine serves is configured for this role. The request is refused
+    before anything is sent, so the engine never loads (and evicts for) a model nobody chose.
+    `setting` names the configuration key; the message carries no model id."""
+
+    def __init__(self, setting: str, message: str):
+        super().__init__(message)
+        self.setting = setting
+
+
 def _served_entries(data: Any) -> List[Dict[str, Any]]:
     """The router's /v1/models body as [{id, loaded, chat}]. A fixed single-model server has no
     per-model `status`; it only answers once that model is loaded."""
@@ -143,6 +153,9 @@ class LLMClient:
         embed_base_url: str = "",
         resolve_served_model: bool = False,
         prefer_model_from: Optional["LLMClient"] = None,
+        fallback_model: str = "",
+        setting_key: str = "LLM_CHAT_MODEL",
+        fallback_setting_key: str = "LLM_CHAT_FALLBACK_MODEL",
     ):
         self.base_url = base_url.rstrip("/")
         self.chat_model = chat_model
@@ -150,6 +163,10 @@ class LLMClient:
         # chat call uses a model the endpoint serves (see resolve_chat_model).
         self.resolve_served_model = resolve_served_model
         self._prefer_from = prefer_model_from
+        # #2099: the only substitute ever used is one the operator named; never "first listed".
+        self.fallback_model = (fallback_model or "").strip()
+        self.setting_key = setting_key
+        self.fallback_setting_key = fallback_setting_key
         self._resolve_lock = threading.Lock()
         self._resolved: Optional[Tuple[float, str, str]] = None  # (expires, model, source)
         self._logged: Optional[Tuple[str, str]] = None
@@ -184,15 +201,18 @@ class LLMClient:
         return _served_entries(resp.json())
 
     def resolve_chat_model(self) -> Tuple[str, str]:
-        """(model id, source) to send as `model`; source is "configured" (the endpoint serves the
-        configured id), "fallback" (it does not, so another served id was chosen) or "unverified"
-        (the endpoint cannot list models, so the configured id is kept). The configured id when the endpoint serves it;
-        otherwise a model the endpoint does serve: the one this client's partner already resolved to
-        (aux follows chat), else the first loaded chat model, else the first listed chat model. The
-        answer is remembered for SERVED_TTL_S. An endpoint that cannot list models keeps the
-        configured id. Raises EngineUnreachable when the engine cannot be
-        contacted and LLMError when it serves no chat model. Never leaves the configured endpoint."""
+        """(model id, source) to send as `model`. Source is "configured" (the endpoint serves the
+        configured id), "fallback" (it does not, so the explicitly configured fallback id, or the id
+        the partner client resolved to, is used; both are served) or "unverified" (the endpoint cannot
+        list models, so the configured id is kept). #2099: a request never goes out without an
+        explicit id the endpoint serves. When neither the configured id nor a configured substitute is
+        served, raises ModelNotServed (naming the setting key, not its value) and sends nothing; the
+        engine is never left to pick a model. Raises EngineUnreachable when the engine cannot be
+        contacted and LLMError when it serves no chat model. The answer is remembered for
+        SERVED_TTL_S (a refusal is not). Never leaves the configured endpoint."""
         if not self.resolve_served_model:
+            if not self.chat_model.strip():
+                raise self._not_configured()
             return self.chat_model, "configured"
         with self._resolve_lock:
             now = time.monotonic()
@@ -206,37 +226,59 @@ class LLMClient:
                 raise
             except Exception as exc:  # noqa: BLE001 - endpoint without a usable model list
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-                log.warning("model list unavailable (%s%s); using the configured model %r",
-                            type(exc).__name__, f" {status}" if status else "", self.chat_model)
+                if not self.chat_model.strip():
+                    self._resolved = None
+                    raise self._not_configured() from exc
+                log.warning("model list unavailable (%s%s); using the model set in %s",
+                            type(exc).__name__, f" {status}" if status else "", self.setting_key)
                 model, source, why = self.chat_model, "unverified", "the endpoint did not list its models"
             else:
-                model, source, why = self._choose(entries)
+                try:
+                    model, source, why = self._choose(entries)
+                except ModelNotServed as refusal:
+                    self._resolved = None
+                    if self._logged != ("", "not_served"):
+                        self._logged = ("", "not_served")
+                        log.error("%s", refusal)
+                    raise
             self._resolved = (now + SERVED_TTL_S, model, source)
             if self._logged != (model, source):
                 self._logged = (model, source)
-                (log.info if source != "fallback" else log.warning)(
-                    "Diary chat model %r chosen (%s): %s; configured %r", model, source, why, self.chat_model)
+                if source == "fallback":
+                    log.warning("Diary chat model: the id set in %s is not served; using %s", self.setting_key, why)
+                else:
+                    log.info("Diary chat model chosen (%s): %s", source, why)
             return model, source
 
+    def _not_configured(self) -> ModelNotServed:
+        return ModelNotServed(
+            self.setting_key,
+            f"no model id is set in {self.setting_key}; set it to an id the model engine serves "
+            "(the diary never lets the engine choose a model)")
+
     def _choose(self, entries: List[Dict[str, Any]]) -> Tuple[str, str, str]:
-        ids = {e["id"] for e in entries}
-        if self.chat_model in ids:
+        chat_ids = {e["id"] for e in entries if e["chat"]}
+        if not chat_ids:
+            raise LLMError("the model engine serves no chat model")
+        if self.chat_model in chat_ids:
             return self.chat_model, "configured", "the configured model is served"
-        chat = [e for e in entries if e["chat"]]
+        if self.fallback_model and self.fallback_model in chat_ids:
+            return self.fallback_model, "fallback", f"the explicit fallback set in {self.fallback_setting_key}"
         partner = ""
         if self._prefer_from is not None and self._prefer_from is not self:
             try:
                 partner = self._prefer_from.resolve_chat_model()[0]
             except LLMError:
                 pass
-        if partner and any(e["id"] == partner for e in chat):
-            return partner, "fallback", "the configured model is not served; using the chat model's"
-        for e in chat:
-            if e["loaded"]:
-                return e["id"], "fallback", "the configured model is not served; using the first loaded model"
-        if chat:
-            return chat[0]["id"], "fallback", "the configured model is not served and none is loaded; using the first listed model"
-        raise LLMError("the model engine serves no chat model")
+        if partner and partner in chat_ids:
+            return partner, "fallback", "the chat model's id"
+        raise ModelNotServed(
+            self.setting_key,
+            f"the model id set in {self.setting_key} is not served by the model engine; "
+            f"set {self.setting_key} to a served id"
+            + (f" (the fallback set in {self.fallback_setting_key} is not served either)" if self.fallback_model else
+               f" or set {self.fallback_setting_key} to a served id")
+            + ". No request was sent.")
 
     def invalidate_resolution(self) -> None:
         with self._resolve_lock:
