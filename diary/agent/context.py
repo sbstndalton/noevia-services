@@ -20,6 +20,7 @@ from typing import List, Optional
 
 from .corpus_store import CorpusStore
 from .retrieval import Retriever
+from .retrieval_trace import RetrievalTrace, SafeTrace
 from .util import estimate_tokens
 
 log = logging.getLogger(__name__)
@@ -61,7 +62,9 @@ class ContextAssembler:
         user_message: str,
         session_turns: Optional[List[dict]] = None,
         today_header: Optional[str] = None,
+        trace: Optional[RetrievalTrace] = None,
     ) -> List[dict]:
+        trace = SafeTrace.wrap(trace)
         system_prompt = self._system_prompt()
         # #1505: only answered exchanges are replayed; the new message is appended below, always last.
         session_turns = completed_exchanges(session_turns)
@@ -92,7 +95,7 @@ class ContextAssembler:
         blocks.append("=== END MEMORY / CONTEXT ===")
 
         # 3. Retrieved past entries
-        retrieved = self._retrieve(user_message, session_turns)
+        retrieved = self._retrieve(user_message, session_turns) if trace is None else self._retrieve(user_message, session_turns, trace)
         blocks.append("=== RETRIEVED PAST ENTRIES (semantic matches; reference material) ===")
         if retrieved:
             for r in retrieved:
@@ -104,7 +107,10 @@ class ContextAssembler:
         blocks.append("=== END RETRIEVED PAST ENTRIES ===")
         if not retrieved:
             blocks.append("=== DIRECT PAST ENTRY FALLBACK (limited file reads; reference material, not semantic matches) ===")
-            blocks.append(self._direct_past_entries(day, user_message) or "(no entries found within the limited date lookup; this is not a search of the whole diary)")
+            direct = self._direct_past_entries(day, user_message)
+            if trace is not None:
+                trace.set_direct_fallback(bool(direct), estimate_tokens(direct) if direct else 0)
+            blocks.append(direct or "(no entries found within the limited date lookup; this is not a search of the whole diary)")
             blocks.append("=== END DIRECT PAST ENTRY FALLBACK ===")
 
         context_block = "\n".join(blocks)
@@ -136,13 +142,20 @@ class ContextAssembler:
         default = Path(__file__).resolve().parent.parent / "config" / "prompts" / "system.md"
         return default.read_text(encoding="utf-8")
 
-    def _retrieve(self, user_message: str, session_turns: Optional[List[dict]]) -> List[dict]:
+    def _retrieve(self, user_message: str, session_turns: Optional[List[dict]],
+                  trace: Optional[RetrievalTrace] = None) -> List[dict]:
+        trace = SafeTrace.wrap(trace)
         if self.retriever is None:
+            if trace is not None:
+                trace.set_status("no_retriever")
             return []
         top_k = int(self.cfg.get("retrieval.top_k", 8))
         min_score = float(self.cfg.get("retrieval.min_score", 0.30))
         budget_tokens = float(self.cfg.get("retrieval.max_context_tokens", 5200))
         budget_chars = int(budget_tokens * 3.6)
+        if trace is not None:
+            trace.set_params(top_k=top_k, candidate_k=top_k * 2, min_score=min_score)
+            trace.set_budget(max_context_tokens=int(budget_tokens), max_context_chars=budget_chars, excerpt_char_cap=2400)
 
         # Query: current message plus recent user turns for continuity.
         recent_user = [
@@ -150,27 +163,50 @@ class ContextAssembler:
         ][-3:]
         query = "\n".join([*recent_user, user_message]).strip()
         if not query:
+            if trace is not None:
+                trace.set_status("empty_query")
             return []
 
+        diag: dict = {}
         try:
-            results = self.retriever.search(query, top_k=top_k * 2, min_score=min_score)
+            if trace is None:
+                results = self.retriever.search(query, top_k=top_k * 2, min_score=min_score)
+            else:
+                results = self.retriever.search(query, top_k=top_k * 2, min_score=min_score, with_ids=True, diag=diag)
         except Exception:  # retrieval must not make durable, readable files unreachable
             log.warning("Semantic retrieval unavailable; using bounded direct-file fallback")
+            if trace is not None:
+                trace.set_status("search_failed")
             return []
+        if trace is not None:
+            trace.set_status(diag.get("status", "ok"))
         # Fit budget: keep highest-scored, cap each excerpt, drop overflow lowest-first.
         kept: List[dict] = []
         used = 0
-        for r in results:
+        for rank, r in enumerate(results, 1):
+            cand = trace.add_candidate(rank, r) if trace is not None else None
             text = r["text"]
             if len(text) > 2400:
                 text = text[:2400] + " …"
             cost = len(text) + len(r["header"]) + 60
             if used + cost > budget_chars:
+                if cand is not None:
+                    cand["dropped"] = "budget"
                 continue
             kept.append({**r, "text": text})
             used += cost
+            if cand is not None:
+                cand["loaded"] = True
+                trace.add_loaded(r, estimate_tokens(text), cost)
             if len(kept) >= top_k:
+                if trace is not None:
+                    for later_rank, later in enumerate(results[rank:], rank + 1):
+                        later_cand = trace.add_candidate(later_rank, later)
+                        if later_cand is not None:
+                            later_cand["dropped"] = "top_k"
                 break
+        if trace is not None:
+            trace.finish(used)
         return kept
 
     def _direct_past_entries(self, day: date, user_message: str) -> str:
