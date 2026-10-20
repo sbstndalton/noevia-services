@@ -472,4 +472,6 @@ def test_a_failing_collector_on_the_streaming_diary_events_path_still_streams_wi
     assert got[-1] == {"type": "done"}  # the stream completed normally
     diary = [e for e in got if e.get("type") == "diary"]
     assert len(diary) == 1 and "retrieval_trace" not in diary[0]
-    assert diary[0] == [e for e in plain if e.get("type") == "diary"][0]  # same reply as with tracing off
+    plain_diary = [e for e in plain if e.get("type") == "diary"]
+    assert len(plain_diary) == 1, f"the untraced stream should carry exactly one diary event, got {len(plain_diary)}"
+    assert diary[0] == plain_diary[0]  # same reply as with tracing off
