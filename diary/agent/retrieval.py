@@ -306,8 +306,10 @@ class Retriever:
 
     # ---------------- search ----------------
 
-    def search(self, query: str, top_k: int = 8, min_score: float = 0.30) -> List[dict]:
-        """Cosine-similarity search over past chunks. Returns [{'day','header','text','score'}]."""
+    def search(self, query: str, top_k: int = 8, min_score: float = 0.30, with_ids: bool = False) -> List[dict]:
+        """Cosine-similarity search over past chunks. Returns [{'day','header','text','score'}].
+
+        ``with_ids`` (retrieval tracing only) adds each chunk's ``id``; results are otherwise identical."""
         if not self.vec_available:
             return []
         # #1636: only the active model's slot, with a query embedded by that model. No slot yet
@@ -319,9 +321,10 @@ class Retriever:
         # lock and must not wait behind a slow query embedding.
         q = self._embed_one(query, target, "query")
         with self._lock:
-            return self._search_vector(q, top_k, min_score, slot)
+            return self._search_vector(q, top_k, min_score, slot, with_ids)
 
-    def _search_vector(self, q: Optional[List[float]], top_k: int, min_score: float, slot: Optional[dict] = None) -> List[dict]:
+    def _search_vector(self, q: Optional[List[float]], top_k: int, min_score: float, slot: Optional[dict] = None,
+                       with_ids: bool = False) -> List[dict]:
         if slot is None:
             slot = self._active_slot()[1]
         if q is None or slot is None or len(q) != slot["dim"]:
@@ -342,6 +345,11 @@ class Retriever:
         except sqlite3.Error as exc:
             log.warning("vector search failed: %s", exc)
             return []
+        if with_ids:
+            return [
+                {"id": r["id"], "day": r["day"], "header": r["header"], "text": r["body"], "score": round(r["score"], 4)}
+                for r in rows
+            ]
         return [
             {"day": r["day"], "header": r["header"], "text": r["body"], "score": round(r["score"], 4)}
             for r in rows

@@ -77,6 +77,22 @@ and win over the environment until that file is deleted.
 
 Set `DIARY_AUTH_TOKEN` before network exposure. The SQLite database contains the retrieval index and durable write journal and must live on persistent storage.
 
+## Retrieval trace (test harness only)
+
+For the synthetic Diary gate. Off unless the service environment sets `DIARY_RETRIEVAL_TRACE=1` (production never
+does) **and** the request sends `X-Diary-Retrieval-Trace: 1`. Then `/v1/chat/completions` returns a
+`retrieval_trace` object (top level of the JSON response; in the `diary` event when streaming with `diary_events`).
+It is built per request and returned only to that caller; nothing is stored and there is no trace endpoint.
+It holds ids, scores, counts and the budget only, never entry text, headers, the query or embeddings, and it does
+not change retrieval or the model input.
+
+- `candidates`: vector-search hits in score order (`rank`, chunk `id`, `day`, `time`, `score`, `loaded`, and `dropped`
+  = `budget` or `top_k` when not loaded). `params`: `top_k` 8, `candidate_k` 16 (2x top_k), `min_score` 0.30.
+- `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
+- `loaded`: the excerpts actually placed in the context (`id`, `day`, `time`, `score`, `tokens`, `chars`);
+  `budget`: `max_context_tokens`, `max_context_chars`, `excerpt_char_cap`, `used_chars`, `used_tokens`.
+- `counts`, `status` (`ok`, `no_retriever`, `empty_query`, `search_failed`), `direct_fallback` (`used`, `tokens`).
+
 ## Editing — the integrity guarantee
 
 The logger keeps the user's own words near-verbatim; that guarantee extends to
