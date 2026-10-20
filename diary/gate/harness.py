@@ -251,10 +251,11 @@ def cmd_restore_selftest(args, run: Path | None = None) -> int:
                                                                         "version": cur.get("version")})
     contaminated = w1.status == 200 and w2.status == 200 and not g.baseline_matches(client, user, baseline["files"])
     report = restore_baseline(client, user, baseline, env, log)
-    ok = contaminated and report["ok"] and {d["path"] for d in report["deleted"]} == {new} and \
+    ok = contaminated and report["ok"] and {d["path"] for d in report["deleted"] + report["emptied"]} == {new} and \
         {r["path"] for r in report["rewritten"]} == {old}
     g.write_json(run / "stages" / "restore-selftest.json", {"ok": ok, "contaminated": contaminated, **report})
-    print(json.dumps({"stage": "restore-selftest", "ok": ok, "deleted": len(report["deleted"]), "rewritten": len(report["rewritten"]),
+    print(json.dumps({"stage": "restore-selftest", "ok": ok, "deleted": len(report["deleted"]), "emptied": len(report["emptied"]),
+                      "rewritten": len(report["rewritten"]),
                       "matches": report["matches"]}))
     return 0 if ok else 1
 
@@ -285,7 +286,7 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
     except g.GateBlocked as exc:
         return f"restore after {q['id']} stopped by the MS-01 load gate: {exc}"
     if restore_log:
-        restore_log({"query": q["id"], **{k: report[k] for k in ("deleted", "rewritten", "failures", "settled", "matches", "ok")}})
+        restore_log({"query": q["id"], **{k: report[k] for k in ("deleted", "emptied", "rewritten", "failures", "settled", "matches", "ok")}})
     if not report["ok"]:
         return f"restore after {q['id']} failed: {json.dumps({k: report[k] for k in ('failures', 'settled', 'matches')})}"
     return None

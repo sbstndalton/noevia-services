@@ -496,8 +496,9 @@ def settle(client: Client, user: str, expect_chunks=None, timeout: float = 300, 
 
 def restore(client: Client, user: str, baseline: dict, env: dict | None = None, gate_log=None) -> dict:
     """Put the tenant back to `baseline`: PUT back every changed or missing file with its current version,
-    and move every new file to Trash. Each write is gated (it reindexes)."""
-    report = {"rewritten": [], "deleted": [], "failures": []}
+    and move every new file to Trash. Diary day files are protected from deletion (403), so a new day
+    file is emptied instead: it then holds no entries and no chunks. Each write is gated (it reindexes)."""
+    report = {"rewritten": [], "deleted": [], "emptied": [], "failures": []}
     for path in list_tree(client, user):
         if path in baseline:
             continue
@@ -506,6 +507,17 @@ def restore(client: Client, user: str, baseline: dict, env: dict | None = None, 
             version = (st.json() or {}).get("version")
             r = client.request("POST", "/api/workspace-ops", user=user,
                                json_body={"op": "delete", "path": path, "version": version}, timeout=300)
+        if r.status == 403:
+            with inference_slot(env or {}, gate_log):
+                cur = client.request("POST", "/api/file", user=user, json_body={"path": path})
+                body = cur.json() or {}
+                if body.get("content") == "":
+                    report["emptied"].append({"path": path, "status": 200})
+                    continue
+                r = client.request("PUT", "/api/file", user=user,
+                                   json_body={"path": path, "content": "", "version": body.get("version")}, timeout=300)
+            (report["emptied"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
+            continue
         (report["deleted"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
     for path, content in sorted(baseline.items()):
         cur = client.request("POST", "/api/file", user=user, json_body={"path": path})
@@ -521,10 +533,12 @@ def restore(client: Client, user: str, baseline: dict, env: dict | None = None, 
 
 
 def baseline_matches(client: Client, user: str, baseline: dict) -> bool:
+    """The tenant equals the baseline, ignoring new files that restore() emptied (no text, no chunks)."""
     try:
-        return snapshot(client, user) == baseline
+        current = snapshot(client, user)
     except RuntimeError:
         return False
+    return {p: t for p, t in current.items() if p in baseline or t != ""} == baseline
 
 
 # ---------------- workflow-area result ----------------

@@ -169,6 +169,8 @@ class FakeDiary:
             if body["op"] == "stat":
                 return g.Response(200, json.dumps({"version": v(self.files[body["path"]])}).encode(), {})
             assert body["version"] == v(self.files[body["path"]])
+            if body["path"].startswith("Entries/"):
+                return g.Response(403, b"{}", {})  # diary day files are protected (agent/workspace_ops.py)
             del self.files[body["path"]]
             return g.Response(200, b"{}", {})
         raise AssertionError((method, path))
@@ -179,9 +181,11 @@ def test_restore_puts_back_changed_files_and_deletes_new_ones():
     d = FakeDiary(base)
     d.files["Entries/2030/March/March 7, 2030.md"] = "logged exchange\n"
     d.files["Entries/2030/January/January 6, 2030.md"] = "b\nlogged\n"
+    d.files["Notes/scratch.md"] = "new note"
     report = g.restore(d, "u", base)
-    assert report["ok"] and d.files == base
-    assert [x["path"] for x in report["deleted"]] == ["Entries/2030/March/March 7, 2030.md"]
+    assert report["ok"] and d.files == {**base, "Entries/2030/March/March 7, 2030.md": ""}
+    assert [x["path"] for x in report["deleted"]] == ["Notes/scratch.md"]
+    assert [x["path"] for x in report["emptied"]] == ["Entries/2030/March/March 7, 2030.md"]
     assert [x["path"] for x in report["rewritten"]] == ["Entries/2030/January/January 6, 2030.md"]
     assert g.baseline_matches(d, "u", base)
 
