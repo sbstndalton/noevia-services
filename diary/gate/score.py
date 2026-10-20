@@ -222,7 +222,14 @@ def score(run: Path, fixture: Path, judgements_path: Path | None = None) -> dict
     elif plan is None or not answers:
         stages.extend({"stage": s, "status": "untested: no queries run"} for s in later)
     elif len(answers) < plan["planned_rows"]:
-        stages.extend({"stage": s, "status": f"untested: partial {len(answers)}/{plan['planned_rows']}"} for s in later)
+        partial = f"untested: partial {len(answers)}/{plan['planned_rows']}"
+        stages.extend({"stage": s, "status": partial} for s in later[:3])
+        if any(a.get("status") != 200 for a in answers):
+            # A failed turn ends its query early (a follow-up is never asked): that is a failure, not a gap.
+            answer, rows = stage_answer(queries, answers, th, rubric, judgements)
+            stages.append({**answer, "status": "fail", "partial": partial})
+        else:
+            stages.append({"stage": "answer", "status": partial})
     else:
         stages.extend(stage_retrieval(queries, traces, th))
         answer, rows = stage_answer(queries, answers, th, rubric, judgements)

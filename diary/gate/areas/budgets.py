@@ -27,7 +27,7 @@ def main() -> int:
     area = g.Area("budgets", args.run_dir, PARALLEL_SAFE)
     env = g.load_env(args.env_file)
     user = g.tenant_id(args.tenant_label or "area-budgets")
-    c = g.Client(g.NOMODEL_BASE_URL, env, log=area.log_request)  # limits: no embedding work possible
+    c = g.Client(g.NOMODEL_BASE_URL, env, log=area.log_request, nomodel=True)  # limits: no embedding work possible
     model = g.Client(args.base_url, env, log=area.log_request)
     now = lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")  # noqa: E731
     for name, size, want in (("append-at-limit", 8000, 200), ("append-over-limit", 8001, 400)):

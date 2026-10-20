@@ -26,7 +26,7 @@ def main() -> int:
     env = g.load_env(args.env_file)
     label = args.tenant_label or "area-tenancy"
     a, b = g.tenant_id(label + "-a"), g.tenant_id(label + "-b")
-    c = g.Client(args.base_url, env, log=area.log_request)
+    c = g.Client(args.base_url, env, log=area.log_request, nomodel=True)
     if not c.key:
         area.mark("tenant-key", "blocked", "DIARY_TENANT_KEY is empty in .env.gate")
         return area.finish()

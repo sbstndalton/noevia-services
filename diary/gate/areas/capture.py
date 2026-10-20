@@ -23,7 +23,7 @@ def main() -> int:
     area = g.Area("capture", args.run_dir, PARALLEL_SAFE)
     env = g.load_env(args.env_file)
     user = g.tenant_id(args.tenant_label or "area-capture")
-    c = g.Client(args.base_url, env, log=area.log_request)
+    c = g.Client(args.base_url, env, log=area.log_request, nomodel=True)
 
     r = c.request("GET", "/api/health")
     area.check("health", r.status == 200 and (r.json() or {}).get("ok") is True, http=r.status)

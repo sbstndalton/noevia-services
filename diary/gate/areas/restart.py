@@ -31,7 +31,7 @@ def main() -> int:
     area = g.Area("restart", args.run_dir, PARALLEL_SAFE)
     env = g.load_env(args.env_file)
     user = g.tenant_id(args.tenant_label or "area-restart")
-    c = g.Client(args.base_url, env, log=area.log_request)
+    c = g.Client(args.base_url, env, log=area.log_request, nomodel=True)
     try:
         project = docker("inspect", CONTAINER, "--format", '{{index .Config.Labels "com.docker.compose.project"}}')
     except (subprocess.SubprocessError, OSError) as exc:

@@ -316,3 +316,56 @@ def test_isolation_check_with_fake_inspect(bad):
     containers = [a] if bad == "missing" else [a, b]
     result = isolation.check_containers(containers, vols, nets)
     assert result["ok"] is (bad is None), result["problems"]
+
+
+def test_http_failure_on_a_turn_with_a_followup_is_fail_not_untested(fixture_dir, tmp_path):
+    run, _ = _full_run(tmp_path, fixture_dir)
+    path = run / "stages" / "answers.jsonl"
+    rows = g.read_jsonl(path)
+    first = next(r for r in rows if r["id"] + "#followup" in {x["id"] for x in rows})
+    kept = [dict(r, status=502) if r["id"] == first["id"] else r for r in rows if r["id"] != first["id"] + "#followup"]
+    path.write_text("".join(json.dumps(r) + "\n" for r in kept))
+    stages = {s["stage"]: s["status"] for s in score.score(run, fixture_dir)["stages"]}
+    assert stages["answer"] == "fail" and stages["candidate_retrieval"].startswith("untested: partial")
+
+
+@pytest.mark.parametrize("url,nomodel,ok", [
+    ("http://127.0.0.1:18910", False, True), ("http://localhost:18911/", False, True), ("http://127.0.0.1:18911", True, True),
+    ("http://127.0.0.1:18910", True, False), ("http://10.69.0.131:18910", False, False), ("http://127.0.0.1:11435", False, False),
+    ("https://127.0.0.1:18910", False, False), ("http://u:p@127.0.0.1:18910", False, False), ("http://127.0.0.1", False, False),
+    ("http://127.0.0.1:18910/v1", False, False), ("http://127.0.0.1.example:18910", False, False), ("not a url", False, False)])
+def test_base_url_guard(url, nomodel, ok):
+    if ok:
+        assert g.check_base_url(url, nomodel).startswith("http://")
+        g.Client(url, {}, nomodel=nomodel)
+    else:
+        with pytest.raises(SystemExit):
+            g.Client(url, {}, nomodel=nomodel)
+
+
+def test_no_model_area_refuses_the_gate_diary(tmp_path, monkeypatch, capsys):
+    import runpy
+    monkeypatch.setattr(sys, "argv", ["capture.py", "--run-dir", str(tmp_path), "--env-file", str(tmp_path / "env"),
+                                      "--base-url", "http://127.0.0.1:18910"])
+    (tmp_path / "env").write_text("DIARY_AUTH_TOKEN=t\n")
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(str(GATE / "areas" / "capture.py"), run_name="__main__")
+    assert "no-model diary" in str(exc.value)
+
+
+def test_inference_lock_times_out_fail_closed_in_a_private_dir(tmp_path, monkeypatch):
+    import fcntl
+    import os
+    monkeypatch.setattr(g, "require_gate", lambda env: {"ok": True, "reasons": []})
+    monkeypatch.setattr(g, "LOCK_DIR", str(tmp_path / "locks"))
+    with g.inference_slot(ENV):
+        pass
+    assert (os.stat(tmp_path / "locks").st_mode & 0o777) == 0o700
+    lock = str(tmp_path / "locks" / "inference.lock")
+    with open(lock, "a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        logged = []
+        with pytest.raises(g.GateBlocked):
+            with g.inference_slot(ENV, logged.append, lock_timeout=0.2):
+                pytest.fail("must not run while another process holds the lock")
+        assert "lock still held" in logged[-1]["reasons"][0]

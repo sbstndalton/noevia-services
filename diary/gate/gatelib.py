@@ -89,11 +89,36 @@ class Response:
             return None
 
 
-class Client:
-    """Talks to the gate diary as the web server would: bearer token plus a signed tenant assertion."""
+GATE_HOSTS = ("127.0.0.1", "localhost")
 
-    def __init__(self, base_url: str, env: dict, timeout: float = 30.0, log=None):
-        self.base_url = base_url.rstrip("/")
+
+def gate_ports() -> tuple:
+    """(gate diary port, no-model diary port), as compose.yml publishes them."""
+    return int(os.environ.get("GATE_PORT", "18910")), int(os.environ.get("GATE_NOMODEL_PORT", "18911"))
+
+
+def check_base_url(url: str, nomodel: bool = False) -> str:
+    """Hard isolation guard, applied before any request: plain http on 127.0.0.1 or localhost, on one of
+    the two gate ports; a no-model client may use only the no-model port. Anything else is refused."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url))
+        port = parsed.port
+    except ValueError:
+        raise SystemExit(f"refused base URL {url!r}: not a URL")
+    gate, nomodel_port = gate_ports()
+    allowed = (nomodel_port,) if nomodel else (gate, nomodel_port)
+    if parsed.scheme != "http" or parsed.hostname not in GATE_HOSTS or port not in allowed             or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise SystemExit(f"refused base URL {url!r}: only http://127.0.0.1 or localhost on port "
+                         f"{' or '.join(map(str, allowed))} ({'no-model diary' if nomodel else 'gate diaries'})")
+    return f"http://{parsed.hostname}:{port}"
+
+
+class Client:
+    """Talks to a gate diary as the web server would: bearer token plus a signed tenant assertion.
+    The base URL is checked by check_base_url before any request (nomodel=True: the no-model diary only)."""
+
+    def __init__(self, base_url: str, env: dict, timeout: float = 30.0, log=None, nomodel: bool = False):
+        self.base_url = check_base_url(base_url, nomodel)
         self.token = env.get("DIARY_AUTH_TOKEN", "")
         self.key = env.get("DIARY_TENANT_KEY", "")
         self.timeout = timeout
@@ -188,7 +213,9 @@ def add_blocker(run: Path, text: str) -> None:
 # ---------------- MS-01 load gate (before every inference call and every embedding write) ----------------
 
 MIN_MEM_AVAILABLE = 6 * 1024 ** 3
-LOCK_FILE = os.environ.get("GATE_LOCK_FILE", "/tmp/diarygate-inference.lock")
+# A private directory (mode 0700) under the gate work dir, never a predictable shared /tmp path.
+LOCK_DIR = os.path.expanduser(os.environ.get("GATE_LOCK_DIR", "~/noevia-work/diarygate-work/locks"))
+LOCK_TIMEOUT_S = float(os.environ.get("GATE_LOCK_TIMEOUT_S", "1800"))
 RECHECKS = int(os.environ.get("GATE_RECHECKS", "12"))
 RECHECK_S = float(os.environ.get("GATE_RECHECK_S", "5"))
 
@@ -309,15 +336,42 @@ def require_gate(env: dict, rechecks: int = RECHECKS, wait: float = RECHECK_S, c
     raise GateBlocked(result)
 
 
+def _lock_path(lock_file: str | None) -> str:
+    if lock_file:
+        return lock_file
+    os.makedirs(LOCK_DIR, mode=0o700, exist_ok=True)
+    os.chmod(LOCK_DIR, 0o700)
+    return os.path.join(LOCK_DIR, "inference.lock")
+
+
+def _acquire(fh, timeout: float, sleep=time.sleep) -> None:
+    """flock with a bounded wait; fails closed with GateBlocked when another gate process holds it too long."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise GateBlocked({"ok": False, "reasons": [f"inference lock still held after {timeout:.0f} s"]})
+            sleep(0.5)
+
+
 @contextmanager
-def inference_slot(env: dict, log=None, lock_file: str | None = None):
+def inference_slot(env: dict, log=None, lock_file: str | None = None, lock_timeout: float | None = None):
     """Hold a cross-process lock around the load check AND the call it guards, so no two gate processes
     start inference work at once. A no-op when inference is disabled (nothing can reach a model)."""
     if not inference_enabled(env):
         yield None
         return
-    with open(lock_file or LOCK_FILE, "a") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    fd = os.open(_lock_path(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as fh:
+        try:
+            _acquire(fh, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout)
+        except GateBlocked as exc:
+            if log:
+                log(exc.result)
+            raise
         try:
             try:
                 result = require_gate(env)
@@ -497,7 +551,11 @@ def settle(client: Client, user: str, expect_chunks=None, timeout: float = 300, 
 def restore(client: Client, user: str, baseline: dict, env: dict | None = None, gate_log=None) -> dict:
     """Put the tenant back to `baseline`: PUT back every changed or missing file with its current version,
     and move every new file to Trash. Diary day files are protected from deletion (403), so a new day
-    file is emptied instead: it then holds no entries and no chunks. Each write is gated (it reindexes)."""
+    file is emptied instead: it then holds no entries and no chunks. Each write is gated (it reindexes).
+
+    With env set, each write takes its own inference_slot. The lock is not re-entrant: calling this with
+    env from INSIDE another inference_slot would wait on itself (until the lock timeout). Inside a slot,
+    call it without env, as harness.restore_baseline does."""
     report = {"rewritten": [], "deleted": [], "emptied": [], "failures": []}
     for path in list_tree(client, user):
         if path in baseline:

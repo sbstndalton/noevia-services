@@ -13,7 +13,8 @@ The fixture is verified against its manifest (every file hash and the tree hash)
 With inference enabled, every write that reindexes (load, mutations, restores) and every query runs
 inside gatelib.inference_slot: a cross-process lock around the MS-01 load check (bounded re-checks,
 fail closed) and the call. After every query the tenant is restored to the post-mutation baseline
-(changed files PUT back, new files moved to Trash) and the index settles, so no query sees an earlier
+(changed files PUT back; new files moved to Trash, or emptied when they are protected diary day files)
+and the index settles, so no query sees an earlier
 query's logged exchange. Retrieval traces are recorded when the diary returns a known shape;
 otherwise each row says "trace unavailable".
 """
@@ -36,7 +37,7 @@ CANDIDATE_KEYS = ("candidates", "retrieved", "results")
 
 
 def _client(args, run: Path, env: dict) -> g.Client:
-    return g.Client(args.base_url, env, log=lambda row: g.append_jsonl(run / "logs" / "requests.jsonl", row))
+    return g.Client(args.base_url, env, log=lambda row: g.append_jsonl(run / "logs" / "requests.jsonl", row))  # guarded URL
 
 
 def _gate_log(run: Path, what: str):
@@ -348,6 +349,7 @@ def main(argv=None) -> int:
     ap.add_argument("--only", default="")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args(argv)
+    g.check_base_url(args.base_url)  # refuse anything but a gate diary before any request
     if args.command in ("init", "all") and not (args.evidence_root and args.rev and args.phase):
         raise SystemExit("init/all need --evidence-root, --rev and --phase")
     if args.command not in ("init", "all") and not args.run_dir:

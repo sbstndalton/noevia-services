@@ -23,7 +23,7 @@ def main() -> int:
     env = g.load_env(args.env_file)
     label = args.tenant_label or "area-error-paths"
     user, doomed = g.tenant_id(label), g.tenant_id(label + "-deleted")
-    c = g.Client(args.base_url, env, log=area.log_request)
+    c = g.Client(args.base_url, env, log=area.log_request, nomodel=True)
 
     def expect(name, resp, statuses):
         area.check(name, resp.status in statuses, http=resp.status, expected=sorted(statuses))
