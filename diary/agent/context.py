@@ -159,9 +159,10 @@ class ContextAssembler:
                           trace: Optional[RetrievalTrace] = None):
         """(loaded entries, a header label per entry, note lines opening the block).
 
-        #116: when the message names an entity or a time anchor (entity_focus.py), a wider vector pool is
-        checked lexically: entries naming the asked entity exactly are kept, near-name and later-dated
-        entries left out; when no entry names it exactly, near-name entries are labelled as someone else."""
+        #116: when the message names an entity (or is a name-less follow-up to a question that did) or has a
+        time anchor (entity_focus.py), a wider vector pool is checked lexically. Only confirmed near-name hits
+        (a near spelling of a name another hit names exactly) and hits dated after the anchor are left out;
+        similar names are labelled "may be a different person; check the name"."""
         trace = SafeTrace.wrap(trace)
         if self.retriever is None:
             if trace is not None:
@@ -172,18 +173,17 @@ class ContextAssembler:
         budget_tokens = float(self.cfg.get("retrieval.max_context_tokens", 5200))
         budget_chars = int(budget_tokens * 3.6)
         candidate_k = top_k * 2
-        probe = entity_focus.analyse(user_message) if _enabled(self.cfg.get("retrieval.entity_focus", True)) else None
-        focused = probe is not None and probe.active
+        # Earlier user messages of this conversation: a name-less follow-up carries their entities.
+        earlier = [t["content"] for t in (session_turns or []) if t.get("role") == "user"][-3:]
+        enabled = _enabled(self.cfg.get("retrieval.entity_focus", True))
+        focused = enabled and entity_focus.analyse(user_message, earlier).active
         pool = top_k * 4 if focused else candidate_k
         if trace is not None:
             trace.set_params(top_k=top_k, candidate_k=pool, min_score=min_score)
             trace.set_budget(max_context_tokens=int(budget_tokens), max_context_chars=budget_chars, excerpt_char_cap=2400)
 
         # Query: current message plus recent user turns for continuity.
-        recent_user = [
-            t["content"] for t in (session_turns or []) if t.get("role") == "user"
-        ][-3:]
-        query = "\n".join([*recent_user, user_message]).strip()
+        query = "\n".join([*earlier, user_message]).strip()
         if not query:
             if trace is not None:
                 trace.set_status("empty_query")
@@ -204,8 +204,7 @@ class ContextAssembler:
             trace.set_status(diag.get("status", "ok"))
         focus = None
         if focused:
-            # Only the current message says what is asked: earlier turns widen the vector query only.
-            focus = entity_focus.focus_candidates(user_message, results, limit=candidate_k)
+            focus = entity_focus.focus_candidates(user_message, results, limit=candidate_k, earlier=earlier)
             ranked = focus.kept
             if trace is not None:
                 trace.set_focus(focus, len(results))

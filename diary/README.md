@@ -97,8 +97,9 @@ not change retrieval or the model input.
 - `focus` (services#116): `{"checked": false}` when the message names no entity and no time anchor; then
   `candidates` are the vector hits. Otherwise `entities` and `time_anchor` (counts and flags only, never the
   names), `applied` (some hit named an asked entity exactly), `vector_candidates`, `removed` (each dropped hit:
-  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `entity_absent`, `after_time_anchor` or
-  `candidate_limit`), `near_name_labelled` and `superseded_labelled`.
+  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `after_time_anchor` or
+  `candidate_limit`), `carried` (the entities came from the previous question), `similar_name_labelled`
+  and `superseded_labelled`.
 - `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
 - `loaded`: the excerpts actually placed in the context (`id`, `day`, `time`, `score`, `tokens`, `chars`);
   `budget`: `max_context_tokens`, `max_context_chars`, `excerpt_char_cap`, `used_chars`, `used_tokens`.
@@ -106,14 +107,23 @@ not change retrieval or the model input.
 
 ## Entity focus (services#116)
 
-Vector similarity cannot tell similarly spelled names apart, so entries about "Alder Brennock" crowd out the one
-about "Alder Brannock". When the user's message names an entity (a capitalised name phrase) or a time anchor
-("as of January 20, 2030", "before 2030-02-10"), `agent/entity_focus.py` checks a wider vector pool (4x top_k)
-lexically, with no model call: hits dated after the anchor are dropped; if any hit names an asked entity exactly,
-only those are kept (score order, at most 2x top_k); otherwise every hit is kept and hits naming only a similar
-spelling are labelled as a different person. A short note opens the retrieved block, and an entry dated before an
-explicit correction of the same entity is labelled as superseded. Messages without a name or anchor are
-unaffected. `retrieval.entity_focus: false` turns the check off.
+Vector similarity cannot tell similarly spelled names apart, so entries about "Alder Brennock" sit next to the one
+about "Alder Brannock" and the answer conflates them. When the user's message names an entity (a capitalised name
+phrase; titles, accents and punctuation ignored), is a name-less follow-up ("and her email?") to a question that
+did, or is explicitly framed by a date ("As of January 20, 2030, ...?"), `agent/entity_focus.py` checks a wider
+vector pool (4x top_k) lexically, with no model call:
+
+- A hit naming only a near spelling of a name that another hit names exactly (or by first name or surname alone)
+  is dropped: the diary names that person, so the near spelling is someone else. Nothing else is dropped for a
+  name, so recall never falls below plain vector search.
+- With no exact match (a typo or a short form in the question) nothing is dropped; similar names are labelled
+  "may be a different person, check the name".
+- Hits dated after a time anchor are dropped. A date inside a statement ("away until 3 March") is not an anchor.
+- An earlier entry is labelled superseded only by an explicit correction of the same entity that replaces a
+  value found in it ("..., not smoked lapsang").
+
+A short note opens the retrieved block. Messages without a name or anchor are unaffected, and
+`retrieval.entity_focus: false` turns the check off.
 
 ## Editing — the integrity guarantee
 
