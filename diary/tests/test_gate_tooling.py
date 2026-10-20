@@ -369,3 +369,75 @@ def test_inference_lock_times_out_fail_closed_in_a_private_dir(tmp_path, monkeyp
             with g.inference_slot(ENV, logged.append, lock_timeout=0.2):
                 pytest.fail("must not run while another process holds the lock")
         assert "lock still held" in logged[-1]["reasons"][0]
+
+
+def _serve(handler_body):
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        hits = []
+
+        def do_GET(self):
+            H.hits.append(dict(self.headers))
+            handler_body(self)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, H
+
+
+def _ok(h):
+    h.send_response(200)
+    h.send_header("Content-Type", "application/json")
+    h.end_headers()
+    h.wfile.write(b"[]")
+
+
+def test_redirects_are_refused_and_never_followed():
+    import urllib.request
+    target, t = _serve(_ok)
+    def redirect(h):
+        h.send_response(302)
+        h.send_header("Location", f"http://127.0.0.1:{target.server_port}/steal")
+        h.end_headers()
+    source, _ = _serve(redirect)
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{source.server_port}/slots", headers={"Authorization": "Bearer secret"})
+        with pytest.raises(g.RedirectRefused):
+            g.OPENER.open(req, timeout=5)
+        with pytest.raises(g.RedirectRefused):
+            g._get_json(f"http://127.0.0.1:{source.server_port}/slots", "secret")
+        assert t.hits == []  # the bearer token never reached the redirect target
+    finally:
+        source.shutdown()
+        target.shutdown()
+
+
+def test_proxy_settings_in_the_environment_are_ignored(monkeypatch):
+    srv, h = _serve(_ok)
+    for key in ("http_proxy", "HTTP_PROXY", "all_proxy"):
+        monkeypatch.setenv(key, "http://127.0.0.1:9")  # nothing listens there
+    monkeypatch.setenv("no_proxy", "")
+    try:
+        assert g._get_json(f"http://127.0.0.1:{srv.server_port}/slots") == []
+        assert len(h.hits) == 1
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.parametrize("gate,nomodel,ok", [("18910", "18911", True), ("18912", "18919", True), ("11435", "18911", False),
+                                             ("18080", "18911", False), ("18910", "18910", False), ("18920", "18911", False),
+                                             ("8010", "18911", False), ("x", "18911", False)])
+def test_gate_ports_are_pinned_to_the_gate_band(monkeypatch, gate, nomodel, ok):
+    monkeypatch.setenv("GATE_PORT", gate)
+    monkeypatch.setenv("GATE_NOMODEL_PORT", nomodel)
+    if ok:
+        assert g.gate_ports() == (int(gate), int(nomodel))
+        assert g.check_base_url(f"http://127.0.0.1:{gate}")
+    else:
+        with pytest.raises(SystemExit):
+            g.check_base_url(f"http://127.0.0.1:{gate}")
+    assert not set(g.GATE_PORT_RANGE) & g.PRODUCTION_PORTS

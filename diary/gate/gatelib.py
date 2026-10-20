@@ -92,9 +92,28 @@ class Response:
 GATE_HOSTS = ("127.0.0.1", "localhost")
 
 
+# compose.yml publishes the two gate diaries in this band only (defaults 18910 and 18911).
+GATE_PORT_RANGE = range(18910, 18920)
+# Ports production services publish or listen on (MS-01 inference compose; noevia compose.yaml and
+# deploy overrides): never a gate port, whatever the environment says.
+PRODUCTION_PORTS = frozenset({8010, 8021, 8031, 8040, 8080, 8082, 8092, 11435, 18040, 18080})
+
+
 def gate_ports() -> tuple:
-    """(gate diary port, no-model diary port), as compose.yml publishes them."""
-    return int(os.environ.get("GATE_PORT", "18910")), int(os.environ.get("GATE_NOMODEL_PORT", "18911"))
+    """(gate diary port, no-model diary port). GATE_PORT / GATE_NOMODEL_PORT may move them within
+    GATE_PORT_RANGE only; they must differ and never be a production port."""
+    try:
+        gate = int(os.environ.get("GATE_PORT", "18910"))
+        nomodel = int(os.environ.get("GATE_NOMODEL_PORT", "18911"))
+    except ValueError:
+        raise SystemExit("refused: GATE_PORT and GATE_NOMODEL_PORT must be integers")
+    for name, port in (("GATE_PORT", gate), ("GATE_NOMODEL_PORT", nomodel)):
+        if port not in GATE_PORT_RANGE or port in PRODUCTION_PORTS:
+            raise SystemExit(f"refused: {name}={port} is outside the gate port range "
+                             f"{GATE_PORT_RANGE.start}-{GATE_PORT_RANGE.stop - 1} or a production port")
+    if gate == nomodel:
+        raise SystemExit("refused: GATE_PORT and GATE_NOMODEL_PORT must differ")
+    return gate, nomodel
 
 
 def check_base_url(url: str, nomodel: bool = False) -> str:
@@ -107,10 +126,26 @@ def check_base_url(url: str, nomodel: bool = False) -> str:
         raise SystemExit(f"refused base URL {url!r}: not a URL")
     gate, nomodel_port = gate_ports()
     allowed = (nomodel_port,) if nomodel else (gate, nomodel_port)
-    if parsed.scheme != "http" or parsed.hostname not in GATE_HOSTS or port not in allowed             or parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+    bad_target = parsed.scheme != "http" or parsed.hostname not in GATE_HOSTS or port not in allowed
+    extras = parsed.username or parsed.password or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+    if bad_target or extras:
         raise SystemExit(f"refused base URL {url!r}: only http://127.0.0.1 or localhost on port "
                          f"{' or '.join(map(str, allowed))} ({'no-model diary' if nomodel else 'gate diaries'})")
     return f"http://{parsed.hostname}:{port}"
+
+
+class RedirectRefused(urllib.error.HTTPError):
+    """A gate request was answered with a redirect; it is never followed (the bearer token would go along)."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RedirectRefused(req.full_url, code, f"redirect refused ({code})", headers, fp)
+
+
+# Every gate request (diary API and load probes) goes through this opener: no proxy from the
+# environment (http_proxy / no_proxy are ignored) and no redirects.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
 class Client:
@@ -154,7 +189,7 @@ class Client:
                                      method=method, headers=headers)
         started = time.monotonic()
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            with OPENER.open(req, timeout=timeout or self.timeout) as resp:
                 result = Response(resp.status, resp.read(), dict(resp.headers))
         except urllib.error.HTTPError as exc:
             result = Response(exc.code, exc.read(), dict(exc.headers or {}))
@@ -230,7 +265,7 @@ class GateBlocked(Exception):
 
 def _get_json(url: str, token: str = "", timeout: float = 5.0):
     headers = {"Authorization": "Bearer " + token} if token else {}
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+    with OPENER.open(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
