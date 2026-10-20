@@ -34,15 +34,20 @@ Configuration defaults live in `config/config.yaml`. Environment variables overr
 
 ## Which model answers
 
-The chat and aux model ids (`LLM_CHAT_MODEL`, `LLM_AUX_MODEL`) must be ids the engine serves. The
-companion checks this at call time against the engine's `/v1/models` (remembered for 60 s): a
-served configured id is used; otherwise it uses the first loaded chat model (else the first listed
-one; sections launched with an embedding or reranking flag are never chosen), logs the choice once
-at WARNING with ids only, and never leaves the configured endpoint. An engine that cannot be reached
-is a logged `EngineUnreachable` error. `GET /api/health` reports `model` (the id in use),
-`model_configured` and `model_source` (`configured`, `fallback`, `unverified`, `unreachable` or
-`none_served`). The companion has no access to noevia's per-user Auto roles (they live in the web
-server's workspace), so the fallback does not consult them.
+The chat and aux model ids (`LLM_CHAT_MODEL`, `LLM_AUX_MODEL`) must be ids the engine serves, and
+every chat request names one explicitly. The companion checks this at call time against the engine's
+`/v1/models` (remembered for 60 s). A served configured id is used. Otherwise it uses the id named in
+the optional `LLM_CHAT_FALLBACK_MODEL` / `LLM_AUX_FALLBACK_MODEL` if that is served (the aux role then
+follows the chat model's id), and logs this once at WARNING naming the setting key, never the value.
+It never picks "the loaded model" or "the first listed model": that would make a one-model router load
+and swap out a model nobody chose (#2099). With no served id the request is refused before anything
+is sent, with an error that names the setting key. Sections launched with an embedding or reranking
+flag are never chat models. An engine that cannot be reached is a logged `EngineUnreachable` error.
+The service also warns at startup, and `GET /api/health` lists in `model_warnings`, the setting keys
+(never values) whose id is not served. `GET /api/health` reports `model` (the id in use),
+`model_configured` and `model_source` (`configured`, `fallback`, `unverified`, `unreachable`,
+`not_served` or `none_served`). The companion has no access to noevia's per-user Auto roles (they
+live in the web server's workspace), so the fallback does not consult them.
 
 ## Embedding model and re-indexing (#1636)
 

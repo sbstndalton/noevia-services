@@ -17,7 +17,7 @@ def test_provider_reasoning_is_emitted_before_answer_and_marker_is_not_shown():
         assert json.loads(request.content)['stream'] is True
         content = ''.join('data: '+json.dumps({'choices':[{'delta':d}]})+'\n\n' for d in chunks)+'data: [DONE]\n\n'
         return httpx.Response(200, text=content, headers={'Content-Type':'text/event-stream'})
-    client=LLMClient('http://synthetic/v1')
+    client=LLMClient("http://synthetic/v1", chat_model="Synthetic-model")
     client._client.close()
     client._client=httpx.Client(base_url='http://synthetic/v1',transport=httpx.MockTransport(provider))
     events=[]
@@ -33,7 +33,7 @@ def test_provider_reasoning_is_emitted_before_answer_and_marker_is_not_shown():
 
 
 def test_truncated_provider_output_is_not_accepted_as_a_complete_answer():
-    client=LLMClient('http://synthetic/v1')
+    client=LLMClient("http://synthetic/v1", chat_model="Synthetic-model")
     client._client.close()
     client._client=httpx.Client(base_url='http://synthetic/v1',transport=httpx.MockTransport(lambda r:httpx.Response(200,text='data: {"choices":[{"delta":{"content":"Partial answer"}}]}\n\n',headers={'Content-Type':'text/event-stream'})))
     events=[]

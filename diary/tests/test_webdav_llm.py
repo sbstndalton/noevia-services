@@ -169,7 +169,7 @@ def test_missing_marker_defaults_to_none():
 
 def test_chat_retains_request_local_provider_reasoning(monkeypatch):
     import httpx
-    llm = LLMClient("http://synthetic.invalid/v1", max_retries=1)
+    llm = LLMClient("http://synthetic.invalid/v1", chat_model="Synthetic-model", max_retries=1)
     messages = iter([
         {"content": "First [LOG: ok]", "reasoning_content": "First reasoning"},
         {"content": "Second", "reasoning": "Second reasoning"},

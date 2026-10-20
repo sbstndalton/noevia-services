@@ -61,7 +61,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import EngineUnreachable, LLMClient, strip_reasoning
+from .llm import EngineUnreachable, LLMClient, ModelNotServed, strip_reasoning
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .retrieval_trace import RetrievalTrace, attach as attach_trace, trace_requested
@@ -93,6 +93,7 @@ class AppState:
             max_retries=int(cfg.get("llm.max_retries", 3)),
             embed_base_url=cfg.get("llm.embed_base_url") or "",
             resolve_served_model=True,
+            fallback_model=cfg.get("llm.chat_fallback_model") or "",
         )
         self.llm_aux = LLMClient(
             base_url=cfg.get("llm.aux.base_url"),
@@ -102,6 +103,9 @@ class AppState:
             timeout_s=float(cfg.get("llm.timeout_s", 300)),
             max_retries=int(cfg.get("llm.max_retries", 3)),
             resolve_served_model=True,
+            fallback_model=cfg.get("llm.aux.fallback_model") or "",
+            setting_key="LLM_AUX_MODEL",
+            fallback_setting_key="LLM_AUX_FALLBACK_MODEL",
             # Same engine: when the aux model is not served either, follow the chat model's choice.
             prefer_model_from=self.llm_main if cfg.get("llm.aux.base_url") == cfg.get("llm.base_url") else None,
         )
@@ -632,11 +636,42 @@ def _start_embedding() -> None:
         log.exception("embedding start-up check failed")
 
 
+def _model_setting_warnings(st) -> list:
+    """#2099: the setting keys (never their values) whose configured model id the router does not
+    serve. Lists models only (this never loads one) and never raises."""
+    keys = []
+    for client in (getattr(st, "llm_main", None), getattr(st, "llm_aux", None)):
+        resolve = getattr(client, "resolve_chat_model", None)
+        if resolve is None:
+            continue
+        key = getattr(client, "setting_key", "LLM_CHAT_MODEL")
+        try:
+            _model, source = resolve()
+        except ModelNotServed:
+            keys.append(key)
+        except Exception:  # noqa: BLE001 - engine down / no chat model: reported by the model fields
+            continue
+        else:
+            if source == "fallback":
+                keys.append(key)
+    return keys
+
+
+def _model_startup_check() -> None:
+    try:
+        for key in _model_setting_warnings(get_state()):
+            log.warning("Model setting %s names an id the model engine does not serve; "
+                        "chat requests that need it are refused until it is fixed", key)
+    except Exception:  # noqa: BLE001 - a check never takes the service down
+        log.exception("model start-up check failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     st = get_state()
     enforce_open_mode_policy(st.auth_token)
     tenant_assertion.startup_checks()
+    threading.Thread(target=_model_startup_check, name="model-start-check", daemon=True).start()
     # Replay is tenant-scoped in _tenant_state. Never replay the retired global
     # corpus after a tenant has explicitly moved into app storage.
     # #1636: a re-index configured at start (LLM_EMBED_NEXT_*, or saved) resumes in the background,
@@ -1439,12 +1474,16 @@ def _health_model() -> dict:
     resolve = getattr(get_state().llm_main, "resolve_chat_model", None)
     if resolve is None:
         return {"model": configured, "model_configured": configured, "model_source": "configured"}
+    warnings = _model_setting_warnings(get_state())
     try:
         model, source = resolve()
-    except Exception as exc:  # noqa: BLE001 - engine down or serves no chat model
-        return {"model": configured, "model_configured": configured,
-                "model_source": "unreachable" if isinstance(exc, EngineUnreachable) else "none_served"}
-    return {"model": model, "model_configured": configured, "model_source": source}
+    except Exception as exc:  # noqa: BLE001 - engine down, id not served, or no chat model served
+        kind = ("unreachable" if isinstance(exc, EngineUnreachable)
+                else "not_served" if isinstance(exc, ModelNotServed) else "none_served")
+        return {"model": configured, "model_configured": configured, "model_source": kind,
+                "model_warnings": warnings}
+    return {"model": model, "model_configured": configured, "model_source": source,
+            "model_warnings": warnings}
 
 
 @app.get("/api/health")

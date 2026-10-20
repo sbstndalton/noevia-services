@@ -3,6 +3,7 @@
 Env overrides:
   LLM_BASE_URL, LLM_API_KEY, LLM_CHAT_MODEL, LLM_EMBED_MODEL, LLM_EMBED_BASE_URL,
   LLM_AUX_BASE_URL, LLM_AUX_MODEL, LLM_AUX_API_KEY,
+  LLM_CHAT_FALLBACK_MODEL, LLM_AUX_FALLBACK_MODEL (optional explicit substitutes, #2099),
   CORPUS_BACKEND, CORPUS_ROOT, CORPUS_LOCAL_ROOT,
   WEBDAV_BASE_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD, CORPUS_REMOTE_ROOT (legacy),
   S3_ENDPOINT_URL, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY,
@@ -78,6 +79,9 @@ def _apply_env(cfg: Config) -> None:
         "LLM_EMBED_NEXT_BASE_URL": "llm.embed_next_base_url",
         "LLM_EMBED_NEXT_PROFILE": "llm.embed_next_profile",
         "EMBEDDING_REINDEX_DUTY": "retrieval.reindex_duty",
+        # #2099: the only substitutes the diary will use when the id above is not served by the router.
+        "LLM_CHAT_FALLBACK_MODEL": "llm.chat_fallback_model",
+        "LLM_AUX_FALLBACK_MODEL": "llm.aux.fallback_model",
         "LLM_AUX_BASE_URL": "llm.aux.base_url",
         "LLM_AUX_MODEL": "llm.aux.model",
         "LLM_AUX_API_KEY": "llm.aux.api_key",
