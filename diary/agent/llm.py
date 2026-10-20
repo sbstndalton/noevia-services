@@ -1,12 +1,13 @@
 """LLM client for OpenAI-compatible chat and embedding endpoints."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
@@ -106,6 +107,25 @@ _LIST_TIMEOUT_S = 3.0
 _NON_CHAT_FLAGS = frozenset({"--embedding", "--embeddings", "--reranking", "--rerank"})
 
 
+# #112: the listing scope of one GET /api/health check (per thread; None outside a check).
+_listing_scope = threading.local()
+
+
+@contextmanager
+def one_listing_per_check() -> Iterator[None]:
+    """#112: inside this block each engine (base URL and credential) is listed at most once. Every
+    client that asks gets the same answer, a failure included, so the chat and aux clients on one
+    engine cost one /models call per health check. A nested block shares the outer block answers."""
+    if getattr(_listing_scope, "memo", None) is not None:
+        yield
+        return
+    _listing_scope.memo = {}
+    try:
+        yield
+    finally:
+        _listing_scope.memo = None
+
+
 class EngineUnreachable(LLMError):
     """The model engine could not be contacted at all (transport failure)."""
 
@@ -193,6 +213,26 @@ class LLMClient:
     # ---------------- served-model resolution ----------------
 
     def _list_served(self) -> List[Dict[str, Any]]:
+        # #112: inside one_listing_per_check, clients that reach the same endpoint with the same
+        # credential share one listing, a failed one included.
+        memo = getattr(_listing_scope, "memo", None)
+        key = (self.base_url, self._client.headers.get("Authorization", ""))
+        if memo is not None and key in memo:
+            shared = memo[key]
+            if isinstance(shared, Exception):
+                raise shared
+            return shared
+        try:
+            entries = self._fetch_served()
+        except Exception as exc:
+            if memo is not None:
+                memo[key] = exc
+            raise
+        if memo is not None:
+            memo[key] = entries
+        return entries
+
+    def _fetch_served(self) -> List[Dict[str, Any]]:
         try:
             resp = self._client.get("/models", timeout=_LIST_TIMEOUT_S)
         except httpx.TransportError as exc:
@@ -257,6 +297,8 @@ class LLMClient:
             "(the diary never lets the engine choose a model)")
 
     def _choose(self, entries: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        # #112: the configured id must be a chat-capable served id (not an embedding or reranking
+        # section), not merely a listed one.
         chat_ids = {e["id"] for e in entries if e["chat"]}
         if not chat_ids:
             raise LLMError("the model engine serves no chat model")
@@ -264,6 +306,11 @@ class LLMClient:
             return self.chat_model, "configured", "the configured model is served"
         if self.fallback_model and self.fallback_model in chat_ids:
             return self.fallback_model, "fallback", f"the explicit fallback set in {self.fallback_setting_key}"
+        # #112: the last substitute of the aux role is the resolved id of the chat client. The caller
+        # sets prefer_model_from only when both roles name the same engine. This is not an explicit
+        # fallback: the operator named no id for aux here, and the chat id is whatever chat resolved
+        # to, including the chat fallback. It is used only after the aux id and the aux fallback are
+        # both unserved.
         partner = ""
         if self._prefer_from is not None and self._prefer_from is not self:
             try:

@@ -31,10 +31,11 @@ class Engine:
         self.down = False
 
     def __call__(self, request):
+        if request.method == "GET" and request.url.path == "/v1/models":
+            self.listings += 1  # a refused attempt is still a /models call
         if self.down:
             raise httpx.ConnectError("synthetic connection refused", request=request)
         if request.method == "GET" and request.url.path == "/v1/models":
-            self.listings += 1
             if self.models_status != 200:
                 return httpx.Response(self.models_status, text="no")
             return httpx.Response(200, json={"object": "list", "data": self.models})
@@ -427,3 +428,77 @@ def test_status_contract_pre_save_texts_and_saving_began_before_any_store_write(
     assert ("store", "log_exchange") in order[began:]
     assert order.index(("status", core_model_status)) < order.index(("model", "chat_stream"))
     assert order.index(("model", "chat_stream")) < began
+
+
+def _health_app(monkeypatch, state):
+    import agent.app as appmod
+    monkeypatch.setattr(appmod, "get_state", lambda: state)
+    monkeypatch.setattr(appmod, "check_auth", lambda r: True)
+    monkeypatch.delenv("DIARY_LEGACY_USER_ID", raising=False)
+    return appmod
+
+
+def test_one_health_check_lists_the_engine_once_with_chat_and_aux_on_it(monkeypatch):
+    """#112: /api/health resolved the chat model twice (warnings, then the model fields), and the aux
+    client listed the same engine again. A check now lists the engine once: on success, when the id
+    is not served and when the engine is down."""
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    engine = Engine([entry("Configured-GGUF"), entry("Configured-aux")])
+    main = client_for(engine, "Configured-GGUF")
+    aux = client_for(engine, "Configured-aux", setting_key="LLM_AUX_MODEL", prefer_model_from=main)
+    appmod = _health_app(monkeypatch, SimpleNamespace(llm_main=main, llm_aux=aux, auth_token=""))
+
+    def check():
+        main.invalidate_resolution()
+        aux.invalidate_resolution()
+        before = engine.listings
+        body = TestClient(appmod.app).get("/api/health").json()
+        return body, engine.listings - before
+
+    body, listed = check()
+    assert body["model"] == "Configured-GGUF" and body["model_source"] == "configured"
+    assert body["model_warnings"] == [] and listed == 1
+    engine.models = [entry("served-a")]
+    body, listed = check()
+    assert body["model_source"] == "not_served"
+    assert body["model_warnings"] == ["LLM_CHAT_MODEL", "LLM_AUX_MODEL"]
+    assert listed == 1
+    engine.down = True
+    body, listed = check()
+    assert body["model_source"] == "unreachable" and listed == 1
+    main.close()
+    aux.close()
+
+
+def test_one_health_check_lists_a_lone_chat_client_once_when_refused_or_down(monkeypatch):
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    engine = Engine([entry("served-a")])
+    main = client_for(engine, "Configured-GGUF")
+    appmod = _health_app(monkeypatch, SimpleNamespace(llm_main=main, auth_token=""))
+    before = engine.listings
+    body = TestClient(appmod.app).get("/api/health").json()
+    assert body["model_source"] == "not_served" and engine.listings - before == 1
+    engine.down = True
+    before = engine.listings
+    body = TestClient(appmod.app).get("/api/health").json()
+    assert body["model_source"] == "unreachable" and engine.listings - before == 1
+    main.close()
+
+
+def test_the_listing_is_shared_only_inside_one_listing_block():
+    engine = Engine([entry("served-a")])
+    main = client_for(engine, "served-a")
+    other = client_for(engine, "served-a")
+    with llm_mod.one_listing_per_check():
+        main.chat([])
+        other.chat([])
+    assert engine.listings == 1
+    main.invalidate_resolution()
+    other.invalidate_resolution()
+    main.chat([])
+    other.chat([])
+    assert engine.listings == 3, "outside the block each client lists for itself"
+    main.close()
+    other.close()

@@ -61,7 +61,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import EngineUnreachable, LLMClient, ModelNotServed, strip_reasoning
+from .llm import EngineUnreachable, LLMClient, ModelNotServed, one_listing_per_check, strip_reasoning
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .retrieval_trace import RetrievalTrace, attach as attach_trace, trace_requested
@@ -636,25 +636,40 @@ def _start_embedding() -> None:
         log.exception("embedding start-up check failed")
 
 
+def _model_outcomes(st) -> list:
+    """#112: (client, model, source, error) for the chat and aux clients, the chat client first. Each
+    client is resolved exactly once. One pass shares its listings (llm.one_listing_per_check), so
+    clients on one engine cost one /models call. Never raises: a failure is returned as its error."""
+    outcomes = []
+    with one_listing_per_check():
+        for client in (getattr(st, "llm_main", None), getattr(st, "llm_aux", None)):
+            resolve = getattr(client, "resolve_chat_model", None)
+            if resolve is None:
+                continue
+            try:
+                model, source = resolve()
+            except Exception as exc:  # noqa: BLE001 - engine down, id not served, or no chat model served
+                outcomes.append((client, None, None, exc))
+            else:
+                outcomes.append((client, model, source, None))
+    return outcomes
+
+
+def _setting_warnings(outcomes) -> list:
+    """#2099: the setting keys (never their values) whose configured id is not served, or is served
+    only through a substitute. Engine-down and no-chat-model failures are reported by the model fields."""
+    keys = []
+    for client, _model, source, error in outcomes:
+        key = getattr(client, "setting_key", "LLM_CHAT_MODEL")
+        if isinstance(error, ModelNotServed) or (error is None and source == "fallback"):
+            keys.append(key)
+    return keys
+
+
 def _model_setting_warnings(st) -> list:
     """#2099: the setting keys (never their values) whose configured model id the router does not
     serve. Lists models only (this never loads one) and never raises."""
-    keys = []
-    for client in (getattr(st, "llm_main", None), getattr(st, "llm_aux", None)):
-        resolve = getattr(client, "resolve_chat_model", None)
-        if resolve is None:
-            continue
-        key = getattr(client, "setting_key", "LLM_CHAT_MODEL")
-        try:
-            _model, source = resolve()
-        except ModelNotServed:
-            keys.append(key)
-        except Exception:  # noqa: BLE001 - engine down / no chat model: reported by the model fields
-            continue
-        else:
-            if source == "fallback":
-                keys.append(key)
-    return keys
+    return _setting_warnings(_model_outcomes(st))
 
 
 def _model_startup_check() -> None:
@@ -1471,18 +1486,20 @@ def _health_model() -> dict:
     """The chat model the companion will actually use (noevia core's modelNotServed diagnosis reads
     `model`), how that was decided, and the configured id. Never fails a liveness probe."""
     configured = _base_cfg.get("llm.chat_model")
-    resolve = getattr(get_state().llm_main, "resolve_chat_model", None)
-    if resolve is None:
+    st = get_state()
+    if getattr(st.llm_main, "resolve_chat_model", None) is None:
         return {"model": configured, "model_configured": configured, "model_source": "configured"}
-    warnings = _model_setting_warnings(get_state())
-    try:
-        model, source = resolve()
-    except Exception as exc:  # noqa: BLE001 - engine down, id not served, or no chat model served
-        kind = ("unreachable" if isinstance(exc, EngineUnreachable)
-                else "not_served" if isinstance(exc, ModelNotServed) else "none_served")
-        return {"model": configured, "model_configured": configured, "model_source": kind,
+    # #112: one resolution per client for the whole check; the warnings and the model fields both
+    # reuse it (the chat client is the first outcome).
+    outcomes = _model_outcomes(st)
+    warnings = _setting_warnings(outcomes)
+    _client, model, source, error = outcomes[0]
+    if error is None:
+        return {"model": model, "model_configured": configured, "model_source": source,
                 "model_warnings": warnings}
-    return {"model": model, "model_configured": configured, "model_source": source,
+    kind = ("unreachable" if isinstance(error, EngineUnreachable)
+            else "not_served" if isinstance(error, ModelNotServed) else "none_served")
+    return {"model": configured, "model_configured": configured, "model_source": kind,
             "model_warnings": warnings}
 
 
