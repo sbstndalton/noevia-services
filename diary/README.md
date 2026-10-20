@@ -34,17 +34,24 @@ Configuration defaults live in `config/config.yaml`. Environment variables overr
 
 ## Which model answers
 
-The chat and aux model ids (`LLM_CHAT_MODEL`, `LLM_AUX_MODEL`) must be ids the engine serves, and
-every chat request names one explicitly. The companion checks this at call time against the engine's
-`/v1/models` (remembered for 60 s). A served configured id is used. Otherwise it uses the id named in
-the optional `LLM_CHAT_FALLBACK_MODEL` / `LLM_AUX_FALLBACK_MODEL` if that is served (the aux role then
-follows the chat model's id), and logs this once at WARNING naming the setting key, never the value.
+The chat and aux model ids (`LLM_CHAT_MODEL`, `LLM_AUX_MODEL`) must be chat-capable ids the engine
+serves, and every chat request names one explicitly. Being listed is not enough: a section the engine
+launched with an embedding or reranking flag is listed but is not a chat model, so a configured id that
+names one is refused like an unserved id (#112). The companion checks this at call time against the
+engine's `/v1/models` (remembered for 60 s). A served configured id is used. Otherwise it uses the id
+named in the optional `LLM_CHAT_FALLBACK_MODEL` / `LLM_AUX_FALLBACK_MODEL` if that is served, and logs
+this once at WARNING naming the setting key, never the value. The aux role has one more substitute, the
+resolved id of the chat model. It is used only after the aux id and `LLM_AUX_FALLBACK_MODEL` are both
+unserved, and only when `LLM_AUX_BASE_URL` is the same base URL as `LLM_BASE_URL` (the same engine). It
+follows whatever chat resolved to, including the chat fallback. It is not an explicit fallback and has no
+setting of its own (#112).
 It never picks "the loaded model" or "the first listed model": that would make a one-model router load
 and swap out a model nobody chose (#2099). With no served id the request is refused before anything
 is sent, with an error that names the setting key. Sections launched with an embedding or reranking
 flag are never chat models. An engine that cannot be reached is a logged `EngineUnreachable` error.
 The service also warns at startup, and `GET /api/health` lists in `model_warnings`, the setting keys
-(never values) whose id is not served. `GET /api/health` reports `model` (the id in use),
+(never values) whose id is not served or is replaced by a substitute. A health check resolves each model
+client once and lists each engine at most once (#112). `GET /api/health` reports `model` (the id in use),
 `model_configured` and `model_source` (`configured`, `fallback`, `unverified`, `unreachable`,
 `not_served` or `none_served`). The companion has no access to noevia's per-user Auto roles (they
 live in the web server's workspace), so the fallback does not consult them.
