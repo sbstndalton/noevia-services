@@ -97,8 +97,8 @@ not change retrieval or the model input.
 - `focus` (services#116): `{"checked": false}` when the message names no entity and no time anchor; then
   `candidates` are the vector hits. Otherwise `entities` and `time_anchor` (counts and flags only, never the
   names), `applied` (some hit named an asked entity exactly), `vector_candidates`, `removed` (each dropped hit:
-  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `after_time_anchor` or
-  `candidate_limit`), `carried` (the entities came from the previous question), `similar_name_labelled`
+  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `other_person`, `after_time_anchor` or
+  `candidate_limit`), `removed_by_reason` (counts), `carried` (the entities came from the previous question), `similar_name_labelled`
   and `superseded_labelled`.
 - `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
 - `loaded`: the excerpts actually placed in the context (`id`, `day`, `time`, `score`, `tokens`, `chars`);
@@ -116,6 +116,9 @@ vector pool (4x top_k) lexically, with no model call:
 - A hit naming only a near spelling of a name that another hit names exactly (or by first name or surname alone)
   is dropped: the diary names that person, so the near spelling is someone else. Nothing else is dropped for a
   name, so recall never falls below plain vector search.
+- When the question names a person (a full name, or a title and a name) that a hit names in full, hits that
+  explicitly name only other identified people (full or titled names), none matching or resembling the asked
+  one, are dropped as `other_person`. Entries naming nobody, or the asked person among others, stay.
 - With no exact match (a typo or a short form in the question) nothing is dropped; similar names are labelled
   "may be a different person, check the name".
 - Hits dated after a time anchor are dropped. A date inside a statement ("away until 3 March") is not an anchor.

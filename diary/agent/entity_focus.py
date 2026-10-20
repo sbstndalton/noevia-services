@@ -19,6 +19,12 @@ detail as competing with another's. This module needs no model call.
   same entity in full, so the diary does name that person and the near spelling is someone else. With no
   full match for an entity nothing is dropped (a typo or a nickname in the question must not hide the entry);
   similar names are labelled "may be a different person; check the name" instead.
+- Other people: when the question names a person (a full name, or a title and a name) and some candidate
+  names that person in full, a candidate that explicitly names only other identified people (full names or
+  titled names; a single word such as "Marit" identifies nobody for certain), none of them matching or
+  resembling an asked entity, is dropped too (a different full name that only shares a first name or a
+  surname, "Alder Pennick" for "Alder Brannock", is another person, not a resemblance). Entries naming nobody, or the asked person alongside others,
+  stay.
 - Time anchor: an explicitly framed question ("As of <date>, ...?", "As at <date>", or a question opening
   "Before/Until/Up to <date>, ...?") drops candidates dated after it. A date in a statement does not.
 - Supersession: an earlier entry about the same entity is labelled superseded only by an explicit
@@ -313,6 +319,53 @@ def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
     return best
 
 
+# ---------------- other identified people ----------------
+
+# Last words that make a capitalised phrase a place, organisation or thing rather than a person.
+_NOT_PERSON_LAST = {
+    "moor", "cove", "bay", "point", "hill", "hills", "street", "st", "road", "rd", "lane", "avenue", "way", "lock",
+    "mill", "wood", "woods", "fell", "end", "cross", "quay", "flats", "sands", "rise", "hollow", "fold", "gap",
+    "brow", "steps", "strand", "reach", "park", "square", "bridge", "river", "lake", "island", "beach", "harbour",
+    "harbor", "market", "library", "cafe", "station", "school", "college", "university", "hospital", "church",
+    "chapel", "hall", "house", "office", "centre", "center", "museum", "gallery", "shop", "club", "green",
+    "common", "heath", "vale", "valley", "head", "ness", "marsh", "field", "fields", "farm", "court", "gardens",
+    "garden", "place", "close", "crescent", "terrace", "drive", "city", "town", "village", "county", "survey",
+    "project", "council", "company", "ltd", "inc", "group", "team", "crossing", "kingdom", "states", "sea",
+    "ocean", "mountain", "mountains", "forest", "castle", "abbey", "cathedral", "airport", "port", "pier",
+    "theatre", "cinema", "hotel", "inn", "pub", "bar", "restaurant", "kitchen", "bakery", "studio", "works",
+}
+
+
+def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
+    """The comparison words of a capitalised phrase that identifies a person: a title and a name ("Dr.
+    Patel"), or a two- to four-word full name ("Bryony Castellow") that is not a place or organisation.
+    A single word ("Marit", "Scarrow") identifies nobody for certain, so it is never counted."""
+    if not words:
+        return None
+    titled = _key(words[0]) in TITLES
+    keys = _keys(words)
+    if not keys or any(k in _NOT_NAMES for k in keys):
+        return None
+    if titled or (2 <= len(keys) <= 4 and keys[-1] not in _NOT_PERSON_LAST):
+        return keys
+    return None
+
+
+def identified_people(text: str) -> List[Tuple[str, ...]]:
+    """The people ``text`` explicitly names (see _person_keys), as comparison words."""
+    out = []
+    for run in _cap_runs(_norm(text), stop=False):
+        keys = _person_keys([w for w, _ in run])
+        if keys and keys not in out:
+            out.append(keys)
+    return out
+
+
+def is_person(entity: Entity) -> bool:
+    """The asked entity is a person by the same test (a full name, or a title and a name)."""
+    return _person_keys(entity.name.split()) is not None
+
+
 @dataclass
 class FocusResult:
     entities: List[Entity] = field(default_factory=list)
@@ -349,7 +402,10 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
     """Check vector candidates (``rows`` in score order) against ``message``; keep at most ``limit``.
 
     Removal reasons: ``after_time_anchor``, ``near_name`` (names only a near spelling of an entity that
-    another candidate names exactly) and ``candidate_limit`` (beyond ``limit``). Kept rows stay in order."""
+    another candidate names in full), ``other_person`` (when an asked person is named in full by some
+    candidate: names only other identified people, none matching or resembling an asked entity; sharing
+    just a first name or surname is not resembling) and
+    ``candidate_limit`` (beyond ``limit``). Kept rows stay in order."""
     res = analyse(message, earlier)
     ranked = list(enumerate(rows, 1))
     if res.anchor is not None:
@@ -368,6 +424,8 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
     if res.entities:
         kinds = {rank: [classify(_row_text(row), e) for e in res.entities] for rank, row in ranked}
         res.matched = [e for i, e in enumerate(res.entities) if any(k[i][0] == "match" for k in kinds.values())]
+        # Asked people some hit names in full: hits naming only other identified people can go.
+        people_asked = [e for e in res.matched if is_person(e)]
         survivors = []
         for rank, row in ranked:
             found = kinds[rank]
@@ -377,6 +435,9 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
             confirmed = [i for i, (kind, _) in enumerate(found) if kind == "near" and res.entities[i] in res.matched]
             if confirmed:
                 res.removed.append((rank, row, "near_name"))
+                continue
+            if people_asked and all(kind in (None, "shared") for kind, _ in found) and identified_people(_row_text(row)):
+                res.removed.append((rank, row, "other_person"))  # names only other people, none like the asked
                 continue
             survivors.append((rank, row))
             similar = [(_RANK[kind], kind, shown, res.entities[i].name) for i, (kind, shown) in enumerate(found) if kind]
@@ -479,6 +540,8 @@ def context_notes(res: FocusResult) -> List[str]:
             if any(reason == "near_name" for _, _, reason in res.removed):
                 line += (" Entries naming only a near spelling of that name were left out: the diary names the"
                          " person exactly, so the near spelling is someone else.")
+            if any(reason == "other_person" for _, _, reason in res.removed):
+                line += " Entries naming only other people were left out."
         if unmatched:
             line += (f" No retrieved entry names {_names(unmatched)} exactly. An entry with a similar name may be a"
                      " different person, or the name may be spelled differently: check the name before relying"

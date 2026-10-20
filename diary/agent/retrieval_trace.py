@@ -11,7 +11,8 @@ embeddings, the query or credentials.
 The diary has no reranker. The stages are (1) vector-search candidates (cosine similarity, at least
 min_score; top_k * 2 requested, or top_k * 4 when the message names an entity or a time anchor), then
 (1b, services#116) the entity focus (entity_focus.py): a lexical check that drops only confirmed
-near-name hits and hits dated after a time anchor, keeping score order, at most top_k * 2, then (2) selection in score order under the token budget, capped at top_k. `candidates` lists what
+near-name hits, hits naming only other identified people (when an asked person is named in full) and hits
+dated after a time anchor, keeping score order, at most top_k * 2, then (2) selection in score order under the token budget, capped at top_k. `candidates` lists what
 stage 1b kept (`rank` is the position there, `vector_rank` the stage 1 rank) and `focus.removed` every
 stage 1 candidate it dropped, with the reason. With no entity or time anchor in the message stage 1b
 does not run (`focus.checked` is false) and `candidates` is stage 1. `rerank.present` is false so the
@@ -89,6 +90,8 @@ class RetrievalTrace:
             "vector_candidates": vector_candidates,
             "removed": [{"vector_rank": rank, **self._ref(row), "score": row.get("score"), "reason": reason}
                         for rank, row, reason in focus.removed],
+            "removed_by_reason": {reason: sum(1 for _, _, r in focus.removed if r == reason)
+                                  for reason in sorted({r for _, _, r in focus.removed})},
             "similar_name_labelled": len(focus.similar),
             "superseded_labelled": len(focus.corrected_by),
         }

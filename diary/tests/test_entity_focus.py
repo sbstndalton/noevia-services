@@ -315,10 +315,12 @@ def test_several_people_in_one_question():
             _row("2030-01-13", "09:00 — Caspian", "Caspian Dunmore likes white peony.")]
     res = ef.focus_candidates("Do Alder Brannock and Bryony Castellow both like tea?", rows)
     # Brennock is confirmed someone else (Brannock is named exactly); Bryony has no exact entry: kept, hedged.
-    assert [(rank, reason) for rank, _, reason in res.removed] == [(1, "near_name")]
-    assert [rank for rank, _ in res.kept] == [2, 3, 4] and "may be a different person" in ef.entry_label(res, 3)
+    # Caspian Dunmore is another identified person entirely.
+    assert [(rank, reason) for rank, _, reason in res.removed] == [(1, "near_name"), (4, "other_person")]
+    assert [rank for rank, _ in res.kept] == [2, 3] and "may be a different person" in ef.entry_label(res, 3)
     both = ef.focus_candidates("Compare Alder Brannock and Alder Brennock.", rows)
-    assert both.removed == []  # each named exactly by its own entry
+    assert [rank for rank, _ in both.kept] == [1, 2]  # each named exactly by its own entry
+    assert {reason for _, _, reason in both.removed} == {"other_person"}
 
 
 def test_name_less_follow_up_carries_the_previous_entity():
@@ -367,7 +369,8 @@ def test_trace_accounts_for_every_vector_candidate(world):
         assert got.trace["rerank"] == {"present": False}
         for r in focus["removed"]:
             assert set(r) <= {"vector_rank", "id", "day", "time", "score", "reason"}
-            assert r["reason"] in {"near_name", "after_time_anchor", "candidate_limit"}
+            assert r["reason"] in {"near_name", "other_person", "after_time_anchor", "candidate_limit"}
+        assert sum(focus["removed_by_reason"].values()) == len(focus["removed"])
         blob = json.dumps(got.trace)
         for e in ef.asked_entities(q["text"]):
             assert e.name not in blob  # counts and refs only: never the asked names
@@ -628,3 +631,45 @@ def test_entity_focus_switch_turns_the_check_off(world, value):
     trace = RetrievalTrace()
     asm.build(_day(q), q["text"], trace=trace)
     assert trace.data["focus"] == {"checked": False} and trace.data["params"]["candidate_k"] == 16
+
+
+# ---------------- other identified people (coordinator decision on #117) ----------------
+
+SOLO = ("2030-01-05", "09:00", "Solo", "Bryony Castellow went sailing alone on the estuary.")
+BOTH = ("2030-01-06", "09:00", "Together", "Alder Brannock and Bryony Castellow went sailing on the estuary.")
+CASPIAN = ("2030-01-07", "09:00", "Leeds", "Caspian Dunmore went sailing near Leeds.")
+WALK = ("2030-01-08", "09:00", "Walk", "Walked to Gullet Cove and back along the estuary.")
+
+
+def test_other_people_only_entries_go_when_the_asked_person_is_named(tmp_path):
+    got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK, FILLER], "Where did Alder Brannock go sailing?",
+                ["Boat", "Together", "Walk", "Studio"])
+    # The entry naming the asked person alongside another stays; unnamed and place-only entries stay.
+    assert got.removed == {"Solo": "other_person", "Leeds": "other_person"}
+    assert got.trace["focus"]["removed_by_reason"] == {"other_person": 2}
+    assert "Entries naming only other people were left out." in got.block
+
+
+def test_no_exact_hit_drops_no_other_people(tmp_path):
+    got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK], "Where did Alder Branock go sailing?",
+                ["Boat", "Together", "Solo", "Leeds", "Walk"])
+    assert got.removed == {}
+
+
+def test_a_first_name_question_drops_no_other_people(tmp_path):
+    got = _case(tmp_path, [BOAT, SOLO, CASPIAN], "Where did Alder go sailing?", ["Boat", "Solo", "Leeds"])
+    assert got.removed == {}  # a single word does not identify a person for certain
+
+
+def test_several_asked_people_keep_their_entries(tmp_path):
+    got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK], "Where did Alder Brannock and Bryony Castellow go sailing?",
+                ["Boat", "Together", "Solo", "Walk"])
+    assert got.removed == {"Leeds": "other_person"}
+
+
+def test_people_and_places_are_told_apart():
+    assert ef.identified_people("Had coffee with Bryony Castellow and Dr. Patel.") == [("bryony", "castellow"), ("patel",)]
+    assert ef.identified_people("Marit walked to Gullet Cove, then the Hollin Moor survey.") == []
+    assert ef.identified_people("**Me:** Spent the session inking.") == []
+    assert ef.is_person(_ent("Alder Brannock")) and ef.is_person(_ent("Dr Patel"))
+    assert not ef.is_person(_ent("Tobiah")) and not ef.is_person(_ent("Hollin Moor"))

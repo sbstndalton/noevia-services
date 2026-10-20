@@ -153,7 +153,8 @@ def test_trace_contains_no_entry_text_header_query_or_embedding(tmp_path):
     for row in removed:
         assert set(row) <= {"vector_rank", "id", "day", "time", "score", "reason"}
         assert all(isinstance(v, (int, float, str, bool, type(None))) for v in row.values())
-    assert all(isinstance(v, (int, bool, list)) for v in focused.data["focus"].values())
+    assert all(isinstance(v, (int, bool, list, dict)) for v in focused.data["focus"].values())
+    assert all(isinstance(k, str) and isinstance(v, int) for k, v in focused.data["focus"]["removed_by_reason"].items())
     blob = json.dumps(focused.data)
     for needle in ["ZEBRAQUILL", "ZEBRAQUILT", "Zebraquill", "zebraquill", "MARMOTLANTERN", "Synthetic", "topic"]:
         assert needle not in blob
