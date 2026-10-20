@@ -2,7 +2,8 @@
 # Smoke proof of the gate tooling with NO inference:
 #   1. generate the fixture twice and compare every byte and the tree hash;
 #   2. bring up the diarygate stack (inference URLs point at an unresolvable name) and prove isolation;
-#   3. load the fixture through the API, read every day back, apply the scripted mutations;
+#   3. load the fixture through the API, read every day back, apply the scripted mutations, snapshot
+#      the baseline, contaminate it the way a logged exchange would and restore it byte for byte;
 #   4. run the no-model areas: capture and tenancy (parallel), then error-paths and restart (alone);
 #   5. score, tear down, and prove with docker volume ls / network ls that nothing is left.
 # Production containers are only read (docker inspect StartedAt before and after), never touched.
@@ -36,6 +37,7 @@ trap cleanup EXIT
 "$GATE/up.sh" --rev "$rev" --run-dir "$run"
 $PY "$GATE/harness.py" load --run-dir "$run" --fixture "$fixA"
 $PY "$GATE/harness.py" mutate --run-dir "$run" --fixture "$fixA"
+$PY "$GATE/harness.py" restore-selftest --run-dir "$run" --fixture "$fixA"
 $PY "$GATE/areas/capture.py" --run-dir "$run" & p1=$!
 $PY "$GATE/areas/tenancy.py" --run-dir "$run" & p2=$!
 rc=0; wait $p1 || rc=1; wait $p2 || rc=1

@@ -6,7 +6,7 @@
 #   make_env.sh [--force]                    inference from the caller's environment:
 #       GATE_LLM_BASE_URL GATE_CHAT_MODEL GATE_EMBED_BASE_URL GATE_EMBED_MODEL   (required)
 #       GATE_LLM_API_KEY GATE_AUX_BASE_URL GATE_AUX_MODEL GATE_EMBED_PROFILE      (optional)
-#       GATE_EMBED_LOAD_URL GATE_KEV_LOAD_URL  (default: the base URLs without /v1)
+#       GATE_EMBED_LOAD_URL GATE_KEV_LOAD_URL GATE_AUX_LOAD_URL  (default: the base URLs without /v1)
 set -euo pipefail
 GATE=$(cd "$(dirname "$0")" && pwd)
 OUT="$GATE/.env.gate"
@@ -33,9 +33,10 @@ if [ "$INFERENCE" = 1 ]; then
   aux="${GATE_AUX_BASE_URL:-$llm}"; aux_model="${GATE_AUX_MODEL:-$chat}"; profile="${GATE_EMBED_PROFILE:-}"
   api_key="${GATE_LLM_API_KEY:-}"
   embed_load="${GATE_EMBED_LOAD_URL:-${embed%/v1}}"; kev_load="${GATE_KEV_LOAD_URL:-${llm%/v1}}"
+  aux_load="${GATE_AUX_LOAD_URL:-${aux%/v1}}"
 else
   llm="$DISABLED"; chat=gate-disabled; embed="$DISABLED"; embed_model=gate-disabled
-  aux="$DISABLED"; aux_model=gate-disabled; profile=""; api_key=""; embed_load=""; kev_load=""
+  aux="$DISABLED"; aux_model=gate-disabled; profile=""; api_key=""; embed_load=""; kev_load=""; aux_load=""
 fi
 umask 077
 tmp=$(mktemp "$GATE/.env.gate.XXXXXX")
@@ -55,6 +56,7 @@ trap 'rm -f "$tmp"' EXIT
   [ -n "$profile" ] && echo "LLM_EMBED_PROFILE=$profile"
   echo "GATE_EMBED_LOAD_URL=$embed_load"
   echo "GATE_KEV_LOAD_URL=$kev_load"
+  echo "GATE_AUX_LOAD_URL=$aux_load"
 } > "$tmp"
 chmod 600 "$tmp"
 mv "$tmp" "$OUT"

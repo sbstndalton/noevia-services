@@ -270,7 +270,9 @@ def build(seed: int, anchor: date, days: int):
         mutated[k] = "deletion"
 
     # ---- queries ----
-    clock_day = all_days[-1]
+    # The query clock is an EMPTY trailing day (day days+1, 12:00Z): no fixture entry is "today", so no
+    # needle is pulled into context just for being on the query day; logged exchanges land there too.
+    clock_day = all_days[-1] + timedelta(days=1)
     clock = f"{clock_day.isoformat()}T12:00:00Z"
 
     def cite(*rows):
@@ -330,6 +332,7 @@ def build(seed: int, anchor: date, days: int):
               "ambiguous": len(ambiguous), "followups": sum(1 for q in queries if "followup" in q),
               "mutations": {"paraphrase": len(para_idx), "correction": len(corr_idx), "deletion": len(del_idx)},
               "positions": {p: sum(1 for n in needles if n["pos"] == p) for p in positions}}
+    counts["query_day"] = {"day": clock_day.isoformat(), "entries": 0}
     return files, entry_rows, queries, mutations, {"query_clock": clock, "counts": counts}
 
 

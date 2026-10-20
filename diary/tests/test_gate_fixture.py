@@ -57,7 +57,9 @@ def test_a_different_seed_changes_the_fixture(fixture_dir, tmp_path):
 def test_manifest_records_inputs_and_query_clock(fixture_dir):
     m = json.loads((fixture_dir / "manifest.json").read_text())
     assert (m["seed"], m["anchor"], m["days"], m["tz"]) == (20261020, "2030-01-06", 60, "UTC")
-    assert m["query_clock"] == "2030-03-06T12:00:00Z"
+    assert m["query_clock"] == "2030-03-07T12:00:00Z"  # an empty trailing day after the 60 fixture days
+    assert m["counts"]["query_day"] == {"day": "2030-03-07", "entries": 0}
+    assert "Entries/2030/March/March 7, 2030.md" not in gatelib.fixture_files(fixture_dir)
     assert m["generator_commit"] == "0" * 40
     c = m["counts"]
     assert c["entries"] == 180 and c["queries"] == 60 and c["needles"] == 40 and c["distractors"] == 40

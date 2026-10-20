@@ -21,7 +21,7 @@ PROBE = "Notes/tenancy-probe.md"
 
 
 def main() -> int:
-    args = g.area_args(__doc__).parse_args()
+    args = g.area_args(__doc__, nomodel=True).parse_args()
     area = g.Area("tenancy", args.run_dir, PARALLEL_SAFE)
     env = g.load_env(args.env_file)
     label = args.tenant_label or "area-tenancy"

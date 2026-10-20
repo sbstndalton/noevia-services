@@ -2,38 +2,71 @@
 # No WebDAV or other remote file storage, no S3, no bind mounts, no production volumes or networks.
 # up.sh builds the image from `git archive <rev>` (GATE_BUILD_CONTEXT) so the image is the pinned
 # revision, never a dirty work tree. Inference URLs and the fresh test secrets come from .env.gate.
+#
+# Two diaries from the same image:
+#   diary          inference as .env.gate says (the harness and the model areas)
+#   diary-nomodel  chat, aux and embed URLs always disabled: the no-model areas (capture, tenancy,
+#                  error-paths, restart, the budgets limits) write here, so their writes can never
+#                  start embedding work on the MS-01 engines.
 name: diarygate
+
+x-diary: &diary
+  image: diarygate-diary:${GATE_REV:?run up.sh, which sets the revision}
+  env_file:
+    - path: .env.gate
+      required: true
+  networks:
+    - diarygate_net
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/api/health', headers={'Authorization': 'Bearer ' + os.environ['DIARY_AUTH_TOKEN']}), timeout=5)"]
+    interval: 5s
+    timeout: 6s
+    retries: 24
+    start_period: 5s
+  restart: "no"
 
 services:
   diary:
+    <<: *diary
     build:
       context: ${GATE_BUILD_CONTEXT:?run up.sh, which sets the build context}
       dockerfile: Dockerfile
-    image: diarygate-diary:${GATE_REV:?run up.sh, which sets the revision}
     container_name: diarygate-diary
-    env_file:
-      - path: .env.gate
-        required: true
     environment:
       CORPUS_BACKEND: local
       CORPUS_LOCAL_ROOT: /corpus
       DB_PATH: /data/index.db
       TZ: UTC
       DIARY_ENTRY_LAYOUT: daily
+      # Retrieval trace (services#107); a revision without it ignores the variable (retrieval stages: untested).
+      DIARY_RETRIEVAL_TRACE: "1"
     volumes:
       - diarygate_data:/data
       - diarygate_corpus:/corpus
-    networks:
-      - diarygate_net
     ports:
       - "127.0.0.1:${GATE_PORT:-18910}:8010"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/api/health', headers={'Authorization': 'Bearer ' + os.environ['DIARY_AUTH_TOKEN']}), timeout=5)"]
-      interval: 5s
-      timeout: 6s
-      retries: 24
-      start_period: 5s
-    restart: "no"
+
+  diary-nomodel:
+    <<: *diary
+    container_name: diarygate-diary-nomodel
+    pull_policy: never
+    depends_on:
+      - diary
+    environment:
+      CORPUS_BACKEND: local
+      CORPUS_LOCAL_ROOT: /corpus
+      DB_PATH: /data/index.db
+      TZ: UTC
+      DIARY_ENTRY_LAYOUT: daily
+      LLM_BASE_URL: http://gate-inference-disabled.invalid:9/v1
+      LLM_AUX_BASE_URL: http://gate-inference-disabled.invalid:9/v1
+      LLM_EMBED_BASE_URL: http://gate-inference-disabled.invalid:9/v1
+      LLM_EMBED_NEXT_BASE_URL: ""
+    volumes:
+      - diarygate_nomodel_data:/data
+      - diarygate_nomodel_corpus:/corpus
+    ports:
+      - "127.0.0.1:${GATE_NOMODEL_PORT:-18911}:8010"
 
 networks:
   diarygate_net:
@@ -44,3 +77,7 @@ volumes:
     name: diarygate_data
   diarygate_corpus:
     name: diarygate_corpus
+  diarygate_nomodel_data:
+    name: diarygate_nomodel_data
+  diarygate_nomodel_corpus:
+    name: diarygate_nomodel_corpus

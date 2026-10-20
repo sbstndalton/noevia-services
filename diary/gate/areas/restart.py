@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Workflow area: restart (no model). RUN ALONE: it restarts the gate diary container.
 
-Restarts ONLY the container named diarygate-diary, after checking it belongs to compose project
+Restarts ONLY the container named diarygate-diary-nomodel, after checking it belongs to compose project
 diarygate. Writes survive the restart byte for byte, the journal is empty afterwards, and an
 assertion signed before the restart cannot be replayed after it.
 """
@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gatelib as g  # noqa: E402
 
 PARALLEL_SAFE = False
-CONTAINER = "diarygate-diary"
+# The no-model diary: restarting it can never trigger embedding work.
+CONTAINER = "diarygate-diary-nomodel"
 
 
 def docker(*args) -> str:
@@ -26,7 +27,7 @@ def docker(*args) -> str:
 
 
 def main() -> int:
-    args = g.area_args(__doc__).parse_args()
+    args = g.area_args(__doc__, nomodel=True).parse_args()
     area = g.Area("restart", args.run_dir, PARALLEL_SAFE)
     env = g.load_env(args.env_file)
     user = g.tenant_id(args.tenant_label or "area-restart")
