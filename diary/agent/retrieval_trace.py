@@ -14,9 +14,12 @@ top_k. `rerank.present` is false so the gate can tell "no reranker" from "rerank
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 ENV_FLAG = "DIARY_RETRIEVAL_TRACE"
 HEADER = "X-Diary-Retrieval-Trace"
@@ -35,6 +38,7 @@ class RetrievalTrace:
     """Collects one exchange's retrieval stages. Created per request, never shared."""
 
     def __init__(self) -> None:
+        self.failed = False  # set when any tracing step raised: the response then carries no trace
         self.data: dict = {
             "version": SCHEMA_VERSION,
             "status": "not_run",
@@ -44,7 +48,7 @@ class RetrievalTrace:
             "loaded": [],
             "budget": {},
             "counts": {"candidates": 0, "loaded": 0, "dropped_budget": 0, "dropped_top_k": 0},
-            "direct_fallback": {"used": False, "tokens": 0},
+            "direct_fallback": {"used": False, "found": False, "tokens": 0},
         }
 
     def set_status(self, status: str) -> None:
@@ -81,11 +85,52 @@ class RetrievalTrace:
             "dropped_top_k": sum(1 for c in cands if c["dropped"] == "top_k"),
         }
 
-    def set_direct_fallback(self, tokens: int) -> None:
-        self.data["direct_fallback"] = {"used": True, "tokens": tokens}
+    def set_direct_fallback(self, found: bool, tokens: int) -> None:
+        """The direct-file fallback ran (``used``); ``found`` says whether it produced any text."""
+        self.data["direct_fallback"] = {"used": True, "found": bool(found), "tokens": tokens}
+
+
+class SafeTrace:
+    """Guards a collector so tracing can never fail an exchange.
+
+    Every collector call goes through here: if one raises, it is logged once, the collector is marked
+    failed, and this and every later call is a no-op returning None. The response then has no trace.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    @classmethod
+    def wrap(cls, trace):
+        if trace is None or isinstance(trace, cls):
+            return trace
+        return cls(trace)
+
+    def __getattr__(self, name):
+        inner = self._inner
+
+        def call(*args, **kwargs):
+            if getattr(inner, "failed", False):
+                return None
+            try:
+                return getattr(inner, name)(*args, **kwargs)
+            except Exception:  # noqa: BLE001 - tracing is optional; never take the chat down
+                log.warning("retrieval trace disabled for this request: %s failed", name, exc_info=True)
+                try:
+                    inner.failed = True
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+
+        return call
 
 
 def attach(result: dict, trace: Optional[RetrievalTrace]) -> dict:
-    if trace is not None:
-        result["retrieval_trace"] = trace.data
+    """Add the trace to a result, unless tracing is off or failed (then the result is untouched)."""
+    try:
+        if trace is not None and not trace.failed:
+            result["retrieval_trace"] = trace.data
+    except Exception:  # noqa: BLE001
+        log.warning("retrieval trace dropped from the response", exc_info=True)
+        result.pop("retrieval_trace", None)
     return result

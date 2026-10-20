@@ -306,28 +306,37 @@ class Retriever:
 
     # ---------------- search ----------------
 
-    def search(self, query: str, top_k: int = 8, min_score: float = 0.30, with_ids: bool = False) -> List[dict]:
+    def search(self, query: str, top_k: int = 8, min_score: float = 0.30, with_ids: bool = False,
+               diag: Optional[dict] = None) -> List[dict]:
         """Cosine-similarity search over past chunks. Returns [{'day','header','text','score'}].
 
-        ``with_ids`` (retrieval tracing only) adds each chunk's ``id``; results are otherwise identical."""
+        ``with_ids`` and ``diag`` serve retrieval tracing only: ``with_ids`` adds each chunk's ``id``; ``diag`` (a dict)
+        receives ``status`` saying why a search came back empty. Results and behaviour are otherwise identical."""
         if not self.vec_available:
+            if diag is not None:
+                diag["status"] = "index_unavailable"
             return []
         # #1636: only the active model's slot, with a query embedded by that model. No slot yet
         # (its re-index has not reached this file) means no vector search, never another model's.
         target, slot = self._active_slot()
         if slot is None:
+            if diag is not None:
+                diag["status"] = "index_unavailable"
             return []
         # Embed outside the lock: apply_reindex runs under the store write
         # lock and must not wait behind a slow query embedding.
         q = self._embed_one(query, target, "query")
         with self._lock:
-            return self._search_vector(q, top_k, min_score, slot, with_ids)
+            return self._search_vector(q, top_k, min_score, slot, with_ids, diag)
 
     def _search_vector(self, q: Optional[List[float]], top_k: int, min_score: float, slot: Optional[dict] = None,
-                       with_ids: bool = False) -> List[dict]:
+                       with_ids: bool = False, diag: Optional[dict] = None) -> List[dict]:
         if slot is None:
             slot = self._active_slot()[1]
         if q is None or slot is None or len(q) != slot["dim"]:
+            if diag is not None:
+                diag["status"] = ("index_unavailable" if slot is None else
+                                  "embed_failed" if q is None else "embed_dim_mismatch")
             return []
         try:
             rows = self._conn.execute(
@@ -344,6 +353,8 @@ class Retriever:
             ).fetchall()
         except sqlite3.Error as exc:
             log.warning("vector search failed: %s", exc)
+            if diag is not None:
+                diag["status"] = "search_error"
             return []
         if with_ids:
             return [

@@ -103,9 +103,9 @@ def test_trace_matches_the_ids_actually_loaded(tmp_path):
     assert [c["id"] for c in data["candidates"] if c["loaded"]] == loaded_ids
     assert data["params"] == {"top_k": 8, "candidate_k": 16, "min_score": 0.30}
     assert data["rerank"] == {"present": False}
-    assert data["budget"]["max_context_tokens"] == 5200
+    assert data["budget"]["max_context_tokens"] == 5200 and isinstance(data["budget"]["max_context_tokens"], int)
     assert data["budget"]["used_tokens"] == sum(e["tokens"] for e in data["loaded"])
-    assert data["direct_fallback"] == {"used": False, "tokens": 0}
+    assert data["direct_fallback"] == {"used": False, "found": False, "tokens": 0}
 
 
 def test_trace_marks_top_k_and_budget_drops_and_loaded_matches_context(tmp_path):
@@ -140,7 +140,7 @@ def test_trace_contains_no_entry_text_header_query_or_embedding(tmp_path):
         assert all(isinstance(v, (int, float, str, bool, type(None))) for v in row.values())
 
 
-def test_trace_statuses_without_a_usable_index(tmp_path):
+def test_trace_status_no_retriever_and_search_failed():
     t = RetrievalTrace()
     _assembler(None).build(date(2026, 9, 1), "hello", trace=t)
     assert t.data["status"] == "no_retriever" and t.data["candidates"] == []
@@ -152,6 +152,101 @@ def test_trace_statuses_without_a_usable_index(tmp_path):
     t2 = RetrievalTrace()
     _assembler(Boom()).build(date(2026, 9, 1), "hello", trace=t2)
     assert t2.data["status"] == "search_failed"
+
+
+def _break_index_unavailable(tmp_path):
+    r = _retriever(tmp_path, "s1", WORDS_A)
+    r.vec_available = False
+    return r
+
+
+def _break_no_slot(tmp_path):
+    r = Retriever(tmp_path / "s2.db", StubLLM())  # never indexed: no vectors for the active model
+    if not r.vec_available:
+        pytest.skip("sqlite-vec not available in this environment")
+    return r
+
+
+def _break_embed_failed(tmp_path):
+    r = _retriever(tmp_path, "s3", WORDS_A)
+
+    def down(*a, **k):
+        raise RuntimeError("embed server down")
+
+    r.embedding.embed = down
+    return r
+
+
+def _break_embed_dim(tmp_path):
+    r = _retriever(tmp_path, "s4", WORDS_A)
+    r.embedding.embed = lambda target, texts, kind="document", titles=None: [[0.1, 0.2, 0.3] for _ in texts]
+    return r
+
+
+def _break_sql(tmp_path):
+    r = _retriever(tmp_path, "s5", WORDS_A)
+    r._conn.execute("DROP TABLE dirty_documents")  # the search SQL now errors
+    return r
+
+
+@pytest.mark.parametrize("make, status", [
+    (_break_index_unavailable, "index_unavailable"),
+    (_break_no_slot, "index_unavailable"),
+    (_break_embed_failed, "embed_failed"),
+    (_break_embed_dim, "embed_dim_mismatch"),
+    (_break_sql, "search_error"),
+])
+def test_trace_status_says_why_search_came_back_empty(tmp_path, make, status):
+    r = make(tmp_path)
+    asm = _assembler(r)
+    off = asm.build(date(2026, 9, 1), "tell me about the entries")
+    trace = RetrievalTrace()
+    on = asm.build(date(2026, 9, 1), "tell me about the entries", trace=trace)
+    assert on == off  # behaviour is the same with tracing on; only the trace knows the reason
+    assert trace.data["status"] == status
+    assert trace.data["candidates"] == [] and trace.data["loaded"] == []
+
+
+def test_a_search_with_no_matches_is_still_ok(tmp_path):
+    trace = RetrievalTrace()
+    _assembler(_retriever(tmp_path, "a", WORDS_A), min_score=1.5).build(date(2026, 9, 1), "entries", trace=trace)
+    assert trace.data["status"] == "ok" and trace.data["counts"]["candidates"] == 0
+
+
+def test_direct_fallback_used_is_true_whenever_it_ran_with_a_separate_found_flag(tmp_path):
+    r = _retriever(tmp_path, "a", WORDS_A)
+    # no semantic match: the fallback runs; the store has text for the recent days -> found
+    found = RetrievalTrace()
+    ContextAssembler(FakeStore(today_text="Synthetic day text"), r, _cfg(min_score=1.5))         .build(date(2026, 9, 1), "entries", trace=found)
+    assert found.data["direct_fallback"]["used"] is True and found.data["direct_fallback"]["found"] is True
+    assert found.data["direct_fallback"]["tokens"] > 0
+    # the fallback ran but the store holds nothing: used, not found, no tokens
+    empty = RetrievalTrace()
+    _assembler(r, min_score=1.5).build(date(2026, 9, 1), "entries", trace=empty)
+    assert empty.data["direct_fallback"] == {"used": True, "found": False, "tokens": 0}
+    # a semantic match means the fallback did not run
+    hit = RetrievalTrace()
+    _assembler(r).build(date(2026, 9, 1), "entries", trace=hit)
+    assert hit.data["direct_fallback"]["used"] is False
+
+
+@pytest.mark.parametrize("method, min_score", [
+    ("set_params", 0.30), ("set_budget", 0.30), ("set_status", 0.30), ("add_candidate", 0.30),
+    ("add_loaded", 0.30), ("finish", 0.30), ("set_direct_fallback", 1.5),
+])
+def test_a_failing_collector_never_fails_the_context_build(tmp_path, monkeypatch, method, min_score):
+    asm = _assembler(_retriever(tmp_path, "a", WORDS_A), min_score=min_score)
+    off = asm.build(date(2026, 9, 1), "tell me about the entries")
+
+    def boom(self, *a, **k):
+        raise RuntimeError("collector bug")
+
+    monkeypatch.setattr(RetrievalTrace, method, boom)
+    trace = RetrievalTrace()
+    on = asm.build(date(2026, 9, 1), "tell me about the entries", trace=trace)
+    assert on == off
+    assert trace.failed is True
+    assert "retrieval_trace" not in appmod.attach_trace({}, trace)
 
 
 # ---------------- request level ----------------
@@ -261,15 +356,59 @@ def test_a_tenant_only_ever_sees_its_own_trace(world, monkeypatch):
     assert all("trace" not in getattr(route, "path", "") for route in appmod.app.routes)
 
 
-def test_request_without_a_tenant_state_cannot_borrow_a_trace(world, monkeypatch):
-    """Tenant B's traced exchange never reads tenant A's retriever, even when A ran first."""
+def test_two_tenants_through_the_app_each_get_only_their_own_trace_even_concurrently(world, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
     monkeypatch.setenv(ENV_FLAG, "1")
-    _post(world, A, {HEADER: "1"}, session="u1")
-    calls = []
-    real = world.retrievers[A].search
-    world.retrievers[A].search = lambda *a, **k: calls.append(1) or real(*a, **k)
-    _post(world, B, {HEADER: "1"}, session="u2")
-    assert calls == []
+    query = "tell me about the entries"
+
+    def hits(tenant):
+        return [(h["id"], h["score"]) for h in
+                world.retrievers[tenant].search(query, top_k=16, min_score=0.30, with_ids=True)]
+
+    expected = {A: hits(A), B: hits(B)}
+    assert expected[A] != expected[B]  # the two tenants really do hold different data
+    searches = {A: 0, B: 0}
+    for tenant, r in world.retrievers.items():
+        real = r.search
+
+        def spy(*a, _real=real, _t=tenant, **k):
+            searches[_t] += 1
+            return _real(*a, **k)
+
+        r.search = spy
+
+    def candidates(resp):
+        assert resp.status_code == 200
+        return [(c["id"], c["score"]) for c in resp.json()["retrieval_trace"]["candidates"]]
+
+    # interleaved
+    for n, tenant in enumerate([A, B, B, A]):
+        assert candidates(_post(world, tenant, {HEADER: "1"}, session=f"w{n}")) == expected[tenant]
+    assert searches == {A: 2, B: 2}  # a tenant's request only ever touched its own index
+    # concurrent
+    order = [A, B] * 8
+    with ThreadPoolExecutor(8) as pool:
+        got = list(pool.map(lambda args: candidates(_post(world, args[1], {HEADER: "1"}, session=f"c{args[0]}")),
+                            enumerate(order)))
+    assert got == [expected[t] for t in order]
+    assert searches == {A: 10, B: 10}
+    # an untraced request after traced ones carries nothing over, for either tenant
+    for tenant in (A, B):
+        assert "retrieval_trace" not in _post(world, tenant, session=f"z{tenant}").json()
+
+
+def test_a_failing_collector_does_not_fail_the_chat_over_http(world, monkeypatch):
+    plain = _post(world, A, session="f1")
+    monkeypatch.setenv(ENV_FLAG, "1")
+
+    def boom(self, *a, **k):
+        raise RuntimeError("collector bug")
+
+    monkeypatch.setattr(RetrievalTrace, "add_candidate", boom)
+    resp = _post(world, A, {HEADER: "1"}, session="f2")
+    assert resp.status_code == 200 and "retrieval_trace" not in resp.json()
+    assert _norm(resp) == _norm(plain)  # same reply: the model input was untouched
 
 
 def test_http_trace_has_no_entry_text(world, monkeypatch):

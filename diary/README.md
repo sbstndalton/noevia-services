@@ -91,7 +91,7 @@ not change retrieval or the model input.
 - `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
 - `loaded`: the excerpts actually placed in the context (`id`, `day`, `time`, `score`, `tokens`, `chars`);
   `budget`: `max_context_tokens`, `max_context_chars`, `excerpt_char_cap`, `used_chars`, `used_tokens`.
-- `counts`, `status` (`ok`, `no_retriever`, `empty_query`, `search_failed`), `direct_fallback` (`used`, `tokens`).
+- `counts`; `status` (`ok`, `no_retriever`, `empty_query`, `search_failed`, `index_unavailable`, `embed_failed`, `embed_dim_mismatch`, `search_error`; only `ok` means the search ran); `direct_fallback` (`used` = it ran, `found` = it produced text, `tokens`). If tracing itself fails the chat still succeeds and the response carries no trace.
 
 ## Editing — the integrity guarantee
 
