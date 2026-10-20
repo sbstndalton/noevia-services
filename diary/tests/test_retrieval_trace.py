@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from datetime import date
 from types import SimpleNamespace
 
@@ -19,6 +20,9 @@ from agent.retrieval import Retriever
 from agent.retrieval_trace import ENV_FLAG, HEADER, RetrievalTrace
 from agent.util import estimate_tokens
 from tests.test_retrieval_context import FakeStore, StubLLM
+
+# The world fixture stubs _tenant_state; keep the real one for the no-tenant test.
+_REAL_TENANT_STATE = appmod._tenant_state
 
 A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -416,3 +420,56 @@ def test_http_trace_has_no_entry_text(world, monkeypatch):
     blob = json.dumps(_post(world, A, {HEADER: "1"}, session="v1").json()["retrieval_trace"])
     for needle in WORDS_A + ["Synthetic", "topic", "tell me about"]:
         assert needle not in blob
+
+
+def test_a_request_with_no_tenant_state_gets_no_trace_and_borrows_none(world, monkeypatch):
+    """A request that resolves to no tenant is refused by the real _tenant_state with 400, before any retriever runs.
+
+    The world fixture stubs _tenant_state, so the real one is put back here. Tenant A's state is also cached in
+    this process, as it is on a live server, so a fallback to "whichever state is cached" would hand A's trace
+    to this request. It must not, for the plain request or the streamed diary_events request.
+    """
+    monkeypatch.setenv(ENV_FLAG, "1")
+    monkeypatch.delenv("DIARY_LEGACY_USER_ID", raising=False)  # no legacy mapping may name a tenant
+    monkeypatch.setattr(appmod, "_tenant_state", _REAL_TENANT_STATE)
+    monkeypatch.setattr(appmod, "_tenant_states", OrderedDict([(f"{A}:cached", world.states[A])]))
+    searches = []
+    for r in world.retrievers.values():
+        real = r.search
+
+        def spy(*a, _real=real, **k):
+            searches.append(1)
+            return _real(*a, **k)
+
+        r.search = spy
+
+    body = {"session_id": "n1", "messages": [{"role": "user", "content": "tell me about the entries"}]}
+    for extra in ({}, {"stream": True, "diary_events": True}):
+        resp = world.client.post("/v1/chat/completions", headers={HEADER: "1"}, json={**body, **extra})
+        assert resp.status_code == 400, resp.text
+        assert "retrieval_trace" not in resp.text
+    assert searches == []  # no tenant's index was touched, A's included
+
+
+def test_a_failing_collector_on_the_streaming_diary_events_path_still_streams_with_no_trace(world, monkeypatch):
+    def events(resp):
+        return [json.loads(line[6:]) for line in resp.text.splitlines() if line.startswith("data: ")]
+
+    plain = events(_post(world, A, stream=True, session="y1"))
+    monkeypatch.setenv(ENV_FLAG, "1")
+    calls = []
+
+    def boom(self, *a, **k):
+        calls.append(1)
+        raise RuntimeError("collector bug")
+
+    monkeypatch.setattr(RetrievalTrace, "add_candidate", boom)
+    resp = _post(world, A, {HEADER: "1"}, stream=True, session="y2")
+    assert resp.status_code == 200
+    got = events(resp)
+    assert calls, "the failing collector must really run on the streaming path"
+    assert not any(e.get("type") == "error" for e in got)  # the exchange did not fail
+    assert got[-1] == {"type": "done"}  # the stream completed normally
+    diary = [e for e in got if e.get("type") == "diary"]
+    assert len(diary) == 1 and "retrieval_trace" not in diary[0]
+    assert diary[0] == [e for e in plain if e.get("type") == "diary"][0]  # same reply as with tracing off
