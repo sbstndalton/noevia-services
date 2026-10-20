@@ -64,6 +64,7 @@ from .journal import Journal
 from .llm import EngineUnreachable, LLMClient, strip_reasoning
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
+from .retrieval_trace import RetrievalTrace, attach as attach_trace, trace_requested
 from . import embedding as embedding_mod
 from .embedding_migration import EmbeddingMigration
 from .storage import create_backend
@@ -866,7 +867,7 @@ def _replayable_history(messages) -> list:
     return pairs
 
 
-def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy", entry_time=None, entry_day=None, background=True, extra_context="", emit=None) -> dict:
+def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy", entry_time=None, entry_day=None, background=True, extra_context="", emit=None, retrieval_trace=False) -> dict:
     """One full exchange: context build -> main model -> strip marker -> log -> return payload."""
     if emit:
         emit({"type": "status", "text": "Reading diary entries and memory…"})
@@ -874,7 +875,10 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     sess = _session(session_id, tenant_id)
     now = entry_time or datetime.now()
     day = entry_day or now.date()
-    messages = st.assembler.build(day, message, session_turns=sess["turns"])
+    # Opt-in gate tracing (retrieval_trace.py): a per-call collector, returned only to this caller.
+    trace = RetrievalTrace() if retrieval_trace else None
+    messages = (st.assembler.build(day, message, session_turns=sess["turns"]) if trace is None
+                else st.assembler.build(day, message, session_turns=sess["turns"], trace=trace))
     if extra_context:
         # Per-exchange reference only: never change the journaled user message,
         # session history, system prompt, or shared assembler state.
@@ -914,7 +918,7 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
         threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
     # #1505: "reasoning" stays in the payload for older callers but is always empty: the companion's
     # reasoning is never returned to the user.
-    return {"reply": visible, "reasoning": "", "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
+    return attach_trace({"reply": visible, "reasoning": "", "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}, trace)
 
 
 def _reindex_dirty(st: AppState) -> None:
@@ -1508,6 +1512,8 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
 
     session_id = str(body.get("session_id") or "openai-client")
     tenant_id = request.headers.get("X-Cowork-User-ID", "legacy")
+    # Gate tracing: off unless the operator flag and this request's header are both set.
+    trace_kw = {"retrieval_trace": True} if trace_requested(request) else {}
     if body.get("stream") is True and body.get("diary_events") is True:
         # noevia activity protocol; preserve the existing OpenAI JSON surface.
         entry_time, entry_day = entry_target(body)
@@ -1524,7 +1530,7 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
             if prior and not sess["turns"]:
                 sess["turns"].extend(prior)
             return _run_exchange(st, last, session_id, tenant_id, entry_time, entry_day,
-                                 True, optional_reference(body), emit)
+                                 True, optional_reference(body), emit, **trace_kw)
         return exchange_stream(work)
     # Tenant recovery does remote writes and embeddings: never on the event loop (#805).
     st = await run_in_threadpool(_tenant_state, request)
@@ -1535,7 +1541,7 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
     try:
         # _run_exchange does blocking inference I/O — keep the event loop free.
         entry_time, entry_day = entry_target(body)
-        result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day, True, optional_reference(body))
+        result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day, True, optional_reference(body), **trace_kw)
     except HTTPException:
         raise
     except Exception:  # noqa: BLE001
@@ -1559,6 +1565,7 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         "diary": {"decision": result["decision"], "xid": result["xid"]},
+        **({"retrieval_trace": result["retrieval_trace"]} if "retrieval_trace" in result else {}),
     })
 
 
