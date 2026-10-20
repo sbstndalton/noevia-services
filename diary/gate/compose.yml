@@ -1,0 +1,46 @@
+# Isolated Diary gate stack: compose project "diarygate", its own network and volumes only.
+# No WebDAV or other remote file storage, no S3, no bind mounts, no production volumes or networks.
+# up.sh builds the image from `git archive <rev>` (GATE_BUILD_CONTEXT) so the image is the pinned
+# revision, never a dirty work tree. Inference URLs and the fresh test secrets come from .env.gate.
+name: diarygate
+
+services:
+  diary:
+    build:
+      context: ${GATE_BUILD_CONTEXT:?run up.sh, which sets the build context}
+      dockerfile: Dockerfile
+    image: diarygate-diary:${GATE_REV:?run up.sh, which sets the revision}
+    container_name: diarygate-diary
+    env_file:
+      - path: .env.gate
+        required: true
+    environment:
+      CORPUS_BACKEND: local
+      CORPUS_LOCAL_ROOT: /corpus
+      DB_PATH: /data/index.db
+      TZ: UTC
+      DIARY_ENTRY_LAYOUT: daily
+    volumes:
+      - diarygate_data:/data
+      - diarygate_corpus:/corpus
+    networks:
+      - diarygate_net
+    ports:
+      - "127.0.0.1:${GATE_PORT:-18910}:8010"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/api/health', headers={'Authorization': 'Bearer ' + os.environ['DIARY_AUTH_TOKEN']}), timeout=5)"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 5s
+    restart: "no"
+
+networks:
+  diarygate_net:
+    name: diarygate_net
+
+volumes:
+  diarygate_data:
+    name: diarygate_data
+  diarygate_corpus:
+    name: diarygate_corpus

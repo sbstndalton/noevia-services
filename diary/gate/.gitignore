@@ -1,0 +1,3 @@
+.env.gate
+.env.gate.*
+__pycache__/

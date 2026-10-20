@@ -1,0 +1,31 @@
+{
+  "_doc": "Declared before any run. Each stage is judged on its own; there is no blended score.",
+  "candidate_retrieval": {
+    "k": 8,
+    "recall_at_k_min": 0.90,
+    "precision_at_k_min": 0.40,
+    "recall_definition": "per query, the best alternative relevant set: |set & top-k| / |set|; macro mean over queries with relevant entries",
+    "precision_definition": "per query, relevant candidates / candidates returned (at most k; the diary drops candidates under min_score); macro mean"
+  },
+  "reranking": {
+    "k": 8,
+    "mrr_no_worse": true,
+    "ndcg_at_k_min": 0.80,
+    "not_applicable": "N/A: no reranker in diary"
+  },
+  "context_load": {
+    "recall_min": 0.90,
+    "budget_tokens": 5200,
+    "within_budget_min": 1.0,
+    "recall_definition": "best alternative relevant set: |set & loaded context| / |set|; macro mean"
+  },
+  "answer": {
+    "fact_accuracy_min": 0.90,
+    "citation_min": 0.90,
+    "stale_facts_max": 0,
+    "abstentions_min": 5,
+    "abstentions_of": 6,
+    "false_abstentions_max": 1,
+    "verdict": "needs-judge: deterministic signals are provisional; a judge applies rubric.json to every row"
+  }
+}

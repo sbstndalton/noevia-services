@@ -1,0 +1,21 @@
+{
+  "_doc": "Fixed answer rubric. score.py computes the deterministic signals; every answer row stays needs-judge until a judge records a verdict per criterion. No model judge is built in.",
+  "version": 1,
+  "normalize": "lower case, collapse whitespace, straight quotes; facts match as substrings",
+  "criteria": {
+    "fact": "Every expected fact is stated as the answer (not merely mentioned as a rejected option).",
+    "citation": "The answer names the day of at least one relevant entry (e.g. 'January 21', '21 January' or '2030-01-21').",
+    "stale": "No forbidden fact (a distractor, a superseded value or a deleted detail) is asserted as true.",
+    "abstention": "For expect_abstain rows: the answer says the diary does not record it and invents nothing.",
+    "false_abstention": "For answerable rows: an abstention is a failure.",
+    "ambiguity": "For ambiguous rows: the answer names both candidates or asks which one is meant.",
+    "confirmed_vs_inferred": "The answer separates what the diary records from what it infers."
+  },
+  "abstention_phrases": [
+    "don't have", "do not have", "no record", "not recorded", "isn't recorded", "is not recorded", "no entry", "no entries",
+    "doesn't mention", "does not mention", "not mentioned", "can't find", "cannot find", "couldn't find", "could not find",
+    "don't know", "do not know", "not sure", "no information", "nothing in", "not in your diary", "wasn't recorded",
+    "was removed", "were removed", "withdrew", "withdrawn"
+  ],
+  "citation_formats": ["{month} {day}", "{day} {month}", "{iso}"]
+}
