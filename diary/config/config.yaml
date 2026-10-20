@@ -49,6 +49,8 @@ retrieval:
   top_k: 8
   max_context_tokens: 5200
   min_score: 0.30
+  # services#116: lexical check of the hits against names and time anchors in the message (README).
+  entity_focus: true
 
 context:
   max_today_tokens: 4500

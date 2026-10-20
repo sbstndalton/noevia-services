@@ -138,7 +138,7 @@ def test_trace_contains_no_entry_text_header_query_or_embedding(tmp_path):
     blob = json.dumps(trace.data)
     for needle in WORDS_A + ["SECRETQUERYPHRASE", "EARLIERTURNPHRASE", "Synthetic body", "topic", "SYSTEM", "embedding"]:
         assert needle not in blob
-    allowed = {"id", "rank", "day", "time", "score", "loaded", "dropped", "tokens", "chars"}
+    allowed = {"id", "rank", "vector_rank", "day", "time", "score", "loaded", "dropped", "tokens", "chars"}
     for row in trace.data["candidates"] + trace.data["loaded"]:
         assert set(row) <= allowed
         assert all(isinstance(v, (int, float, str, bool, type(None))) for v in row.values())

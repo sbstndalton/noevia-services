@@ -40,7 +40,8 @@ in the tests. Each area uses fixed synthetic tenant ids (`gatelib.tenant_id`); t
 
 The gate diary runs with `DIARY_RETRIEVAL_TRACE=1` and the harness sends `X-Diary-Retrieval-Trace: 1` on
 every `/v1/chat/completions` call (services#107). It reads `retrieval_trace` (schema v1: `params`, `status`,
-`rerank`, `candidates`, `loaded`, `budget`, `counts`, `direct_fallback`). Trace `id`s are chunk rowids and
+`rerank`, `candidates`, `loaded`, `budget`, `counts`, `direct_fallback`, and `focus` from services#116: the
+`candidates` scored are those left after the diary's entity focus, its removals are listed in `focus.removed`). Trace `id`s are chunk rowids and
 change on reindex, so candidates and loaded items are matched to truth entries by **day and HH:MM**
 (the entry header's leading time); items on the empty query day (this session's own logged exchanges)
 and any item carrying this exchange's xid are dropped. `rerank.present` is false in the diary, so the

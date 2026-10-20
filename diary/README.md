@@ -91,12 +91,29 @@ It is built per request and returned only to that caller; nothing is stored and 
 It holds ids, scores, counts and the budget only, never entry text, headers, the query or embeddings, and it does
 not change retrieval or the model input.
 
-- `candidates`: vector-search hits in score order (`rank`, chunk `id`, `day`, `time`, `score`, `loaded`, and `dropped`
-  = `budget` or `top_k` when not loaded). `params`: `top_k` 8, `candidate_k` 16 (2x top_k), `min_score` 0.30.
+- `candidates`: the candidates offered for selection, in score order (`rank`, `vector_rank`, chunk `id`, `day`,
+  `time`, `score`, `loaded`, and `dropped` = `budget` or `top_k` when not loaded). `params`: `top_k` 8,
+  `candidate_k` (vector hits requested: 16 = 2x top_k, or 32 when the entity focus runs), `min_score` 0.30.
+- `focus` (services#116): `{"checked": false}` when the message names no entity and no time anchor; then
+  `candidates` are the vector hits. Otherwise `entities` and `time_anchor` (counts and flags only, never the
+  names), `applied` (some hit named an asked entity exactly), `vector_candidates`, `removed` (each dropped hit:
+  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `entity_absent`, `after_time_anchor` or
+  `candidate_limit`), `near_name_labelled` and `superseded_labelled`.
 - `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
 - `loaded`: the excerpts actually placed in the context (`id`, `day`, `time`, `score`, `tokens`, `chars`);
   `budget`: `max_context_tokens`, `max_context_chars`, `excerpt_char_cap`, `used_chars`, `used_tokens`.
 - `counts`; `status` (`ok`, `no_retriever`, `empty_query`, `search_failed`, `index_unavailable`, `embed_failed`, `embed_dim_mismatch`, `search_error`; only `ok` means the search ran); `direct_fallback` (`used` = it ran, `found` = it produced text, `tokens`). If tracing itself fails the chat still succeeds and the response carries no trace.
+
+## Entity focus (services#116)
+
+Vector similarity cannot tell similarly spelled names apart, so entries about "Alder Brennock" crowd out the one
+about "Alder Brannock". When the user's message names an entity (a capitalised name phrase) or a time anchor
+("as of January 20, 2030", "before 2030-02-10"), `agent/entity_focus.py` checks a wider vector pool (4x top_k)
+lexically, with no model call: hits dated after the anchor are dropped; if any hit names an asked entity exactly,
+only those are kept (score order, at most 2x top_k); otherwise every hit is kept and hits naming only a similar
+spelling are labelled as a different person. A short note opens the retrieved block, and an entry dated before an
+explicit correction of the same entity is labelled as superseded. Messages without a name or anchor are
+unaffected. `retrieval.entity_focus: false` turns the check off.
 
 ## Editing — the integrity guarantee
 
