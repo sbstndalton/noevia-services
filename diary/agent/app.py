@@ -1827,8 +1827,8 @@ def local_exchange(body: dict, request: Request):
         # #1505: a stalled model is a coded failure the caller can act on, not a bare 500.
         if not exc.nothing_saved:
             raise
-        return JSONResponse({"error": MODEL_TIMEOUT_TEXT, "detail": MODEL_TIMEOUT_TEXT, "code": "modelFailed", "saved": False},
-                            status_code=503)
+        return JSONResponse({"error": MODEL_TIMEOUT_TEXT, "detail": MODEL_TIMEOUT_TEXT, "code": "modelFailed",
+                             "reason": "chat_timeout", "saved": False}, status_code=503)
     except LengthCapError:
         # #140: the answer cap used the whole budget before any answer text; same shape as the stalled branch,
         # with the reason the stream reports. Nothing was saved.
