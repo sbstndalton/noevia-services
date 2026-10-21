@@ -133,16 +133,22 @@ def test_time_anchored_question_measures_the_gap_from_the_best_entry_before_the_
     assert "skep" not in context and "top-bar" in context
 
 
-@pytest.mark.parametrize("question", ["What does Orla Kilbride grow?",   # the name in full
-                                      "What does Orla Kilbrid grow?"])   # a typo: no full exact hit
-def test_an_entry_about_the_asked_person_is_never_cut_for_its_score(question):
+@pytest.mark.parametrize("question, loaded, by_name", [
+    ("What does Orla Kilbride grow?", ["best", "other", "needle"], []),  # the name in full
+    # A typo: no full exact hit. services#145 leaves the near spelling out for its name, never for its score.
+    ("What does Orla Kilbrid grow?", ["other"], ["best", "needle"]),
+])
+def test_an_entry_about_the_asked_person_is_never_cut_for_its_score(question, loaded, by_name):
     rows = [_row("best", "2030-01-10", 0.85, "Orla Kilbride grows sweet peas."),
             _row("other", "2030-01-11", 0.80, "Gardening club met in the hall."),
             _row("needle", "2030-01-20", 0.60, "Orla Kilbride said the sweet peas failed this year.")]
-    data, _ = _build(rows, question, score_gap=0.08)
+    data, context = _build(rows, question, score_gap=0.08)
     assert data["focus"]["entities"] == 1
     assert data["score_gap"]["applied"] is False and data["score_gap"]["removed"] == []
-    assert "needle" in _loaded(data)
+    assert _loaded(data) == loaded
+    assert [(r["id"], r["reason"]) for r in data["focus"]["removed"]] == [(i, "near_name_unmatched") for i in by_name]
+    if by_name:
+        assert 'ask whether "Orla Kilbride" was meant' in context and "sweet peas" not in context
 
 
 def test_by_default_nothing_is_cut():

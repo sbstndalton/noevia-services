@@ -40,8 +40,14 @@ detail as competing with another's. This module needs no model call.
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
                   full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
                   full exact hit (a deliberate precision/recall trade-off, see the README).
-  With no full exact hit nothing is dropped for a name (a typo or a nickname in the question must not
-  hide the entry); similar names are labelled "may be a different person, check the name" instead.
+  With no full exact hit nothing is dropped for a name (a nickname in the question must not hide the entry);
+  similar names are labelled "may be a different person, check the name" instead, with one exception:
+    near_name_unmatched  (services#145) the asked entity is a two-word person no hit names in full (its entry
+                  was deleted, or never written), the question is not relational, and the entry names the
+                  same given name with a near-spelled surname ("Caspian Juxton" for "Caspian Juxon", the same
+                  near_word measure). It is someone else; the note says the diary does not record the asked
+                  person and names the near spelling so the answer can ask whether it was meant. Accepted
+                  trade-off: a misspelt real name now gets that abstention instead of an answer.
   A relational question ("Alder Brannock's sister-in-law", "the wife of Alder Brannock") drops nothing for
   not naming the asked entity.
 - Accepted recall limits: an entry about the asked person that never names them (a pronoun only, a
@@ -65,6 +71,8 @@ from datetime import date
 from typing import Dict, List, Optional, Sequence, Tuple
 
 MAX_ENTITIES = 4
+MAX_NEAR_SPELLINGS = 3  # #145: near spellings a note names per asked person
+ABSENT_NOTE = "The diary has no entry naming"  # #145: opens the abstain sentence; kept even when nothing loads
 # below_margin: an entry naming no asked entity is dropped when it scores more than this below the best full
 # exact-name hit. A deliberate precision/recall trade-off (README); retrieval.entity_focus_margin overrides it.
 MARGIN = 0.05
@@ -703,6 +711,7 @@ class FocusResult:
     removed: List[Tuple[int, dict, str]] = field(default_factory=list)  # (vector rank, row, reason)
     similar: Dict[int, Tuple[str, str, str]] = field(default_factory=dict)  # rank -> (kind, name in entry, asked)
     corrected_by: Dict[int, str] = field(default_factory=dict)  # vector rank -> day of a later correction
+    absent: Dict[Entity, List[str]] = field(default_factory=dict)  # #145: asked person nobody names -> near spellings left out
 
     @property
     def active(self) -> bool:
@@ -733,12 +742,27 @@ def _score(row: dict) -> Optional[float]:
         return None
 
 
+def _same_given_near_surname(text: str, entity: Entity) -> Optional[str]:
+    """The first name in ``text`` with ``entity``'s given name and a near-spelled surname, as written
+    ("Caspian Juxton" for "Caspian Juxon"), else None. ``entity`` has exactly two comparison words."""
+    given, surname = entity.keys
+    for run in _cap_runs(_clean(text), stop=False):
+        words = [w for w, _ in run if _key(w) not in TITLES]
+        keys = _keys(words)
+        if len(keys) != len(words):
+            continue
+        for i in range(len(keys) - 1):
+            if keys[i] == given and near_word(keys[i + 1], surname):
+                return f"{words[i]} {words[i + 1]}"
+    return None
+
+
 def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None,
                      earlier: Sequence[str] = (), margin: float = MARGIN) -> FocusResult:
     """Check vector candidates (``rows`` in score order) against ``message``; keep at most ``limit``.
 
-    Removal reasons (module docstring): ``after_time_anchor``, ``near_name``, ``other_person``,
-    ``below_margin`` and ``candidate_limit``. Kept rows stay in score order."""
+    Removal reasons (module docstring): ``after_time_anchor``, ``near_name``, ``near_name_unmatched``,
+    ``other_person``, ``below_margin`` and ``candidate_limit``. Kept rows stay in score order."""
     res = analyse(message, earlier)
     res.margin = margin = parse_margin(margin)  # never nan, negative or above 1, wherever it came from
     ranked = list(enumerate(rows, 1))
@@ -768,6 +792,9 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
         best = max(exact) if exact and len(res.matched) == len(res.entities) else None
         # Name-based drops need a full exact hit, and none for a relational question.
         people_asked = [] if res.relational else [e for e in res.matched if is_person(e)]
+        # #145: a two-word person no hit names in full; a same-given-name near spelling is someone else.
+        absent = [] if res.relational else [e for e in res.entities
+                                            if e not in res.matched and len(e.keys) == 2 and is_person(e)]
         survivors = []
         for rank, row in ranked:
             found = kinds[rank]
@@ -776,6 +803,16 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
                 continue
             if any(kind == "near" and res.entities[i] in res.matched for i, (kind, _) in enumerate(found)):
                 res.removed.append((rank, row, "near_name"))  # a near spelling of a name the diary has in full
+                continue
+            near = [(e, _same_given_near_surname(_row_text(row), e))
+                    for i, (kind, _) in enumerate(found) if kind == "near" and (e := res.entities[i]) in absent]
+            near = [(e, shown) for e, shown in near if shown]
+            if near:
+                res.removed.append((rank, row, "near_name_unmatched"))
+                for e, shown in near:
+                    spellings = res.absent.setdefault(e, [])
+                    if shown not in spellings and len(spellings) < MAX_NEAR_SPELLINGS:
+                        spellings.append(shown)
                 continue
             if not could_refer(found, res.entities, res.matched, _row_text(row)) and not res.relational:
                 if people_asked and identified_people(_body(row)):
@@ -892,6 +929,14 @@ def context_notes(res: FocusResult) -> List[str]:
                 line += (" Some entries that named none of the asked names were left out, so this list may be"
                          " incomplete: an entry about the asked person that does not name them (a pronoun or"
                          " a nickname) may be missing.")
+        for e, spellings in res.absent.items():
+            near = " or ".join(f'"{s}"' for s in spellings)
+            what, who = (("a near spelling", "a different person") if len(spellings) == 1
+                         else ("near spellings", "different people"))
+            line += (f' {ABSENT_NOTE} "{e.name}". Entries naming {near}, {what} with the same first'
+                     f' name, were left out as {who}: say the diary does not record this about "{e.name}", do not'
+                     f' give the details of {near} as the answer, and ask whether {near} was meant.')
+        unmatched = [e for e in unmatched if e not in res.absent]
         if unmatched:
             line += (f" No retrieved entry names {_names(unmatched)} exactly. An entry with a similar name may be a"
                      " different person, or the name may be spelled differently: check the name before relying"
