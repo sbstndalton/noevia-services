@@ -57,16 +57,23 @@ AREA_TIMEOUT_S = float(os.environ.get("GATE_AREA_TIMEOUT_S", "10800"))
 # finishes the chat call it is on (up to g.CHAT_TIMEOUT_S) and then restores its tenant, and only after that is
 # it killed. The restore (harness.restore_baseline) waits for the engines to go idle (g.IDLE_WAIT_S), then in
 # ONE inference slot waits for the lock (g.LOCK_TIMEOUT_S) and the load gate (g.RECHECKS * g.RECHECK_S), writes,
-# and settles the index (g.SETTLE_TIMEOUT_S). The default grace is therefore
+# then settles the index and checks the baseline (g.SETTLE_TIMEOUT_S). The default grace is therefore
 #   g.CHAT_TIMEOUT_S + RESTORE_ALLOWANCE_S, with
-#   RESTORE_ALLOWANCE_S = IDLE_WAIT_S + LOCK_TIMEOUT_S + RECHECKS * RECHECK_S + SETTLE_TIMEOUT_S + RESTORE_MARGIN_S
-# (the margin is for the restore's own writes), all taken from gatelib. With the stock values the allowance is
-# 900 + 1800 + 60 + 300 + 300 = 3360 s and the default grace 600 + 3360 = 3960 s. GATE_AREA_GRACE_S overrides it.
-RESTORE_MARGIN_S = 300.0
+#   RESTORE_ALLOWANCE_S = IDLE_WAIT_S + LOCK_TIMEOUT_S + RECHECKS * RECHECK_S + SETTLE_TIMEOUT_S + RESTORE_WRITE_DEADLINE_S
+# all taken from gatelib. What each term bounds (services#141):
+#   - RESTORE_WRITE_DEADLINE_S (the write margin, RESTORE_MARGIN_S below) is ONE total deadline for all of
+#     g.restore()'s HTTP calls: listing, reads, deletes and PUTs, each clamped to the time left. A restore cut by
+#     it is reported incomplete and the area blocked; the margin never has to grow with the number of files.
+#   - SETTLE_TIMEOUT_S is ONE budget shared by settle and the baseline check after it, each call clamped to it.
+#   - The idle and lock waits poll (IDLE_POLL_S, a 5 s HTTP probe; lock polling has no HTTP), so each can run
+#     past its limit by about one poll; the SIGTERM delivery and the process exit are not counted either.
+# With the stock values the allowance is 900 + 1800 + 60 + 300 + 300 = 3360 s and the default grace
+# 600 + 3360 = 3960 s (GATE_RECHECKS=120: 4500 s). GATE_AREA_GRACE_S overrides it.
+RESTORE_MARGIN_S = g.RESTORE_WRITE_DEADLINE_S  # the same constant; restore_allowance_s() reads it live
 
 
 def restore_allowance_s() -> float:
-    return g.IDLE_WAIT_S + g.LOCK_TIMEOUT_S + g.RECHECKS * g.RECHECK_S + g.SETTLE_TIMEOUT_S + RESTORE_MARGIN_S
+    return g.IDLE_WAIT_S + g.LOCK_TIMEOUT_S + g.RECHECKS * g.RECHECK_S + g.SETTLE_TIMEOUT_S + g.RESTORE_WRITE_DEADLINE_S
 
 
 RESTORE_ALLOWANCE_S = restore_allowance_s()

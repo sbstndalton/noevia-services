@@ -265,8 +265,16 @@ RECHECK_S = float(os.environ.get("GATE_RECHECK_S", "5"))
 IDLE_WAIT_S = float(os.environ.get("GATE_IDLE_WAIT_S", "900"))
 IDLE_POLL_S = float(os.environ.get("GATE_IDLE_POLL_S", "5"))
 AREA_WAIT_S = float(os.environ.get("GATE_AREA_WAIT_S", "3600"))
-# The longest settle() waits for the journal and the index (restore_baseline); run_areas.py sizes its stop grace on it.
+# The longest settle() waits for the journal and the index. restore_baseline gives settle AND the baseline check
+# that follows it this one budget together; run_areas.py sizes its stop grace on it.
 SETTLE_TIMEOUT_S = 300.0
+# ONE total deadline for all of restore()'s HTTP calls (listing, reads, deletes and PUTs). run_areas.py counts
+# exactly this constant as the restore's write margin in the stop grace (services#141).
+RESTORE_WRITE_DEADLINE_S = 300.0
+# The longest one restore write (delete or PUT) may take on its own; it is clamped to the time left.
+WRITE_TIMEOUT_S = 300.0
+# A call is not started with less than this left before its deadline (the deadline counts as hit).
+MIN_CALL_S = 0.05
 # The longest the gate waits for one chat call (harness.ask). run_areas.py derives its default stop grace from it.
 CHAT_TIMEOUT_S = 600.0
 
@@ -770,98 +778,171 @@ def apply_mutations(client: Client, user: str, fixture_dir: Path, env: dict | No
 
 # ---------------- baseline and restore (no query may see an earlier query's logged exchange) ----------------
 
-def list_tree(client: Client, user: str, path: str = "") -> list:
-    """Every Markdown file path under `path` (recursive, through GET /api/files)."""
-    r = client.request("GET", "/api/files", user=user, query=("path=" + urllib.parse.quote(path)) if path else "")
+class DeadlineHit(RuntimeError):
+    """A call was not started: its deadline had (all but) run out."""
+
+
+def _obj(r: Response) -> dict:
+    """The response body as a dict; anything else (garbage, a list, null) is an empty dict."""
+    body = r.json()
+    return body if isinstance(body, dict) else {}
+
+
+def _call_timeout(client, deadline, cap=None) -> float | None:
+    """The timeout for one call: min(cap or the client's timeout, time left before `deadline`).
+    Without a deadline: `cap` (None = the client's default). Raises DeadlineHit when too little is left."""
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    if left < MIN_CALL_S:
+        raise DeadlineHit("deadline reached")
+    return min(cap if cap is not None else getattr(client, "timeout", 30.0), left)
+
+
+def list_tree(client: Client, user: str, path: str = "", deadline: float | None = None) -> list:
+    """Every Markdown file path under `path` (recursive, through GET /api/files). Each call is clamped to
+    `deadline` (time.monotonic()). Raises RuntimeError (DeadlineHit included) on any failure or bad body."""
+    r = client.request("GET", "/api/files", user=user, query=("path=" + urllib.parse.quote(path)) if path else "",
+                       timeout=_call_timeout(client, deadline))
     if r.status != 200:
         raise RuntimeError(f"listing {path or '/'} failed: http {r.status}")
+    items = _obj(r).get("files")
+    if not isinstance(items, list):  # a 200 without a file list (garbage, null, a bare list) is never "empty"
+        raise RuntimeError(f"listing {path or '/'} failed: unreadable body")
     out = []
-    for item in (r.json() or {}).get("files") or []:
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise RuntimeError(f"listing {path or '/'} failed: unreadable entry")
         if item.get("isDir"):
-            out.extend(list_tree(client, user, item["path"]))
+            out.extend(list_tree(client, user, item["path"], deadline))
         else:
             out.append(item["path"])
     return sorted(out)
 
 
-def snapshot(client: Client, user: str) -> dict:
-    """path -> content for every file of the tenant (the post-mutation baseline)."""
+def snapshot(client: Client, user: str, deadline: float | None = None) -> dict:
+    """path -> content for every file of the tenant (the post-mutation baseline). Clamped to `deadline`."""
     files = {}
-    for path in list_tree(client, user):
-        r = client.request("POST", "/api/file", user=user, json_body={"path": path})
-        if r.status != 200 or (r.json() or {}).get("content") is None:
+    for path in list_tree(client, user, deadline=deadline):
+        r = client.request("POST", "/api/file", user=user, json_body={"path": path}, timeout=_call_timeout(client, deadline))
+        content = _obj(r).get("content")
+        if r.status != 200 or not isinstance(content, str):
             raise RuntimeError(f"snapshot read of {path} failed: http {r.status}")
-        files[path] = r.json()["content"]
+        files[path] = content
     return files
 
 
-def health(client: Client, user: str) -> dict:
-    r = client.request("GET", "/api/health", user=user, storage=LOCAL_STORAGE)
-    return (r.json() or {}) if r.status == 200 else {}
+def health(client: Client, user: str, timeout: float | None = None) -> dict:
+    r = client.request("GET", "/api/health", user=user, storage=LOCAL_STORAGE, timeout=timeout)
+    return _obj(r) if r.status == 200 else {}
 
 
-def settle(client: Client, user: str, expect_chunks=None, timeout: float = SETTLE_TIMEOUT_S, sleep=time.sleep) -> dict:
+def settle(client: Client, user: str, expect_chunks=None, timeout: float = SETTLE_TIMEOUT_S, sleep=time.sleep,
+           deadline: float | None = None) -> dict:
     """Wait until the journal is empty and (with inference) the index holds the baseline chunk count,
-    twice in a row. Returns {"ok": bool, ...}; never raises."""
-    deadline, stable, last = time.monotonic() + timeout, 0, {}
+    twice in a row, until `deadline` (time.monotonic(); default now + `timeout`). Every health call is
+    clamped to the time left, so settle never runs a call past its deadline. Returns {"ok": bool, ...};
+    never raises."""
+    deadline = time.monotonic() + timeout if deadline is None else deadline
+    stable, last = 0, {}
     while time.monotonic() < deadline:
-        h = health(client, user)
-        chunks = (h.get("retrieval") or {}).get("chunks")
+        try:
+            h = health(client, user, timeout=_call_timeout(client, deadline))
+        except DeadlineHit:
+            break
+        retrieval = h.get("retrieval")
+        chunks = retrieval.get("chunks") if isinstance(retrieval, dict) else None
         last = {"journal_pending": h.get("journal_pending"), "chunks": chunks}
         good = h.get("journal_pending") == 0 and (expect_chunks is None or chunks == expect_chunks)
         stable = stable + 1 if good else 0
         if stable >= 2:
             return {"ok": True, **last}
-        sleep(2)
+        sleep(max(0.0, min(2.0, deadline - time.monotonic())))
     return {"ok": False, **last}
 
 
-def restore(client: Client, user: str, baseline: dict, env: dict | None = None, gate_log=None) -> dict:
+def restore(client: Client, user: str, baseline: dict, env: dict | None = None, gate_log=None,
+            deadline_s: float | None = None) -> dict:
     """Put the tenant back to `baseline`: PUT back every changed or missing file with its current version,
     and move every new file to Trash. Diary day files are protected from deletion (403), so a new day
     file is emptied instead: it then holds no entries and no chunks. Each write is gated (it reindexes).
 
+    All of its HTTP calls share ONE total deadline, `deadline_s` seconds (default RESTORE_WRITE_DEADLINE_S,
+    the write margin run_areas.py counts in the stop grace). Each call's timeout is min(its own timeout,
+    time left), so no call overruns the total. When the deadline is hit no further call is made and the
+    report has "deadline_hit": true. "remaining" counts the files still differing from the baseline or not
+    verified (failed writes included); "incomplete" is remaining > 0, and "ok" is true only when nothing
+    remains. Never raises on HTTP or body errors (refused, timeouts, 5xx, garbage): they are failures.
+
     With env set, each write takes its own inference_slot. The lock is not re-entrant: calling this with
     env from INSIDE another inference_slot would wait on itself (until the lock timeout). Inside a slot,
     call it without env, as harness.restore_baseline does."""
-    report = {"rewritten": [], "deleted": [], "emptied": [], "failures": []}
-    for path in list_tree(client, user):
-        if path in baseline:
-            continue
-        with inference_slot(env or {}, gate_log):
-            st = client.request("POST", "/api/workspace-ops", user=user, json_body={"op": "stat", "path": path})
-            version = (st.json() or {}).get("version")
-            r = client.request("POST", "/api/workspace-ops", user=user,
-                               json_body={"op": "delete", "path": path, "version": version}, timeout=300)
-        if r.status == 403:
-            with inference_slot(env or {}, gate_log):
-                cur = client.request("POST", "/api/file", user=user, json_body={"path": path})
-                body = cur.json() or {}
-                if body.get("content") == "":
-                    report["emptied"].append({"path": path, "status": 200})
-                    continue
-                r = client.request("PUT", "/api/file", user=user,
-                                   json_body={"path": path, "content": "", "version": body.get("version")}, timeout=300)
-            (report["emptied"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
-            continue
-        (report["deleted"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
-    for path, content in sorted(baseline.items()):
-        cur = client.request("POST", "/api/file", user=user, json_body={"path": path})
-        body = cur.json() or {}
-        if cur.status == 200 and body.get("content") == content:
-            continue
-        with inference_slot(env or {}, gate_log):
-            r = client.request("PUT", "/api/file", user=user,
-                               json_body={"path": path, "content": content, "version": body.get("version")}, timeout=300)
-        (report["rewritten"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
-    report["ok"] = not report["failures"]
-    return report
+    budget = RESTORE_WRITE_DEADLINE_S if deadline_s is None else deadline_s
+    deadline = time.monotonic() + budget
+    report = {"rewritten": [], "deleted": [], "emptied": [], "failures": [], "deadline_s": budget,
+              "deadline_hit": False, "incomplete": False, "remaining": 0}
 
+    def call(method, path, body, cap=None):
+        return client.request(method, path, user=user, json_body=body, timeout=_call_timeout(client, deadline, cap))
 
-def baseline_matches(client: Client, user: str, baseline: dict) -> bool:
-    """The tenant equals the baseline, ignoring new files that restore() emptied (no text, no chunks)."""
+    def finish(unhandled: int) -> dict:
+        report["remaining"] = unhandled + len(report["failures"])
+        report["incomplete"] = report["remaining"] > 0
+        report["ok"] = not report["incomplete"]
+        return report
+
     try:
-        current = snapshot(client, user)
+        current = list_tree(client, user, deadline=deadline)
+    except DeadlineHit:
+        report["deadline_hit"] = True
+        return finish(len(baseline))
+    except RuntimeError as exc:
+        report["listing_error"] = str(exc)
+        return finish(len(baseline))  # nothing is known: every baseline file counts as unverified
+    work = [("new", p) for p in current if p not in baseline] + [("base", p) for p in sorted(baseline)]
+    done = 0
+    try:
+        for kind, path in work:
+            if kind == "new":
+                with inference_slot(env or {}, gate_log):
+                    st = call("POST", "/api/workspace-ops", {"op": "stat", "path": path})
+                    r = call("POST", "/api/workspace-ops", {"op": "delete", "path": path, "version": _obj(st).get("version")},
+                             WRITE_TIMEOUT_S)
+                if r.status == 403:
+                    with inference_slot(env or {}, gate_log):
+                        cur = call("POST", "/api/file", {"path": path})
+                        body = _obj(cur)
+                        if cur.status == 200 and body.get("content") == "":
+                            report["emptied"].append({"path": path, "status": 200})
+                            done += 1
+                            continue
+                        r = call("PUT", "/api/file", {"path": path, "content": "", "version": body.get("version")},
+                                 WRITE_TIMEOUT_S)
+                    (report["emptied"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
+                else:
+                    (report["deleted"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
+            else:
+                content = baseline[path]
+                cur = call("POST", "/api/file", {"path": path})
+                body = _obj(cur)
+                if cur.status == 200 and body.get("content") == content:
+                    done += 1
+                    continue
+                with inference_slot(env or {}, gate_log):
+                    r = call("PUT", "/api/file", {"path": path, "content": content, "version": body.get("version")},
+                             WRITE_TIMEOUT_S)
+                (report["rewritten"] if r.status == 200 else report["failures"]).append({"path": path, "status": r.status})
+            done += 1
+    except DeadlineHit:
+        report["deadline_hit"] = True
+    return finish(len(work) - done)
+
+
+def baseline_matches(client: Client, user: str, baseline: dict, deadline: float | None = None) -> bool:
+    """The tenant equals the baseline, ignoring new files that restore() emptied (no text, no chunks).
+    Every read is clamped to `deadline` (time.monotonic()); a check that cannot finish is not a match."""
+    try:
+        current = snapshot(client, user, deadline)
     except RuntimeError:
         return False
     return {p: t for p, t in current.items() if p in baseline or t != ""} == baseline

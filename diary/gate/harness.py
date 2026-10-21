@@ -221,9 +221,13 @@ def restore_baseline(client: g.Client, user: str, baseline: dict, env: dict, gat
     # that must still finish; run_areas.py's grace period (GATE_AREA_GRACE_S) is sized for it.
     idle = g.require_idle(env, gate_log, "restore", stoppable=False)
     with g.inference_slot(env, gate_log, stoppable=False):
+        # The writes share one total deadline (g.RESTORE_WRITE_DEADLINE_S); a cut restore is not ok. Settle and
+        # the baseline check then share ONE budget (g.SETTLE_TIMEOUT_S), every call clamped to it: a check that
+        # cannot finish in time is not a match, so a tenant left dirty is never reported as restored.
         report = g.restore(client, user, baseline["files"])
-        settled = g.settle(client, user, expect_chunks=baseline.get("chunks"))
-        same = g.baseline_matches(client, user, baseline["files"])
+        post = g.time.monotonic() + g.SETTLE_TIMEOUT_S
+        settled = g.settle(client, user, expect_chunks=baseline.get("chunks"), deadline=post)
+        same = g.baseline_matches(client, user, baseline["files"], deadline=post)
     report.update(settled=settled, matches=same, ok=report["ok"] and settled["ok"] and same, idle_wait_s=idle["waited_s"])
     return report
 
@@ -361,9 +365,11 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
         return f"blocked at the restore after {q['id']}: MS-01 load gate: {exc}"
     if restore_log:
         restore_log({"query": q["id"], **{k: report[k] for k in ("deleted", "emptied", "rewritten", "failures", "settled", "matches", "ok",
-                                                                  "idle_wait_s")}})
+                                                                  "idle_wait_s")},
+                     **{k: report[k] for k in ("incomplete", "remaining", "deadline_hit") if k in report}})
     if not report["ok"]:
-        return f"restore after {q['id']} failed: {json.dumps({k: report[k] for k in ('failures', 'settled', 'matches')})}"
+        detail = {k: report[k] for k in ("failures", "settled", "matches", "incomplete", "remaining", "deadline_hit") if k in report}
+        return f"restore after {q['id']} failed: {json.dumps(detail)}"
     return blocked and blocked + "; the tenant is restored"
 
 
