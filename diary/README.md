@@ -64,6 +64,13 @@ and `diary.truncated: true`. When the 300 s exchange deadline gives up on an ans
 connection to the engine so it stops generating, and `/v1` answers 502 with `error.code: "chat_timeout"`
 (the stream error event carries `reason: "chat_timeout"`) (#127).
 
+If the cap is reached before any answer text (the model spent the whole budget on reasoning), nothing is saved
+and the reason is told apart from other model failures (#135): `/v1` answers 502 with
+`error.code: "length_cap"` and a message naming `LLM_MAX_ANSWER_TOKENS`, and the stream error event keeps
+`code: "modelFailed"` and adds `reason: "length_cap"`. A cut answer that lost its trailing log marker is logged
+by default (never lose content), saved without the shortened-answer note, and one info log line records that
+the marker was missing because of truncation (no answer text).
+
 ## Embedding model and re-indexing (#1636)
 
 Retrieval embeds each `###` subsection with the configured embedding model. `LLM_EMBED_MODEL` and
