@@ -61,7 +61,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import (DEFAULT_MAX_ANSWER_TOKENS, EMPTY_ANSWER_TEXT, LENGTH_CAP_TEXT, EmptyAnswerError, EngineUnreachable, LengthCapError, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
+from .llm import (DEFAULT_MAX_ANSWER_TOKENS, DEFAULT_MAX_REASONING_TOKENS, EMPTY_ANSWER_TEXT, LENGTH_CAP_TEXT, EmptyAnswerError, EngineUnreachable, LengthCapError, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
                   strip_reasoning, with_shortened_note)
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
@@ -90,6 +90,21 @@ def answer_token_cap(cfg) -> int:
     if value <= 0:
         log.warning("llm.max_answer_tokens is not a positive whole number; using %d", DEFAULT_MAX_ANSWER_TOKENS)
         return DEFAULT_MAX_ANSWER_TOKENS
+    return value
+
+
+def reasoning_token_allowance(cfg) -> int:
+    """#164: llm.max_reasoning_tokens (LLM_MAX_REASONING_TOKENS), a whole number of tokens >= 0 added to the
+    model call's max_tokens for reasoning before the answer (0 sends the answer cap alone). Anything else
+    falls back to the default with a warning."""
+    raw = cfg.get("llm.max_reasoning_tokens", DEFAULT_MAX_REASONING_TOKENS)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = -1
+    if value < 0:
+        log.warning("llm.max_reasoning_tokens is not a whole number of 0 or more; using %d", DEFAULT_MAX_REASONING_TOKENS)
+        return DEFAULT_MAX_REASONING_TOKENS
     return value
 
 
@@ -126,6 +141,8 @@ class AppState:
         )
         # #127: the token cap sent with every companion answer.
         self.max_answer_tokens = answer_token_cap(cfg)
+        # #164: the reasoning allowance added to each capped model call (the cap applies to the visible answer).
+        self.llm_main.reasoning_tokens = self.llm_aux.reasoning_tokens = reasoning_token_allowance(cfg)
         self.store = CorpusStore(cfg, self.backend, self.journal)
         # #1636: the service's one embedding configuration (shared by every tenant state).
         self.retrieval = Retriever(Path(cfg.get("retrieval.db_path")), self.llm_main,

@@ -64,7 +64,18 @@ and `diary.truncated: true`. When the 300 s exchange deadline gives up on an ans
 connection to the engine so it stops generating, and `/v1` answers 502 with `error.code: "chat_timeout"`
 (the stream error event carries `reason: "chat_timeout"`) (#127).
 
-If the cap is reached before any answer text (the model spent the whole budget on reasoning), nothing is saved
+The cap bounds the visible answer, not private reasoning (#164). A model that streams reasoning before its
+answer gets a reasoning allowance on top of the cap: the model call is sent `max_tokens` = `LLM_MAX_ANSWER_TOKENS`
++ `LLM_MAX_REASONING_TOKENS` (`llm.max_reasoning_tokens`, default 4096; a whole number of 0 or more, anything
+else falls back to the default, and 0 sends the answer cap alone). That combined `max_tokens` is the hard
+generation bound. The answer cap itself is approximate: it is enforced on the visible answer as characters,
+`LLM_MAX_ANSWER_TOKENS` x 4 (inline reasoning and the trailing log marker are not counted), the same way for
+`/v1`, the stream and an unstreamed reply, whatever the engine chunking. A longer answer is cut exactly at that
+character boundary, the stream is closed so the engine stops, and the answer counts as cut at the cap, as above
+(#166). The exchange deadline still bounds the time spent.
+
+If the cap is reached before any answer text (the model spent the whole budget, answer cap plus reasoning
+allowance, on reasoning), nothing is saved
 and the reason is told apart from other model failures (#135): `/v1` answers 502 with
 `error.code: "length_cap"` and a message naming `LLM_MAX_ANSWER_TOKENS`, and the stream error event keeps
 `code: "modelFailed"` and adds `reason: "length_cap"`. A cut answer that lost its trailing log marker is logged

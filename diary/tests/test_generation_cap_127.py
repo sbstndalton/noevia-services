@@ -202,7 +202,7 @@ def test_every_chat_call_of_an_exchange_sends_a_token_cap(upstream_factory, monk
     client.close()
     assert result["reply"] == ANSWER
     answers = _answer_requests(upstream)
-    assert len(answers) == 1 and answers[0]["max_tokens"] == 1024
+    assert len(answers) == 1 and answers[0]["max_tokens"] == 1024 + 4096  # #164: cap + reasoning allowance
     assert len(upstream.requests) > 1, "the aux steps also ran"
     assert all(isinstance(r.get("max_tokens"), int) and r["max_tokens"] > 0 for r in upstream.requests)
 
@@ -212,7 +212,7 @@ def test_the_configured_cap_is_the_one_sent(upstream_factory, monkeypatch, strea
     upstream = upstream_factory()
     _, _, _, client = _exchange(upstream, stream, monkeypatch, max_answer_tokens=300)
     client.close()
-    assert _answer_requests(upstream)[0]["max_tokens"] == 300
+    assert _answer_requests(upstream)[0]["max_tokens"] == 300 + 4096
 
 
 def test_the_cap_setting_falls_back_to_the_default_when_unusable():
