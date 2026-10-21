@@ -20,8 +20,11 @@ class FakeUpstream:
     """mode: "answer" (a full answer), "stall_mid" (headers and one token, then nothing), "stall_head"
     (nothing at all). Every request body is kept; a client disconnect during a stall is recorded."""
 
-    def __init__(self, mode="answer", finish="stop"):
-        self.mode, self.finish = mode, finish
+    def __init__(self, mode="answer", finish="stop", text=ANSWER, marker=None):
+        # text: the visible answer ("" = the model spent its budget on reasoning only). marker: True or False
+        # forces the trailing log marker on or off; None keeps the original behaviour (always sent unstreamed,
+        # sent streamed only when the answer was not cut).
+        self.mode, self.finish, self.text, self.marker = mode, finish, text, marker
         self.requests = []
         self.release = threading.Event()
         self.disconnected = threading.Event()
@@ -47,14 +50,15 @@ class FakeUpstream:
                         self.end_headers()
                         self.wfile.flush()
                         return self._wait_for_disconnect()
-                    return self._json(ANSWER + "\n[LOG: ok]", upstream.finish)
+                    return self._json(upstream.text + ("\n[LOG: ok]" if upstream.marker is not False else ""), upstream.finish)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                self._event({"choices": [{"delta": {"content": ANSWER}}]})
+                if upstream.text:
+                    self._event({"choices": [{"delta": {"content": upstream.text}}]})
                 if upstream.mode == "stall_mid":
                     return self._wait_for_disconnect()
-                if upstream.finish == "stop":
+                if upstream.marker if upstream.marker is not None else upstream.finish == "stop":
                     self._event({"choices": [{"delta": {"content": "\n[LOG: ok]"}}]})
                 self._event({"choices": [{"delta": {}, "finish_reason": upstream.finish}]})
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -351,3 +355,97 @@ def test_the_streamed_timeout_event_names_the_deadline():
     events = [json.loads(line[6:]) for line in asyncio.run(run()).splitlines() if line.startswith("data: ")]
     error = next(e for e in events if e["type"] == "error")
     assert error["reason"] == "chat_timeout" and error["code"] == "modelFailed" and error["saved"] is False
+
+
+# ---- #135: a length cut that leaves no answer, and a cut answer without the log marker ------------------
+
+
+def _stream_events(work):
+    import asyncio
+    from agent.streaming import exchange_stream
+
+    async def run():
+        return "".join([c async for c in exchange_stream(work).body_iterator])
+
+    return [json.loads(line[6:]) for line in asyncio.run(run()).splitlines() if line.startswith("data: ")]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_empty_answer_after_a_length_cut_raises_the_distinct_error(upstream_factory, monkeypatch, stream):
+    from agent.llm import LengthCapError
+    upstream = upstream_factory(finish="length", text="", marker=False)
+    with pytest.raises(LengthCapError) as raised:
+        _exchange(upstream, stream, monkeypatch)
+    assert "LLM_MAX_ANSWER_TOKENS" in str(raised.value)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_empty_answer_after_a_length_cut_saves_nothing(upstream_factory, monkeypatch, stream):
+    from agent.llm import LengthCapError
+    import agent.app as appmod
+    upstream = upstream_factory(finish="length", text="", marker=False)
+    store = {}
+    original = appmod._session
+
+    def spy(session_id, tenant_id):
+        store["sess"] = original(session_id, tenant_id)
+        return store["sess"]
+    monkeypatch.setattr(appmod, "_session", spy)
+    with pytest.raises(LengthCapError):
+        _exchange(upstream, stream, monkeypatch)
+    assert store["sess"]["turns"] == [], "no session history for the failed turn"
+    assert all(not r.get("messages", [{}])[-1].get("content", "").startswith(("SUMMARIZE", "GATE", "EDIT"))
+               for r in upstream.requests), "no save step ran"
+
+
+def test_v1_length_cap_is_a_coded_502(monkeypatch):
+    from agent.llm import LengthCapError
+
+    def run(*a, **k):
+        raise LengthCapError()
+
+    r = _v1(monkeypatch, run)
+    assert r.status_code == 502
+    error = r.json()["error"]
+    assert error == {"message": error["message"], "type": "api_error", "code": "length_cap"}
+    assert "LLM_MAX_ANSWER_TOKENS" in error["message"] and "before any answer text" in error["message"]
+    assert "nothing was saved" in error["message"]
+
+
+def test_the_streamed_length_cap_event_names_the_cap():
+    from agent.llm import LengthCapError
+
+    def work(emit):
+        raise LengthCapError()
+
+    events = _stream_events(work)
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "modelFailed" and error["reason"] == "length_cap" and error["saved"] is False
+    assert "LLM_MAX_ANSWER_TOKENS" in error["text"]
+    assert not any(e["type"] in ("diary", "done") and e["type"] == "diary" for e in events)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_cut_answer_without_the_marker_is_logged_and_recorded(upstream_factory, monkeypatch, caplog, stream):
+    import logging
+    from agent.llm import SHORTENED_NOTE
+    upstream = upstream_factory(finish="length", marker=False)
+    with caplog.at_level(logging.INFO, logger="diary"):
+        result, _, store, client = _exchange(upstream, stream, monkeypatch)
+    client.close()
+    assert result["decision"] == "logged" and store.saved, "a cut answer with no marker defaults to logging"
+    assert store.answers == [ANSWER] and SHORTENED_NOTE not in store.answers[0]
+    assert result["reply"].endswith(SHORTENED_NOTE)
+    lines = [r for r in caplog.records if r.levelno == logging.INFO and "log marker" in r.getMessage()]
+    assert len(lines) == 1 and "truncat" in lines[0].getMessage()
+    assert ANSWER not in lines[0].getMessage(), "the answer text is never logged"
+
+
+def test_a_complete_answer_without_the_marker_logs_no_truncation_line(upstream_factory, monkeypatch, caplog):
+    import logging
+    upstream = upstream_factory(marker=False)
+    with caplog.at_level(logging.INFO, logger="diary"):
+        result, _, _, client = _exchange(upstream, False, monkeypatch)
+    client.close()
+    assert result["decision"] == "logged"
+    assert not [r for r in caplog.records if "log marker" in r.getMessage()]

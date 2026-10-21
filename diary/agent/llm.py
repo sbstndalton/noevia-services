@@ -90,6 +90,18 @@ class LLMError(RuntimeError):
     pass
 
 
+# #135: the reason code and text for an answer the cap cut off before any answer text (reasoning used it all).
+LENGTH_CAP_TEXT = ("The answer cap (LLM_MAX_ANSWER_TOKENS) was reached before any answer text; "
+                   "nothing was saved. You can resend or raise the cap.")
+
+
+class LengthCapError(LLMError):
+    """#135: finish_reason "length" with an empty visible answer. Nothing was saved. Told apart from other
+    model failures so /v1 and the stream can report reason "length_cap"."""
+    def __init__(self, message: str = LENGTH_CAP_TEXT):
+        super().__init__(message)
+
+
 class _Redirected(LLMError):
     """An embeddings server answered with a redirect; never retried."""
 
@@ -488,9 +500,11 @@ class LLMClient:
         content, reasoning, finish = self._stream_completion(messages, None, temperature, max_tokens, None, alive, emit)
         content = strip_reasoning(content)  # #1505: the final answer never carries inline reasoning
         visible, _ = self.strip_log_marker(content)
+        truncated = finish == "length"
+        if not visible and truncated:
+            raise LengthCapError()  # #135: the cap, not the provider, is why there is no answer
         if not visible:
             raise LLMError("provider returned no final answer")
-        truncated = finish == "length"
         emit({"type": "answer", "text": with_shortened_note(visible) if truncated else visible})
         return ChatReply(content, reasoning, truncated)
 

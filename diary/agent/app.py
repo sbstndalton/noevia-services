@@ -61,7 +61,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import (DEFAULT_MAX_ANSWER_TOKENS, EngineUnreachable, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
+from .llm import (DEFAULT_MAX_ANSWER_TOKENS, LENGTH_CAP_TEXT, EngineUnreachable, LengthCapError, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
                   strip_reasoning, with_shortened_note)
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
@@ -973,8 +973,12 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     # #1505: inline reasoning is removed again here, so neither the saved entry nor the reply can carry it.
     visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
     if truncated and not visible:
-        raise LLMError("the answer length limit was reached before any answer text")
+        raise LengthCapError()  # #135: a distinct reason; nothing is saved
     if marker is None:
+        # A truncated answer is cut before its trailing log marker, so the marker is missing. That is
+        # expected and defaults to logging (never lose content); #135 records it, without the answer text.
+        if truncated:
+            log.info("Diary answer reached the length cap and has no log marker because it was truncated; logging it by default")
         marker = "ok"  # model omitted the marker — default to logging (never lose content)
 
     outcome = st.pipeline.log_exchange(user_message=message, assistant_message=visible, now=now, day=day, budget=budget, **({"progress": emit} if emit else {}))
@@ -1635,6 +1639,10 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         return JSONResponse({"error": {
             "message": "the model did not answer before the diary deadline" + ("; nothing was saved" if exc.nothing_saved else ""),
             "type": "api_error", "code": "chat_timeout"}}, status_code=502)
+    except LengthCapError:
+        # #135: the cap used the whole budget before any answer text; same shape as chat_timeout.
+        log.error("v1 exchange hit the answer length cap before any answer text")
+        return JSONResponse({"error": {"message": LENGTH_CAP_TEXT, "type": "api_error", "code": "length_cap"}}, status_code=502)
     except Exception:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
