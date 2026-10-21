@@ -54,8 +54,8 @@ retrieval:
   # below_margin: drop hits naming no asked entity that score more than this below the best exact-name hit.
   entity_focus_margin: 0.05
   # services#114: drop hits scoring more than this below the best hit, for messages naming no entity (the entity
-  # focus decides otherwise). A number in (0, 1], or off.
-  score_gap: 0.08
+  # focus decides otherwise). A number in (0, 1], or off. Off until a full gate run measures it (0.08 suggested).
+  score_gap: off
 
 context:
   max_today_tokens: 4500

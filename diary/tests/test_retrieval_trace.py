@@ -49,11 +49,9 @@ def _retriever(tmp_path, name, words):
 
 
 def _cfg(**retrieval):
-    # The stub embedder's scores are arbitrary, so the #114 score gap is off here unless a test turns it on:
-    # these tests pin the trace mechanics (top_k, budget, focus). tests/test_score_gap.py covers the gap.
     return Config({
         "context": {"max_today_tokens": 4500, "max_standing_tokens": 2200},
-        "retrieval": {"top_k": 8, "min_score": 0.30, "max_context_tokens": 5200, "score_gap": "off", **retrieval},
+        "retrieval": {"top_k": 8, "min_score": 0.30, "max_context_tokens": 5200, **retrieval},
         "prompts": {"system_path": ""},
     })
 

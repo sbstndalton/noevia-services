@@ -19,9 +19,11 @@ from typing import List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# Default gap. In run 1 the largest gap between the best candidate and a relevant entry was 0.060; 0.08 leaves
-# headroom.
-SCORE_GAP = 0.08
+# Off by default (#114): on run 1's traced queries the cut added no precision over the entity focus, and the
+# query families without traces are untested. SUGGESTED_GAP is the value to try when enabling it: in run 1 the
+# largest gap between the best candidate and a relevant entry was 0.060, so 0.08 leaves headroom.
+SCORE_GAP = None
+SUGGESTED_GAP = 0.08
 _EPSILON = 1e-9  # scores are rounded to 4 decimals: a gap of exactly the setting is kept
 _OFF = ("", "off", "none", "false", "no", "0", "disabled")
 _WARNED: set = set()
@@ -30,7 +32,7 @@ _WARNED: set = set()
 def parse_gap(value) -> Optional[float]:
     """retrieval.score_gap as a number in (0, 1], or None (off) for "off", "none", "false", 0, null or false.
 
-    Anything else (other text, nan, a negative or a number above 1) logs a warning once and uses the default."""
+    Anything else (other text, nan, a negative or a number above 1) logs a warning once and leaves the cut off."""
     if value is None or value is False:
         return None
     if isinstance(value, str) and value.strip().lower() in _OFF:
@@ -46,7 +48,7 @@ def parse_gap(value) -> Optional[float]:
     key = repr(value)
     if key not in _WARNED:
         _WARNED.add(key)
-        log.warning("retrieval.score_gap %s is not a number in [0, 1] or off; using %s", key, SCORE_GAP)
+        log.warning("retrieval.score_gap %s is not a number in (0, 1] or off; the score gap stays off", key)
     return SCORE_GAP
 
 

@@ -67,8 +67,9 @@ def test_parse_gap(value, expected):
 
 
 @pytest.mark.parametrize("value", ["wide", float("nan"), -0.1, 1.5, True, [0.1], float("inf")])
-def test_parse_gap_falls_back_to_the_default(value):
-    assert score_gap.parse_gap(value) == score_gap.SCORE_GAP
+def test_parse_gap_invalid_values_leave_the_cut_off(value):
+    assert score_gap.SCORE_GAP is None
+    assert score_gap.parse_gap(value) is None
 
 
 # ---------------- the cut itself ----------------
@@ -106,7 +107,7 @@ def test_unfocused_question_loads_only_candidates_near_the_best():
             _row("c", "2030-01-14", 0.72, "bees were calm today"),
             _row("d", "2030-01-15", 0.66, "honey jars to label"),
             _row("e", "2030-01-16", 0.55, "a walk by the canal")]
-    data, context = _build(rows, "what kind of hive do i keep?")
+    data, context = _build(rows, "what kind of hive do i keep?", score_gap=0.08)
     assert data["focus"]["checked"] is False
     assert _loaded(data) == ["a", "needle", "c"]
     assert [c["id"] for c in data["candidates"]] == ["a", "needle", "c"]
@@ -123,7 +124,7 @@ def test_time_anchored_question_measures_the_gap_from_the_best_entry_before_the_
             _row("needle", "2030-02-05", 0.78, "the hive is a top-bar hive"),
             _row("near", "2030-02-01", 0.72, "checked the hive roof"),
             _row("old", "2030-01-10", 0.65, "bought jars for honey")]
-    data, context = _build(rows, "As of February 11, 2030, what had I written down about the hive?")
+    data, context = _build(rows, "As of February 11, 2030, what had I written down about the hive?", score_gap=0.08)
     assert data["focus"]["time_anchor"] is True
     assert [r["reason"] for r in data["focus"]["removed"]] == ["after_time_anchor"]
     assert _loaded(data) == ["needle", "near"]
@@ -138,10 +139,24 @@ def test_an_entry_about_the_asked_person_is_never_cut_for_its_score(question):
     rows = [_row("best", "2030-01-10", 0.85, "Orla Kilbride grows sweet peas."),
             _row("other", "2030-01-11", 0.80, "Gardening club met in the hall."),
             _row("needle", "2030-01-20", 0.60, "Orla Kilbride said the sweet peas failed this year.")]
-    data, _ = _build(rows, question)
+    data, _ = _build(rows, question, score_gap=0.08)
     assert data["focus"]["entities"] == 1
     assert data["score_gap"]["applied"] is False and data["score_gap"]["removed"] == []
     assert "needle" in _loaded(data)
+
+
+def test_by_default_nothing_is_cut():
+    rows = [_row(str(n), f"2030-01-1{n}", round(0.9 - n * 0.1, 2), f"note {n}") for n in range(6)]
+    data, _ = _build(rows, "what did i note?")  # no score_gap setting at all
+    assert len(_loaded(data)) == 6
+    assert data["score_gap"] == {"gap": None, "applied": False, "best": 0.9, "removed": []}
+
+
+def test_shipped_config_leaves_the_cut_off():
+    import yaml
+    from pathlib import Path
+    cfg = yaml.safe_load((Path(__file__).resolve().parent.parent / "config" / "config.yaml").read_text())
+    assert score_gap.parse_gap(cfg["retrieval"]["score_gap"]) is None
 
 
 def test_score_gap_off_restores_the_fixed_top_k():
@@ -156,7 +171,7 @@ def test_score_gap_off_restores_the_fixed_top_k():
 def test_trace_score_gap_carries_refs_and_scores_only():
     rows = [_row("a", "2030-01-10", 0.80, "SECRETBODYWORD one"),
             _row("b", "2030-01-11", 0.50, "SECRETBODYWORD two", header="11:30 — SECRETHEADER")]
-    data, _ = _build(rows, "anything about secretbodyword?")
+    data, _ = _build(rows, "anything about secretbodyword?", score_gap=0.08)
     removed = data["score_gap"]["removed"]
     assert removed == [{"vector_rank": 2, "id": "b", "day": "2030-01-11", "time": "11:30", "score": 0.50}]
     assert "SECRET" not in repr(data)
@@ -175,5 +190,6 @@ def test_replay_of_run_1_candidates_keeps_every_needle_and_lifts_precision():
             assert m["loaded_recall"] == 1.0, (label, name)
     gap_only = result["score gap 0.08 only"]["all"]
     assert gap_only["precision@8"] > 2 * base["precision@8"]
-    default = result["focus + score gap 0.08 (default)"]["all"]
-    assert default["precision@8"] >= 0.40
+    default = result["default settings (focus on, gap off)"]["all"]
+    focus_gap = result["focus + score gap 0.08"]["all"]
+    assert default["precision@8"] >= 0.40 and focus_gap["precision@8"] == default["precision@8"]

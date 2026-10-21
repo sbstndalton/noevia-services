@@ -37,7 +37,8 @@ SETTINGS = {
     "run 1 (no focus, no gap)": {"entity_focus": False, "score_gap": "off"},
     "score gap 0.08 only": {"entity_focus": False, "score_gap": 0.08},
     "entity focus only (main)": {"entity_focus": True, "score_gap": "off"},
-    "focus + score gap 0.08 (default)": {},
+    "focus + score gap 0.08": {"entity_focus": True, "score_gap": 0.08},
+    "default settings (focus on, gap off)": {},
 }
 
 
