@@ -1,0 +1,161 @@
+{
+ "_doc": "Loaded entry ids per query of precision_replay_114.json at default settings, replayed through ContextAssembler on main ec3bd47 before services#145. Synthetic ids only. Regenerate only on purpose.",
+ "loaded": {
+  "Q-needle-00": [
+   "E047"
+  ],
+  "Q-needle-01": [
+   "E144",
+   "E104"
+  ],
+  "Q-needle-02": [
+   "E139",
+   "C04"
+  ],
+  "Q-needle-03": [
+   "E056"
+  ],
+  "Q-needle-04": [
+   "E094"
+  ],
+  "Q-needle-05": [
+   "E179"
+  ],
+  "Q-needle-06": [
+   "E030"
+  ],
+  "Q-needle-07": [
+   "E061"
+  ],
+  "Q-needle-08": [
+   "E159",
+   "E165"
+  ],
+  "Q-needle-09": [
+   "E029"
+  ],
+  "Q-needle-10": [
+   "E022",
+   "E057",
+   "E015",
+   "E074",
+   "E066",
+   "E005",
+   "E064",
+   "E018"
+  ],
+  "Q-needle-11": [
+   "E123"
+  ],
+  "Q-needle-12": [
+   "E032"
+  ],
+  "Q-needle-13": [
+   "E090"
+  ],
+  "Q-needle-14": [
+   "E158",
+   "C03"
+  ],
+  "Q-needle-15": [
+   "E048"
+  ],
+  "Q-needle-16": [
+   "E102",
+   "C01"
+  ],
+  "Q-needle-17": [
+   "E130"
+  ],
+  "Q-needle-18": [
+   "E020"
+  ],
+  "Q-needle-19": [
+   "E065"
+  ],
+  "Q-needle-20": [
+   "E129",
+   "C02"
+  ],
+  "Q-needle-21": [
+   "E003"
+  ],
+  "Q-needle-22": [
+   "E095",
+   "E176"
+  ],
+  "Q-needle-23": [
+   "E172"
+  ],
+  "Q-needle-24": [
+   "E010"
+  ],
+  "Q-needle-25": [
+   "E005",
+   "E179",
+   "E093",
+   "E129",
+   "E016",
+   "E167",
+   "E032",
+   "E164"
+  ],
+  "Q-needle-26": [
+   "E155"
+  ],
+  "Q-needle-27": [
+   "E023"
+  ],
+  "Q-needle-28": [
+   "E084"
+  ],
+  "Q-needle-29": [
+   "E164"
+  ],
+  "Q-needle-30": [
+   "E015"
+  ],
+  "Q-needle-31": [
+   "E099",
+   "E142"
+  ],
+  "Q-needle-32": [
+   "E134"
+  ],
+  "Q-needle-33": [
+   "E007"
+  ],
+  "Q-needle-34": [
+   "E077",
+   "C03"
+  ],
+  "Q-needle-35": [
+   "E167",
+   "C04",
+   "C01"
+  ],
+  "Q-needle-36": [
+   "E042"
+  ],
+  "Q-needle-37": [
+   "E072"
+  ],
+  "Q-needle-38": [
+   "E152",
+   "E150",
+   "E020",
+   "E093",
+   "E179",
+   "E066",
+   "E106",
+   "E026"
+  ],
+  "Q-needle-39": [
+   "E018"
+  ]
+ },
+ "metrics": {
+  "precision@8": 0.9144,
+  "recall@8": 1.0
+ }
+}

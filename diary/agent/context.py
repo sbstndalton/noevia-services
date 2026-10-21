@@ -163,7 +163,9 @@ class ContextAssembler:
         time anchor (entity_focus.py), a wider vector pool is checked lexically. Hits dated after the anchor
         are left out. When some hit names an asked entity in full, hits that cannot refer to any asked entity
         are left out if they are a near spelling of it (near_name), confidently name another person
-        (other_person) or score more than the margin below the best exact hit (below_margin). Similar names
+        (other_person) or score more than the margin below the best exact hit (below_margin). When nobody names a
+        two-word asked person in full, hits naming the same given name with a near-spelled surname are left out
+        (near_name_unmatched, services#145). Similar names
         are labelled "may be a different person, check the name"."""
         trace = SafeTrace.wrap(trace)
         if self.retriever is None:
