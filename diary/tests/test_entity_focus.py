@@ -1117,12 +1117,33 @@ def test_places_and_brands_are_not_other_people(phrase):
     assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1, 2], {}), phrase
 
 
-@pytest.mark.parametrize("text", ["We stayed in Port Ellery for a week.", "Found the cafe via Orbel Mapper.",
-                                  "Drove around Castle Combe all day.", "We visited Wren Hollin twice."])
-def test_a_phrase_after_a_place_word_is_not_another_person(text):
-    assert ef.identified_people(text) == []
-    rows = _rows("Went to Leeds with Alder Brannock.", text)
-    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1, 2], {})
+def test_a_listed_place_word_after_in_is_still_not_a_person():
+    assert ef.identified_people("We stayed in Port Ellery for a week.") == []  # "Port" opens a place
+
+
+# Review of #119: a preceding word never shields a given name and surname (each failed on f814d1a).
+@pytest.mark.parametrize("text", ["Met near Daniel Ostrow by the pier.", "Walked around Marcus Fenn for hours.",
+                                  "Sent it via Daniel Ostrow.", "Saw a film; visited Anna Pirelli after.",
+                                  "Sat in Anna Pirelli's kitchen.", "We visited Wren Hollin twice.",
+                                  "Found the cafe via Orbel Mapper."])
+def test_a_person_after_a_place_word_is_still_another_person(text):
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), text
+
+
+# Review of #119: given names, particles and surnames that are also place words still name people.
+@pytest.mark.parametrize("name", ["Santa Ramirez", "Le Minh", "Rio Ferdinand", "Sri Patel", "Wei Kong",
+                                  "Tom Post", "Hal Ridge", "Jo Tower", "Abu Karim", "Costa Varga"])
+def test_people_with_place_like_names_are_still_other_people(name):
+    rows = _rows("Went to Leeds with Bob Hale.", f"Later we had tea with {name} at the harbour.")
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), name
+
+
+def test_mark_is_not_a_short_form_of_marcus():
+    rows = _rows("Went to Leeds with Marcus Hale.", "Later Mark Hale and Bryony Castellow sailed.")
+    assert _kept_reasons("Where did Marcus Hale go?", rows) == ([1], {2: "other_person"})
+    assert "mark" not in ef.SHORT_FORMS and "sandy" not in ef.SHORT_FORMS
+    assert ef.SHORT_FORMS["jan"] == ("janet",)
 
 
 def test_a_real_other_person_is_still_dropped_beside_places():

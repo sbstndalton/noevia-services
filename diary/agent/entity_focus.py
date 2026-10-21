@@ -27,8 +27,9 @@ detail as competing with another's. This module needs no model call.
     other_person  (the asked entity is a person: a full name, or a title and a name) the entry could refer
                   to no asked entity and confidently names another person in its body: a title and a
                   name, or a full name that is not sentence-initial and does not look like a place,
-                  organisation, product or work ("San Francisco", "Orbel Maps", "Harrow Bank", or a phrase
-                  after "in", "near", "via" ...). When in doubt it is not a person and the entry stays.
+                  organisation, product or work (a whole listed place phrase such as "San Francisco" or
+                  "Hong Kong", or an institutional ending such as "Orbel Maps", "Harrow Bank"). A given
+                  name and surname is always a person, whatever word precedes it.
                   Single words ("Marit", "Mum", "Leeds") identify nobody;
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
                   full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
@@ -149,25 +150,21 @@ def _sentence_start(text: str, pos: int) -> bool:
 
 # Common given-name short forms (short -> full forms). Explicit, not fuzzy; a prefix ("Al", "Alex") already counts.
 SHORT_FORMS: Dict[str, Tuple[str, ...]] = {
-    "will": ("william",), "bill": ("william",), "billy": ("william",), "liam": ("william",),
-    "jan": ("janet", "janice", "janine"), "bob": ("robert",), "rob": ("robert",), "bobby": ("robert",),
-    "robbie": ("robert",), "bert": ("robert", "albert", "herbert"), "jim": ("james",), "jimmy": ("james",),
-    "jack": ("john",), "johnny": ("john",), "dick": ("richard",), "rick": ("richard",), "rich": ("richard",),
-    "ted": ("edward", "theodore"), "ned": ("edward",), "eddie": ("edward",), "tom": ("thomas",),
-    "harry": ("henry", "harold"), "hal": ("henry", "harold"), "chuck": ("charles",), "charlie": ("charles",),
+    "will": ("william",), "bill": ("william",), "billy": ("william",), "jan": ("janet",),
+    "bob": ("robert",), "rob": ("robert",), "bobby": ("robert",), "robbie": ("robert",),
+    "jim": ("james",), "jimmy": ("james",), "jack": ("john",), "johnny": ("john",),
+    "dick": ("richard",), "rick": ("richard",), "rich": ("richard",), "ted": ("edward",), "eddie": ("edward",),
+    "tom": ("thomas",), "harry": ("henry",), "chuck": ("charles",), "charlie": ("charles",),
     "peggy": ("margaret",), "meg": ("margaret",), "maggie": ("margaret",), "liz": ("elizabeth",),
-    "beth": ("elizabeth", "bethany"), "betty": ("elizabeth",), "kate": ("katherine", "catherine", "kathleen"),
-    "katie": ("katherine", "catherine"), "kathy": ("katherine", "kathleen"), "cathy": ("catherine",),
-    "sue": ("susan", "susanna", "suzanne"), "susie": ("susan",), "pat": ("patrick", "patricia"),
-    "patty": ("patricia",), "sally": ("sarah",), "polly": ("mary",), "molly": ("mary",), "mark": ("marcus",),
-    "nick": ("nicholas",), "andy": ("andrew",), "drew": ("andrew",), "tony": ("anthony",), "mike": ("michael",),
-    "mick": ("michael",), "dave": ("david",), "joe": ("joseph",), "sam": ("samuel", "samantha"),
-    "ben": ("benjamin",), "dan": ("daniel",), "matt": ("matthew",), "chris": ("christopher", "christine"),
-    "steve": ("stephen", "steven"), "greg": ("gregory",), "jen": ("jennifer",), "jenny": ("jennifer",),
-    "sandy": ("alexander", "sandra"), "sasha": ("alexander", "alexandra"), "frank": ("francis",),
-    "fran": ("frances", "francesca"), "art": ("arthur",), "ray": ("raymond",), "ron": ("ronald",),
-    "don": ("donald",), "gerry": ("gerald",), "fred": ("frederick",), "freddie": ("frederick",),
-    "may": ("mary", "margaret"), "nell": ("eleanor", "helen"),
+    "beth": ("elizabeth",), "betty": ("elizabeth",), "kate": ("katherine", "catherine"),
+    "katie": ("katherine", "catherine"), "kathy": ("katherine",), "cathy": ("catherine",),
+    "sue": ("susan",), "susie": ("susan",), "pat": ("patrick", "patricia"), "patty": ("patricia",),
+    "sally": ("sarah",), "nick": ("nicholas",), "andy": ("andrew",), "tony": ("anthony",),
+    "mike": ("michael",), "mick": ("michael",), "dave": ("david",), "joe": ("joseph",),
+    "sam": ("samuel", "samantha"), "ben": ("benjamin",), "dan": ("daniel",), "matt": ("matthew",),
+    "chris": ("christopher", "christine"), "steve": ("stephen", "steven"), "greg": ("gregory",),
+    "jen": ("jennifer",), "jenny": ("jennifer",), "ron": ("ronald",), "don": ("donald",),
+    "fred": ("frederick",), "freddie": ("frederick",),
 }
 # Words a short form must not be followed by to read as a name: pronouns, determiners and the bare verbs and
 # adverbs that follow a modal or an imperative ("Will you", "May I", "Mark the date", "Bill me", "Will be").
@@ -175,18 +172,20 @@ _AFTER_VERB = {
     "i", "you", "we", "he", "she", "it", "they", "me", "him", "her", "us", "them", "this", "that", "these",
     "those", "there", "the", "a", "an", "my", "your", "our", "his", "their", "its", "not", "never", "also",
     "always", "just", "still", "be", "have", "do", "go", "get", "come", "see", "need", "try", "take", "make",
-    "let", "keep", "its", "up", "down", "out", "off", "all", "everyone", "anyone", "someone", "each",
+    "let", "keep", "up", "down", "out", "off", "all", "everyone", "anyone", "someone", "each",
     "both", "some", "any", "as", "so", "too", "soon", "later", "today", "tomorrow", "tonight", "again",
 }
 _DATE_LEAD = {"in", "on", "since", "until", "till", "by", "from", "of", "last", "next", "early", "late", "mid",
               "during", "before", "after", "through", "this"}
+# Names that are also verbs or modals: read with the sentence-start context check, short form or not.
 _VERB_FORMS = {"will", "may", "mark", "bill", "rob", "sue", "pat", "jack", "nick", "frank", "chuck", "drew",
                "rich", "ray", "art", "sandy", "don", "hal", "bob", "dick", "ted"}
 
 
 def _ordinary(key: str) -> bool:
-    """A short form that is also an ordinary word (a modal, a verb or a month)."""
-    return key in SHORT_FORMS and (key in _NOT_NAMES or key in _VERB_FORMS)
+    """A name that is also an ordinary word: a listed short form that is a modal or a month, or a name that is
+    also a verb ("Mark the date", "May I")."""
+    return key in _VERB_FORMS or (key in SHORT_FORMS and key in _NOT_NAMES)
 
 
 def _reads_as_name(text: str, start: int, end: int, initial: bool) -> bool:
@@ -465,10 +464,6 @@ _NOT_PERSON_FIRST = {
     "western", "upper", "lower", "great", "little", "big", "royal", "national", "united", "grand", "central",
     "saint", "mount", "lake", "peak", "port", "fort", "cape", "the", "morning", "evening", "weekly", "daily",
     "monthly", "annual", "happy", "merry", "good", "best", "first", "second", "third", "last", "final",
-    # place-name openers in many languages ("San Francisco", "Los Alamos", "Hong Kong", "Kuala Lumpur")
-    "san", "santa", "santo", "sao", "los", "las", "el", "la", "le", "les", "abu", "hong", "kuala", "buenos",
-    "rio", "tel", "ho", "phnom", "ciudad", "puerto", "porto", "costa", "sri", "baton", "palm", "salt", "st",
-    "ste", "isle", "glen", "loch", "bay", "air", "radio",
 }
 _NOT_PERSON_LAST = {
     "moor", "cove", "bay", "point", "hill", "hills", "street", "st", "road", "rd", "lane", "avenue", "way", "lock",
@@ -486,21 +481,20 @@ _NOT_PERSON_LAST = {
     "press", "books", "records", "festival", "show", "series", "band", "orchestra", "choir", "league", "cup",
     "fc", "rovers", "trip", "pages", "review", "time", "day", "week", "notes", "plan", "list", "meeting",
     "men", "women", "man", "woman", "people", "kids", "children", "boys", "girls", "everyone", "family",
-    # place, organisation and product endings ("Hong Kong", "Orbel Maps", "Harrow Bank", "Dunmore Airport")
-    "kong", "lumpur", "aires", "janeiro", "aviv", "penh", "minh", "lanka", "rica", "rouge", "springs",
-    "falls", "heights", "creek", "canyon", "ridge", "junction", "plaza", "mall", "tower", "towers", "stadium",
-    "arena", "terminal", "maps", "map", "mail", "docs", "cloud", "app", "apps", "pay", "store", "online",
-    "labs", "lab", "systems", "software", "technologies", "tech", "media", "news", "times", "post",
-    "airlines", "airways", "air", "rail", "railway", "motors", "energy", "pharma", "health", "insurance",
-    "capital", "partners", "holdings", "corp", "corporation", "co", "gmbh", "ag", "llp", "academy",
-    "polytechnic", "clinic", "surgery", "practice", "pharmacy", "supermarket", "markets", "foods", "brewery",
-    "studios", "pictures", "games", "network", "networks", "gym", "fitness", "radio", "tv", "magazine",
-    "journal", "index",
+    # clearly institutional or product endings ("Orbel Maps", "Fenwick Labs", "Dunmore Airport")
+    "maps", "apps", "app", "labs", "lab", "software", "systems", "technologies", "airlines", "airways", "corp",
+    "corporation", "gmbh", "llp", "academy", "polytechnic", "clinic", "pharmacy", "supermarket", "brewery",
+    "studios", "stadium", "arena", "terminal", "mall", "plaza", "magazine",
 }
-# A phrase after these reads as a place or a thing, not a person ("lives in Port Ellery", "via Orbel Maps"):
-# when in doubt it is not another person, so the entry is not dropped for it.
-_PLACE_LEAD = {"in", "near", "via", "using", "around", "across", "throughout", "inside", "outside", "towards",
-               "toward", "visited", "visiting", "downtown"}
+# Multi-word places matched as whole phrases, never by one word ("Santa Ramirez" and "Wei Kong" are people).
+PLACE_PHRASES = {
+    ("hong", "kong"), ("kuala", "lumpur"), ("san", "francisco"), ("san", "diego"), ("san", "jose"),
+    ("san", "antonio"), ("los", "angeles"), ("los", "alamos"), ("las", "vegas"), ("buenos", "aires"),
+    ("rio", "de", "janeiro"), ("sao", "paulo"), ("tel", "aviv"), ("phnom", "penh"), ("ho", "chi", "minh"),
+    ("sri", "lanka"), ("costa", "rica"), ("baton", "rouge"), ("santa", "rosa"), ("santa", "fe"),
+    ("santa", "barbara"), ("santa", "monica"), ("palm", "springs"), ("salt", "lake"), ("abu", "dhabi"),
+    ("el", "paso"), ("la", "paz"), ("le", "havre"), ("new", "delhi"), ("cape", "town"), ("hong", "kong", "island"),
+}
 
 
 def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
@@ -517,6 +511,8 @@ def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
         return None  # an acronym or numeral ("Eckert IV", "NHS Trust"): not a confident person name
     if titled:
         return keys if keys[-1] not in _NOT_PERSON_LAST else None  # not "Mr Men"
+    if any(keys[i:i + len(ph)] == ph for ph in PLACE_PHRASES for i in range(len(keys) - len(ph) + 1)):
+        return None  # a whole multi-word place ("Hong Kong", "San Francisco")
     if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST and keys[-1] not in _NOT_PERSON_LAST:
         return keys
     return None
@@ -548,9 +544,6 @@ def identified_people(text: str) -> List[Tuple[str, ...]]:
                 continue
         if any(_key(w) in RELATIONS and _key(w) not in TITLES for w in words):  # "Mum", not "Aunt Peg"
             continue
-        lead = re.search(r"([^\W\d_]+)[\s,]*$", text[:run[0][1]])
-        if lead and _key(lead.group(1)) in _PLACE_LEAD and _key(words[0]) not in TITLES:
-            continue  # "lives in Port Ellery", "found it via Orbel Maps": a place or a thing, when in doubt
         keys = _person_keys(words)
         if keys and keys not in out:
             out.append(keys)

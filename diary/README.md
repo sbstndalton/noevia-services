@@ -125,7 +125,8 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   until 3 March") is not an anchor.
 - A hit that could refer to an asked entity is never dropped for a name: one that names it in full, with a
   middle name or initial or in reverse order ("Alder J. Brannock"), by first name or surname alone, by a short
-  form ("Al", or a listed one such as "Will" for "William" or "Jan" for "Janet"), by a shared name of an entity
+  form ("Al", or one from a small table of unambiguous pairs such as "Will" for "William" or "Jan" for
+  "Janet"; "Mark" is its own name, not a short form of "Marcus"), by a shared name of an entity
   that no hit names in full, or in lower case (one-word names of three or more letters too: "saw marit"). A
   near spelling is kept (and labelled) while no hit names that entity in full; once one does, it is dropped
   as `near_name`. A short form that is also an ordinary word ("Will", "May", "Mark", "Bill", "Jan") counts
@@ -138,9 +139,9 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   - `other_person`: the asked entity is a person (a full name, or a title and a name) and the hit's own body
     confidently names another person: a title and a name, or a full name that does not open a sentence (list
     markers, quotes and dashes are skipped: "- Visited Leeds", "1) Called Mum") and does not look like a place,
-    organisation, product or work (place openers and endings such as "San ...", "Hong Kong", "... Maps",
-    "... Bank", "... Airport", "... University", or a phrase after "in", "near", "via", "visited"). When in
-    doubt it is not another person and the hit stays. Single words ("Marit", "Mum", "Leeds"), relation words
+    organisation, product or work (a whole listed place phrase such as "San Francisco" or "Hong Kong", or an
+    institutional ending such as "... Maps", "... Bank", "... Airport", "... University"). A given name and
+    surname is always a person, whatever word precedes it ("visited Anna Pirelli"). Single words ("Marit", "Mum", "Leeds"), relation words
     and headers never count;
   - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`; a gap of exactly
     the margin is kept) below the best full exact hit. It arms only for an asked name of two or more words or a
