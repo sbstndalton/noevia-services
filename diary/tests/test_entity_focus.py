@@ -61,9 +61,12 @@ class TrigramLLM:
 
 
 def _cfg(focus=True, min_score=0.30):
+    # The #114 score gap is off: "focus off" here means plain vector search, the baseline the focus is measured
+    # against. tests/test_score_gap.py covers the gap.
     return Config({
         "context": {"max_today_tokens": 4500, "max_standing_tokens": 2200},
-        "retrieval": {"top_k": 8, "min_score": min_score, "max_context_tokens": 5200, "entity_focus": focus},
+        "retrieval": {"top_k": 8, "min_score": min_score, "max_context_tokens": 5200, "entity_focus": focus,
+                      "score_gap": "off"},
         "prompts": {"system_path": ""},
     })
 

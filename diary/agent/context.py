@@ -18,7 +18,7 @@ import logging
 import re
 from typing import List, Optional
 
-from . import entity_focus
+from . import entity_focus, score_gap
 from .corpus_store import CorpusStore
 from .retrieval import Retriever
 from .retrieval_trace import RetrievalTrace, SafeTrace
@@ -214,6 +214,14 @@ class ContextAssembler:
                 trace.set_focus(focus, len(results))
         else:
             ranked = list(enumerate(results[:candidate_k], 1))
+        # #114: drop candidates far below the best one, only when the message names (or carries) no entity: the
+        # name check decides relevance then, and an entry about an asked or mistyped name is never dropped for
+        # its score.
+        gap = score_gap.parse_gap(self.cfg.get("retrieval.score_gap", score_gap.SCORE_GAP))
+        gap_applies = gap is not None and not (focus is not None and focus.entities)
+        ranked, gap_removed, gap_best = score_gap.cut(ranked, gap if gap_applies else None)
+        if trace is not None:
+            trace.set_score_gap(gap, gap_applies, gap_best, gap_removed)
         notes = entity_focus.context_notes(focus) if focus is not None else []
         # Fit budget: keep highest-scored, cap each excerpt, drop overflow lowest-first. The notes and
         # labels are charged to the same budget as the excerpts they describe.
