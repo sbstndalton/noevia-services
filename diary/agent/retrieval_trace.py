@@ -10,13 +10,16 @@ embeddings, the query or credentials.
 
 The diary has no reranker. The stages are (1) vector-search candidates (cosine similarity, at least
 min_score; top_k * 2 requested, or top_k * 4 when the message names an entity or a time anchor), then
-(1b, services#116) the entity focus (entity_focus.py): a lexical check that drops only confirmed
-near-name hits, hits naming only other identified people (when an asked person is named in full) and hits
-dated after a time anchor, keeping score order, at most top_k * 2, then (2) selection in score order under the token budget, capped at top_k. `candidates` lists what
-stage 1b kept (`rank` is the position there, `vector_rank` the stage 1 rank) and `focus.removed` every
-stage 1 candidate it dropped, with the reason. With no entity or time anchor in the message stage 1b
-does not run (`focus.checked` is false) and `candidates` is stage 1. `rerank.present` is false so the
-gate can tell "no reranker" from "reranker returned nothing": the focus filters and never reorders.
+(1b, services#116) the entity focus (entity_focus.py): a lexical check that drops hits dated after a
+time anchor and, when some hit names an asked entity in full, hits that cannot refer to any asked
+entity and are a near spelling of it (near_name), confidently name another person (other_person) or
+score more than the margin below the best exact hit (below_margin); score order is kept, at most
+top_k * 2. Then (2) selection in score order under the token budget, capped at top_k. `candidates`
+lists what stage 1b kept (`rank` is the position there, `vector_rank` the stage 1 rank) and
+`focus.removed` every stage 1 candidate it dropped, with the reason; `focus.removed_by_reason` counts
+them. With no entity or time anchor in the message stage 1b does not run (`focus.checked` is false)
+and `candidates` is stage 1. `rerank.present` is false so the gate can tell "no reranker" from
+"reranker returned nothing": the focus filters and never reorders.
 """
 from __future__ import annotations
 
@@ -85,6 +88,8 @@ class RetrievalTrace:
             "checked": True,
             "entities": len(focus.entities),
             "carried": bool(focus.carried),
+            "relational": bool(focus.relational),
+            "margin": float(focus.margin),
             "time_anchor": focus.anchor is not None,
             "applied": bool(focus.applied),
             "vector_candidates": vector_candidates,

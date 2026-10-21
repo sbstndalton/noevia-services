@@ -160,9 +160,11 @@ class ContextAssembler:
         """(loaded entries, a header label per entry, note lines opening the block).
 
         #116: when the message names an entity (or is a name-less follow-up to a question that did) or has a
-        time anchor (entity_focus.py), a wider vector pool is checked lexically. Only confirmed near-name hits
-        (a near spelling of a name another hit names exactly) and hits dated after the anchor are left out;
-        similar names are labelled "may be a different person; check the name"."""
+        time anchor (entity_focus.py), a wider vector pool is checked lexically. Hits dated after the anchor
+        are left out. When some hit names an asked entity in full, hits that cannot refer to any asked entity
+        are left out if they are a near spelling of it (near_name), confidently name another person
+        (other_person) or score more than the margin below the best exact hit (below_margin). Similar names
+        are labelled "may be a different person, check the name"."""
         trace = SafeTrace.wrap(trace)
         if self.retriever is None:
             if trace is not None:
@@ -204,7 +206,9 @@ class ContextAssembler:
             trace.set_status(diag.get("status", "ok"))
         focus = None
         if focused:
-            focus = entity_focus.focus_candidates(user_message, results, limit=candidate_k, earlier=earlier)
+            margin = float(self.cfg.get("retrieval.entity_focus_margin", entity_focus.MARGIN))
+            focus = entity_focus.focus_candidates(user_message, results, limit=candidate_k, earlier=earlier,
+                                                  margin=margin)
             ranked = focus.kept
             if trace is not None:
                 trace.set_focus(focus, len(results))

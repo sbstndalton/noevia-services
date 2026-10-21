@@ -97,9 +97,10 @@ not change retrieval or the model input.
 - `focus` (services#116): `{"checked": false}` when the message names no entity and no time anchor; then
   `candidates` are the vector hits. Otherwise `entities` and `time_anchor` (counts and flags only, never the
   names), `applied` (some hit named an asked entity exactly), `vector_candidates`, `removed` (each dropped hit:
-  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `other_person`, `after_time_anchor` or
-  `candidate_limit`), `removed_by_reason` (counts), `carried` (the entities came from the previous question), `similar_name_labelled`
-  and `superseded_labelled`.
+  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `other_person`, `below_margin`,
+  `after_time_anchor` or
+  `candidate_limit`), `removed_by_reason` (counts), `carried` (the entities came from the previous
+  question), `relational`, `margin`, `similar_name_labelled` and `superseded_labelled`.
 - `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
 - `loaded`: the excerpts actually placed in the context (`id`, `day`, `time`, `score`, `tokens`, `chars`);
   `budget`: `max_context_tokens`, `max_context_chars`, `excerpt_char_cap`, `used_chars`, `used_tokens`.
@@ -111,19 +112,34 @@ Vector similarity cannot tell similarly spelled names apart, so entries about "A
 about "Alder Brannock" and the answer conflates them. When the user's message names an entity (a capitalised name
 phrase; titles, accents and punctuation ignored), is a name-less follow-up ("and her email?") to a question that
 did, or is explicitly framed by a date ("As of January 20, 2030, ...?"), `agent/entity_focus.py` checks a wider
-vector pool (4x top_k) lexically, with no model call:
+vector pool (4x top_k) lexically, with no model call, and never reorders it:
 
-- A hit naming only a near spelling of a name that another hit names exactly (or by first name or surname alone)
-  is dropped: the diary names that person, so the near spelling is someone else. Nothing else is dropped for a
-  name, so recall never falls below plain vector search.
-- When the question names a person (a full name, or a title and a name) that a hit names in full, hits that
-  explicitly name only other identified people (full or titled names), none matching or resembling the asked
-  one, are dropped as `other_person`. Entries naming nobody, or the asked person among others, stay.
-- With no exact match (a typo or a short form in the question) nothing is dropped; similar names are labelled
-  "may be a different person, check the name".
-- Hits dated after a time anchor are dropped. A date inside a statement ("away until 3 March") is not an anchor.
+- `after_time_anchor`: hits dated after an explicit time anchor are dropped. A date inside a statement ("away
+  until 3 March") is not an anchor.
+- A hit that could refer to an asked entity is never dropped for a name: one that names it in full, with a
+  middle name or initial or in reverse order ("Alder J. Brannock"), by first name or surname alone, by a near
+  spelling or a short form ("Al"), by a shared name when no hit names that entity in full, or in lower case.
+- Only when some hit names an asked entity in full (a full exact hit), a hit that cannot refer to any asked
+  entity is dropped as:
+  - `near_name`: a near spelling of that entity; the diary names the person, so this is someone else;
+  - `other_person`: the asked entity is a person (a full name, or a title and a name) and the hit's own body
+    confidently names another person: a title and a name, or a full name that does not open a sentence and
+    does not look like a place, organisation or work. Single words ("Marit", "Mum", "Leeds") and headers
+    never count;
+  - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`) below the best
+    full exact hit. This is a deliberate precision/recall trade-off: an unnamed entry about the person (a
+    pronoun only) that scores more than the margin below the best exact hit is dropped.
+- With no full exact hit nothing is dropped for a name (a typo or a short form in the question); similar names
+  are labelled "may be a different person, check the name". A relational question ("Alder Brannock's sister")
+  drops nothing for not naming the asked entity.
 - An earlier entry is labelled superseded only by an explicit correction of the same entity that replaces a
   value found in it ("..., not smoked lapsang").
+
+Accepted recall limits, each pinned by a test: an entry about the asked person that never names them (a
+pronoun only, a nickname unrelated to the name such as "Bob" for "Robert", a relation not phrased as "X's
+sister") is dropped when it confidently names another person or falls below the margin; a work title read as a
+full name ("Moby Dick") counts as a person. When anything was dropped for not naming the asked entities, the
+note says the list may be incomplete.
 
 A short note opens the retrieved block. Messages without a name or anchor are unaffected, and
 `retrieval.entity_focus: false` turns the check off.

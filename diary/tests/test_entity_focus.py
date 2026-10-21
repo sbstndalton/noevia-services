@@ -134,7 +134,8 @@ def metrics(world, focus, categories=None):
         rec.append(score.best_recall(sets, top))
         prec.append(score.precision(sets, top))
         ctx.append(score.best_recall(sets, got.loaded))
-    return {"queries": len(rec), "recall": score.mean(rec), "precision": score.mean(prec), "context_recall": score.mean(ctx)}
+    return {"queries": len(rec), "recall": score.mean(rec), "precision": score.mean(prec),
+            "context_recall": score.mean(ctx)}
 
 
 def _text(retriever, chunk_id):
@@ -180,7 +181,8 @@ def test_asked_entities(message, entities):
 def test_asked_entities_are_capped_and_unique():
     found = ef.asked_entities("Did Anna, anna, Bea, Cleo, Dora and Esme come?")
     assert _names(found) == ["Anna", "Bea", "Cleo", "Dora"][:ef.MAX_ENTITIES]
-    assert ef.asked_entities("Did Dr Patel or Dr. Patel call?")[0].keys == ("patel",) and len(ef.asked_entities("Did Dr Patel or Dr. Patel call?")) == 1
+    titled = ef.asked_entities("Did Dr Patel or Dr. Patel call?")
+    assert len(titled) == 1 and titled[0].keys == ("patel",)
 
 
 @pytest.mark.parametrize("message, anchor", [
@@ -243,8 +245,9 @@ def _row(day, header, text, score=0.5):
 TEA = [
     _row("2030-01-10", "09:00 — Chat with Alder Brennock", "Alder Brennock likes nettle tea.", 0.9),
     _row("2030-01-08", "12:00 — Bumped into Alder Brannock", "Alder Brannock said his tea is smoked lapsang.", 0.8),
-    _row("2030-01-09", "19:00 — Studio day", "Inked the coastal chart.", 0.7),
-    _row("2030-01-30", "22:00 — Correction", "Correction to my note: Alder Brannock's tea is white peony, not smoked lapsang.", 0.6),
+    _row("2030-01-09", "19:00 — Studio day", "Inked the coastal chart.", 0.78),  # within MARGIN of 0.8
+    _row("2030-01-30", "22:00 — Correction",
+         "Correction to my note: Alder Brannock's tea is white peony, not smoked lapsang.", 0.6),
     _row("2030-01-11", "08:00 — Phone", "Alder called, new number is 0789.", 0.55),
 ]
 
@@ -270,7 +273,8 @@ def test_focus_without_an_exact_entry_drops_nothing_and_hedges():
     rows = [TEA[0], TEA[2]]
     res = ef.focus_candidates("What is Alder Brannock's favourite tea?", rows)
     assert not res.applied and [rank for rank, _ in res.kept] == [1, 2] and res.removed == []
-    assert ef.entry_label(res, 1) == '; names "Alder Brennock", similar to "Alder Brannock": may be a different person, check the name'
+    assert ef.entry_label(res, 1) == ('; names "Alder Brennock", similar to "Alder Brannock": '
+                                      "may be a different person, check the name")
     note = ef.context_notes(res)[0]
     assert "No retrieved entry names" in note and "check the name" in note and "do not answer" not in note.lower()
 
@@ -305,7 +309,8 @@ def test_incidental_or_unrelated_corrections_supersede_nothing():
         assert res.corrected_by == {}, later["text"]
     fixed = _row("2030-01-05", "10:00 — Note", "I had misheard: Alder Brannock's favourite tea is white peony.")
     assert ef.focus_candidates("What is Alder Brannock's tea?", [base, fixed]).corrected_by == {1: "2030-01-05"}
-    older_fix = _row("2029-12-30", "10:00 — Correction", "Correction: Alder Brannock's tea is white peony, not smoked lapsang.")
+    older_fix = _row("2029-12-30", "10:00 — Correction",
+                     "Correction: Alder Brannock's tea is white peony, not smoked lapsang.")
     assert ef.focus_candidates("What is Alder Brannock's tea?", [base, older_fix]).corrected_by == {}
 
 
@@ -315,12 +320,13 @@ def test_several_people_in_one_question():
             _row("2030-01-13", "09:00 — Caspian", "Caspian Dunmore likes white peony.")]
     res = ef.focus_candidates("Do Alder Brannock and Bryony Castellow both like tea?", rows)
     # Brennock is confirmed someone else (Brannock is named exactly); Bryony has no exact entry: kept, hedged.
-    # Caspian Dunmore is another identified person entirely.
-    assert [(rank, reason) for rank, _, reason in res.removed] == [(1, "near_name"), (4, "other_person")]
+    # "Caspian Dunmore" opens its sentence, so it is not a confident person name; it scores 0.3 below the
+    # best exact hit and names no asked entity, so the margin drops it.
+    assert [(rank, reason) for rank, _, reason in res.removed] == [(1, "near_name"), (4, "below_margin")]
     assert [rank for rank, _ in res.kept] == [2, 3] and "may be a different person" in ef.entry_label(res, 3)
     both = ef.focus_candidates("Compare Alder Brannock and Alder Brennock.", rows)
     assert [rank for rank, _ in both.kept] == [1, 2]  # each named exactly by its own entry
-    assert {reason for _, _, reason in both.removed} == {"other_person"}
+    assert {reason for _, _, reason in both.removed} == {"below_margin"}
 
 
 def test_name_less_follow_up_carries_the_previous_entity():
@@ -335,7 +341,8 @@ def test_name_less_follow_up_carries_the_previous_entity():
 def test_focus_limit_is_recorded_as_a_removal():
     rows = [_row("2030-01-0%d" % (i + 1), "09:00 — Tobiah", f"Tobiah visit {i}") for i in range(5)]
     res = ef.focus_candidates("What did Tobiah give me?", rows, limit=3)
-    assert len(res.kept) == 3 and [(r, why) for r, _, why in res.removed] == [(4, "candidate_limit"), (5, "candidate_limit")]
+    assert len(res.kept) == 3
+    assert [(r, why) for r, _, why in res.removed] == [(4, "candidate_limit"), (5, "candidate_limit")]
 
 
 # ---------------- the gate's near-name fixture ----------------
@@ -369,7 +376,8 @@ def test_trace_accounts_for_every_vector_candidate(world):
         assert got.trace["rerank"] == {"present": False}
         for r in focus["removed"]:
             assert set(r) <= {"vector_rank", "id", "day", "time", "score", "reason"}
-            assert r["reason"] in {"near_name", "other_person", "after_time_anchor", "candidate_limit"}
+            assert r["reason"] in {"near_name", "other_person", "below_margin", "after_time_anchor",
+                                   "candidate_limit"}
         assert sum(focus["removed_by_reason"].values()) == len(focus["removed"])
         blob = json.dumps(got.trace)
         for e in ef.asked_entities(q["text"]):
@@ -437,7 +445,8 @@ def test_correction_context_marks_only_the_superseded_entry(world):
         correction = next(i for i in got.loaded if world.entries[i]["kind"] == "correction")
         cday = world.entries[correction]["day"]
         assert all(_norm(f) in _norm(got.block) for f in q["expected_facts"])
-        stale = [line for line in got.block.splitlines() if line.startswith("--- [") and f"correction of {cday}" in line]
+        stale = [line for line in got.block.splitlines()
+                 if line.startswith("--- [") and f"correction of {cday}" in line]
         about = [e["id"] for e, kind in zip(got.trace["loaded"], _loaded_kinds(world, got, entity))
                  if kind == "match" and world.entries[world.index[(e["day"], e["time"])]]["kind"] == "needle"]
         assert len(stale) == len(about) == 1, q["id"]  # the original note only, not other people's entries
@@ -486,7 +495,8 @@ def _corpus(tmp_path, entries):
     """entries: (ISO day, HH:MM, topic, text) -> a retriever over them and {chunk id: topic}."""
     by_day = {}
     for day, hhmm, topic, me in entries:
-        by_day.setdefault(day, []).append(gen_fixture.render_block(f"{hhmm} — {topic}", me, "Noted.", hashlib.sha1(topic.encode()).hexdigest()[:12]))
+        xid = hashlib.sha1(topic.encode()).hexdigest()[:12]
+        by_day.setdefault(day, []).append(gen_fixture.render_block(f"{hhmm} — {topic}", me, "Noted.", xid))
     files = {gen_fixture.day_path(date.fromisoformat(d)): gen_fixture.render_day(date.fromisoformat(d), blocks)
              for d, blocks in by_day.items()}
     r = Retriever(tmp_path / "small.db", TrigramLLM())
@@ -504,7 +514,8 @@ def _case(tmp_path, entries, question, relevant, turns=None):
     assert set(relevant) <= loaded, (question, loaded)
     assert set(relevant) & {topic[e["id"]] for e in off.data["loaded"]} <= loaded
     removed = {topic[e["id"]]: e["reason"] for e in on.data["focus"].get("removed", [])}
-    return SimpleNamespace(block=_retrieved_block(messages), removed=removed, trace=on.data)
+    named = {t: why for t, why in removed.items() if why != "below_margin"}  # the margin depends on stub scores
+    return SimpleNamespace(block=_retrieved_block(messages), removed=removed, named=named, trace=on.data)
 
 
 BOAT = ("2030-01-01", "09:00", "Boat", "Alder Brannock showed me his boat, the Curlew.")
@@ -515,14 +526,14 @@ FILLER = ("2030-01-04", "11:00", "Studio", "Inked the legend for the coastal cha
 def test_first_name_only_entry_is_kept(tmp_path):
     phone = ("2030-01-02", "09:10", "Phone", "Alder called, new number is 0789 552.")
     got = _case(tmp_path, [BOAT, phone, COFFEE, FILLER], "What is Alder Brannock's phone number?", ["Phone", "Boat"])
-    assert got.removed == {"Coffee": "near_name"}
+    assert got.named == {"Coffee": "near_name"}
 
 
 def test_title_with_or_without_a_full_stop(tmp_path):
     knee = ("2030-01-02", "09:10", "Knee", "Saw Dr. Patel about my knee; rest it for a week.")
     clinic = ("2030-01-03", "09:10", "Clinic", "Dr Patil at the clinic said to stretch my knee.")
     got = _case(tmp_path, [knee, clinic, FILLER], "What did Dr Patel say about my knee?", ["Knee"])
-    assert got.removed == {"Clinic": "near_name"}
+    assert got.named == {"Clinic": "near_name"}
 
 
 def test_typo_in_the_question_keeps_and_hedges(tmp_path):
@@ -534,7 +545,7 @@ def test_typo_in_the_question_keeps_and_hedges(tmp_path):
 def test_nickname_on_either_side_is_kept(tmp_path):
     sail = ("2030-01-02", "09:10", "Sail", "Al Brannock took me sailing on the Curlew.")
     got = _case(tmp_path, [BOAT, sail, COFFEE, FILLER], "Where did Alder Brannock take me sailing?", ["Sail", "Boat"])
-    assert "Sail" not in got.removed and got.removed == {"Coffee": "near_name"}
+    assert "Sail" not in got.removed and got.named == {"Coffee": "near_name"}
     short = _case(tmp_path / "b", [BOAT, COFFEE, FILLER], "Which boat did Al show me?", ["Boat"])
     assert short.removed == {}
 
@@ -543,7 +554,7 @@ def test_until_in_a_statement_is_not_a_time_anchor(tmp_path):
     back = ("2030-03-05", "08:00", "Back", "Sam got back from Lisbon today.")
     away = ("2030-02-20", "08:00", "Away", "Sam left for Lisbon this morning.")
     got = _case(tmp_path, [back, away, FILLER], "Sam is away until 3 March 2030. Is Sam back yet?", ["Back", "Away"])
-    assert got.removed == {} and "Time anchor" not in got.block
+    assert got.named == {} and "Time anchor" not in got.block
 
 
 def test_incidental_corrected_supersedes_nothing(tmp_path):
@@ -560,7 +571,7 @@ def test_name_less_follow_up_carries_the_person(tmp_path):
     turns = [{"role": "user", "content": "What is Bryony Castellow's phone number?"},
              {"role": "companion", "content": "It is 0123 456."}]
     got = _case(tmp_path, [email, other, phone, FILLER], "And her email?", ["Email"], turns=turns)
-    assert got.removed == {"Email two": "near_name"} and got.trace["focus"]["carried"] is True
+    assert got.named == {"Email two": "near_name"} and got.trace["focus"]["carried"] is True
     assert "carried from the earlier question" in got.block
 
 
@@ -569,7 +580,7 @@ def test_several_people_in_one_question(tmp_path):
     near = ("2030-01-06", "09:00", "Peony", "Bryony Castelow likes white peony.")
     got = _case(tmp_path, [BOAT, COFFEE, tea, near, FILLER], "What do Alder Brannock and Bryony Castellow like?",
                 ["Boat", "Nettle"])
-    assert got.removed == {"Coffee": "near_name", "Peony": "near_name"}
+    assert got.named == {"Coffee": "near_name", "Peony": "near_name"}
 
 
 NEAR_ONLY = """## Monday, January 14, 2030
@@ -635,41 +646,241 @@ def test_entity_focus_switch_turns_the_check_off(world, value):
 
 # ---------------- other identified people (coordinator decision on #117) ----------------
 
-SOLO = ("2030-01-05", "09:00", "Solo", "Bryony Castellow went sailing alone on the estuary.")
+SOLO = ("2030-01-05", "09:00", "Solo", "Went sailing alone with Bryony Castellow on the estuary.")
 BOTH = ("2030-01-06", "09:00", "Together", "Alder Brannock and Bryony Castellow went sailing on the estuary.")
-CASPIAN = ("2030-01-07", "09:00", "Leeds", "Caspian Dunmore went sailing near Leeds.")
+CASPIAN = ("2030-01-07", "09:00", "Leeds", "Sailed near Leeds with Caspian Dunmore.")
 WALK = ("2030-01-08", "09:00", "Walk", "Walked to Gullet Cove and back along the estuary.")
 
 
 def test_other_people_only_entries_go_when_the_asked_person_is_named(tmp_path):
     got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK, FILLER], "Where did Alder Brannock go sailing?",
-                ["Boat", "Together", "Walk", "Studio"])
-    # The entry naming the asked person alongside another stays; unnamed and place-only entries stay.
-    assert got.removed == {"Solo": "other_person", "Leeds": "other_person"}
-    assert got.trace["focus"]["removed_by_reason"] == {"other_person": 2}
-    assert "Entries naming only other people were left out." in got.block
+                ["Boat", "Together"])
+    # The entry naming the asked person alongside another stays; unnamed and place-only entries are never
+    # other_person (only the score margin can drop them).
+    assert got.named == {"Solo": "other_person", "Leeds": "other_person"}
+    assert got.trace["focus"]["removed_by_reason"]["other_person"] == 2
+    assert "may be incomplete" in got.block
 
 
-def test_no_exact_hit_drops_no_other_people(tmp_path):
+def test_no_exact_hit_drops_nothing(tmp_path):
     got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK], "Where did Alder Branock go sailing?",
                 ["Boat", "Together", "Solo", "Leeds", "Walk"])
-    assert got.removed == {}
+    assert got.removed == {}  # neither other_person nor below_margin without a full exact hit
 
 
 def test_a_first_name_question_drops_no_other_people(tmp_path):
-    got = _case(tmp_path, [BOAT, SOLO, CASPIAN], "Where did Alder go sailing?", ["Boat", "Solo", "Leeds"])
-    assert got.removed == {}  # a single word does not identify a person for certain
+    got = _case(tmp_path, [BOAT, SOLO, CASPIAN], "Where did Alder go sailing?", ["Boat"])
+    assert "other_person" not in got.removed.values()  # a single word does not identify a person for certain
 
 
 def test_several_asked_people_keep_their_entries(tmp_path):
-    got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK], "Where did Alder Brannock and Bryony Castellow go sailing?",
-                ["Boat", "Together", "Solo", "Walk"])
-    assert got.removed == {"Leeds": "other_person"}
+    got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK],
+                "Where did Alder Brannock and Bryony Castellow go sailing?", ["Boat", "Together", "Solo"])
+    assert got.named == {"Leeds": "other_person"}
+
+
+def _rows(*texts, scores=None):
+    scores = scores or [0.8] * len(texts)
+    return [_row(f"2030-01-{i + 1:02d}", "09:00 — Note", t, s) for i, (t, s) in enumerate(zip(texts, scores))]
+
+
+def _kept_reasons(question, rows, **kw):
+    res = ef.focus_candidates(question, rows, **kw)
+    return [rank for rank, _ in res.kept], {rank: why for rank, _, why in res.removed}
+
+
+# Review finding 1: the asked person's own entry with a middle name, an initial, or in reverse order.
+@pytest.mark.parametrize("question, text", [
+    ("Where did Alder Brannock go sailing?", "Went to Leeds; Alder John Brannock sailed there."),
+    ("Where did Alder Brannock go sailing?", "Went to Leeds; Alder J Brannock sailed there."),
+    ("Where did Alder Brannock go sailing?", "Went to Leeds; Alder J. Brannock sailed there."),
+    ("Where did Alder Brannock go sailing?", "Went to Leeds; Brannock Alder sailed there."),
+    ("Where did Mary Smith go?", "Went to York with Mary Ann Smith."),
+    ("Where did Alder Brannock go sailing?", "Went to Leeds; A. Brannock sailed there."),
+])
+def test_middle_names_initials_and_reverse_order_stay(question, text):
+    exact = "Went sailing with " + ef.asked_entities(question)[0].name + " on the estuary."
+    kept, removed = _kept_reasons(question, _rows(exact, text, scores=[0.9, 0.5]))
+    assert kept == [1, 2] and removed == {}  # far below the margin, yet about the asked person
+
+
+def test_extended_names_classify_as_about():
+    assert ef.classify("Saw Alder John Brannock.", _ent("Alder Brannock"))[0] == "extended"
+    assert ef.classify("Saw Brannock Alder.", _ent("Alder Brannock"))[0] == "extended"
+    assert ef.classify("Saw A. Brannock.", _ent("Alder Brannock"))[0] == "variant"
+
+
+# Review finding 2: an asked person with no exact hit keeps an entry sharing their surname.
+@pytest.mark.parametrize("question", ["Compare Alder Brannock and Bree Castellow.",
+                                      "Compare Alder Brannock and Bryn Castellow."])
+def test_unmatched_asked_person_keeps_a_shared_name_entry(question):
+    rows = _rows("Went sailing with Alder Brannock.", "Saw Bryony Castellow start work as a dentist.",
+                 scores=[0.9, 0.5])
+    assert _kept_reasons(question, rows) == ([1, 2], {})
+
+
+# Review finding 3 and decision A: capitalised non-names, headers and role labels are never people or names.
+@pytest.mark.parametrize("header, text", [
+    ("09:00 — Note", "Visited Leeds yesterday. Felt great."),
+    ("09:00 — Note", "Saw Marit at the market. She was cheerful."),
+    ("09:00 — Note", "Called Mum. Felt better afterwards."),
+    ("09:00 — Knee Physio", "He told me to rest it for a week."),
+    ("09:00 — Sailing Trip", "Great wind today, fifteen knots."),
+    ("09:00 — Note", "Morning Pages\nFelt calm after the ride."),
+    ("09:00 — Note", "Coffee Time with nobody. Weekly Review done."),
+    ("09:00 — Note", "Read Mr Men to the kids."),
+    ("09:00 — Note", "**Bryony Castellow:** went to Leeds."),
+])
+def test_entries_naming_nobody_are_never_other_person(header, text):
+    rows = [_row("2030-01-01", "09:00 — Boat", "Went sailing with Alder Brannock.", 0.8),
+            _row("2030-01-02", header, text, 0.8)]
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1, 2], {})
+    assert ef.identified_people(ef._body({"text": f"### {header}\n{text}"})) == []
+
+
+@pytest.mark.parametrize("surname", ["Merriman", "Wenlock", "Hesketh", "Annand"])
+def test_role_labels_and_function_words_are_never_name_variants(surname):
+    entity = _ent(f"Rosalind {surname}")
+    text = "**Me:** We got talking. He said so. An odd day. In the end it rained."
+    assert ef.classify(text, entity) == (None, None)
+    rows = [_row("2030-01-01", "09:00 — Tea", f"Ran into Rosalind {surname} at the market.", 0.8),
+            _row("2030-01-02", "09:00 — Chat", "**Me:** We got talking with Bryony Castellow at the market.", 0.8)]
+    assert _kept_reasons(f"What is Rosalind {surname}'s tea?", rows) == ([1], {2: "other_person"})
+
+
+def test_places_organisations_and_works_are_not_people():
+    for phrase in ("Blue Heron", "Peak District", "Lake District", "New York", "Red Kite", "Hollin Moor"):
+        assert not ef.is_person(_ent(phrase)), phrase
+        assert ef.identified_people(f"We went past {phrase} today.") == [], phrase
+    rows = _rows("Blue Heron decided to expand.", "Then Red Kite decided to shrink.")
+    assert _kept_reasons("What did Blue Heron decide?", rows) == ([1, 2], {})  # not a person: no other_person
+    assert ef.identified_people("Met Bryony Castellow and Dr. Patel.") == [("bryony", "castellow"), ("patel",)]
+    assert ef.identified_people("Bryony Castellow came round.") == []  # sentence-initial: not confident
+    assert ef.identified_people("Projected it in the Eckert IV, and the NHS Trust wrote.") == []  # caps: not names
+
+
+# Review finding 4: the accepted recall limits, each pinned so the behaviour is deliberate.
+def test_limit_relational_question_drops_nothing_for_not_naming():
+    rows = _rows("Went sailing with Alder Brannock.", "Saw Bryony Castellow start work as a dentist.",
+                 "Inked the coastal chart.", scores=[0.9, 0.5, 0.5])
+    res = ef.focus_candidates("What does Alder Brannock's sister do for work?", rows)
+    assert res.relational and res.removed == []
+    assert not ef.focus_candidates("What is Alder Brannock's favourite tea?", rows).relational
+
+
+def test_limit_unrelated_nickname_beside_another_person_is_dropped():
+    rows = _rows("Went to Leeds with Robert Hale.", "Went sailing; Bob and then Bryony Castellow came too.")
+    assert _kept_reasons("Where did Robert Hale go?", rows) == ([1], {2: "other_person"})  # accepted limit
+
+
+def test_lower_case_mention_of_the_asked_person_stays():
+    rows = _rows("Went sailing with Alder Brannock.", "went sailing with alder brannock and then Bryony Castellow",
+                 scores=[0.9, 0.5])
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1, 2], {})
+
+
+def test_limit_pronoun_entry_beyond_the_margin_is_dropped_and_the_note_says_so():
+    rows = _rows("Went sailing with Alder Brannock.", "He told me to rest it for a week.", scores=[0.9, 0.8])
+    res = ef.focus_candidates("What did Alder Brannock tell me?", rows)
+    assert [(r, why) for r, _, why in res.removed] == [(2, "below_margin")]
+    assert "may be incomplete" in ef.context_notes(res)[0] and "pronoun" in ef.context_notes(res)[0]
+
+
+def test_limit_a_work_title_can_read_as_a_person():
+    assert ef.identified_people("Started reading Moby Dick again.") == [("moby", "dick")]  # documented limit
+
+
+# Decision B: the score margin.
+def test_margin_keeps_an_unnamed_hit_within_it_and_drops_one_beyond():
+    rows = _rows("Went sailing with Alder Brannock.", "Inked the coastal chart.", "Sorted the plan chest.",
+                 scores=[0.80, 0.751, 0.749])
+    kept, removed = _kept_reasons("Where did Alder Brannock go?", rows)
+    assert ef.MARGIN == 0.05 and kept == [1, 2] and removed == {3: "below_margin"}
+    assert _kept_reasons("Where did Alder Brannock go?", rows, margin=0.10) == ([1, 2, 3], {})
+
+
+def test_margin_needs_a_full_exact_hit_and_never_touches_a_possible_mention():
+    rows = _rows("Went sailing with Alder Brannock.", "Alder called about the boat.", "Al came round.",
+                 "Had tea with Alder Brennock.", "Inked the coastal chart.", scores=[0.9, 0.3, 0.3, 0.3, 0.3])
+    kept, removed = _kept_reasons("Compare Alder Brannock and Bryony Castellow.", rows)
+    assert kept == [1, 2, 3] and removed == {4: "near_name", 5: "below_margin"}
+    assert _kept_reasons("Where did Alder Branock go?", rows) == ([1, 2, 3, 4, 5], {})  # no exact hit
+
+
+def test_margin_applies_to_a_non_person_match():
+    rows = _rows("Day 1 of the Hollin Moor survey at Scarrow.", "Day 2 of the Beckside survey at Lowfold.",
+                 scores=[0.9, 0.7])
+    question = "Which places did I survey during the Hollin Moor survey?"
+    assert _kept_reasons(question, rows) == ([1], {2: "below_margin"})
+
+
+def test_margin_drops_are_counted_on_their_own(world):
+    q = world.by_id["Q-needle-00"]
+    got = ask(world, q["text"], _day(q))
+    counts = got.trace["focus"]["removed_by_reason"]
+    assert counts.get("below_margin", 0) > 0 and sum(counts.values()) == len(got.trace["focus"]["removed"])
+    assert got.trace["focus"]["margin"] == ef.MARGIN
+    cfg = _cfg().as_dict()
+    cfg["retrieval"] = {**cfg["retrieval"], "entity_focus_margin": 1.0}
+    asm = ContextAssembler(FakeStore(), world.retriever, Config(cfg))
+    asm._system_prompt = lambda: "SYSTEM"
+    wide = RetrievalTrace()
+    asm.build(_day(q), q["text"], trace=wide)
+    assert "below_margin" not in wide.data["focus"]["removed_by_reason"] and wide.data["focus"]["margin"] == 1.0
 
 
 def test_people_and_places_are_told_apart():
-    assert ef.identified_people("Had coffee with Bryony Castellow and Dr. Patel.") == [("bryony", "castellow"), ("patel",)]
+    found = ef.identified_people("Had coffee with Bryony Castellow and Dr. Patel.")
+    assert found == [("bryony", "castellow"), ("patel",)]
     assert ef.identified_people("Marit walked to Gullet Cove, then the Hollin Moor survey.") == []
     assert ef.identified_people("**Me:** Spent the session inking.") == []
     assert ef.is_person(_ent("Alder Brannock")) and ef.is_person(_ent("Dr Patel"))
     assert not ef.is_person(_ent("Tobiah")) and not ef.is_person(_ent("Hollin Moor"))
+
+
+# The independent review's probes of af2730b (r117_probe*.py), kept as regressions: every hit scores 0.5,
+# so only the name rules act. Expected: {rank: reason} of the removed hits.
+_A = "Alder Brannock went sailing on the estuary."
+_BC = "Bryony Castellow started work as a dentist."
+_NONE = "Walked along the estuary with the dog."
+
+
+@pytest.mark.parametrize("question, texts, removed", [
+    ("What does Alder Brannock's sister do for work?", [_A, _BC, _NONE], {}),
+    ("Compare Alder Brannock and Bree Castellow.", [_A, _BC, _NONE], {}),
+    ("Where did Alder Brannock go?", [_A, "went sailing with alder brannock and Bryony Castellow"], {}),
+    ("Where did Alder Brannock go?", [_A, "Alder and Bryony Castellow went to Leeds."], {}),
+    ("Where did Alder Brannock go?", [_A, "Al and Bryony Castellow went to Leeds."], {}),
+    ("Where did Alder Brannock go?", [_A, "Bryony Brannock went to Leeds."], {}),
+    ("Where did Zoë Brännock go?", ["Zoe Brannock's boat sank.", _BC], {}),
+    ("What did Ann Lee say?", ["Ann Lee said hello.", "Joanne Lee said goodbye."], {}),
+    ("Where did Alder Brannok go?", [_A, _BC], {}),
+    ("Where did Alder Brannock go?", [_A, "The Brannocks visited Leeds."], {}),
+    ("What did Alder Brannock say?", [_A, "Then Dr Patel said my knee is fine."], {2: "other_person"}),
+    ("What did Alder Brannock say?", [_A, "Mary-Jane Watson said hi."], {}),
+    ("Where did A. Brannock go?", [_A, _BC], {}),
+    ("What did Dr Patel say?", ["Dr. Patel said rest.", "Then Dr Chen said exercise.", "Raj Patel said hi"],
+     {2: "other_person"}),
+    ("Where did Alder Brannock go?", [_A, "Then Aunt Peg phoned."], {2: "other_person"}),
+    ("Where did Alder Brannock go?", [_A, "**Bryony Castellow:** went to Leeds."], {}),
+    ("What is Tobiah Wren's number?", ["Alder Brannock number is 1", "Coffee at the market."], {}),
+    ("What is Alder Brannock's number?", ["Alder Brannock number is 1", "Brannock called, new number 2.",
+                                          "Alder Brennock number is 3"], {3: "near_name"}),
+])
+def test_review_probes(question, texts, removed):
+    assert _kept_reasons(question, _rows(*texts, scores=[0.5] * len(texts)))[1] == removed
+
+
+def test_fixture_never_drops_an_entry_about_an_asked_entity(world):
+    """Over every fixture query: no removed hit names an asked entity in any about-form, and every
+    other_person drop names, in its body, a person the heuristic is confident about."""
+    for q in world.queries:
+        got = ask(world, q["text"], _day(q))
+        entities = ef.asked_entities(q["text"])
+        for r in got.trace["focus"].get("removed", []):
+            if r["reason"] in ("after_time_anchor", "candidate_limit"):
+                continue
+            text = _text(world.retriever, r["id"])
+            assert not any(ef.classify(text, e)[0] in ef.ABOUT for e in entities), (q["id"], r)
+            if r["reason"] == "other_person":
+                assert ef.identified_people(ef._body({"text": text})), (q["id"], r)

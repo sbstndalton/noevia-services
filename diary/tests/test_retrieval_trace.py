@@ -147,13 +147,14 @@ def test_trace_contains_no_entry_text_header_query_or_embedding(tmp_path):
     # time anchor make both kinds of removal happen; neither the asked name nor any entry text leaks.
     near = _retriever(tmp_path, "near", ["ZEBRAQUILL", "ZEBRAQUILT", "MARMOTLANTERN"])
     focused = RetrievalTrace()
-    _assembler(near, min_score=0.0).build(date(2026, 9, 1), "As of August 2, 2026, what about Zebraquill?", trace=focused)
+    question = "As of August 2, 2026, what about Zebraquill?"
+    _assembler(near, min_score=0.0).build(date(2026, 9, 1), question, trace=focused)
     removed = focused.data["focus"]["removed"]
     assert {r["reason"] for r in removed} == {"near_name", "after_time_anchor"}
     for row in removed:
         assert set(row) <= {"vector_rank", "id", "day", "time", "score", "reason"}
         assert all(isinstance(v, (int, float, str, bool, type(None))) for v in row.values())
-    assert all(isinstance(v, (int, bool, list, dict)) for v in focused.data["focus"].values())
+    assert all(isinstance(v, (int, float, bool, list, dict)) for v in focused.data["focus"].values())
     assert all(isinstance(k, str) and isinstance(v, int) for k, v in focused.data["focus"]["removed_by_reason"].items())
     blob = json.dumps(focused.data)
     for needle in ["ZEBRAQUILL", "ZEBRAQUILT", "Zebraquill", "zebraquill", "MARMOTLANTERN", "Synthetic", "topic"]:

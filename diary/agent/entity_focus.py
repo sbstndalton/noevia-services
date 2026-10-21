@@ -9,22 +9,29 @@ detail as competing with another's. This module needs no model call.
   titles such as "Dr" or "Dr." are not part of the name). A follow-up that names nobody ("and her
   email?") carries the entities of the previous question in the same conversation.
 - Each candidate is classified per asked entity. Names compare case-, accent-, title- and
-  punctuation-insensitively:
-    match    names the entity in full;
-    partial  names only part of a multi-word name on its own ("Alder called", "Dr. Brannock");
-    near     names a similar but different spelling (every word equal or within a small edit distance);
-    variant  names a possible short form ("Al" for "Alder"): never treated as a different person;
-    shared   names a different full name that shares a word with the entity.
-- Only confirmed near-name hits are dropped: a near hit is dropped when some other candidate names the
-  same entity in full, so the diary does name that person and the near spelling is someone else. With no
-  full match for an entity nothing is dropped (a typo or a nickname in the question must not hide the entry);
-  similar names are labelled "may be a different person; check the name" instead.
-- Other people: when the question names a person (a full name, or a title and a name) and some candidate
-  names that person in full, a candidate that explicitly names only other identified people (full names or
-  titled names; a single word such as "Marit" identifies nobody for certain), none of them matching or
-  resembling an asked entity, is dropped too (a different full name that only shares a first name or a
-  surname, "Alder Pennick" for "Alder Brannock", is another person, not a resemblance). Entries naming nobody, or the asked person alongside others,
-  stay.
+  punctuation-insensitively; "**Me:**"-style role labels and function words ("We", "So") are never names:
+    match     names the entity in full;
+    extended  names it with a middle name or initial, or in reverse order ("Alder J. Brannock");
+    partial   names only part of a multi-word name on its own ("Alder called", "Dr. Brannock");
+    near      names a similar but different spelling (every word equal or within a small edit distance);
+    variant   names a possible short form or initial ("Al", "A. Brannock"): never a different person;
+    shared    names a different full name that shares a word with the entity ("Alder Pennick").
+- An entry "could refer" to an asked entity when it is match, extended, partial, near or variant for it,
+  shares a name with one that no hit names in full, or spells it in lower case. Such entries are never
+  dropped for a name. Only when some hit names an asked entity in full (a "full exact hit"):
+    near_name     a near spelling of that entity: the diary names the person, so this is someone else;
+    other_person  (the asked entity is a person: a full name, or a title and a name) the entry could refer
+                  to no asked entity and confidently names another person in its body: a title and a
+                  name, or a full name that is not sentence-initial and does not look like a place,
+                  organisation or work. Single words ("Marit", "Mum", "Leeds") identify nobody;
+    below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
+                  full exact hit (a deliberate precision/recall trade-off, see the README).
+  With no full exact hit nothing is dropped for a name (a typo or a nickname in the question must not
+  hide the entry); similar names are labelled "may be a different person, check the name" instead.
+  A relational question ("Alder Brannock's sister") drops nothing for not naming the asked entity.
+- Accepted recall limits: an entry about the asked person that never names them (a pronoun only, a
+  nickname unrelated to the name such as "Bob" for "Robert", a relation not phrased as "X's sister") is
+  dropped when it names another person, or scores more than MARGIN below the best exact hit.
 - Time anchor: an explicitly framed question ("As of <date>, ...?", "As at <date>", or a question opening
   "Before/Until/Up to <date>, ...?") drops candidates dated after it. A date in a statement does not.
 - Supersession: an earlier entry about the same entity is labelled superseded only by an explicit
@@ -41,6 +48,9 @@ from datetime import date
 from typing import Dict, List, Optional, Sequence, Tuple
 
 MAX_ENTITIES = 4
+# below_margin: an entry naming no asked entity is dropped when it scores more than this below the best full
+# exact-name hit. A deliberate precision/recall trade-off (README); retrieval.entity_focus_margin overrides it.
+MARGIN = 0.05
 
 MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
           "november", "december"]
@@ -100,14 +110,18 @@ def _sentence_start(text: str, pos: int) -> bool:
 
 
 def _cap_runs(text: str, stop: bool) -> List[List[Tuple[str, int]]]:
-    """Runs of capitalised words joined only by spaces (or "." after a title). ``stop`` splits at non-names."""
+    """Runs of capitalised words joined only by spaces (or "." after a title or an initial). ``stop`` splits
+    at non-names."""
     runs: List[List[Tuple[str, int]]] = []
     current: List[Tuple[str, int]] = []
-    prev_end, prev_possessive, prev_title = None, False, False
+    prev_end, prev_possessive, prev_title, prev_initial = None, False, False, False
     for word, start, end, possessive in _words(text):
         gap = text[prev_end:start].strip(" \t") if prev_end is not None else None
-        joined = gap is not None and not prev_possessive and (gap == "" or (prev_title and gap == "."))
-        name_like = word[:1].isupper() and (len(word) > 1 or not stop) and not (stop and word.lower() in _NOT_NAMES)
+        dotted = prev_title or prev_initial  # "Dr. Patel", "Alder J. Brannock"
+        joined = gap is not None and not prev_possessive and (gap == "" or (dotted and gap == "."))
+        initial = len(word) == 1 and word.isupper() and word != "I" and text[end:end + 1] == "."
+        name_like = (word[:1].isupper() and (len(word) > 1 or not stop or initial)
+                     and not (stop and not initial and word.lower() in _NOT_NAMES))
         if name_like and current and joined:
             current.append((word, start))
         else:
@@ -115,6 +129,7 @@ def _cap_runs(text: str, stop: bool) -> List[List[Tuple[str, int]]]:
                 runs.append(current)
             current = [(word, start)] if name_like else []
         prev_end, prev_possessive, prev_title = end, possessive, _key(word) in TITLES
+        prev_initial = len(word) == 1 and word.isupper()
     if current:
         runs.append(current)
     return runs
@@ -268,6 +283,10 @@ def near_word(a: str, b: str) -> bool:
 def _relation(word: str, want: str) -> Optional[str]:
     if word == want:
         return "eq"
+    if (len(want) == 1 and word.startswith(want)) or (len(word) == 1 and want.startswith(word)):
+        return "variant"  # an initial: "J" for "John", "A. Brannock" for "Alder Brannock"
+    if word in _NOT_NAMES or word in _ROLE_WORDS:
+        return None  # "We", "Me", "So", a role label: never a spelling or short form of a name
     if near_word(word, want):
         return "near"
     if min(len(word), len(want)) >= 2 and (want.startswith(word) or word.startswith(want)):
@@ -280,16 +299,25 @@ def _subsequence(short: Sequence[str], long: Sequence[str]) -> bool:
     return bool(short) and all(word in it for word in short)
 
 
-ABOUT = ("match", "partial")  # an entry about the entity (full name, or first name or surname alone)
-_RANK = {"match": 5, "partial": 4, "near": 3, "variant": 2, "shared": 1}
+# Kinds that make an entry about the entity: the full name; the full name with a middle name or initial, or in
+# reverse order ("Alder J Brannock", "Brannock Alder"); or a first name or surname on its own.
+ABOUT = ("match", "extended", "partial")
+_RANK = {"match": 6, "extended": 5, "partial": 4, "near": 3, "variant": 2, "shared": 1}
+_ROLE_WORDS = {"assistant", "claude", "companion", "user"}
+_ROLE_LABEL = re.compile(r"\*\*\s*(?:Me|Assistant|Claude|Companion|User)\s*:\s*\*\*", re.I)
+
+
+def _clean(text: str) -> str:
+    """Text to read names from: no "**Me:**" / "**Assistant:**" role labels (each starts a new sentence)."""
+    return _ROLE_LABEL.sub("\n", _norm(text))
 
 
 def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
     """(kind, the name as written) of the strongest mention of ``entity`` in ``text``; kind is one of match,
-    partial (a first name or surname on its own), near, variant, shared or None (module docstring)."""
+    extended, partial, near, variant, shared or None (see the module docstring)."""
     e, n = entity.keys, len(entity.keys)
     best: Tuple[Optional[str], Optional[str]] = (None, None)
-    for run in _cap_runs(_norm(text), stop=False):
+    for run in _cap_runs(_clean(text), stop=False):
         words = [w for w, _ in run]
         keys = _keys(words)
         if not keys:
@@ -298,10 +326,12 @@ def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
         if any(keys[i:i + n] == e for i in range(len(keys) - n + 1)):
             return "match", shown
         kinds = []
+        if n >= 2 and len(keys) >= n and (_subsequence(e, keys) or set(e) <= set(keys)):
+            kinds.append("extended")  # "Alder John Brannock", "Alder J. Brannock", "Brannock Alder"
         if len(keys) < n and _subsequence(keys, e):
             kinds.append("partial")  # "Alder called", "Dr. Brannock": part of a longer name on its own
         windows = [keys[i:i + n] for i in range(len(keys) - n + 1)]
-        if n >= 2 and len(keys) == 1:  # a lone word: compared with the first name and the surname
+        if n >= 2 and len(keys) == 1 and len(keys[0]) > 1:  # a lone word (not a lone letter) vs each name
             rel = [_relation(keys[0], e[0]), _relation(keys[0], e[-1])]
             if "near" in rel:
                 kinds.append("near")
@@ -321,7 +351,14 @@ def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
 
 # ---------------- other identified people ----------------
 
-# Last words that make a capitalised phrase a place, organisation or thing rather than a person.
+# First and last words that make a capitalised phrase a place, organisation or work rather than a person.
+_NOT_PERSON_FIRST = {
+    "blue", "red", "green", "black", "white", "grey", "gray", "yellow", "orange", "purple", "pink", "brown",
+    "golden", "silver", "new", "old", "north", "south", "east", "west", "northern", "southern", "eastern",
+    "western", "upper", "lower", "great", "little", "big", "royal", "national", "united", "grand", "central",
+    "saint", "mount", "lake", "peak", "port", "fort", "cape", "the", "morning", "evening", "weekly", "daily",
+    "monthly", "annual", "happy", "merry", "good", "best", "first", "second", "third", "last", "final",
+}
 _NOT_PERSON_LAST = {
     "moor", "cove", "bay", "point", "hill", "hills", "street", "st", "road", "rd", "lane", "avenue", "way", "lock",
     "mill", "wood", "woods", "fell", "end", "cross", "quay", "flats", "sands", "rise", "hollow", "fold", "gap",
@@ -333,29 +370,54 @@ _NOT_PERSON_LAST = {
     "project", "council", "company", "ltd", "inc", "group", "team", "crossing", "kingdom", "states", "sea",
     "ocean", "mountain", "mountains", "forest", "castle", "abbey", "cathedral", "airport", "port", "pier",
     "theatre", "cinema", "hotel", "inn", "pub", "bar", "restaurant", "kitchen", "bakery", "studio", "works",
+    "district", "region", "province", "state", "republic", "borough", "ward", "estate", "trust", "society",
+    "association", "foundation", "institute", "bank", "agency", "service", "services", "limited", "plc", "llc",
+    "press", "books", "records", "festival", "show", "series", "band", "orchestra", "choir", "league", "cup",
+    "fc", "rovers", "trip", "pages", "review", "time", "day", "week", "notes", "plan", "list", "meeting",
+    "men", "women", "man", "woman", "people", "kids", "children", "boys", "girls", "everyone", "family",
 }
 
 
 def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
-    """The comparison words of a capitalised phrase that identifies a person: a title and a name ("Dr.
-    Patel"), or a two- to four-word full name ("Bryony Castellow") that is not a place or organisation.
-    A single word ("Marit", "Scarrow") identifies nobody for certain, so it is never counted."""
+    """The comparison words of a capitalised phrase that confidently identifies a person: a title and a name
+    ("Dr. Patel"), or a two- to four-word full name ("Bryony Castellow") that does not look like a place,
+    organisation or work. A single word ("Marit", "Leeds", "Mum") identifies nobody for certain."""
     if not words:
         return None
     titled = _key(words[0]) in TITLES
     keys = _keys(words)
-    if not keys or any(k in _NOT_NAMES for k in keys):
+    if not keys or any(k in _NOT_NAMES or len(k) < 2 for k in keys):
         return None
-    if titled or (2 <= len(keys) <= 4 and keys[-1] not in _NOT_PERSON_LAST):
+    if any(len(w) > 1 and w.isupper() for w in words):
+        return None  # an acronym or numeral ("Eckert IV", "NHS Trust"): not a confident person name
+    if titled:
+        return keys if keys[-1] not in _NOT_PERSON_LAST else None  # not "Mr Men"
+    if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST and keys[-1] not in _NOT_PERSON_LAST:
         return keys
     return None
 
 
+_HEADER_LINE = re.compile(r"^\s*(?:\[\d{4}-\d{2}-\d{2}\]\s*)?#+\s.*$", re.M)
+
+
+def _body(row: dict) -> str:
+    """An entry's own words: the text without its header lines or role labels (headers are often title case)."""
+    return _clean(_HEADER_LINE.sub("\n", str(row.get("text") or "")))
+
+
 def identified_people(text: str) -> List[Tuple[str, ...]]:
-    """The people ``text`` explicitly names (see _person_keys), as comparison words."""
+    """The people ``text`` confidently names (see _person_keys), as comparison words.
+
+    A sentence-initial word never starts a person name unless it is a title: "Visited Leeds", "Called Mum"
+    and "Saw Marit" leave the single words "Leeds", "Mum" and "Marit", which identify nobody. So a full name
+    opening a sentence ("Bryony Castellow came") is not counted either: dropping too little is the safe side."""
+    text = _clean(text)
     out = []
-    for run in _cap_runs(_norm(text), stop=False):
-        keys = _person_keys([w for w, _ in run])
+    for run in _cap_runs(text, stop=False):
+        words = [w for w, _ in run]
+        if _sentence_start(text, run[0][1]) and _key(words[0]) not in TITLES:
+            words = words[1:]
+        keys = _person_keys(words)
         if keys and keys not in out:
             out.append(keys)
     return out
@@ -366,11 +428,53 @@ def is_person(entity: Entity) -> bool:
     return _person_keys(entity.name.split()) is not None
 
 
+RELATIONS = {
+    "sister", "brother", "mother", "father", "mum", "mom", "mam", "dad", "wife", "husband", "partner", "spouse",
+    "son", "daughter", "child", "children", "kid", "kids", "baby", "friend", "boyfriend", "girlfriend", "fiance",
+    "fiancee", "boss", "manager", "colleague", "coworker", "neighbour", "neighbor", "cousin", "aunt", "uncle",
+    "niece", "nephew", "grandmother", "grandfather", "grandma", "grandpa", "granddaughter", "grandson", "nan",
+    "family", "parent", "parents", "sibling", "siblings", "stepmother", "stepfather", "stepson", "stepdaughter",
+    "flatmate", "housemate", "roommate", "landlord", "landlady", "carer", "doctor", "therapist", "teacher",
+    "student", "mentor", "ex", "twin", "in-laws", "relative", "relatives",
+}
+
+
+def relational(message: str, entities: Sequence[Entity]) -> bool:
+    """The question asks about someone by their relation to an asked entity ("Alder Brannock's sister"):
+    that person's entries need not name the asked one, so nothing is dropped for not naming them."""
+    text = _norm(message)
+    for e in entities:
+        name = r"\.?\s+".join(re.escape(w) for w in e.name.split())
+        for m in re.finditer(name + r"(?:'s|')\s+((?:[^\W\d_]+\s+)?[^\W\d_-]+(?:-[^\W\d_]+)?)", text, re.I):
+            words = [w.lower() for w in m.group(1).split()]
+            if any(w in RELATIONS or w.rstrip("s") in RELATIONS for w in words):
+                return True
+    return False
+
+
+def could_refer(found: Sequence[Tuple[Optional[str], Optional[str]]], entities: Sequence[Entity],
+                matched: Sequence[Entity], text: str) -> bool:
+    """The entry may be about an asked entity, so no name-based drop may touch it: it names one in any
+    form (full, extended, partial, near or variant), shares a name with one that no hit names in full (a
+    nickname case), or spells an asked multi-word name in lower case ("went sailing with alder brannock")."""
+    plain = _plain(text)
+    for (kind, _), e in zip(found, entities):
+        if kind in ABOUT or kind in ("near", "variant"):
+            return True
+        if kind == "shared" and e not in matched:
+            return True
+        if len(e.keys) >= 2 and f" {' '.join(e.keys)} " in plain:
+            return True
+    return False
+
+
 @dataclass
 class FocusResult:
     entities: List[Entity] = field(default_factory=list)
     carried: bool = False  # the entities come from the previous question (a name-less follow-up)
     anchor: Optional[Tuple[date, bool]] = None
+    relational: bool = False  # asks about someone by relation ("X's sister"): no drop for not naming X
+    margin: float = MARGIN
     matched: List[Entity] = field(default_factory=list)  # entities some candidate names in full
     kept: List[Tuple[int, dict]] = field(default_factory=list)  # (vector rank, row), score order
     removed: List[Tuple[int, dict, str]] = field(default_factory=list)  # (vector rank, row, reason)
@@ -390,23 +494,30 @@ class FocusResult:
 def analyse(message: str, earlier: Sequence[str] = ()) -> FocusResult:
     entities = asked_entities(message)
     carried = [] if entities else carried_entities(message, earlier)
-    return FocusResult(entities=entities or carried, carried=bool(carried), anchor=time_anchor(message))
+    found = entities or carried
+    return FocusResult(entities=found, carried=bool(carried), anchor=time_anchor(message),
+                       relational=relational(message if entities else (list(earlier) or [""])[-1], found))
 
 
 def _row_text(row: dict) -> str:
     return f"{row.get('header') or ''}\n{row.get('text') or ''}"
 
 
+def _score(row: dict) -> Optional[float]:
+    try:
+        return float(row.get("score"))
+    except (TypeError, ValueError):
+        return None
+
+
 def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None,
-                     earlier: Sequence[str] = ()) -> FocusResult:
+                     earlier: Sequence[str] = (), margin: float = MARGIN) -> FocusResult:
     """Check vector candidates (``rows`` in score order) against ``message``; keep at most ``limit``.
 
-    Removal reasons: ``after_time_anchor``, ``near_name`` (names only a near spelling of an entity that
-    another candidate names in full), ``other_person`` (when an asked person is named in full by some
-    candidate: names only other identified people, none matching or resembling an asked entity; sharing
-    just a first name or surname is not resembling) and
-    ``candidate_limit`` (beyond ``limit``). Kept rows stay in order."""
+    Removal reasons (module docstring): ``after_time_anchor``, ``near_name``, ``other_person``,
+    ``below_margin`` and ``candidate_limit``. Kept rows stay in score order."""
     res = analyse(message, earlier)
+    res.margin = margin
     ranked = list(enumerate(rows, 1))
     if res.anchor is not None:
         cutoff, inclusive = res.anchor
@@ -424,23 +535,32 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
     if res.entities:
         kinds = {rank: [classify(_row_text(row), e) for e in res.entities] for rank, row in ranked}
         res.matched = [e for i, e in enumerate(res.entities) if any(k[i][0] == "match" for k in kinds.values())]
-        # Asked people some hit names in full: hits naming only other identified people can go.
-        people_asked = [e for e in res.matched if is_person(e)]
+        exact = [_score(row) for rank, row in ranked
+                 if any(kind == "match" and res.entities[i] in res.matched for i, (kind, _) in enumerate(kinds[rank]))]
+        exact = [s for s in exact if s is not None]
+        best = max(exact) if exact else None
+        # Name-based drops need a full exact hit, and none for a relational question.
+        people_asked = [] if res.relational else [e for e in res.matched if is_person(e)]
         survivors = []
         for rank, row in ranked:
             found = kinds[rank]
             if any(kind in ABOUT for kind, _ in found):
                 survivors.append((rank, row))
                 continue
-            confirmed = [i for i, (kind, _) in enumerate(found) if kind == "near" and res.entities[i] in res.matched]
-            if confirmed:
-                res.removed.append((rank, row, "near_name"))
+            if any(kind == "near" and res.entities[i] in res.matched for i, (kind, _) in enumerate(found)):
+                res.removed.append((rank, row, "near_name"))  # a near spelling of a name the diary has in full
                 continue
-            if people_asked and all(kind in (None, "shared") for kind, _ in found) and identified_people(_row_text(row)):
-                res.removed.append((rank, row, "other_person"))  # names only other people, none like the asked
-                continue
+            if not could_refer(found, res.entities, res.matched, _row_text(row)) and not res.relational:
+                if people_asked and identified_people(_body(row)):
+                    res.removed.append((rank, row, "other_person"))
+                    continue
+                score = _score(row)
+                if best is not None and score is not None and best - score > margin:
+                    res.removed.append((rank, row, "below_margin"))
+                    continue
             survivors.append((rank, row))
-            similar = [(_RANK[kind], kind, shown, res.entities[i].name) for i, (kind, shown) in enumerate(found) if kind]
+            similar = [(_RANK[kind], kind, shown, res.entities[i].name)
+                       for i, (kind, shown) in enumerate(found) if kind]
             if similar:
                 res.similar[rank] = max(similar)[1:]
         ranked = survivors
@@ -537,11 +657,14 @@ def context_notes(res: FocusResult) -> List[str]:
         if res.matched:
             line += (f" Entries naming {_names(res.matched)}, or only the first name or surname, are about "
                      f"{'that person' if len(res.matched) == 1 else 'those people'}.")
-            if any(reason == "near_name" for _, _, reason in res.removed):
+            reasons = {reason for _, _, reason in res.removed}
+            if "near_name" in reasons:
                 line += (" Entries naming only a near spelling of that name were left out: the diary names the"
                          " person exactly, so the near spelling is someone else.")
-            if any(reason == "other_person" for _, _, reason in res.removed):
-                line += " Entries naming only other people were left out."
+            if reasons & {"other_person", "below_margin"}:
+                line += (" Some entries that named none of the asked names were left out, so this list may be"
+                         " incomplete: an entry about the asked person that does not name them (a pronoun or"
+                         " a nickname) may be missing.")
         if unmatched:
             line += (f" No retrieved entry names {_names(unmatched)} exactly. An entry with a similar name may be a"
                      " different person, or the name may be spelled differently: check the name before relying"
