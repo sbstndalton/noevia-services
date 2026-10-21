@@ -77,7 +77,7 @@ def test_stream_error_reason_chat_timeout_wins_over_model_failed():
 
 def test_stream_error_without_the_timeout_reason_uses_its_code():
     assert ask(504, {"type": "error", "code": "modelFailed", "saved": False})["error_code"] == "modelFailed"
-    
+
 
 def test_v1_502_length_cap_code_is_recorded():
     body = {"error": {"message": "the answer hit the length cap", "type": "api_error", "code": "length_cap"}}
@@ -99,6 +99,13 @@ def test_error_code_of_reads_the_reason_from_the_nested_error_too():
     assert harness.error_code_of({"error": {"code": "modelFailed", "reason": "length_cap"}}) == "length_cap"
     assert harness.error_code_of({"error": {"code": "length_cap"}}) == "length_cap"
     assert harness.error_code_of({"error": {"code": "modelFailed", "reason": ""}}) == "modelFailed"
+
+
+def test_a_nested_error_code_beats_a_top_level_reason_but_reason_wins_inside_one_object():
+    # #144: the nested object is read first; only inside one object does `reason` win over `code`.
+    assert harness.error_code_of({"error": {"code": "length_cap"}, "reason": "x"}) == "length_cap"
+    assert harness.error_code_of({"error": {"code": "length_cap", "reason": "y"}, "reason": "x"}) == "y"
+    assert harness.error_code_of({"error": "text", "code": "modelFailed", "reason": "x"}) == "x"
 
 
 @pytest.mark.parametrize("diary", ["oops", 7, ["x"], True])
