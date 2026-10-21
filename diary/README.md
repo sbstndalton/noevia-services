@@ -125,8 +125,13 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   until 3 March") is not an anchor.
 - A hit that could refer to an asked entity is never dropped for a name: one that names it in full, with a
   middle name or initial or in reverse order ("Alder J. Brannock"), by first name or surname alone, by a short
-  form ("Al"), by a near spelling or a shared name of an entity that no hit names in full, or in lower case
-  (one-word names of three or more letters too: "saw marit"). Names compare without case, accents or letters
+  form ("Al", or one from a small table of unambiguous pairs such as "Will" for "William" or "Jan" for
+  "Janet"; "Mark" is its own name, not a short form of "Marcus"), by a shared name of an entity
+  that no hit names in full, or in lower case (one-word names of three or more letters too: "saw marit"). A
+  near spelling is kept (and labelled) while no hit names that entity in full; once one does, it is dropped
+  as `near_name`. A short form that is also an ordinary word ("Will", "May", "Mark", "Bill", "Jan") counts
+  only where its position and the next word read as a name: "Will you ...", "Mark the date", "Bill me" and
+  "in Jan 2030" name nobody, and in a question it never counts when it opens the sentence. Names compare without case, accents or letters
   such as ø, ł and ß ("Søren" = "Soren", "Strauß" = "Strauss").
 - Only when some hit names an asked entity in full (a full exact hit), a hit that cannot refer to any asked
   entity is dropped as:
@@ -134,7 +139,10 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   - `other_person`: the asked entity is a person (a full name, or a title and a name) and the hit's own body
     confidently names another person: a title and a name, or a full name that does not open a sentence (list
     markers, quotes and dashes are skipped: "- Visited Leeds", "1) Called Mum") and does not look like a place,
-    organisation or work. Single words ("Marit", "Mum", "Leeds"), relation words and headers never count;
+    organisation, product or work (a whole listed place phrase such as "San Francisco" or "Hong Kong", or an
+    institutional ending such as "... Maps", "... Bank", "... Airport", "... University"). A given name and
+    surname is always a person, whatever word precedes it ("visited Anna Pirelli"). Single words ("Marit", "Mum", "Leeds"), relation words
+    and headers never count;
   - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`; a gap of exactly
     the margin is kept) below the best full exact hit. It arms only for an asked name of two or more words or a
     titled name ("Alder Brannock", "Hollin Moor", "Dr Patel"), never for a lone word ("Christmas", "Paris",
@@ -149,7 +157,7 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   value found in it ("..., not smoked lapsang").
 
 Accepted recall limits, each pinned by a test: an entry about the asked person that never names them (a
-pronoun only, a nickname unrelated to the name such as "Bob" for "Robert") is dropped when it confidently names
+pronoun only, a nickname unrelated to the name and not in the short-form table, such as "Ziggy") is dropped when it confidently names
 another person or falls below the margin; a work title read as a full name ("Moby Dick") counts as a person. When anything was dropped for not naming the asked entities, the
 note says the list may be incomplete.
 

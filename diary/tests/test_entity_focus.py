@@ -770,7 +770,7 @@ def test_limit_relational_question_drops_nothing_for_not_naming():
 
 
 def test_limit_unrelated_nickname_beside_another_person_is_dropped():
-    rows = _rows("Went to Leeds with Robert Hale.", "Went sailing; Bob and then Bryony Castellow came too.")
+    rows = _rows("Went to Leeds with Robert Hale.", "Went sailing; Ziggy and then Bryony Castellow came too.")
     assert _kept_reasons("Where did Robert Hale go?", rows) == ([1], {2: "other_person"})  # accepted limit
 
 
@@ -1055,3 +1055,113 @@ def test_mc_and_mac_spellings_are_near_names():
     """Accepted, like "Mueller" for "Müller": a different spelling is a near name when the exact one exists."""
     rows = _rows("Tom McDonald said hi.", "Tom MacDonald rang.", scores=[0.9, 0.3])
     assert _kept_reasons("What did Tom McDonald say?", rows) == ([1], {2: "near_name"})
+
+
+# ---------------- services#118: short forms, places and brands, sentence-initial verbs ----------------
+
+def test_listed_short_form_is_kept_beside_another_person():
+    """#118 reverses the #117 limit for listed short forms: "Bob" is a short form of "Robert"."""
+    rows = _rows("Went to Leeds with Robert Hale.", "Went sailing; Bob and then Bryony Castellow came too.")
+    assert _kept_reasons("Where did Robert Hale go?", rows) == ([1, 2], {})
+
+
+@pytest.mark.parametrize("short, full", [("Will", "William"), ("Bill", "William"), ("Jan", "Janet"),
+                                         ("Peggy", "Margaret"), ("Jim", "James"), ("Liz", "Elizabeth")])
+def test_short_form_in_an_entry_is_a_variant_of_the_full_name(short, full):
+    entity = ef.Entity(f"{full} Ashcombe", (full.lower(), "ashcombe"))
+    assert ef.classify(f"Had lunch and then {short} came over.", entity)[0] == "variant"
+    assert ef.classify(f"{short} called about the boat.", entity)[0] == "variant"  # sentence-initial, a name
+    rows = _rows(f"Went to Leeds with {full} Ashcombe.", f"That evening {short} sailed with Bryony Castellow.")
+    assert _kept_reasons(f"Where did {full} Ashcombe go?", rows) == ([1, 2], {})
+
+
+@pytest.mark.parametrize("question", ["What did Will say about the boat?", "Where did Jan go sailing?",
+                                      "Is Bill still at the harbour?"])
+def test_short_form_in_the_question_is_an_asked_name_matching_full_name_entries(question):
+    entities = ef.asked_entities(question)
+    assert len(entities) == 1
+    rows = _rows("William Ashcombe and Janet Ashcombe went sailing.", "Bought bread.")
+    assert ef.classify(rows[0]["text"], entities[0])[0] == "variant"
+    kept, removed = _kept_reasons(question, rows)
+    assert 1 in kept and removed == {}
+
+
+@pytest.mark.parametrize("question", ["Will you remind me what I ate?", "May I see my notes?",
+                                      "Mark the date: what did I plan?", "Bill me later, what was the cost?",
+                                      "Will it rain at the harbour?", "What did I do in Jan 2030?",
+                                      "What happened on 3 Jan 2030?", "Will?"])
+def test_sentence_initial_modal_or_verb_and_months_are_not_asked_names(question):
+    assert ef.asked_entities(question) == []
+
+
+@pytest.mark.parametrize("text", ["Will you call me back?", "Mark the date in the planner.", "Bill me for it.",
+                                  "May I come too?", "Will be late tonight.", "Met them in Jan 2030."])
+def test_sentence_initial_verb_in_an_entry_is_not_a_short_form(text):
+    for full in ("William", "Marcus", "Mary", "Janet"):
+        entity = ef.Entity(f"{full} Ashcombe", (full.lower(), "ashcombe"))
+        assert ef.classify(text, entity)[0] is None, (text, full)
+    assert ef.identified_people(text) == []
+
+
+def test_sentence_initial_verb_does_not_shield_an_other_person_entry():
+    rows = _rows("Went to Leeds with William Ashcombe.", "Will you ask Bryony Castellow about it?")
+    assert _kept_reasons("Where did William Ashcombe go?", rows) == ([1], {2: "other_person"})
+
+
+@pytest.mark.parametrize("phrase", ["San Francisco", "Hong Kong", "Kuala Lumpur", "Orbel Maps",
+                                    "Harrow Bank", "Dunmore Airport", "Kestrel Inc", "Tollan University",
+                                    "Quarry Street", "Fenwick Labs", "Santa Rosa", "Los Alamos"])
+def test_places_and_brands_are_not_other_people(phrase):
+    assert ef.identified_people(f"Spent the afternoon with friends and then {phrase} was great.") == [], phrase
+    rows = _rows("Went to Leeds with Alder Brannock.", f"The trip went well and {phrase} was busy.")
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1, 2], {}), phrase
+
+
+def test_a_listed_place_word_after_in_is_still_not_a_person():
+    assert ef.identified_people("We stayed in Port Ellery for a week.") == []  # "Port" opens a place
+
+
+# Review of #119: a preceding word never shields a given name and surname (each failed on f814d1a).
+@pytest.mark.parametrize("text", ["Met near Daniel Ostrow by the pier.", "Walked around Marcus Fenn for hours.",
+                                  "Sent it via Daniel Ostrow.", "Saw a film; visited Anna Pirelli after.",
+                                  "Sat in Anna Pirelli's kitchen.", "We visited Wren Hollin twice.",
+                                  "Found the cafe via Orbel Mapper."])
+def test_a_person_after_a_place_word_is_still_another_person(text):
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), text
+
+
+# Review of #119: given names, particles and surnames that are also place words still name people.
+@pytest.mark.parametrize("name", ["Santa Ramirez", "Le Minh", "Rio Ferdinand", "Sri Patel", "Wei Kong",
+                                  "Tom Post", "Hal Ridge", "Jo Tower", "Abu Karim", "Costa Varga",
+                                  "Lucia Plaza", "Paolo Arena", "Ines Mall", "Rosa Terminal"])
+def test_people_with_place_like_names_are_still_other_people(name):
+    rows = _rows("Went to Leeds with Bob Hale.", f"Later we had tea with {name} at the harbour.")
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), name
+
+
+def test_mark_is_not_a_short_form_of_marcus():
+    rows = _rows("Went to Leeds with Marcus Hale.", "Later Mark Hale and Bryony Castellow sailed.")
+    assert _kept_reasons("Where did Marcus Hale go?", rows) == ([1], {2: "other_person"})
+    assert "mark" not in ef.SHORT_FORMS and "sandy" not in ef.SHORT_FORMS
+    assert ef.SHORT_FORMS["jan"] == ("janet",)
+
+
+def test_a_real_other_person_is_still_dropped_beside_places():
+    rows = _rows("Went to Leeds with Alder Brannock.", "Had tea with Bryony Castellow in Hong Kong.")
+    assert ef.identified_people(rows[1]["text"]) == [("bryony", "castellow")]
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1], {2: "other_person"})
+
+
+def test_docs_describe_near_spellings_the_same_way():
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    for text in (ef.__doc__, readme):
+        assert "A near spelling is kept (and labelled) while no hit names that entity in full" in \
+            " ".join(text.split()), text[:40]
+
+
+@pytest.mark.parametrize("name", ["Lucia Plaza", "Paolo Arena"])
+def test_plaza_and_arena_surnames_are_people(name):
+    rows = _rows("Went to Leeds with Alder Brannock.", f"Had tea with {name}.")
+    assert ef.identified_people(rows[1]["text"]) == [tuple(name.lower().split())]
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1], {2: "other_person"})

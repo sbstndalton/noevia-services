@@ -14,16 +14,23 @@ detail as competing with another's. This module needs no model call.
     extended  names it with a middle name or initial, or in reverse order ("Alder J. Brannock");
     partial   names only part of a multi-word name on its own ("Alder called", "Dr. Brannock");
     near      names a similar but different spelling (every word equal or within a small edit distance);
-    variant   names a possible short form or initial ("Al", "A. Brannock"): never a different person;
+    variant   names a possible short form or initial ("Al", "A. Brannock", "Will" for "William", "Jan" for
+              "Janet" from a small explicit table): never a different person. A short form that is also an
+              ordinary word ("Will", "May", "Mark", "Bill", "Jan") counts only where its position and the next
+              word read as a name: "Will you ...", "Mark the date", "Bill me", "in Jan 2030" name nobody;
     shared    names a different full name that shares a word with the entity ("Alder Pennick").
-- An entry "could refer" to an asked entity when it is match, extended, partial or variant for it, is a
-  near spelling of or shares a name with one that no hit names in full, or spells it in lower case. Such
-  entries are never dropped for a name. Only when some hit names an asked entity in full (a "full exact hit"):
+- An entry "could refer" to an asked entity when it is match, extended, partial or variant for it, shares a
+  name with one that no hit names in full, or spells it in lower case. Such entries are never dropped for a
+  name. A near spelling is kept (and labelled) while no hit names that entity in full; once one does, the
+  near spelling is dropped as near_name. Only when some hit names an asked entity in full (a "full exact hit"):
     near_name     a near spelling of that entity: the diary names the person, so this is someone else;
     other_person  (the asked entity is a person: a full name, or a title and a name) the entry could refer
                   to no asked entity and confidently names another person in its body: a title and a
                   name, or a full name that is not sentence-initial and does not look like a place,
-                  organisation or work. Single words ("Marit", "Mum", "Leeds") identify nobody;
+                  organisation, product or work (a whole listed place phrase such as "San Francisco" or
+                  "Hong Kong", or an institutional ending such as "Orbel Maps", "Harrow Bank"). A given
+                  name and surname is always a person, whatever word precedes it.
+                  Single words ("Marit", "Mum", "Leeds") identify nobody;
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
                   full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
                   full exact hit (a deliberate precision/recall trade-off, see the README).
@@ -32,7 +39,7 @@ detail as competing with another's. This module needs no model call.
   A relational question ("Alder Brannock's sister-in-law", "the wife of Alder Brannock") drops nothing for
   not naming the asked entity.
 - Accepted recall limits: an entry about the asked person that never names them (a pronoun only, a
-  nickname unrelated to the name such as "Bob" for "Robert") is dropped when it names another person, or
+  nickname unrelated to the name and not in the short-form table, such as "Ziggy") is dropped when it names another person, or
   scores more than MARGIN below the best exact hit.
 - Time anchor: an explicitly framed question ("As of <date>, ...?", "As at <date>", or a question opening
   "Before/Until/Up to <date>, ...?") drops candidates dated after it. A date in a statement does not.
@@ -141,6 +148,67 @@ def _sentence_start(text: str, pos: int) -> bool:
     return i < 0 or text[i] in _SENTENCE_END
 
 
+# Common given-name short forms (short -> full forms). Explicit, not fuzzy; a prefix ("Al", "Alex") already counts.
+SHORT_FORMS: Dict[str, Tuple[str, ...]] = {
+    "will": ("william",), "bill": ("william",), "billy": ("william",), "jan": ("janet",),
+    "bob": ("robert",), "rob": ("robert",), "bobby": ("robert",), "robbie": ("robert",),
+    "jim": ("james",), "jimmy": ("james",), "jack": ("john",), "johnny": ("john",),
+    "dick": ("richard",), "rick": ("richard",), "rich": ("richard",), "ted": ("edward",), "eddie": ("edward",),
+    "tom": ("thomas",), "harry": ("henry",), "chuck": ("charles",), "charlie": ("charles",),
+    "peggy": ("margaret",), "meg": ("margaret",), "maggie": ("margaret",), "liz": ("elizabeth",),
+    "beth": ("elizabeth",), "betty": ("elizabeth",), "kate": ("katherine", "catherine"),
+    "katie": ("katherine", "catherine"), "kathy": ("katherine",), "cathy": ("catherine",),
+    "sue": ("susan",), "susie": ("susan",), "pat": ("patrick", "patricia"), "patty": ("patricia",),
+    "sally": ("sarah",), "nick": ("nicholas",), "andy": ("andrew",), "tony": ("anthony",),
+    "mike": ("michael",), "mick": ("michael",), "dave": ("david",), "joe": ("joseph",),
+    "sam": ("samuel", "samantha"), "ben": ("benjamin",), "dan": ("daniel",), "matt": ("matthew",),
+    "chris": ("christopher", "christine"), "steve": ("stephen", "steven"), "greg": ("gregory",),
+    "jen": ("jennifer",), "jenny": ("jennifer",), "ron": ("ronald",), "don": ("donald",),
+    "fred": ("frederick",), "freddie": ("frederick",),
+}
+# Words a short form must not be followed by to read as a name: pronouns, determiners and the bare verbs and
+# adverbs that follow a modal or an imperative ("Will you", "May I", "Mark the date", "Bill me", "Will be").
+_AFTER_VERB = {
+    "i", "you", "we", "he", "she", "it", "they", "me", "him", "her", "us", "them", "this", "that", "these",
+    "those", "there", "the", "a", "an", "my", "your", "our", "his", "their", "its", "not", "never", "also",
+    "always", "just", "still", "be", "have", "do", "go", "get", "come", "see", "need", "try", "take", "make",
+    "let", "keep", "up", "down", "out", "off", "all", "everyone", "anyone", "someone", "each",
+    "both", "some", "any", "as", "so", "too", "soon", "later", "today", "tomorrow", "tonight", "again",
+}
+_DATE_LEAD = {"in", "on", "since", "until", "till", "by", "from", "of", "last", "next", "early", "late", "mid",
+              "during", "before", "after", "through", "this"}
+# Names that are also verbs or modals: read with the sentence-start context check, short form or not.
+_VERB_FORMS = {"will", "may", "mark", "bill", "rob", "sue", "pat", "jack", "nick", "frank", "chuck", "drew",
+               "rich", "ray", "art", "sandy", "don", "hal", "bob", "dick", "ted"}
+
+
+def _ordinary(key: str) -> bool:
+    """A name that is also an ordinary word: a listed short form that is a modal or a month, or a name that is
+    also a verb ("Mark the date", "May I")."""
+    return key in _VERB_FORMS or (key in SHORT_FORMS and key in _NOT_NAMES)
+
+
+def _reads_as_name(text: str, start: int, end: int, initial: bool) -> bool:
+    """A capitalised ordinary-word short form reads as a name here: not followed by a digit or by a pronoun,
+    determiner or bare verb when it opens a sentence ("Will you", "Mark the date"), not a month after a date
+    word or before a number ("in Jan", "Jan 2030"), and, in a question (``initial`` False), not opening the
+    sentence at all."""
+    opens = _sentence_start(text, start)
+    if opens and not initial:
+        return False
+    nxt = re.match(r"[\s,]*([^\W_]+)", text[end:])
+    if nxt and (nxt.group(1)[:1].isdigit() or (opens and _key(nxt.group(1)) in _AFTER_VERB)):
+        return False  # mid-sentence a capitalised short form is a name ("did Bill still ..."), unless a date
+    if opens and re.match(r"\s*[?!]", text[end:]):
+        return False  # "Will?" on its own
+    prev = re.search(r"([^\W\d_]+)[\s,]*$", text[:start])
+    key = _key(_POSSESSIVE.sub("", text[start:end]))
+    if (key in _MONTH_ABBR or key in MONTHS) and ((prev is not None and _key(prev.group(1)) in _DATE_LEAD)
+                                                    or re.match(r"[\s,]*\d", text[end:]) is not None):
+        return False
+    return True
+
+
 def _cap_runs(text: str, stop: bool) -> List[List[Tuple[str, int]]]:
     """Runs of capitalised words joined only by spaces (or "." after a title or an initial). ``stop`` splits
     at non-names."""
@@ -154,6 +222,10 @@ def _cap_runs(text: str, stop: bool) -> List[List[Tuple[str, int]]]:
         initial = len(word) == 1 and word.isupper() and word != "I" and text[end:end + 1] == "."
         name_like = (word[:1].isupper() and (len(word) > 1 or not stop or initial)
                      and not (stop and not initial and word.lower() in _NOT_NAMES))
+        if word[:1].isupper() and _ordinary(_key(word)) and not (current and joined):
+            # "What did Will say?" is a name; "Will you ...?", "Mark the date", "in Jan 2030" are not. Inside a
+            # run ("Alder Will") the word stays as the run decided.
+            name_like = _reads_as_name(text, start, end, initial=not stop)
         if name_like and current and joined:
             current.append((word, start))
         else:
@@ -317,6 +389,8 @@ def _relation(word: str, want: str) -> Optional[str]:
         return "eq"
     if (len(want) == 1 and word.startswith(want)) or (len(word) == 1 and want.startswith(word)):
         return "variant"  # an initial: "J" for "John", "A. Brannock" for "Alder Brannock"
+    if want in SHORT_FORMS.get(word, ()) or word in SHORT_FORMS.get(want, ()):
+        return "variant"  # a listed short form: "Will" / "William", "Jan" / "Janet", "Bob" / "Robert"
     if word in _NOT_NAMES or word in _ROLE_WORDS:
         return None  # "We", "Me", "So", a role label: never a spelling or short form of a name
     if near_word(word, want):
@@ -407,6 +481,19 @@ _NOT_PERSON_LAST = {
     "press", "books", "records", "festival", "show", "series", "band", "orchestra", "choir", "league", "cup",
     "fc", "rovers", "trip", "pages", "review", "time", "day", "week", "notes", "plan", "list", "meeting",
     "men", "women", "man", "woman", "people", "kids", "children", "boys", "girls", "everyone", "family",
+    # clearly institutional or product endings ("Orbel Maps", "Fenwick Labs", "Dunmore Airport")
+    "maps", "apps", "app", "labs", "lab", "software", "systems", "technologies", "airlines", "airways", "corp",
+    "corporation", "gmbh", "llp", "academy", "polytechnic", "clinic", "pharmacy", "supermarket", "brewery",
+    "studios", "stadium", "magazine",
+}
+# Multi-word places matched as whole phrases, never by one word ("Santa Ramirez" and "Wei Kong" are people).
+PLACE_PHRASES = {
+    ("hong", "kong"), ("kuala", "lumpur"), ("san", "francisco"), ("san", "diego"), ("san", "jose"),
+    ("san", "antonio"), ("los", "angeles"), ("los", "alamos"), ("las", "vegas"), ("buenos", "aires"),
+    ("rio", "de", "janeiro"), ("sao", "paulo"), ("tel", "aviv"), ("phnom", "penh"), ("ho", "chi", "minh"),
+    ("sri", "lanka"), ("costa", "rica"), ("baton", "rouge"), ("santa", "rosa"), ("santa", "fe"),
+    ("santa", "barbara"), ("santa", "monica"), ("palm", "springs"), ("salt", "lake"), ("abu", "dhabi"),
+    ("el", "paso"), ("la", "paz"), ("le", "havre"), ("new", "delhi"), ("cape", "town"), ("hong", "kong", "island"),
 }
 
 
@@ -424,6 +511,8 @@ def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
         return None  # an acronym or numeral ("Eckert IV", "NHS Trust"): not a confident person name
     if titled:
         return keys if keys[-1] not in _NOT_PERSON_LAST else None  # not "Mr Men"
+    if any(keys[i:i + len(ph)] == ph for ph in PLACE_PHRASES for i in range(len(keys) - len(ph) + 1)):
+        return None  # a whole multi-word place ("Hong Kong", "San Francisco")
     if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST and keys[-1] not in _NOT_PERSON_LAST:
         return keys
     return None
