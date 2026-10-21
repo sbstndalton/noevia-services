@@ -45,7 +45,10 @@ class LoggingPipeline:
     def _aux_call(self, template_key: str, system_prompt: str, budget: Optional[ExchangeBudget] = None, **fields) -> str:
         prompt = self.templates[template_key].format(**fields)
 
-        def call(gate, alive):  # aux calls are not streamed; the budget only bounds the wait (#1505)
+        def call(gate, alive):
+            # #1505: nothing of an aux call reaches the user (no gate is passed on). #172: with the deadline's
+            # `alive` the call is streamed internally and its connection is closed when the deadline gives it
+            # up, so the model server stops generating instead of holding its slot until max_tokens.
             return self.llm_aux.chat(
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -54,6 +57,7 @@ class LoggingPipeline:
                 temperature=0.1,
                 max_tokens=2048,
                 stop=None,
+                alive=alive,
             )
 
         if budget is None:
