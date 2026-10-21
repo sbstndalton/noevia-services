@@ -1140,6 +1140,42 @@ def test_people_with_place_like_names_are_still_other_people(name):
     assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), name
 
 
+# #122: a surname-like institutional ending ("bank") shielded real people. It marks an institution only after three
+# or more words or a first word that is no known given name; each person case failed on 3828600.
+@pytest.mark.parametrize("name", ["Elena Bank", "Priya Bank", "Anna-Marie Bank", "Bob Bank", "Dr Bank",
+                                  "Dr Elena Bank", "Dr Northgate Bank"])
+def test_a_given_name_and_a_bank_surname_is_another_person(name):
+    rows = _rows("Went to Leeds with Bob Hale.", f"Later we had tea with {name} at the harbour.")
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), name
+    assert ef.identified_people(f"Later we had tea with {name} at the harbour.") != [], name
+
+
+@pytest.mark.parametrize("name", ["First National Bank", "Northgate Bank", "Harrow Bank", "Elena Marie Bank",
+                                  "Royal Bank", "Dr First National Bank"])
+def test_an_institution_ending_in_bank_is_not_another_person(name):
+    text = f"Later we queued at {name} for an hour."
+    assert ef.identified_people(text) == [], name
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1, 2], {}), name
+
+
+# Endings that are never surnames stay institutions even after a given name: "Ivy Labs" is a company, so a hit
+# naming only it is kept (the unsure side), unlike "Elena Bank". Only "bank" needs the given-name test.
+@pytest.mark.parametrize("name", ["Ivy Labs", "Elena Maps", "Priya Software", "Bob Airways", "Anna Academy",
+                                  "Elena Brewery", "Rose Magazine"])
+def test_a_given_name_before_a_never_surname_ending_is_still_an_institution(name):
+    text = f"Later we spoke to {name} about it."
+    assert ef.identified_people(text) == [], name
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1, 2], {}), name
+
+
+def test_bank_surname_rule_applies_to_the_asked_name_too():
+    assert ef.is_person(ef.Entity("Elena Bank", ("elena", "bank")))
+    assert not ef.is_person(ef.Entity("Northgate Bank", ("northgate", "bank")))
+    assert not ef.is_person(ef.Entity("First National Bank", ("first", "national", "bank")))
+
+
 def test_mark_is_not_a_short_form_of_marcus():
     rows = _rows("Went to Leeds with Marcus Hale.", "Later Mark Hale and Bryony Castellow sailed.")
     assert _kept_reasons("Where did Marcus Hale go?", rows) == ([1], {2: "other_person"})
