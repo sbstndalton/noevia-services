@@ -86,6 +86,7 @@ def _apply_env(cfg: Config) -> None:
         "LLM_AUX_MODEL": "llm.aux.model",
         "LLM_AUX_API_KEY": "llm.aux.api_key",
         "LLM_MAX_ANSWER_TOKENS": "llm.max_answer_tokens",
+        "LLM_MAX_REASONING_TOKENS": "llm.max_reasoning_tokens",
         "CORPUS_BACKEND": "corpus.backend",
         "CORPUS_ROOT": "corpus.root",
         "CORPUS_LOCAL_ROOT": "corpus.local.root",
