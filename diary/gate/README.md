@@ -91,7 +91,7 @@ helper, `gatelib._slots_busy` (a test fails if any other function in the gate bu
 | Load-gate re-checks | `GATE_RECHECKS` (12) x `GATE_RECHECK_S` (5) | `blocked`, kind `load-gate`, with the engines' reasons. |
 | Engines going idle before a restore and before each query turn | `GATE_IDLE_WAIT_S` (900), polled every `GATE_IDLE_POLL_S` (5) | `blocked`, kind `not-idle`; kind `stopped` ("stopped by SIGTERM") as soon as a stop request arrives, except in the wait before a restore. |
 | Another model area still running | `GATE_AREA_WAIT_S` (3600) | the area reports `blocked` (check `serial`) with the holder. A stop request ends the wait early: `blocked` (check `stopped`). |
-| An area overruns under `run_areas.py`, or the runner gets SIGTERM/SIGINT | `GATE_AREA_TIMEOUT_S` (10800), then `GATE_AREA_GRACE_S` (3960: the 600 s chat timeout plus 3360 s to restore) | SIGTERM first (the stop request, see "Stopping a run" below). The area is `blocked` whatever it printed; `areas-run.json` records `timed_out: true`, the child own return code and last result line, and `tenant_may_be_unrestored: true` only when the area had to be killed (SIGKILL) after the grace period. |
+| An area overruns under `run_areas.py`, or the runner gets SIGTERM/SIGINT | `GATE_AREA_TIMEOUT_S` (10800), then `GATE_AREA_GRACE_S` (3960: the 600 s chat timeout plus 3360 s to restore; one area's worst case 10800 + 3960 = 14760 s) | SIGTERM first (the stop request, see "Stopping a run" below). The area is `blocked` whatever it printed; `areas-run.json` records `timed_out: true`, the child own return code and last result line, and `tenant_may_be_unrestored: true` only when the area had to be killed (SIGKILL) after the grace period. |
 
 #### Stopping a run (services#123)
 
@@ -104,9 +104,22 @@ SIGTERM is a request to stop at the next safe point, never a death in the middle
   the stop is waiting for. A follow-up turn that is stopped after the first turn still gets its restore.
 - **Grace period.** `GATE_AREA_GRACE_S` defaults to the diary chat timeout (600 s) plus the worst-case restore
   taken from the same constants the restore waits with: idle wait 900 s (`GATE_IDLE_WAIT_S`), lock wait 1800 s
-  (`GATE_LOCK_TIMEOUT_S`), load-gate re-checks 60 s (`GATE_RECHECKS` x `GATE_RECHECK_S`), settle 300 s, and a 300 s
-  margin for the restore's writes: 3960 s in all, so a stopped area can finish its current call and restore its
-  tenant. Set the variable to change it; only after it has run out is the area killed.
+  (`GATE_LOCK_TIMEOUT_S`), load-gate re-checks 60 s (`GATE_RECHECKS` x `GATE_RECHECK_S`), 300 s shared by settle and
+  the baseline check (`SETTLE_TIMEOUT_S`, every call clamped to it), and the restore's write deadline of 300 s
+  (`RESTORE_WRITE_DEADLINE_S`): 3960 s in all (4500 s with `GATE_RECHECKS=120`), so a stopped area can finish its
+  current call and restore its tenant. Set the variable to change it; only after it has run out is the area killed.
+- **Restore write deadline (services#141).** All of a restore's HTTP calls (listing, reads, deletes, PUTs) share
+  ONE total deadline, `gatelib.RESTORE_WRITE_DEADLINE_S` (300 s), the same constant the grace counts; each call's
+  timeout is the smallest of its own (300 s for a write), and the time left. When the deadline is hit no further
+  call is made, `restore.jsonl` records `incomplete: true`, `deadline_hit: true` and `remaining` (files still
+  differing or not verified), and the area is `blocked` with "restore after ... failed": the area stops there, so no
+  later query runs on the unrestored tenant, and judging its answers cannot turn it into a pass.
+- **Worst case and maintenance windows.** One area can run for up to `GATE_AREA_TIMEOUT_S` + the grace, with the
+  defaults 10800 + 3960 = 14760 s (4 h 6 min). A stop (or an overrun) issued within about 3960 s (66 min) before a
+  daily maintenance window, such as a backup that stops the services, can still be restoring the tenant inside
+  that window. Do not start a run that can reach the window; when a stop must end sooner, set `GATE_AREA_GRACE_S`
+  lower for that run, accepting that an area still restoring is then killed and recorded with
+  `tenant_may_be_unrestored: true`.
 - **The child own result is kept.** When an area exits within the grace period, `areas-run.json` keeps its last
   stdout line (`result`) and its return code (`rc`) next to `timed_out: true` (overrun) or `interrupted: true`
   (the runner was told to stop). `tenant_may_be_unrestored` stays `false`; it is `true` only for a kill, which
