@@ -71,6 +71,11 @@ and the reason is told apart from other model failures (#135): `/v1` answers 502
 by default (never lose content), saved without the shortened-answer note, and one info log line records that
 the marker was missing because of truncation (no answer text).
 
+An answer that stopped normally but holds no answer text (empty, or only the log marker) is also never saved,
+and says so (#146): `/v1` answers 502 with `error.code: "empty_answer"`, the unstreamed local exchange answers
+503 with `code: "modelFailed"`, `reason: "empty_answer"` and `saved: false`, and the stream error event carries
+the same `code`, `reason` and `saved: false`. No `diary` event follows and the exchange is not retried.
+
 ## Embedding model and re-indexing (#1636)
 
 Retrieval embeds each `###` subsection with the configured embedding model. `LLM_EMBED_MODEL` and
