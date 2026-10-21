@@ -754,7 +754,8 @@ def test_places_organisations_and_works_are_not_people():
         assert ef.identified_people(f"We went past {phrase} today.") == [], phrase
     rows = _rows("Blue Heron decided to expand.", "Then Red Kite decided to shrink.")
     assert _kept_reasons("What did Blue Heron decide?", rows) == ([1, 2], {})  # not a person: no other_person
-    assert ef.identified_people("Met Bryony Castellow and Dr. Patel.") == [("bryony", "castellow"), ("patel",)]
+    assert ef.identified_people("Had tea with Bryony Castellow and Dr. Patel.") == [("bryony", "castellow"), ("patel",)]
+    assert ef.identified_people("Met Bryony Castellow and Dr. Patel.") == [("patel",)]  # opens a sentence
     assert ef.identified_people("Bryony Castellow came round.") == []  # sentence-initial: not confident
     assert ef.identified_people("Projected it in the Eckert IV, and the NHS Trust wrote.") == []  # caps: not names
 
@@ -802,7 +803,10 @@ def test_margin_keeps_an_unnamed_hit_within_it_and_drops_one_beyond():
 def test_margin_needs_a_full_exact_hit_and_never_touches_a_possible_mention():
     rows = _rows("Went sailing with Alder Brannock.", "Alder called about the boat.", "Al came round.",
                  "Had tea with Alder Brennock.", "Inked the coastal chart.", scores=[0.9, 0.3, 0.3, 0.3, 0.3])
-    kept, removed = _kept_reasons("Compare Alder Brannock and Bryony Castellow.", rows)
+    kept, removed = _kept_reasons("Compare Alder Brannock and Tobiah Wren.", rows)
+    # Tobiah Wren has no full exact hit, so the margin stays off (its entries may use a form not seen).
+    assert kept == [1, 2, 3, 5] and removed == {4: "near_name"}
+    kept, removed = _kept_reasons("Where did Alder Brannock go?", rows)
     assert kept == [1, 2, 3] and removed == {4: "near_name", 5: "below_margin"}
     assert _kept_reasons("Where did Alder Branock go?", rows) == ([1, 2, 3, 4, 5], {})  # no exact hit
 
@@ -884,3 +888,170 @@ def test_fixture_never_drops_an_entry_about_an_asked_entity(world):
             assert not any(ef.classify(text, e)[0] in ef.ABOUT for e in entities), (q["id"], r)
             if r["reason"] == "other_person":
                 assert ef.identified_people(ef._body({"text": text})), (q["id"], r)
+
+
+# ---------------- re-review of d9238ff (findings 1-8), probes /tmp/rr117-probes kept as regressions ----------------
+
+
+@pytest.mark.parametrize("question, texts", [
+    ("What did I do at Christmas?", ["Christmas with the family, lovely dinner.",
+                                     "Boxing day: long walk after the big family dinner.",
+                                     "Wrapped presents, dinner prep, lights on the tree."]),
+    ("How was my trip to Paris?", ["Arrived in Paris, hotel is small.", "Day two: the Louvre, then a long lunch."]),
+    ("What did I learn about Python?", ["Python decorators finally clicked.",
+                                        "Spent the evening on generators and asyncio."]),
+])
+def test_a_lone_topic_word_never_arms_the_margin(question, texts):
+    scores = [0.9] + [0.6] * (len(texts) - 1)
+    assert _kept_reasons(question, _rows(*texts, scores=scores)) == (list(range(1, len(texts) + 1)), {})
+
+
+def test_multi_word_and_titled_names_arm_the_margin():
+    for question, exact in [("Where did Alder Brannock go?", "Went sailing with Alder Brannock."),
+                            ("What did Dr Patel say?", "Dr Patel said rest."),
+                            ("Which places did I survey during the Hollin Moor survey?", "Day 1 of the Hollin Moor survey.")]:
+        assert _kept_reasons(question, _rows(exact, "Inked the coastal chart.", scores=[0.9, 0.6]))[1] == {2: "below_margin"}
+
+
+@pytest.mark.parametrize("best, score, dropped", [
+    (0.8, 0.75, False), (0.9, 0.85, False), (0.75, 0.70, False), (0.67, 0.62, False), (0.55, 0.50, False),
+    (0.7, 0.65, False), (0.704, 0.654, False), (0.8, 0.7499, True), (0.8, 0.7501, False), (0.9, 0.8499, True),
+])
+def test_margin_boundary_is_exact(best, score, dropped):
+    rows = _rows("Went sailing with Alder Brannock.", "Walked along the estuary with the dog.", scores=[best, score])
+    assert (2 in _kept_reasons("Where did Alder Brannock go?", rows)[1]) is dropped
+
+
+@pytest.mark.parametrize("value, expected", [
+    (0, 0.0), (0.1, 0.1), ("0.1", 0.1), (1, 1.0), (-1, ef.MARGIN), (-0.2, ef.MARGIN), (1.5, ef.MARGIN),
+    ("abc", ef.MARGIN), ("", ef.MARGIN), ("0,05", ef.MARGIN), (None, ef.MARGIN), (True, ef.MARGIN),
+    ("nan", ef.MARGIN), (float("nan"), ef.MARGIN), (float("inf"), ef.MARGIN),
+])
+def test_margin_setting_is_validated(value, expected):
+    assert ef.parse_margin(value) == expected
+
+
+@pytest.mark.parametrize("value", [None, "abc", "", -1, 1.5, "nan", float("nan"), float("inf"), True])
+def test_bad_margin_setting_never_breaks_the_chat_or_the_trace(tmp_path, value, caplog):
+    r = Retriever(tmp_path / "m.db", TrigramLLM())
+    _index_files(r, {"Entries/2030/January/January 1, 2030.md": gen_fixture.render_day(date(2030, 1, 1), [
+        gen_fixture.render_block("09:00 — Boat", "Alder Brannock went sailing on the estuary.", "Noted.", "a1"),
+        gen_fixture.render_block("10:00 — Walk", "Walked along the estuary with the dog.", "Noted.", "a2")])})
+    cfg = _cfg().as_dict()
+    cfg["retrieval"] = {**cfg["retrieval"], "entity_focus_margin": value}
+    asm = ContextAssembler(FakeStore(), r, Config(cfg))
+    asm._system_prompt = lambda: "SYSTEM"
+    trace = RetrievalTrace()
+    asm.build(date(2030, 2, 1), "Where did Alder Brannock go sailing?", trace=trace)
+    assert trace.data["focus"]["margin"] == ef.MARGIN
+    json.dumps(trace.data, allow_nan=False)  # strict JSON: no nan or inf
+
+
+def test_margin_passed_directly_is_validated_too():
+    rows = _rows("Went sailing with Alder Brannock.", "Walked along the estuary with the dog.", scores=[0.8, 0.9])
+    for bad in (-0.1, float("nan"), 2):
+        res = ef.focus_candidates("Where did Alder Brannock go?", rows, margin=bad)
+        assert res.margin == ef.MARGIN and res.removed == []  # a hit above the best is never "below"
+
+
+def test_config_yaml_documents_the_margin():
+    text = (Path(__file__).resolve().parent.parent / "config" / "config.yaml").read_text()
+    assert "entity_focus_margin: 0.05" in text
+
+
+@pytest.mark.parametrize("text", [
+    "- Visited Leeds yesterday.", "* Called Mum after lunch.", "1. Saw Marit at the market.", "1) Called Mum",
+    "> Saw Marit at the market", "“Called Mum yesterday,” I said.", "He said: Called Mum",
+    "— Visited Leeds", "• Visited Leeds", "Went out.\n\n- Met Marit\n- Phoned Mum\n- Cleaned Kitchen",
+    "Then: Visited Leeds", "Done) Called Mum", "Today… Called Mum", "- **Visited Leeds** today",
+    "(Visited Leeds) fine", "Went to the pub. Then Visited Leeds again", "Nice day. Mum Visited Leeds",
+    "TODO: Call Mum", "Spent the day. Next Steps: Call Mum", "I think Mum Called yesterday",
+    "Went out – Visited Leeds after", "[Visited Leeds] fine",
+])
+def test_list_markers_quotes_and_dashes_open_a_sentence(text):
+    rows = [_row("2030-01-01", "09:00 — Boat", _A, 0.5), _row("2030-01-02", "09:00 — Note", text, 0.5)]
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1, 2], {})
+    assert ef.identified_people(text) == []
+
+
+def test_titled_people_after_an_opening_word_still_count():
+    assert ef.identified_people("Then Dr Patel said rest.") == [("patel",)]
+    assert ef.identified_people("Then Aunt Peg phoned.") == [("peg",)]
+    assert ef.identified_people("Called Mum, then Aunt Peg.") == [("peg",)]
+
+
+def test_unmatched_asked_person_disarms_the_margin():
+    rows = _rows("Alder Brannock went sailing.", "Bryony called about the dentist job.", scores=[0.9, 0.8])
+    assert _kept_reasons("Compare Alder Brannock and Bree Castellow.", rows) == ([1, 2], {})
+    rows = _rows("Alder Brannock went sailing.", "Spent the day on the dentist job.", scores=[0.9, 0.7])
+    assert _kept_reasons("Compare Alder Brannock and Bree Castellow.", rows) == ([1, 2], {})
+    both = _rows("Alder Brannock went sailing.", "Bryony Castellow started at the dentist.", "Inked the chart.",
+                 scores=[0.9, 0.85, 0.6])
+    assert _kept_reasons("Compare Alder Brannock and Bryony Castellow.", both)[1] == {3: "below_margin"}
+
+
+@pytest.mark.parametrize("asked, ascii_text", [
+    ("Søren Kierkegaard", "Spoke with Soren Kierkegaard."), ("Łukasz Nowak", "Met Lukasz Nowak."),
+    ("Hans Strauß", "Met Hans Strauss."), ("Hans Strauß", "Met Hans STRAUSS."), ("Zoë Brännock", "Met Zoe Brannock."),
+    ("Ægir Dahl", "Met Aegir Dahl."), ("Đorđe Ilić", "Met Djordje Ilic."),
+])
+def test_letters_without_a_decomposition_fold_for_matching(asked, ascii_text):
+    rows = _rows(f"Met {asked}.", ascii_text, scores=[0.9, 0.85])
+    kept, removed = _kept_reasons(f"What did {asked} say?", rows)
+    if asked.startswith("Đ"):  # "Dj" is a transliteration, not a fold: a near spelling, as for Mueller
+        assert removed in ({}, {2: "near_name"})
+    else:
+        assert kept == [1, 2] and removed == {}
+    assert ef._key("Søren") == "soren" and ef._key("Łukasz") == "lukasz" and ef._key("Strauß") == "strauss"
+
+
+def test_lower_case_mention_of_a_one_word_name_is_protected():
+    rows = _rows("Saw Marit at the market.", "saw marit again. said it would rain", "Inked the chart.",
+                 scores=[0.9, 0.4, 0.4])
+    assert ef.could_refer([(None, None)], [_ent("Marit")], [], "saw marit again")
+    assert not ef.could_refer([(None, None)], [_ent("Al")], [], "al fresco lunch")  # under three letters: no
+    res = ef.focus_candidates("What did Marit say?", rows)
+    assert 2 in [rank for rank, _ in res.kept]
+
+
+@pytest.mark.parametrize("question, relational", [
+    ("What does Alder Brannock's sister-in-law do?", True), ("What does Alder Brannock's mother-in-law think?", True),
+    ("What does the sister of Alder Brannock do?", True), ("What does the wife of Alder Brannock do?", True),
+    ("What does the sister-in-law of Alder Brannock do?", True),
+    ("What does Alder Brannock's older sister do?", True), ("Does Alder Brannock's wife work?", True),
+    ("What does Alder Brannock’s sister do?", True), ("What is Alder Brannock's favourite tea?", False),
+    ("What is the boat of Alder Brannock called?", False),
+])
+def test_relational_questions_include_hyphenated_and_of_forms(question, relational):
+    rows = _rows("Went sailing with Alder Brannock.", "Then Dr Patel started work as a dentist.", scores=[0.9, 0.8])
+    res = ef.focus_candidates(question, rows)
+    assert res.relational is relational
+    if relational:
+        assert res.removed == []
+
+
+# Probes p4 and p6 of the re-review: the asked person's own entries in many spellings all stay.
+@pytest.mark.parametrize("question, exact, other", [
+    ("Where did Alder Brannock go?", "Alder Brannock went sailing.", "Took Alder Brannock’s boat out."),
+    ("Where did Alder Brannock go?", "Alder Brannock went sailing.", "Saw A Brannock out."),
+    ("Where did Alder Brannock go?", "Alder Brannock went sailing.", "Went out with Alder\nBrannock today."),
+    ("Where did Alder Brannock go?", "Alder Brannock went sailing.", "Went out with Alder  Brannock today."),
+    ("Where did Alder Brannock go?", "Alder Brannock went sailing.", "ALDER BRANNOCK called"),
+    ("Where did Alder Brannock go?", "Alder Brannock went sailing.", "went out with alder brannock today"),
+    ("Where did Sean O'Neill go?", "Sean O'Neill went home.", "Took Sean O’Neill’s boat out."),
+    ("Where did Sean O'Neill go?", "Sean O'Neill went home.", "Met Sean ONeill at the pub."),
+    ("Where did Mary Smith-Jones go?", "Mary Smith-Jones went home.", "Met Mary Smith Jones."),
+    ("Where did Mary Smith-Jones go?", "Mary Smith-Jones went home.", "Mrs Smith-Jones called."),
+    ("Where did Jean-Luc Picard go?", "Jean-Luc Picard went home.", "Jean Luc Picard came by."),
+    ("What did Dr Patel say?", "Dr Patel said rest.", "Patel rang about the results."),
+    ("Что сказал Иван Петров?", "Встретил Иван Петров.", "Иван Петров позвонил."),
+])
+def test_rereview_probe_target_spellings_stay(question, exact, other):
+    kept, removed = _kept_reasons(question, _rows(exact, other, scores=[0.9, 0.3]))
+    assert kept == [1, 2] and removed == {}
+
+
+def test_mc_and_mac_spellings_are_near_names():
+    """Accepted, like "Mueller" for "Müller": a different spelling is a near name when the exact one exists."""
+    rows = _rows("Tom McDonald said hi.", "Tom MacDonald rang.", scores=[0.9, 0.3])
+    assert _kept_reasons("What did Tom McDonald say?", rows) == ([1], {2: "near_name"})

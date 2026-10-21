@@ -206,7 +206,7 @@ class ContextAssembler:
             trace.set_status(diag.get("status", "ok"))
         focus = None
         if focused:
-            margin = float(self.cfg.get("retrieval.entity_focus_margin", entity_focus.MARGIN))
+            margin = entity_focus.parse_margin(self.cfg.get("retrieval.entity_focus_margin", entity_focus.MARGIN))
             focus = entity_focus.focus_candidates(user_message, results, limit=candidate_k, earlier=earlier,
                                                   margin=margin)
             ranked = focus.kept

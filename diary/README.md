@@ -117,28 +117,33 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
 - `after_time_anchor`: hits dated after an explicit time anchor are dropped. A date inside a statement ("away
   until 3 March") is not an anchor.
 - A hit that could refer to an asked entity is never dropped for a name: one that names it in full, with a
-  middle name or initial or in reverse order ("Alder J. Brannock"), by first name or surname alone, by a near
-  spelling or a short form ("Al"), by a shared name when no hit names that entity in full, or in lower case.
+  middle name or initial or in reverse order ("Alder J. Brannock"), by first name or surname alone, by a short
+  form ("Al"), by a near spelling or a shared name of an entity that no hit names in full, or in lower case
+  (one-word names of three or more letters too: "saw marit"). Names compare without case, accents or letters
+  such as ø, ł and ß ("Søren" = "Soren", "Strauß" = "Strauss").
 - Only when some hit names an asked entity in full (a full exact hit), a hit that cannot refer to any asked
   entity is dropped as:
   - `near_name`: a near spelling of that entity; the diary names the person, so this is someone else;
   - `other_person`: the asked entity is a person (a full name, or a title and a name) and the hit's own body
-    confidently names another person: a title and a name, or a full name that does not open a sentence and
-    does not look like a place, organisation or work. Single words ("Marit", "Mum", "Leeds") and headers
-    never count;
-  - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`) below the best
-    full exact hit. This is a deliberate precision/recall trade-off: an unnamed entry about the person (a
-    pronoun only) that scores more than the margin below the best exact hit is dropped.
+    confidently names another person: a title and a name, or a full name that does not open a sentence (list
+    markers, quotes and dashes are skipped: "- Visited Leeds", "1) Called Mum") and does not look like a place,
+    organisation or work. Single words ("Marit", "Mum", "Leeds"), relation words and headers never count;
+  - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`; a gap of exactly
+    the margin is kept) below the best full exact hit. It arms only for an asked name of two or more words or a
+    titled name ("Alder Brannock", "Hollin Moor", "Dr Patel"), never for a lone word ("Christmas", "Paris",
+    "Python"), and only while every asked entity has a full exact hit. A two-word place or product ("San
+    Francisco") arms it too. This is a deliberate precision/recall trade-off: an unnamed entry about the person
+    (a pronoun only) that scores more than the margin below the best exact hit is dropped. The setting must be
+    a number in [0, 1]; anything else logs a warning and uses 0.05.
 - With no full exact hit nothing is dropped for a name (a typo or a short form in the question); similar names
-  are labelled "may be a different person, check the name". A relational question ("Alder Brannock's sister")
-  drops nothing for not naming the asked entity.
+  are labelled "may be a different person, check the name". A relational question ("Alder Brannock's sister",
+  "sister-in-law", "the wife of Alder Brannock") drops nothing for not naming the asked entity.
 - An earlier entry is labelled superseded only by an explicit correction of the same entity that replaces a
   value found in it ("..., not smoked lapsang").
 
 Accepted recall limits, each pinned by a test: an entry about the asked person that never names them (a
-pronoun only, a nickname unrelated to the name such as "Bob" for "Robert", a relation not phrased as "X's
-sister") is dropped when it confidently names another person or falls below the margin; a work title read as a
-full name ("Moby Dick") counts as a person. When anything was dropped for not naming the asked entities, the
+pronoun only, a nickname unrelated to the name such as "Bob" for "Robert") is dropped when it confidently names
+another person or falls below the margin; a work title read as a full name ("Moby Dick") counts as a person. When anything was dropped for not naming the asked entities, the
 note says the list may be incomplete.
 
 A short note opens the retrieved block. Messages without a name or anchor are unaffected, and

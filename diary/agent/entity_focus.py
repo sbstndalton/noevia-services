@@ -16,22 +16,24 @@ detail as competing with another's. This module needs no model call.
     near      names a similar but different spelling (every word equal or within a small edit distance);
     variant   names a possible short form or initial ("Al", "A. Brannock"): never a different person;
     shared    names a different full name that shares a word with the entity ("Alder Pennick").
-- An entry "could refer" to an asked entity when it is match, extended, partial, near or variant for it,
-  shares a name with one that no hit names in full, or spells it in lower case. Such entries are never
-  dropped for a name. Only when some hit names an asked entity in full (a "full exact hit"):
+- An entry "could refer" to an asked entity when it is match, extended, partial or variant for it, is a
+  near spelling of or shares a name with one that no hit names in full, or spells it in lower case. Such
+  entries are never dropped for a name. Only when some hit names an asked entity in full (a "full exact hit"):
     near_name     a near spelling of that entity: the diary names the person, so this is someone else;
     other_person  (the asked entity is a person: a full name, or a title and a name) the entry could refer
                   to no asked entity and confidently names another person in its body: a title and a
                   name, or a full name that is not sentence-initial and does not look like a place,
                   organisation or work. Single words ("Marit", "Mum", "Leeds") identify nobody;
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
+                  full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
                   full exact hit (a deliberate precision/recall trade-off, see the README).
   With no full exact hit nothing is dropped for a name (a typo or a nickname in the question must not
   hide the entry); similar names are labelled "may be a different person, check the name" instead.
-  A relational question ("Alder Brannock's sister") drops nothing for not naming the asked entity.
+  A relational question ("Alder Brannock's sister-in-law", "the wife of Alder Brannock") drops nothing for
+  not naming the asked entity.
 - Accepted recall limits: an entry about the asked person that never names them (a pronoun only, a
-  nickname unrelated to the name such as "Bob" for "Robert", a relation not phrased as "X's sister") is
-  dropped when it names another person, or scores more than MARGIN below the best exact hit.
+  nickname unrelated to the name such as "Bob" for "Robert") is dropped when it names another person, or
+  scores more than MARGIN below the best exact hit.
 - Time anchor: an explicitly framed question ("As of <date>, ...?", "As at <date>", or a question opening
   "Before/Until/Up to <date>, ...?") drops candidates dated after it. A date in a statement does not.
 - Supersession: an earlier entry about the same entity is labelled superseded only by an explicit
@@ -41,6 +43,8 @@ Score order is never changed.
 """
 from __future__ import annotations
 
+import logging
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -51,6 +55,26 @@ MAX_ENTITIES = 4
 # below_margin: an entry naming no asked entity is dropped when it scores more than this below the best full
 # exact-name hit. A deliberate precision/recall trade-off (README); retrieval.entity_focus_margin overrides it.
 MARGIN = 0.05
+_EPSILON = 1e-9  # scores are rounded to 4 decimals: a gap of exactly MARGIN is not "more than" it
+
+log = logging.getLogger(__name__)
+_WARNED: set = set()
+
+
+def parse_margin(value) -> float:
+    """retrieval.entity_focus_margin as a finite number in [0, 1]; anything else (None, text, nan, a bool, a
+    negative or a value above 1) logs one warning per value and gives MARGIN. Never raises."""
+    try:
+        margin = None if isinstance(value, bool) else float(value)
+    except (TypeError, ValueError):
+        margin = None
+    if margin is not None and math.isfinite(margin) and 0.0 <= margin <= 1.0:
+        return margin
+    key = repr(value)[:40]
+    if key not in _WARNED:
+        _WARNED.add(key)
+        log.warning("retrieval.entity_focus_margin %s is not a number in [0, 1]; using %s", key, MARGIN)
+    return MARGIN
 
 MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
           "november", "december"]
@@ -79,17 +103,25 @@ _NOT_NAMES = set(MONTHS) | set(_WEEKDAYS) | {d + "s" for d in _WEEKDAYS} | set(_
 
 _WORD = re.compile(r"[^\W\d_](?:[^\W\d_]|['\-](?=[^\W\d_]))*")
 _POSSESSIVE = re.compile(r"(?:'s|')$", re.I)
-_SENTENCE_END = set(".!?:;\n\"(")
+# What may stand before a sentence: an end mark, a bracket, an ellipsis, a dash or a bullet; list markers,
+# quotes and emphasis around the first word are skipped ("- Visited Leeds", "1) Called Mum", "> Saw Marit").
+_SENTENCE_END = set(".!?:;\n\"()[]…—–•“”«»")
+_LEAD = set(" \t\r*_->'")
 
 
 def _norm(text: str) -> str:
     return (text or "").replace("’", "'").replace("‘", "'")
 
 
+# Letters that Unicode decomposition does not fold to ASCII ("Søren" = "Soren", "Strauß" = "Strauss").
+_FOLD = str.maketrans({"ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "æ": "ae", "œ": "oe", "ß": "ss", "ı": "i"})
+
+
 def _key(word: str) -> str:
     """Comparison form of one name word: lower case, no accents, no apostrophes."""
-    plain = "".join(c for c in unicodedata.normalize("NFKD", word) if not unicodedata.combining(c))
-    return plain.lower().replace("'", "")
+    plain = "".join(c for c in unicodedata.normalize("NFKD", word.lower().translate(_FOLD))
+                    if not unicodedata.combining(c))
+    return plain.replace("'", "")
 
 
 def _words(text: str) -> List[Tuple[str, int, int, bool]]:
@@ -104,7 +136,7 @@ def _words(text: str) -> List[Tuple[str, int, int, bool]]:
 
 def _sentence_start(text: str, pos: int) -> bool:
     i = pos - 1
-    while i >= 0 and text[i] in " \t\r*_":
+    while i >= 0 and text[i] in _LEAD:
         i -= 1
     return i < 0 or text[i] in _SENTENCE_END
 
@@ -408,15 +440,21 @@ def _body(row: dict) -> str:
 def identified_people(text: str) -> List[Tuple[str, ...]]:
     """The people ``text`` confidently names (see _person_keys), as comparison words.
 
-    A sentence-initial word never starts a person name unless it is a title: "Visited Leeds", "Called Mum"
-    and "Saw Marit" leave the single words "Leeds", "Mum" and "Marit", which identify nobody. So a full name
-    opening a sentence ("Bryony Castellow came") is not counted either: dropping too little is the safe side."""
+    A run that opens a sentence (after list markers, quotes, dashes and brackets) never counts unless it
+    starts with a title: "Visited Leeds", "Mum Visited Leeds", "- Called Mum" identify nobody, and so does a
+    full name opening a sentence ("Bryony Castellow came"): dropping too little is the safe side. Relation
+    words ("Mum", "Dad") are never part of a person name."""
     text = _clean(text)
     out = []
     for run in _cap_runs(text, stop=False):
         words = [w for w, _ in run]
-        if _sentence_start(text, run[0][1]) and _key(words[0]) not in TITLES:
-            words = words[1:]
+        if _sentence_start(text, run[0][1]):
+            while words and _key(words[0]) in _NOT_NAMES:
+                words = words[1:]  # "Then Dr Patel said": the opening function word goes, the title stays
+            if not words or _key(words[0]) not in TITLES:
+                continue
+        if any(_key(w) in RELATIONS and _key(w) not in TITLES for w in words):  # "Mum", not "Aunt Peg"
+            continue
         keys = _person_keys(words)
         if keys and keys not in out:
             out.append(keys)
@@ -440,14 +478,19 @@ RELATIONS = {
 
 
 def relational(message: str, entities: Sequence[Entity]) -> bool:
-    """The question asks about someone by their relation to an asked entity ("Alder Brannock's sister"):
-    that person's entries need not name the asked one, so nothing is dropped for not naming them."""
+    """The question asks about someone by their relation to an asked entity ("Alder Brannock's sister",
+    "the sister-in-law of Alder Brannock"): that person's entries need not name the asked one, so nothing
+    is dropped for not naming them."""
     text = _norm(message)
     for e in entities:
         name = r"\.?\s+".join(re.escape(w) for w in e.name.split())
-        for m in re.finditer(name + r"(?:'s|')\s+((?:[^\W\d_]+\s+)?[^\W\d_-]+(?:-[^\W\d_]+)?)", text, re.I):
-            words = [w.lower() for w in m.group(1).split()]
+        for m in re.finditer(name + r"(?:'s|')\s+((?:[^\W\d_]+\s+)?[^\W\d_-]+(?:-[^\W\d_]+)*)", text, re.I):
+            words = [part.lower() for w in m.group(1).split() for part in [w, *w.split("-")]]  # "sister-in-law"
             if any(w in RELATIONS or w.rstrip("s") in RELATIONS for w in words):
+                return True
+        for m in re.finditer(r"\b([^\W\d_]+(?:-[^\W\d_]+)*)\s+of\s+(?:the\s+)?" + name + r"\b", text, re.I):
+            parts = [m.group(1).lower(), *m.group(1).lower().split("-")]  # "the sister of Alder Brannock"
+            if any(w in RELATIONS or w.rstrip("s") in RELATIONS for w in parts):
                 return True
     return False
 
@@ -455,15 +498,16 @@ def relational(message: str, entities: Sequence[Entity]) -> bool:
 def could_refer(found: Sequence[Tuple[Optional[str], Optional[str]]], entities: Sequence[Entity],
                 matched: Sequence[Entity], text: str) -> bool:
     """The entry may be about an asked entity, so no name-based drop may touch it: it names one in any
-    form (full, extended, partial, near or variant), shares a name with one that no hit names in full (a
-    nickname case), or spells an asked multi-word name in lower case ("went sailing with alder brannock")."""
+    form (full, extended, partial, near or variant; near only stays when no hit names the entity in full,
+    because near_name runs first), shares a name with one that no hit names in full (a nickname case), or
+    spells an asked name in lower case ("with alder brannock", "saw marit"; one word needs 3 letters)."""
     plain = _plain(text)
     for (kind, _), e in zip(found, entities):
         if kind in ABOUT or kind in ("near", "variant"):
             return True
         if kind == "shared" and e not in matched:
             return True
-        if len(e.keys) >= 2 and f" {' '.join(e.keys)} " in plain:
+        if (len(e.keys) >= 2 or len(e.keys[0]) >= 3) and f" {' '.join(e.keys)} " in plain:
             return True
     return False
 
@@ -517,7 +561,7 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
     Removal reasons (module docstring): ``after_time_anchor``, ``near_name``, ``other_person``,
     ``below_margin`` and ``candidate_limit``. Kept rows stay in score order."""
     res = analyse(message, earlier)
-    res.margin = margin
+    res.margin = margin = parse_margin(margin)  # never nan, negative or above 1, wherever it came from
     ranked = list(enumerate(rows, 1))
     if res.anchor is not None:
         cutoff, inclusive = res.anchor
@@ -535,10 +579,14 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
     if res.entities:
         kinds = {rank: [classify(_row_text(row), e) for e in res.entities] for rank, row in ranked}
         res.matched = [e for i, e in enumerate(res.entities) if any(k[i][0] == "match" for k in kinds.values())]
+        # The margin arms only for a matched name of two or more words or a titled name ("Alder Brannock",
+        # "Hollin Moor", "Dr Patel"), never for a lone word ("Christmas", "Paris", "Python"), and not while
+        # any asked entity has no full exact hit (its entries may use a form the check cannot see).
+        arming = [e for e in res.matched if len(e.keys) >= 2 or _key(e.name.split()[0]) in TITLES]
         exact = [_score(row) for rank, row in ranked
-                 if any(kind == "match" and res.entities[i] in res.matched for i, (kind, _) in enumerate(kinds[rank]))]
+                 if any(kind == "match" and res.entities[i] in arming for i, (kind, _) in enumerate(kinds[rank]))]
         exact = [s for s in exact if s is not None]
-        best = max(exact) if exact else None
+        best = max(exact) if exact and len(res.matched) == len(res.entities) else None
         # Name-based drops need a full exact hit, and none for a relational question.
         people_asked = [] if res.relational else [e for e in res.matched if is_person(e)]
         survivors = []
@@ -555,7 +603,7 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
                     res.removed.append((rank, row, "other_person"))
                     continue
                 score = _score(row)
-                if best is not None and score is not None and best - score > margin:
+                if best is not None and score is not None and best - score > margin + _EPSILON:
                     res.removed.append((rank, row, "below_margin"))
                     continue
             survivors.append((rank, row))
