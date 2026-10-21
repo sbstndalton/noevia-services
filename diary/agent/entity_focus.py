@@ -29,7 +29,10 @@ detail as competing with another's. This module needs no model call.
                   name, or a full name that is not sentence-initial and does not look like a place,
                   organisation, product or work (a whole listed place phrase such as "San Francisco" or
                   "Hong Kong", or an institutional ending such as "Orbel Maps", "Harrow Bank"). A given
-                  name and surname is always a person, whatever word precedes it.
+                  name and surname is always a person, whatever word precedes it: "Elena Bank" is one,
+                  "Northgate Bank" and "First National Bank" are not (a surname-like ending such as "bank"
+                  marks an institution only after three or more words or a first word that is no known given
+                  name; endings that are never surnames, such as "Labs" or "Maps", always do).
                   Single words ("Marit", "Mum", "Leeds") identify nobody;
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
                   full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
@@ -496,6 +499,63 @@ PLACE_PHRASES = {
     ("el", "paso"), ("la", "paz"), ("le", "havre"), ("new", "delhi"), ("cape", "town"), ("hong", "kong", "island"),
 }
 
+# Endings in _NOT_PERSON_LAST that are also real surnames ("Elena Bank"). They mark an institution only when
+# the run clearly names one (see _institutional): the other endings in the list ("Maps", "Labs", "Software",
+# "Airways", "Academy", ...) are not surnames, so a run ending in one is always an institution or product.
+_SURNAME_LIKE_LAST = {"bank"}
+# Plausible given names, accent-folded. Together with SHORT_FORMS (keys and values) this is all the module
+# knows about given names; a first word in neither is "unsure", which keeps a surname-like ending an
+# institution. Names that are also places or brands ("Florence", "Austin", "Lincoln", "Chelsea") are left out.
+GIVEN_NAMES = frozenset("""
+    adam adrian aisha alan albert alexander alice alicia alison amanda amelia amy ana andrea angela anita anna
+    anne annie antonio arthur ashley barbara beatrice benedict bernard beverly bianca brenda brian bridget
+    bryony camille carl carla carmen carol caroline catherine cecilia celia charlotte cheryl chloe claire clara
+    colin connor craig cynthia damian daniel daphne dawn deborah denise derek diana diane diego dmitri dolores
+    dominic dorothy douglas edith edmund edwin eileen elaine eleanor elena eliza elizabeth ella ellen elsa emil
+    emilia emily emma enrique eric erica erin esther eugene eva evelyn fatima felix fiona francesca francis
+    frank gabriel gabriela gail gareth gavin george gerald gillian gloria grace graham gregory hannah harold
+    harriet hazel heather hector helen helena henry hilda hugh hugo ian ines ingrid irene iris isaac isabel
+    isabella ivan ivy jacob jade james jamie jane janet janice jasmine jason jean jeffrey jessica joan joanna
+    jocelyn john jonathan jorge joseph josephine joyce juan judith julia julian juliet june karen karin karl
+    katarina katherine kathleen keith kelly kenneth kevin kirsten kristina laura lauren lawrence leah leila
+    lena leo leon leonard leslie lilian lillian linda lisa lola lorena louis louise lucas lucia lucy luis luke
+    lydia lynn magnus malcolm marco marcus margaret margot maria marian marie marina marit marta martin martha
+    mary mateo matilda maurice maxine megan melanie melissa mia michelle miguel mila mildred miriam molly mona
+    monica nadia nadine naomi natalia natalie nathan neil nina noah nora norman olga olivia oscar owen paolo
+    patricia paul paula pauline pedro penelope peter petra philip phoebe phyllis priya rachel rafael ramona
+    raymond rebecca regina renata richard rita robin roger roland ronan rosa rosalind rose ruth ryan sabrina
+    sandra sara sarah saul sean sebastian selma serena sergio sharon sheila shirley sienna simon sofia sonia
+    sophia sophie stella stefan stuart sylvia tamara tania teresa thea theodore theresa tobias valentina
+    valerie vanessa vera veronica vicky viktor viola violet virginia vivian walter wanda wendy wilhelm willa
+    winifred xavier yasmin yolanda yvonne zara zoe
+""".split())
+
+
+def _given_name(key: str) -> bool:
+    """``key`` (a comparison form) is a plausible given name by the module's own knowledge: the list above, a
+    short form or the full name a short form stands for."""
+    return (key in GIVEN_NAMES or key in SHORT_FORMS
+            or any(key in fulls for fulls in SHORT_FORMS.values()))
+
+
+def _institutional(words: Sequence[str], keys: Sequence[str]) -> bool:
+    """The phrase ends in a word that marks a place, organisation, product or work (_NOT_PERSON_LAST).
+
+    A surname-like ending (_SURNAME_LIKE_LAST) counts only when the run clearly names an institution: three or
+    more capitalised words ("First National Bank"), or a first word that is not a known given name
+    ("Northgate Bank"). A title and one or two name words ("Dr Bank"), or a given name and one other word
+    ("Elena Bank"), is a person. Unsure stays an institution, which keeps the entry."""
+    if keys[-1] not in _NOT_PERSON_LAST:
+        return False
+    if keys[-1] not in _SURNAME_LIKE_LAST:
+        return True
+    name_words = [w for w in words if _key(w) not in TITLES]
+    if len(name_words) >= 3:
+        return True
+    if len(name_words) < len(words):  # a title in front: "Dr Elena Bank", "Dr Northgate Bank"
+        return False
+    return not (len(keys) >= 2 and _given_name(keys[0]))
+
 
 def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
     """The comparison words of a capitalised phrase that confidently identifies a person: a title and a name
@@ -510,10 +570,10 @@ def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
     if any(len(w) > 1 and w.isupper() for w in words):
         return None  # an acronym or numeral ("Eckert IV", "NHS Trust"): not a confident person name
     if titled:
-        return keys if keys[-1] not in _NOT_PERSON_LAST else None  # not "Mr Men"
+        return keys if not _institutional(words, keys) else None  # not "Mr Men"
     if any(keys[i:i + len(ph)] == ph for ph in PLACE_PHRASES for i in range(len(keys) - len(ph) + 1)):
         return None  # a whole multi-word place ("Hong Kong", "San Francisco")
-    if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST and keys[-1] not in _NOT_PERSON_LAST:
+    if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST and not _institutional(words, keys):
         return keys
     return None
 
