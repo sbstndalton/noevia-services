@@ -31,10 +31,11 @@ detail as competing with another's. This module needs no model call.
                   "Hong Kong", or an institutional ending such as "Orbel Maps", "Harrow Bank"). A given
                   name and surname is always a person, whatever word precedes it: "Elena Bank" and "Tom Hill"
                   are people, "Northgate Bank", "Hyde Park" and "First National Bank" are not (a surname-like
-                  ending such as "bank", "park", "hill" or "green" marks an institution or place only after
+                  ending that is mostly a surname, such as "bank", "park", "hill" or "green", marks an institution or place only after
                   three or more words, a first word that is no known given name, a listed whole place phrase,
-                  or, for an untitled run, a place cue right before it: "along Rosa Bank", "at Clara Bank";
-                  endings that are never surnames, such as "Labs" or "Maps", always do).
+                  or, for an untitled run, "along" or "at" right before it: "along Rosa Bank", "at Clara Bank";
+                  mostly-place endings such as "Street", "House" or "Church", and endings that are never
+                  surnames, such as "Labs" or "Maps", always do; "Rose Hill" reads as a person).
                   Single words ("Marit", "Mum", "Leeds") identify nobody;
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
                   full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
@@ -501,24 +502,28 @@ PLACE_PHRASES = {
     ("el", "paso"), ("la", "paz"), ("le", "havre"), ("new", "delhi"), ("cape", "town"), ("hong", "kong", "island"),
     # places ending in a surname-like word (_SURNAME_LIKE_LAST), some after a word that may be a given name
     ("hyde", "park"), ("notting", "hill"), ("golders", "green"), ("kings", "cross"), ("central", "park"),
-    ("sherwood", "forest"), ("victoria", "park"), ("alexandra", "park"), ("albert", "hall"), ("albert", "bridge"),
+    ("sherwood", "forest"), ("victoria", "park"), ("alexandra", "park"),
     ("albert", "park"), ("regents", "park"), ("primrose", "hill"), ("tower", "hill"), ("parliament", "hill"),
     ("greenwich", "park"), ("richmond", "park"), ("holland", "park"), ("battersea", "park"),
-    ("finsbury", "park"), ("hampstead", "heath"), ("charlotte", "square"), ("george", "square"),
-    ("george", "street"), ("jane", "street"),
+    ("finsbury", "park"), ("hampstead", "heath"),
 }
 
 # Endings in _NOT_PERSON_LAST that are also real surnames ("Elena Bank"). They mark an institution only when
 # the run clearly names one (see _institutional): the other endings in the list ("Maps", "Labs", "Software",
 # "Airways", "Academy", ...) are not surnames, so a run ending in one is always an institution or product.
+# Only endings that are mostly surnames are listed. A mostly-place ending ("street", "lane", "church", "house",
+# "hall", "bridge", "lake", "castle", "mill", "head") always marks a place, so "Mary Street" or "Ivy House" is
+# never lost. Accepted trade-off: "hill" is a common surname, so a given name and "Hill" ("Rose Hill") reads as
+# a person, and an entry naming only it is dropped beside an exact hit for someone else.
 _SURNAME_LIKE_LAST = {
-    "bank", "park", "hill", "hills", "wood", "woods", "green", "cross", "lane", "street", "field", "fields",
-    "church", "hall", "house", "bridge", "marsh", "heath", "head", "mill", "ward", "lake", "castle",
+    "bank", "park", "hill", "hills", "wood", "woods", "green", "cross", "field", "fields", "marsh", "heath", "ward",
 }
 # The word right before an untitled run that marks it as a place or an institution being visited or paid, not
 # a person: "along Rosa Bank", "at Clara Bank". It only decides a _SURNAME_LIKE_LAST run (see _institutional);
-# a full name is a person whatever precedes it ("Met near Daniel Ostrow", "Sent it via Daniel Ostrow").
-_PLACE_CUES = frozenset({"at", "along", "from", "to", "into", "near"})
+# a full name is a person whatever precedes it ("Met near Daniel Ostrow", "Sent it via Daniel Ostrow"). "at" is
+# a documented known limit: "Met at Elena Bank" keeps the entry (a lost entry costs more than a place kept).
+# "to", "from", "into" and "near" are not cues: "Waved to Elena Bank", "Heard from Ann Wood" are people.
+_PLACE_CUES = frozenset({"at", "along"})
 # Plausible given names, accent-folded. Together with SHORT_FORMS (keys and values) this is all the module
 # knows about given names; a first word in neither is "unsure", which keeps a surname-like ending an
 # institution. Names that are also places or brands ("Florence", "Austin", "Lincoln", "Chelsea") are left out.

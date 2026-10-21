@@ -144,7 +144,9 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
     surname is always a person, whatever word precedes it ("visited Anna Pirelli"). That includes a surname-like
     ending ("Elena Bank", "Tom Hill", "Sam Green"), which marks a place or institution only after three or more
     words, a first word that is no known given name ("Northgate Bank", "Hyde Park"), a listed whole place phrase,
-    or a place cue right before it ("along Rosa Bank", "paid at Clara Bank"; the cue decides nothing else). Single words ("Marit", "Mum", "Leeds"), relation words
+    or "along" or "at" right before it ("along Rosa Bank", "paid at Clara Bank"; the cue decides nothing else, and
+    "waved to Elena Bank" is still a person). Mostly-place endings ("Mary Street", "Ivy House", "Grace Church") always
+    mark a place. Accepted trade-off: "Rose Hill" reads as a person. Single words ("Marit", "Mum", "Leeds"), relation words
     and headers never count;
   - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`; a gap of exactly
     the margin is kept) below the best full exact hit. It arms only for an asked name of two or more words or a
