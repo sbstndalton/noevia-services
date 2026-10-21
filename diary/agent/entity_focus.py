@@ -29,10 +29,12 @@ detail as competing with another's. This module needs no model call.
                   name, or a full name that is not sentence-initial and does not look like a place,
                   organisation, product or work (a whole listed place phrase such as "San Francisco" or
                   "Hong Kong", or an institutional ending such as "Orbel Maps", "Harrow Bank"). A given
-                  name and surname is always a person, whatever word precedes it: "Elena Bank" is one,
-                  "Northgate Bank" and "First National Bank" are not (a surname-like ending such as "bank"
-                  marks an institution only after three or more words or a first word that is no known given
-                  name; endings that are never surnames, such as "Labs" or "Maps", always do).
+                  name and surname is always a person, whatever word precedes it: "Elena Bank" and "Tom Hill"
+                  are people, "Northgate Bank", "Hyde Park" and "First National Bank" are not (a surname-like
+                  ending such as "bank", "park", "hill" or "green" marks an institution or place only after
+                  three or more words, a first word that is no known given name, a listed whole place phrase,
+                  or, for an untitled run, a place cue right before it: "along Rosa Bank", "at Clara Bank";
+                  endings that are never surnames, such as "Labs" or "Maps", always do).
                   Single words ("Marit", "Mum", "Leeds") identify nobody;
     below_margin  the entry could refer to no asked entity and scores more than MARGIN below the best
                   full exact hit of a two-or-more-word or titled asked name, while every asked entity has a
@@ -497,12 +499,26 @@ PLACE_PHRASES = {
     ("sri", "lanka"), ("costa", "rica"), ("baton", "rouge"), ("santa", "rosa"), ("santa", "fe"),
     ("santa", "barbara"), ("santa", "monica"), ("palm", "springs"), ("salt", "lake"), ("abu", "dhabi"),
     ("el", "paso"), ("la", "paz"), ("le", "havre"), ("new", "delhi"), ("cape", "town"), ("hong", "kong", "island"),
+    # places ending in a surname-like word (_SURNAME_LIKE_LAST), some after a word that may be a given name
+    ("hyde", "park"), ("notting", "hill"), ("golders", "green"), ("kings", "cross"), ("central", "park"),
+    ("sherwood", "forest"), ("victoria", "park"), ("alexandra", "park"), ("albert", "hall"), ("albert", "bridge"),
+    ("albert", "park"), ("regents", "park"), ("primrose", "hill"), ("tower", "hill"), ("parliament", "hill"),
+    ("greenwich", "park"), ("richmond", "park"), ("holland", "park"), ("battersea", "park"),
+    ("finsbury", "park"), ("hampstead", "heath"), ("charlotte", "square"), ("george", "square"),
+    ("george", "street"), ("jane", "street"),
 }
 
 # Endings in _NOT_PERSON_LAST that are also real surnames ("Elena Bank"). They mark an institution only when
 # the run clearly names one (see _institutional): the other endings in the list ("Maps", "Labs", "Software",
 # "Airways", "Academy", ...) are not surnames, so a run ending in one is always an institution or product.
-_SURNAME_LIKE_LAST = {"bank"}
+_SURNAME_LIKE_LAST = {
+    "bank", "park", "hill", "hills", "wood", "woods", "green", "cross", "lane", "street", "field", "fields",
+    "church", "hall", "house", "bridge", "marsh", "heath", "head", "mill", "ward", "lake", "castle",
+}
+# The word right before an untitled run that marks it as a place or an institution being visited or paid, not
+# a person: "along Rosa Bank", "at Clara Bank". It only decides a _SURNAME_LIKE_LAST run (see _institutional);
+# a full name is a person whatever precedes it ("Met near Daniel Ostrow", "Sent it via Daniel Ostrow").
+_PLACE_CUES = frozenset({"at", "along", "from", "to", "into", "near"})
 # Plausible given names, accent-folded. Together with SHORT_FORMS (keys and values) this is all the module
 # knows about given names; a first word in neither is "unsure", which keeps a surname-like ending an
 # institution. Names that are also places or brands ("Florence", "Austin", "Lincoln", "Chelsea") are left out.
@@ -528,6 +544,7 @@ GIVEN_NAMES = frozenset("""
     sophia sophie stella stefan stuart sylvia tamara tania teresa thea theodore theresa tobias valentina
     valerie vanessa vera veronica vicky viktor viola violet virginia vivian walter wanda wendy wilhelm willa
     winifred xavier yasmin yolanda yvonne zara zoe
+    ann lee
 """.split())
 
 
@@ -538,13 +555,17 @@ def _given_name(key: str) -> bool:
             or any(key in fulls for fulls in SHORT_FORMS.values()))
 
 
-def _institutional(words: Sequence[str], keys: Sequence[str]) -> bool:
+def _institutional(words: Sequence[str], keys: Sequence[str], lead: str = "") -> bool:
     """The phrase ends in a word that marks a place, organisation, product or work (_NOT_PERSON_LAST).
 
     A surname-like ending (_SURNAME_LIKE_LAST) counts only when the run clearly names an institution: three or
     more capitalised words ("First National Bank"), or a first word that is not a known given name
     ("Northgate Bank"). A title and one or two name words ("Dr Bank"), or a given name and one other word
-    ("Elena Bank"), is a person. Unsure stays an institution, which keeps the entry."""
+    ("Elena Bank"), is a person. Unsure stays an institution, which keeps the entry.
+
+    ``lead`` is the comparison form of the word right before an untitled run. A place cue there (_PLACE_CUES:
+    "along Rosa Bank", "at Clara Bank") keeps a given name and surname-like ending an institution or place. It
+    decides nothing else: a full name is a person whatever precedes it."""
     if keys[-1] not in _NOT_PERSON_LAST:
         return False
     if keys[-1] not in _SURNAME_LIKE_LAST:
@@ -554,10 +575,12 @@ def _institutional(words: Sequence[str], keys: Sequence[str]) -> bool:
         return True
     if len(name_words) < len(words):  # a title in front: "Dr Elena Bank", "Dr Northgate Bank"
         return False
+    if lead in _PLACE_CUES:
+        return True
     return not (len(keys) >= 2 and _given_name(keys[0]))
 
 
-def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
+def _person_keys(words: Sequence[str], lead: str = "") -> Optional[Tuple[str, ...]]:
     """The comparison words of a capitalised phrase that confidently identifies a person: a title and a name
     ("Dr. Patel"), or a two- to four-word full name ("Bryony Castellow") that does not look like a place,
     organisation or work. A single word ("Marit", "Leeds", "Mum") identifies nobody for certain."""
@@ -573,7 +596,8 @@ def _person_keys(words: Sequence[str]) -> Optional[Tuple[str, ...]]:
         return keys if not _institutional(words, keys) else None  # not "Mr Men"
     if any(keys[i:i + len(ph)] == ph for ph in PLACE_PHRASES for i in range(len(keys) - len(ph) + 1)):
         return None  # a whole multi-word place ("Hong Kong", "San Francisco")
-    if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST and not _institutional(words, keys):
+    if 2 <= len(keys) <= 4 and keys[0] not in _NOT_PERSON_FIRST \
+            and not _institutional(words, keys, lead):
         return keys
     return None
 
@@ -604,7 +628,8 @@ def identified_people(text: str) -> List[Tuple[str, ...]]:
                 continue
         if any(_key(w) in RELATIONS and _key(w) not in TITLES for w in words):  # "Mum", not "Aunt Peg"
             continue
-        keys = _person_keys(words)
+        before = re.search(r"([^\W\d_]+)[ \t]+$", text[:run[0][1]])  # the word right before the run, same line
+        keys = _person_keys(words, _key(before.group(1)) if before else "")
         if keys and keys not in out:
             out.append(keys)
     return out
