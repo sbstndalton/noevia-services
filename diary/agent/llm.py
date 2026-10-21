@@ -50,6 +50,33 @@ DEFAULT_MAX_ANSWER_TOKENS = 1024
 # max_tokens = answer cap + this allowance, and the answer cap is then enforced on the visible answer only, so
 # private reasoning never uses up the answer. llm.max_reasoning_tokens overrides it; 0 restores the #127 request.
 DEFAULT_MAX_REASONING_TOKENS = 4096
+# #164: the answer cap is in approximate tokens, enforced on the visible answer as characters: cap tokens times
+# this fixed ratio. A streamed content piece is not a token (servers merge or split them), so the cap is measured
+# on text, never on pieces. The server's max_tokens (answer cap + reasoning allowance) stays the hard bound.
+CHARS_PER_TOKEN = 4
+# #164: a stream is read this many visible characters past the cap before it is closed, so a trailing log
+# marker (never counted) is not mistaken for answer text. Longer than any "[LOG: ok]" / "[LOG: skip]" line.
+MARKER_SLACK_CHARS = 64
+
+
+def visible_char_cap(max_tokens) -> Optional[int]:
+    """#164: the visible-answer limit in characters for an answer cap in tokens (None: no cap)."""
+    return None if max_tokens is None else int(max_tokens) * CHARS_PER_TOKEN
+
+
+def cap_visible(content: str, max_tokens) -> tuple:
+    """#164: (text, cut). The visible answer is `content` after inline reasoning and the trailing log marker
+    are removed (and outer whitespace stripped). When it is longer than the character cap it is cut exactly
+    there and returned without the marker (cut=True); otherwise `content` is returned unchanged."""
+    limit = visible_char_cap(max_tokens)
+    if limit is None:
+        return content, False
+    text = strip_reasoning(content)
+    marker = _LOG_MARKER_RE.search(text)
+    visible = (text[: marker.start()] if marker else text).strip()
+    if len(visible) <= limit:
+        return content, False
+    return visible[:limit], True
 # #127: appended to an answer the model server cut off at the cap, so a shortened answer is never silent.
 SHORTENED_NOTE = "(This answer was shortened: it reached the answer length limit.)"
 
@@ -468,8 +495,12 @@ class LLMClient:
                 raise LLMError(f"unexpected chat response shape: {data!r}")
             message = data["choices"][0]["message"]
             reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+            content, cut = cap_visible(content, max_tokens)  # #164/#166: the same visible cap as the stream
+            if cut:
+                log.warning("Diary model answer reached its length cap (%s tokens, as %s characters) and was shortened",
+                            max_tokens, visible_char_cap(max_tokens))
             return ChatReply(strip_reasoning(content), reasoning if isinstance(reasoning, str) else "",
-                             data["choices"][0].get("finish_reason") == "length")
+                             cut or data["choices"][0].get("finish_reason") == "length")
 
         try:
             return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
@@ -565,10 +596,11 @@ class LLMClient:
         unregister = on_abandon(lambda: _shutdown_upstream(holder)) if callable(on_abandon) else None
         content, reasoning, sent, finish = "", "", 0, None
         completed = False
-        # #164: the answer cap counts visible answer pieces only (one streamed content piece is one token on an
-        # OpenAI-compatible server); reasoning, separate or inline, is not counted. Past the cap the stream is
-        # closed, which stops the model server, and the answer ends as a length cut.
-        visible_pieces, visible_len, capped = 0, 0, False
+        # #164: the answer cap is enforced on visible characters (cap_visible), never on how the stream is
+        # chunked; reasoning, separate or inline, and the trailing log marker are not counted. Once the visible
+        # text runs MARKER_SLACK_CHARS past the cap the stream is closed, which stops the model server.
+        limit = visible_char_cap(max_tokens)
+        capped = False
         try:
             with self._client.stream("POST", "/chat/completions", json=payload, extensions={"trace": trace}) as response:
                 holder["response"] = response
@@ -613,21 +645,20 @@ class LLMClient:
                         if isinstance(thought, str) and thought:
                             reasoning += thought  # #1505: retained request-local only; never streamed
                         text = delta.get("content") or ""
-                        if isinstance(text, str) and text and max_tokens is not None:
-                            grown = len(strip_reasoning(content + text, final=False))
-                            if grown > visible_len:
-                                if visible_pieces >= max_tokens:
-                                    completed, finish, capped = True, "length", True
-                                    break  # the piece past the cap is dropped; leaving the block closes the stream
-                                visible_pieces += 1
-                                visible_len = grown
-                        if isinstance(text, str):
+                        if isinstance(text, str) and text:
                             content += text
+                            if emit is None and limit is None:
+                                continue
+                            # One visible-text computation per delta, shared by the cap and the deltas sent.
+                            shown = strip_reasoning(content, final=False)
+                            if limit is not None and len(shown.strip()) > limit + MARKER_SLACK_CHARS:
+                                completed, capped = True, True
+                                break  # leaving the block closes the stream; the cut is made below
                             if emit is None:
                                 continue
                             # Keep inline reasoning and the trailing protocol marker out of visible tokens.
-                            shown = strip_reasoning(content, final=False)
-                            end = max(sent, len(shown) - 128)
+                            # (The 128 held back exceed MARKER_SLACK_CHARS, so no delta passes the cap.)
+                            end = max(sent, min(len(shown) - 128, limit if limit is not None else len(shown)))
                             if end > sent:
                                 emit({"type": "delta", "text": shown[sent:end]})
                                 sent = end
@@ -636,13 +667,16 @@ class LLMClient:
                 unregister()
         if not completed:
             raise LLMError("provider stream ended before completion")
-        if finish == "length":
-            # #127: the cap is logged, never the text. #164: says which limit stopped it.
-            if capped:
-                log.warning("Diary model answer reached its length cap (%s tokens) and was shortened", max_tokens)
-            else:
-                log.warning("Diary model call reached its token limit (%s answer + %s reasoning tokens) and was shortened",
-                            max_tokens, payload.get("max_tokens", 0) - (max_tokens or 0))
+        content, cut = cap_visible(content, max_tokens)  # #164: exact, whatever the chunking
+        if cut:
+            finish = "length"
+            # #127: the cap is logged, never the text.
+            log.warning("Diary model answer reached its length cap (%s tokens, as %s characters) and was shortened",
+                        max_tokens, limit)
+        elif finish == "length":
+            # #164: the server's hard bound (answer cap + reasoning allowance) stopped the call.
+            log.warning("Diary model call reached its server token limit (%s tokens) and was shortened",
+                        payload.get("max_tokens"))
         return content, reasoning, finish
 
     # ---------------- log-marker handling ----------------

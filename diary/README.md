@@ -67,10 +67,12 @@ connection to the engine so it stops generating, and `/v1` answers 502 with `err
 The cap bounds the visible answer, not private reasoning (#164). A model that streams reasoning before its
 answer gets a reasoning allowance on top of the cap: the model call is sent `max_tokens` = `LLM_MAX_ANSWER_TOKENS`
 + `LLM_MAX_REASONING_TOKENS` (`llm.max_reasoning_tokens`, default 4096; a whole number of 0 or more, anything
-else falls back to the default, and 0 sends the answer cap alone). The diary counts the streamed visible answer
-pieces (reasoning, separate or inline, is not counted) and, past the answer cap, closes the stream and treats the
-answer as cut at the cap, as above. The exchange deadline still bounds the time spent. A reply the engine
-sends unstreamed (not an event stream) is bounded by the combined `max_tokens` only.
+else falls back to the default, and 0 sends the answer cap alone). That combined `max_tokens` is the hard
+generation bound. The answer cap itself is approximate: it is enforced on the visible answer as characters,
+`LLM_MAX_ANSWER_TOKENS` x 4 (inline reasoning and the trailing log marker are not counted), the same way for
+`/v1`, the stream and an unstreamed reply, whatever the engine chunking. A longer answer is cut exactly at that
+character boundary, the stream is closed so the engine stops, and the answer counts as cut at the cap, as above
+(#166). The exchange deadline still bounds the time spent.
 
 If the cap is reached before any answer text (the model spent the whole budget, answer cap plus reasoning
 allowance, on reasoning), nothing is saved
