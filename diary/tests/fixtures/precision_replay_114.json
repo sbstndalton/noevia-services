@@ -1,0 +1,3653 @@
+{
+"_doc": "services#114: trimmed synthetic Diary gate fixture. Recorded vector candidates (entry id, cosine score) per traced query from gate run 1 at b543589, and the synthetic text of every entry they name, after the run mutations.",
+"entries": {
+"C01": {
+"body": "**Me:** Correction to my note from February 8: Lucan Pennick's beekeeping hive is actually a Warre hive, not a top-bar hive. I had misheard.\n\n**Assistant:** Marit corrected the earlier note: Lucan Pennick's beekeeping hive is a Warre hive.",
+"day": "2030-02-12",
+"day_header": "Tuesday, February 12, 2030",
+"header": "22:20 — Correction"
+},
+"C02": {
+"body": "**Me:** Correction to my note from February 17: Mirela Darnell's favourite tea is actually smoked lapsang, not chicory root. I had misheard.\n\n**Assistant:** Marit corrected the earlier note: Mirela Darnell's favourite tea is smoked lapsang.",
+"day": "2030-02-22",
+"day_header": "Friday, February 22, 2030",
+"header": "22:20 — Correction"
+},
+"C03": {
+"body": "**Me:** Correction to my note from January 31: Kestrel Ivensey's map projection is actually the Eckert IV, not the Mollweide. I had misheard.\n\n**Assistant:** Marit corrected the earlier note: Kestrel Ivensey's map projection is the Eckert IV.",
+"day": "2030-02-04",
+"day_header": "Monday, February 4, 2030",
+"header": "22:13 — Correction"
+},
+"C04": {
+"body": "**Me:** Correction to my note from February 21: Gideon Kittredge's allotment plot is actually plot 58, not plot 41. I had misheard.\n\n**Assistant:** Marit corrected the earlier note: Gideon Kittredge's allotment plot is plot 58.",
+"day": "2030-02-27",
+"day_header": "Wednesday, February 27, 2030",
+"header": "22:04 — Correction"
+},
+"E003": {
+"body": "**Me:** Ran into Hesper Esterby at the county archive today. We got talking and they told me their bicycle colour is dusty pink.\n\n**Assistant:** Marit met Hesper Esterby at the county archive; Hesper Esterby said their bicycle colour is dusty pink.",
+"day": "2030-01-06",
+"day_header": "Sunday, January 6, 2030",
+"header": "20:06 — Bumped into Hesper Esterby"
+},
+"E005": {
+"body": "**Me:** Had coffee with Fenella Rockwood near the survey office. Funny coincidence: their boat name is the Dunlin.\n\n**Assistant:** Marit had coffee with Fenella Rockwood, whose boat name is the Dunlin.",
+"day": "2030-01-07",
+"day_header": "Monday, January 7, 2030",
+"header": "12:50 — Chat with Fenella Rockwood"
+},
+"E007": {
+"body": "**Me:** Ran into Orla Brannock at the survey office today. We got talking and they told me their telescope is a 5-inch maksutov.\n\n**Assistant:** Marit met Orla Brannock at the survey office; Orla Brannock said their telescope is a 5-inch maksutov.",
+"day": "2030-01-08",
+"day_header": "Tuesday, January 8, 2030",
+"header": "09:24 — Bumped into Orla Brannock"
+},
+"E010": {
+"body": "**Me:** Ran into Alder Uttley at the print shop today. We got talking and they told me their choir part is second alto.\n\n**Assistant:** Marit met Alder Uttley at the print shop; Alder Uttley said their choir part is second alto.",
+"day": "2030-01-09",
+"day_header": "Wednesday, January 9, 2030",
+"header": "07:40 — Bumped into Alder Uttley"
+},
+"E015": {
+"body": "**Me:** Ran into Delphine Fairweather at the map library today. We got talking and they told me their lighthouse shift is the dusk watch.\n\n**Assistant:** Marit met Delphine Fairweather at the map library; Delphine Fairweather said their lighthouse shift is the dusk watch.",
+"day": "2030-01-10",
+"day_header": "Thursday, January 10, 2030",
+"header": "20:19 — Bumped into Delphine Fairweather"
+},
+"E016": {
+"body": "**Me:** Had coffee with Ivo Wendlock near the tide gauge. Funny coincidence: their rowing seat is bow seat.\n\n**Assistant:** Marit had coffee with Ivo Wendlock, whose rowing seat is bow seat.",
+"day": "2030-01-11",
+"day_header": "Friday, January 11, 2030",
+"header": "08:48 — Chat with Ivo Wendlock"
+},
+"E017": {
+"body": "**Me:** Tobiah the baker gave me a jar of quince jelly today, completely out of the blue.\n\n**Assistant:** Tobiah the baker gave Marit a jar of quince jelly.",
+"day": "2030-01-11",
+"day_header": "Friday, January 11, 2030",
+"header": "13:31 — A gift from Tobiah"
+},
+"E018": {
+"body": "**Me:** Ran into Nyle Hartigan at the county archive today. We got talking and they told me their sea swim spot is Cormorant Steps.\n\n**Assistant:** Marit met Nyle Hartigan at the county archive; Nyle Hartigan said their sea swim spot is Cormorant Steps.",
+"day": "2030-01-11",
+"day_header": "Friday, January 11, 2030",
+"header": "18:05 — Bumped into Nyle Hartigan"
+},
+"E019": {
+"body": "**Me:** Had coffee with Caspian Rendall near the print shop. Funny coincidence: their dog's name is Pumpernickel.\n\n**Assistant:** Marit had coffee with Caspian Rendall, whose dog's name is Pumpernickel.",
+"day": "2030-01-12",
+"day_header": "Saturday, January 12, 2030",
+"header": "08:47 — Chat with Caspian Rendall"
+},
+"E020": {
+"body": "**Me:** Ran into Rosalind Merriman at the map library today. We got talking and they told me their birthday month is in October.\n\n**Assistant:** Marit met Rosalind Merriman at the map library; Rosalind Merriman said their birthday month is in October.",
+"day": "2030-01-12",
+"day_header": "Saturday, January 12, 2030",
+"header": "13:58 — Bumped into Rosalind Merriman"
+},
+"E021": {
+"body": "**Me:** Had coffee with Orla Brennock near the tide gauge. Funny coincidence: their telescope is a 12-inch truss dobsonian.\n\n**Assistant:** Marit had coffee with Orla Brennock, whose telescope is a 12-inch truss dobsonian.",
+"day": "2030-01-12",
+"day_header": "Saturday, January 12, 2030",
+"header": "18:27 — Chat with Orla Brennock"
+},
+"E022": {
+"body": "**Me:** Had coffee with Caspian Juxton near the map library. Funny coincidence: their lighthouse shift is the forenoon watch.\n\n**Assistant:** Marit had coffee with Caspian Juxton, whose lighthouse shift is the forenoon watch.",
+"day": "2030-01-13",
+"day_header": "Sunday, January 13, 2030",
+"header": "09:01 — Chat with Caspian Juxton"
+},
+"E023": {
+"body": "**Me:** Tamsin Ashdown came up in conversation; the weaving pattern they prefer above all is herringbone twill.\n\n**Assistant:** Marit learned that Tamsin Ashdown prefers herringbone twill as their weaving pattern.",
+"day": "2030-01-13",
+"day_header": "Sunday, January 13, 2030",
+"header": "12:10 — Bumped into Tamsin Ashdown"
+},
+"E024": {
+"body": "**Me:** Had coffee with Quill Prideau near the tide gauge. Funny coincidence: their apple variety is Claygate Pearmain.\n\n**Assistant:** Marit had coffee with Quill Prideau, whose apple variety is Claygate Pearmain.",
+"day": "2030-01-13",
+"day_header": "Sunday, January 13, 2030",
+"header": "21:02 — Chat with Quill Prideau"
+},
+"E025": {
+"body": "**Me:** Wren the archivist gave me a box of glass slides today, completely out of the blue.\n\n**Assistant:** Wren the archivist gave Marit a box of glass slides.",
+"day": "2030-01-14",
+"day_header": "Monday, January 14, 2030",
+"header": "08:03 — A gift from Wren"
+},
+"E026": {
+"body": "**Me:** Had coffee with Gideon Quarry near the print shop. Funny coincidence: their rowing seat is stroke seat.\n\n**Assistant:** Marit had coffee with Gideon Quarry, whose rowing seat is stroke seat.",
+"day": "2030-01-14",
+"day_header": "Monday, January 14, 2030",
+"header": "14:35 — Chat with Gideon Quarry"
+},
+"E029": {
+"body": "**Me:** Ran into Quill Prideaux at the county archive today. We got talking and they told me their apple variety is Blenheim Orange.\n\n**Assistant:** Marit met Quill Prideaux at the county archive; Quill Prideaux said their apple variety is Blenheim Orange.",
+"day": "2030-01-15",
+"day_header": "Tuesday, January 15, 2030",
+"header": "14:00 — Bumped into Quill Prideaux"
+},
+"E030": {
+"body": "**Me:** Ran into Nyle Ingleby at the map library today. We got talking and they told me their chess opening is the Scandinavian.\n\n**Assistant:** Marit met Nyle Ingleby at the map library; Nyle Ingleby said their chess opening is the Scandinavian.",
+"day": "2030-01-15",
+"day_header": "Tuesday, January 15, 2030",
+"header": "20:36 — Bumped into Nyle Ingleby"
+},
+"E031": {
+"body": "**Me:** Spent the session redrawing the contour lines on the estuary sheet. Drizzle all morning. Restless, could not settle.\n\n**Assistant:** Marit spent the session redrawing the contour lines on the estuary sheet.",
+"day": "2030-01-16",
+"day_header": "Wednesday, January 16, 2030",
+"header": "08:00 — Studio day"
+},
+"E032": {
+"body": "**Me:** Ran into Fenella Corrigan at the survey office today. We got talking and they told me their bread starter is Sir Bubbles.\n\n**Assistant:** Marit met Fenella Corrigan at the survey office; Fenella Corrigan said their bread starter is Sir Bubbles.",
+"day": "2030-01-16",
+"day_header": "Wednesday, January 16, 2030",
+"header": "14:30 — Bumped into Fenella Corrigan"
+},
+"E036": {
+"body": "**Me:** Day 3 of the Highfell survey: measured the boundary stones at Tarnside.\n\n**Assistant:** Marit surveyed Tarnside as stop 3 of the Highfell survey.",
+"day": "2030-01-17",
+"day_header": "Thursday, January 17, 2030",
+"header": "19:39 — Highfell survey, stop 3"
+},
+"E039": {
+"body": "**Me:** Day 2 of the Hollin Moor survey: measured the boundary stones at Scarrow.\n\n**Assistant:** Marit surveyed Scarrow as stop 2 of the Hollin Moor survey.",
+"day": "2030-01-18",
+"day_header": "Friday, January 18, 2030",
+"header": "21:53 — Hollin Moor survey, stop 2"
+},
+"E041": {
+"body": "**Me:** Had coffee with Kestrel Ormesby near the reading room. Funny coincidence: their bicycle colour is slate grey.\n\n**Assistant:** Marit had coffee with Kestrel Ormesby, whose bicycle colour is slate grey.",
+"day": "2030-01-19",
+"day_header": "Saturday, January 19, 2030",
+"header": "13:34 — Chat with Kestrel Ormesby"
+},
+"E042": {
+"body": "**Me:** Peregrine Nethercott came up in conversation; the beekeeping hive they prefer above all is a skep.\n\n**Assistant:** Marit learned that Peregrine Nethercott prefers a skep as their beekeeping hive.",
+"day": "2030-01-19",
+"day_header": "Saturday, January 19, 2030",
+"header": "21:25 — Bumped into Peregrine Nethercott"
+},
+"E043": {
+"body": "**Me:** Spent the session photographing the tithe maps. Bright and cold. Felt calm and focused.\n\n**Assistant:** Marit spent the session photographing the tithe maps.",
+"day": "2030-01-20",
+"day_header": "Sunday, January 20, 2030",
+"header": "09:51 — Studio day"
+},
+"E047": {
+"body": "**Me:** Ran into Orla Kilbride at the harbour market today. We got talking and they told me their favourite tea is chicory root.\n\n**Assistant:** Marit met Orla Kilbride at the harbour market; Orla Kilbride said their favourite tea is chicory root.",
+"day": "2030-01-21",
+"day_header": "Monday, January 21, 2030",
+"header": "12:38 — Bumped into Orla Kilbride"
+},
+"E048": {
+"body": "**Me:** Ran into Ivo Wenlock at the map library today. We got talking and they told me their rowing seat is seat six.\n\n**Assistant:** Marit met Ivo Wenlock at the map library; Ivo Wenlock said their rowing seat is seat six.",
+"day": "2030-01-21",
+"day_header": "Monday, January 21, 2030",
+"header": "21:07 — Bumped into Ivo Wenlock"
+},
+"E050": {
+"body": "**Me:** Had coffee with Delphine Yeardley near the boatyard. Funny coincidence: their kite is a parafoil.\n\n**Assistant:** Marit had coffee with Delphine Yeardley, whose kite is a parafoil.",
+"day": "2030-01-22",
+"day_header": "Tuesday, January 22, 2030",
+"header": "12:37 — Chat with Delphine Yeardley"
+},
+"E053": {
+"body": "**Me:** Had coffee with Bryony Dunmoore near the survey office. Funny coincidence: their choir part is descant.\n\n**Assistant:** Marit had coffee with Bryony Dunmoore, whose choir part is descant.",
+"day": "2030-01-23",
+"day_header": "Wednesday, January 23, 2030",
+"header": "13:59 — Chat with Bryony Dunmoore"
+},
+"E054": {
+"body": "**Me:** Had coffee with Quill Castelow near the boatyard. Funny coincidence: their allotment plot is plot 58.\n\n**Assistant:** Marit had coffee with Quill Castelow, whose allotment plot is plot 58.",
+"day": "2030-01-23",
+"day_header": "Wednesday, January 23, 2030",
+"header": "19:23 — Chat with Quill Castelow"
+},
+"E056": {
+"body": "**Me:** Peregrine Elphick came up in conversation; the dog's name they prefer above all is Marzipan.\n\n**Assistant:** Marit learned that Peregrine Elphick prefers Marzipan as their dog's name.",
+"day": "2030-01-24",
+"day_header": "Thursday, January 24, 2030",
+"header": "12:41 — Bumped into Peregrine Elphick"
+},
+"E057": {
+"body": "**Me:** Had coffee with Delphine Fairwether near the county archive. Funny coincidence: their lighthouse shift is the dawn watch.\n\n**Assistant:** Marit had coffee with Delphine Fairwether, whose lighthouse shift is the dawn watch.",
+"day": "2030-01-24",
+"day_header": "Thursday, January 24, 2030",
+"header": "20:21 — Chat with Delphine Fairwether"
+},
+"E058": {
+"body": "**Me:** Day 1 of the Upper Vale survey: measured the boundary stones at Hagg Wood.\n\n**Assistant:** Marit surveyed Hagg Wood as stop 1 of the Upper Vale survey.",
+"day": "2030-01-25",
+"day_header": "Friday, January 25, 2030",
+"header": "08:12 — Upper Vale survey, stop 1"
+},
+"E061": {
+"body": "**Me:** Ran into Mirela Stanforth at the reading room today. We got talking and they told me their weaving pattern is rosepath.\n\n**Assistant:** Marit met Mirela Stanforth at the reading room; Mirela Stanforth said their weaving pattern is rosepath.",
+"day": "2030-01-26",
+"day_header": "Saturday, January 26, 2030",
+"header": "08:18 — Bumped into Mirela Stanforth"
+},
+"E064": {
+"body": "**Me:** Had coffee with Hesper Gillchrist near the survey office. Funny coincidence: their ferry crossing is the Moss crossing.\n\n**Assistant:** Marit had coffee with Hesper Gillchrist, whose ferry crossing is the Moss crossing.",
+"day": "2030-01-27",
+"day_header": "Sunday, January 27, 2030",
+"header": "09:48 — Chat with Hesper Gillchrist"
+},
+"E065": {
+"body": "**Me:** Ran into Jessamy Larkham at the station cafe today. We got talking and they told me their sea swim spot is Pebbleworth Bay.\n\n**Assistant:** Marit met Jessamy Larkham at the station cafe; Jessamy Larkham said their sea swim spot is Pebbleworth Bay.",
+"day": "2030-01-27",
+"day_header": "Sunday, January 27, 2030",
+"header": "12:47 — Bumped into Jessamy Larkham"
+},
+"E066": {
+"body": "**Me:** Had coffee with Lucan Penick near the survey office. Funny coincidence: their beekeeping hive is a Layens hive.\n\n**Assistant:** Marit had coffee with Lucan Penick, whose beekeeping hive is a Layens hive.",
+"day": "2030-01-27",
+"day_header": "Sunday, January 27, 2030",
+"header": "21:41 — Chat with Lucan Penick"
+},
+"E068": {
+"body": "**Me:** Had coffee with Alder Blackmore near the survey office. Funny coincidence: their violin maker is a workshop in Rosinby.\n\n**Assistant:** Marit had coffee with Alder Blackmore, whose violin maker is a workshop in Rosinby.",
+"day": "2030-01-28",
+"day_header": "Monday, January 28, 2030",
+"header": "13:46 — Chat with Alder Blackmore"
+},
+"E069": {
+"body": "**Me:** Spent the session inking the legend for the coastal chart. Strong westerly wind. Restless, could not settle.\n\n**Assistant:** Marit spent the session inking the legend for the coastal chart.",
+"day": "2030-01-28",
+"day_header": "Monday, January 28, 2030",
+"header": "21:47 — Studio day"
+},
+"E072": {
+"body": "**Me:** Ran into Bryony Mabery at the station cafe today. We got talking and they told me their kite is a diamond kite.\n\n**Assistant:** Marit met Bryony Mabery at the station cafe; Bryony Mabery said their kite is a diamond kite.",
+"day": "2030-01-29",
+"day_header": "Tuesday, January 29, 2030",
+"header": "21:15 — Bumped into Bryony Mabery"
+},
+"E073": {
+"body": "**Me:** Day 1 of the Coppice survey: measured the boundary stones at Birkdale Hollow.\n\n**Assistant:** Marit surveyed Birkdale Hollow as stop 1 of the Coppice survey.",
+"day": "2030-01-30",
+"day_header": "Wednesday, January 30, 2030",
+"header": "07:46 — Coppice survey, stop 1"
+},
+"E074": {
+"body": "**Me:** Had coffee with Jessamy Larkam near the county archive. Funny coincidence: their sea swim spot is Saltmarsh Point.\n\n**Assistant:** Marit had coffee with Jessamy Larkam, whose sea swim spot is Saltmarsh Point.",
+"day": "2030-01-30",
+"day_header": "Wednesday, January 30, 2030",
+"header": "12:01 — Chat with Jessamy Larkam"
+},
+"E077": {
+"body": "**Me:** Ran into Kestrel Ivensey at the co-op bakery today. We got talking and they told me their map projection is the Mollweide.\n\n**Assistant:** Marit met Kestrel Ivensey at the co-op bakery; Kestrel Ivensey said their map projection is the Mollweide.",
+"day": "2030-01-31",
+"day_header": "Thursday, January 31, 2030",
+"header": "12:47 — Bumped into Kestrel Ivensey"
+},
+"E080": {
+"body": "**Me:** Had coffee with Peregrine Nethercot near the co-op bakery. Funny coincidence: their beekeeping hive is a National hive.\n\n**Assistant:** Marit had coffee with Peregrine Nethercot, whose beekeeping hive is a National hive.",
+"day": "2030-02-01",
+"day_header": "Friday, February 1, 2030",
+"header": "13:11 — Chat with Peregrine Nethercot"
+},
+"E084": {
+"body": "**Me:** Ran into Ivo Garroway at the map library today. We got talking and they told me their ferry crossing is the Hamble crossing.\n\n**Assistant:** Marit met Ivo Garroway at the map library; Ivo Garroway said their ferry crossing is the Hamble crossing.",
+"day": "2030-02-02",
+"day_header": "Saturday, February 2, 2030",
+"header": "20:36 — Bumped into Ivo Garroway"
+},
+"E090": {
+"body": "**Me:** Evander Halloran came up in conversation; the telescope they prefer above all is a 10-inch newtonian.\n\n**Assistant:** Marit learned that Evander Halloran prefers a 10-inch newtonian as their telescope.",
+"day": "2030-02-04",
+"day_header": "Monday, February 4, 2030",
+"header": "18:32 — Bumped into Evander Halloran"
+},
+"E091": {
+"body": "**Me:** Day 3 of the Estuary survey: measured the boundary stones at Heronsgate.\n\n**Assistant:** Marit surveyed Heronsgate as stop 3 of the Estuary survey.",
+"day": "2030-02-05",
+"day_header": "Tuesday, February 5, 2030",
+"header": "08:23 — Estuary survey, stop 3"
+},
+"E092": {
+"body": "**Me:** Had coffee with Fenella Carrigan near the harbour market. Funny coincidence: their bread starter is Auntie Rye.\n\n**Assistant:** Marit had coffee with Fenella Carrigan, whose bread starter is Auntie Rye.",
+"day": "2030-02-05",
+"day_header": "Tuesday, February 5, 2030",
+"header": "13:34 — Chat with Fenella Carrigan"
+},
+"E093": {
+"body": "**Me:** Had coffee with Soren Lockyear near the reading room. Funny coincidence: their boat name is the Knot.\n\n**Assistant:** Marit had coffee with Soren Lockyear, whose boat name is the Knot.",
+"day": "2030-02-05",
+"day_header": "Tuesday, February 5, 2030",
+"header": "20:59 — Chat with Soren Lockyear"
+},
+"E094": {
+"body": "**Me:** Ran into Bryony Dunmore at the harbour market today. We got talking and they told me their choir part is first tenor.\n\n**Assistant:** Marit met Bryony Dunmore at the harbour market; Bryony Dunmore said their choir part is first tenor.",
+"day": "2030-02-06",
+"day_header": "Wednesday, February 6, 2030",
+"header": "09:15 — Bumped into Bryony Dunmore"
+},
+"E095": {
+"body": "**Me:** Ran into Quill Castellow at the reading room today. We got talking and they told me their allotment plot is plot 33.\n\n**Assistant:** Marit met Quill Castellow at the reading room; Quill Castellow said their allotment plot is plot 33.",
+"day": "2030-02-06",
+"day_header": "Wednesday, February 6, 2030",
+"header": "12:40 — Bumped into Quill Castellow"
+},
+"E098": {
+"body": "**Me:** Juniper the florist gave me a bunch of sweet peas today, completely out of the blue.\n\n**Assistant:** Juniper the florist gave Marit a bunch of sweet peas.",
+"day": "2030-02-07",
+"day_header": "Thursday, February 7, 2030",
+"header": "13:31 — A gift from Juniper"
+},
+"E099": {
+"body": "**Me:** Ran into Rosalind Vowles at the county archive today. We got talking and they told me their violin maker is a workshop in Scrollbridge.\n\n**Assistant:** Marit met Rosalind Vowles at the county archive; Rosalind Vowles said their violin maker is a workshop in Scrollbridge.",
+"day": "2030-02-07",
+"day_header": "Thursday, February 7, 2030",
+"header": "20:16 — Bumped into Rosalind Vowles"
+},
+"E102": {
+"body": "**Me:** Ran into Lucan Pennick at the county archive today. We got talking and they told me their beekeeping hive is a top-bar hive.\n\n**Assistant:** Marit met Lucan Pennick at the county archive; Lucan Pennick said their beekeeping hive is a top-bar hive.",
+"day": "2030-02-08",
+"day_header": "Friday, February 8, 2030",
+"header": "19:27 — Bumped into Lucan Pennick"
+},
+"E104": {
+"body": "**Me:** Ran into Kestrel Ormsby at the boatyard today. We got talking and they told me their bicycle colour is burnt orange.\n\n**Assistant:** Marit met Kestrel Ormsby at the boatyard; Kestrel Ormsby said their bicycle colour is burnt orange.",
+"day": "2030-02-09",
+"day_header": "Saturday, February 9, 2030",
+"header": "14:31 — Bumped into Kestrel Ormsby"
+},
+"E105": {
+"body": "**Me:** Had coffee with Mirela Stamforth near the co-op bakery. Funny coincidence: their weaving pattern is huckaback.\n\n**Assistant:** Marit had coffee with Mirela Stamforth, whose weaving pattern is huckaback.",
+"day": "2030-02-09",
+"day_header": "Saturday, February 9, 2030",
+"header": "19:03 — Chat with Mirela Stamforth"
+},
+"E106": {
+"body": "**Me:** Had coffee with Orla Killbride near the print shop. Funny coincidence: their favourite tea is nettle and mint.\n\n**Assistant:** Marit had coffee with Orla Killbride, whose favourite tea is nettle and mint.",
+"day": "2030-02-10",
+"day_header": "Sunday, February 10, 2030",
+"header": "08:48 — Chat with Orla Killbride"
+},
+"E107": {
+"body": "**Me:** Had coffee with Evander Holloran near the harbour market. Funny coincidence: their telescope is a 12-inch truss dobsonian.\n\n**Assistant:** Marit had coffee with Evander Holloran, whose telescope is a 12-inch truss dobsonian.",
+"day": "2030-02-10",
+"day_header": "Sunday, February 10, 2030",
+"header": "13:38 — Chat with Evander Holloran"
+},
+"E109": {
+"body": "**Me:** Had coffee with Alder Utley near the tide gauge. Funny coincidence: their choir part is descant.\n\n**Assistant:** Marit had coffee with Alder Utley, whose choir part is descant.",
+"day": "2030-02-11",
+"day_header": "Monday, February 11, 2030",
+"header": "08:38 — Chat with Alder Utley"
+},
+"E111": {
+"body": "**Me:** Hollis the beekeeper gave me a comb of heather honey today, completely out of the blue.\n\n**Assistant:** Hollis the beekeeper gave Marit a comb of heather honey.",
+"day": "2030-02-11",
+"day_header": "Monday, February 11, 2030",
+"header": "19:45 — A gift from Hollis"
+},
+"E116": {
+"body": "**Me:** Had coffee with Lucan Trevellyan near the harbour market. Funny coincidence: their apple variety is Blenheim Orange.\n\n**Assistant:** Marit had coffee with Lucan Trevellyan, whose apple variety is Blenheim Orange.",
+"day": "2030-02-13",
+"day_header": "Wednesday, February 13, 2030",
+"header": "14:32 — Chat with Lucan Trevellyan"
+},
+"E117": {
+"body": "**Me:** Tobiah the ferry pilot gave me a brass compass today, completely out of the blue.\n\n**Assistant:** Tobiah the ferry pilot gave Marit a brass compass.",
+"day": "2030-02-13",
+"day_header": "Wednesday, February 13, 2030",
+"header": "20:06 — A gift from Tobiah"
+},
+"E121": {
+"body": "**Me:** Had coffee with Peregrine Elphicke near the station cafe. Funny coincidence: their dog's name is Gingersnap.\n\n**Assistant:** Marit had coffee with Peregrine Elphicke, whose dog's name is Gingersnap.",
+"day": "2030-02-15",
+"day_header": "Friday, February 15, 2030",
+"header": "08:10 — Chat with Peregrine Elphicke"
+},
+"E123": {
+"body": "**Me:** Ran into Alder Blakemore at the boatyard today. We got talking and they told me their violin maker is a workshop in Fiddleham.\n\n**Assistant:** Marit met Alder Blakemore at the boatyard; Alder Blakemore said their violin maker is a workshop in Fiddleham.",
+"day": "2030-02-15",
+"day_header": "Friday, February 15, 2030",
+"header": "18:20 — Bumped into Alder Blakemore"
+},
+"E126": {
+"body": "**Me:** Had coffee with Rosalind Voles near the co-op bakery. Funny coincidence: their violin maker is a workshop in Cremsby.\n\n**Assistant:** Marit had coffee with Rosalind Voles, whose violin maker is a workshop in Cremsby.",
+"day": "2030-02-16",
+"day_header": "Saturday, February 16, 2030",
+"header": "18:35 — Chat with Rosalind Voles"
+},
+"E127": {
+"body": "**Me:** Had coffee with Gideon Kitteridge near the reading room. Funny coincidence: their allotment plot is plot 62.\n\n**Assistant:** Marit had coffee with Gideon Kitteridge, whose allotment plot is plot 62.",
+"day": "2030-02-17",
+"day_header": "Sunday, February 17, 2030",
+"header": "07:00 — Chat with Gideon Kitteridge"
+},
+"E129": {
+"body": "**Me:** Ran into Mirela Darnell at the boatyard today. We got talking and they told me their favourite tea is chicory root.\n\n**Assistant:** Marit met Mirela Darnell at the boatyard; Mirela Darnell said their favourite tea is chicory root.",
+"day": "2030-02-17",
+"day_header": "Sunday, February 17, 2030",
+"header": "19:57 — Bumped into Mirela Darnell"
+},
+"E130": {
+"body": "**Me:** Ran into Delphine Yardley at the county archive today. We got talking and they told me their kite is a box kite.\n\n**Assistant:** Marit met Delphine Yardley at the county archive; Delphine Yardley said their kite is a box kite.",
+"day": "2030-02-18",
+"day_header": "Monday, February 18, 2030",
+"header": "09:07 — Bumped into Delphine Yardley"
+},
+"E133": {
+"body": "**Me:** Had coffee with Nyle Hartagan near the station cafe. Funny coincidence: their sea swim spot is Saltmarsh Point.\n\n**Assistant:** Marit had coffee with Nyle Hartagan, whose sea swim spot is Saltmarsh Point.",
+"day": "2030-02-19",
+"day_header": "Tuesday, February 19, 2030",
+"header": "07:52 — Chat with Nyle Hartagan"
+},
+"E134": {
+"body": "**Me:** Ran into Jessamy Jephcott at the survey office today. We got talking and they told me their bread starter is Sir Bubbles.\n\n**Assistant:** Marit met Jessamy Jephcott at the survey office; Jessamy Jephcott said their bread starter is Sir Bubbles.",
+"day": "2030-02-19",
+"day_header": "Tuesday, February 19, 2030",
+"header": "13:27 — Bumped into Jessamy Jephcott"
+},
+"E137": {
+"body": "**Me:** Had coffee with Bryony Maybery near the tide gauge. Funny coincidence: their kite is a sled kite.\n\n**Assistant:** Marit had coffee with Bryony Maybery, whose kite is a sled kite.",
+"day": "2030-02-20",
+"day_header": "Wednesday, February 20, 2030",
+"header": "12:45 — Chat with Bryony Maybery"
+},
+"E139": {
+"body": "**Me:** Ran into Gideon Kittredge at the tide gauge today. We got talking and they told me their allotment plot is plot 41.\n\n**Assistant:** Marit met Gideon Kittredge at the tide gauge; Gideon Kittredge said their allotment plot is plot 41.",
+"day": "2030-02-21",
+"day_header": "Thursday, February 21, 2030",
+"header": "08:38 — Bumped into Gideon Kittredge"
+},
+"E140": {
+"body": "**Me:** Spent the session photographing the tithe maps. Strong westerly wind. Restless, could not settle.\n\n**Assistant:** Marit spent the session photographing the tithe maps.",
+"day": "2030-02-21",
+"day_header": "Thursday, February 21, 2030",
+"header": "14:57 — Studio day"
+},
+"E142": {
+"body": "**Me:** Thinking back to Rosalind Vowles: I remembered it right, the violin maker they mentioned really is a workshop in Scrollbridge.\n\n**Assistant:** Marit confirmed that Rosalind Vowles's violin maker is a workshop in Scrollbridge.",
+"day": "2030-02-22",
+"day_header": "Friday, February 22, 2030",
+"header": "09:32 — Follow-up thought"
+},
+"E144": {
+"body": "**Me:** Thinking back to Kestrel Ormsby: I remembered it right, the bicycle colour they mentioned really is burnt orange.\n\n**Assistant:** Marit confirmed that Kestrel Ormsby's bicycle colour is burnt orange.",
+"day": "2030-02-22",
+"day_header": "Friday, February 22, 2030",
+"header": "20:56 — Follow-up thought"
+},
+"E145": {
+"body": "**Me:** Had coffee with Evander Northum near the harbour market. Funny coincidence: their chess opening is the Catalan.\n\n**Assistant:** Marit had coffee with Evander Northum, whose chess opening is the Catalan.",
+"day": "2030-02-23",
+"day_header": "Saturday, February 23, 2030",
+"header": "09:18 — Chat with Evander Northum"
+},
+"E147": {
+"body": "**Me:** Had coffee with Tamsin Fenimore near the boatyard. Funny coincidence: their map projection is the Eckert IV.\n\n**Assistant:** Marit had coffee with Tamsin Fenimore, whose map projection is the Eckert IV.",
+"day": "2030-02-23",
+"day_header": "Saturday, February 23, 2030",
+"header": "19:26 — Chat with Tamsin Fenimore"
+},
+"E148": {
+"body": "**Me:** Had coffee with Nyle Ingelby near the reading room. Funny coincidence: their chess opening is the Catalan.\n\n**Assistant:** Marit had coffee with Nyle Ingelby, whose chess opening is the Catalan.",
+"day": "2030-02-24",
+"day_header": "Sunday, February 24, 2030",
+"header": "08:03 — Chat with Nyle Ingelby"
+},
+"E149": {
+"body": "**Me:** Had coffee with Tamsin Ashdowne near the map library. Funny coincidence: their weaving pattern is monk's belt.\n\n**Assistant:** Marit had coffee with Tamsin Ashdowne, whose weaving pattern is monk's belt.",
+"day": "2030-02-24",
+"day_header": "Sunday, February 24, 2030",
+"header": "14:24 — Chat with Tamsin Ashdowne"
+},
+"E150": {
+"body": "**Me:** Had coffee with Rosalind Merryman near the reading room. Funny coincidence: their birthday month is in November.\n\n**Assistant:** Marit had coffee with Rosalind Merryman, whose birthday month is in November.",
+"day": "2030-02-24",
+"day_header": "Sunday, February 24, 2030",
+"header": "19:54 — Chat with Rosalind Merryman"
+},
+"E151": {
+"body": "**Me:** Had coffee with Hesper Easterby near the station cafe. Funny coincidence: their bicycle colour is petrol blue.\n\n**Assistant:** Marit had coffee with Hesper Easterby, whose bicycle colour is petrol blue.",
+"day": "2030-02-25",
+"day_header": "Monday, February 25, 2030",
+"header": "08:18 — Chat with Hesper Easterby"
+},
+"E152": {
+"body": "**Me:** Had coffee with Soren Okeshott near the boatyard. Funny coincidence: their birthday month is in October.\n\n**Assistant:** Marit had coffee with Soren Okeshott, whose birthday month is in October.",
+"day": "2030-02-25",
+"day_header": "Monday, February 25, 2030",
+"header": "14:00 — Chat with Soren Okeshott"
+},
+"E155": {
+"body": "**Me:** Ran into Evander Northam at the reading room today. We got talking and they told me their chess opening is the Pirc.\n\n**Assistant:** Marit met Evander Northam at the reading room; Evander Northam said their chess opening is the Pirc.",
+"day": "2030-02-26",
+"day_header": "Tuesday, February 26, 2030",
+"header": "13:40 — Bumped into Evander Northam"
+},
+"E157": {
+"body": "**Me:** Had coffee with Jessamy Jepcott near the print shop. Funny coincidence: their bread starter is Auntie Rye.\n\n**Assistant:** Marit had coffee with Jessamy Jepcott, whose bread starter is Auntie Rye.",
+"day": "2030-02-27",
+"day_header": "Wednesday, February 27, 2030",
+"header": "09:33 — Chat with Jessamy Jepcott"
+},
+"E158": {
+"body": "**Me:** Ran into Tamsin Fennimore at the co-op bakery today. We got talking and they told me their map projection is the Winkel tripel.\n\n**Assistant:** Marit met Tamsin Fennimore at the co-op bakery; Tamsin Fennimore said their map projection is the Winkel tripel.",
+"day": "2030-02-27",
+"day_header": "Wednesday, February 27, 2030",
+"header": "12:27 — Bumped into Tamsin Fennimore"
+},
+"E159": {
+"body": "**Me:** Ran into Hesper Gilchrist at the station cafe today. We got talking and they told me their ferry crossing is the Orrin crossing.\n\n**Assistant:** Marit met Hesper Gilchrist at the station cafe; Hesper Gilchrist said their ferry crossing is the Orrin crossing.",
+"day": "2030-02-27",
+"day_header": "Wednesday, February 27, 2030",
+"header": "20:31 — Bumped into Hesper Gilchrist"
+},
+"E161": {
+"body": "**Me:** Had coffee with Mirela Darnall near the tide gauge. Funny coincidence: their favourite tea is roasted barley.\n\n**Assistant:** Marit had coffee with Mirela Darnall, whose favourite tea is roasted barley.",
+"day": "2030-02-28",
+"day_header": "Thursday, February 28, 2030",
+"header": "12:45 — Chat with Mirela Darnall"
+},
+"E164": {
+"body": "**Me:** Ran into Lucan Trevelyan at the boatyard today. We got talking and they told me their apple variety is Ribston Pippin.\n\n**Assistant:** Marit met Lucan Trevelyan at the boatyard; Lucan Trevelyan said their apple variety is Ribston Pippin.",
+"day": "2030-03-01",
+"day_header": "Friday, March 1, 2030",
+"header": "14:36 — Bumped into Lucan Trevelyan"
+},
+"E165": {
+"body": "**Me:** Thinking back to Hesper Gilchrist: I remembered it right, the ferry crossing they mentioned really is the Orrin crossing.\n\n**Assistant:** Marit confirmed that Hesper Gilchrist's ferry crossing is the Orrin crossing.",
+"day": "2030-03-01",
+"day_header": "Friday, March 1, 2030",
+"header": "20:07 — Follow-up thought"
+},
+"E166": {
+"body": "**Me:** Had coffee with Ivo Garraway near the boatyard. Funny coincidence: their ferry crossing is the Orrin crossing.\n\n**Assistant:** Marit had coffee with Ivo Garraway, whose ferry crossing is the Orrin crossing.",
+"day": "2030-03-02",
+"day_header": "Saturday, March 2, 2030",
+"header": "09:02 — Chat with Ivo Garraway"
+},
+"E167": {
+"body": "**Me:** Ran into Gideon Quarrie at the boatyard today. We got talking and they told me their rowing seat is bow seat.\n\n**Assistant:** Marit met Gideon Quarrie at the boatyard; Gideon Quarrie said their rowing seat is bow seat.",
+"day": "2030-03-02",
+"day_header": "Saturday, March 2, 2030",
+"header": "13:40 — Bumped into Gideon Quarrie"
+},
+"E168": {
+"body": "**Me:** Wren the potter gave me a celadon bowl today, completely out of the blue.\n\n**Assistant:** Wren the potter gave Marit a celadon bowl.",
+"day": "2030-03-02",
+"day_header": "Saturday, March 2, 2030",
+"header": "21:25 — A gift from Wren"
+},
+"E170": {
+"body": "**Me:** Had coffee with Kestrel Ivensay near the reading room. Funny coincidence: their map projection is the Dymaxion.\n\n**Assistant:** Marit had coffee with Kestrel Ivensay, whose map projection is the Dymaxion.",
+"day": "2030-03-03",
+"day_header": "Sunday, March 3, 2030",
+"header": "13:18 — Chat with Kestrel Ivensay"
+},
+"E172": {
+"body": "**Me:** Ran into Caspian Rendell at the map library today. We got talking and they told me their dog's name is Biscotti.\n\n**Assistant:** Marit met Caspian Rendell at the map library; Caspian Rendell said their dog's name is Biscotti.",
+"day": "2030-03-04",
+"day_header": "Monday, March 4, 2030",
+"header": "07:32 — Bumped into Caspian Rendell"
+},
+"E176": {
+"body": "**Me:** Thinking back to Quill Castellow: I remembered it right, the allotment plot they mentioned really is plot 33.\n\n**Assistant:** Marit confirmed that Quill Castellow's allotment plot is plot 33.",
+"day": "2030-03-05",
+"day_header": "Tuesday, March 5, 2030",
+"header": "13:42 — Follow-up thought"
+},
+"E179": {
+"body": "**Me:** Ran into Soren Lockyer at the print shop today. We got talking and they told me their boat name is the Curlew.\n\n**Assistant:** Marit met Soren Lockyer at the print shop; Soren Lockyer said their boat name is the Curlew.",
+"day": "2030-03-06",
+"day_header": "Wednesday, March 6, 2030",
+"header": "13:31 — Bumped into Soren Lockyer"
+},
+"E180": {
+"body": "**Me:** Day 3 of the Hollin Moor survey: measured the boundary stones at Gillamoor Cross.\n\n**Assistant:** Marit surveyed Gillamoor Cross as stop 3 of the Hollin Moor survey.",
+"day": "2030-03-06",
+"day_header": "Wednesday, March 6, 2030",
+"header": "19:06 — Hollin Moor survey, stop 3"
+}
+},
+"queries": [
+{
+"candidates": [
+[
+"E047",
+0.8168
+],
+[
+"E106",
+0.8
+],
+[
+"E161",
+0.7628
+],
+[
+"E129",
+0.754
+],
+[
+"E137",
+0.7223
+],
+[
+"E024",
+0.7199
+],
+[
+"E092",
+0.7153
+],
+[
+"E116",
+0.7124
+],
+[
+"E127",
+0.7078
+],
+[
+"E041",
+0.7063
+],
+[
+"E023",
+0.7031
+],
+[
+"E149",
+0.7001
+],
+[
+"C02",
+0.6997
+],
+[
+"E166",
+0.6993
+],
+[
+"E054",
+0.6981
+],
+[
+"E126",
+0.6974
+]
+],
+"category": "needle",
+"id": "Q-needle-00",
+"relevant": [
+[
+"E047"
+]
+],
+"text": "What is Orla Kilbride's favourite tea?"
+},
+{
+"candidates": [
+[
+"E144",
+0.8053
+],
+[
+"E104",
+0.7895
+],
+[
+"E041",
+0.7707
+],
+[
+"E151",
+0.7312
+],
+[
+"E003",
+0.7253
+],
+[
+"E090",
+0.6658
+],
+[
+"E159",
+0.6634
+],
+[
+"E077",
+0.6607
+],
+[
+"E137",
+0.6594
+],
+[
+"E179",
+0.6589
+],
+[
+"E023",
+0.6582
+],
+[
+"E007",
+0.6547
+],
+[
+"E072",
+0.6534
+],
+[
+"E047",
+0.652
+],
+[
+"E021",
+0.6497
+],
+[
+"E065",
+0.6497
+]
+],
+"category": "needle",
+"id": "Q-needle-01",
+"relevant": [
+[
+"E104"
+],
+[
+"E144"
+]
+],
+"text": "What colour is Kestrel Ormsby's bicycle?"
+},
+{
+"candidates": [
+[
+"E139",
+0.7938
+],
+[
+"C04",
+0.7931
+],
+[
+"E127",
+0.781
+],
+[
+"E176",
+0.7349
+],
+[
+"E054",
+0.7275
+],
+[
+"E095",
+0.722
+],
+[
+"E123",
+0.6624
+],
+[
+"E167",
+0.6603
+],
+[
+"E042",
+0.6576
+],
+[
+"E164",
+0.6568
+],
+[
+"E047",
+0.6551
+],
+[
+"E024",
+0.6537
+],
+[
+"E080",
+0.65
+],
+[
+"E068",
+0.6482
+],
+[
+"E029",
+0.6466
+],
+[
+"E066",
+0.6456
+]
+],
+"category": "correction",
+"id": "Q-needle-02",
+"relevant": [
+[
+"C04"
+]
+],
+"text": "Which allotment plot does Gideon Kittredge rent?"
+},
+{
+"candidates": [
+[
+"E056",
+0.7806
+],
+[
+"E121",
+0.7661
+],
+[
+"E019",
+0.7043
+],
+[
+"E042",
+0.6997
+],
+[
+"E172",
+0.6946
+],
+[
+"E164",
+0.665
+],
+[
+"E024",
+0.6643
+],
+[
+"E137",
+0.6637
+],
+[
+"E116",
+0.6632
+],
+[
+"E066",
+0.6603
+],
+[
+"E005",
+0.6584
+],
+[
+"E080",
+0.6566
+],
+[
+"E023",
+0.6519
+],
+[
+"E130",
+0.6505
+],
+[
+"E123",
+0.6505
+],
+[
+"E015",
+0.6499
+]
+],
+"category": "paraphrase",
+"id": "Q-needle-03",
+"relevant": [
+[
+"E056"
+]
+],
+"text": "What is the name of Peregrine Elphick's dog?"
+},
+{
+"candidates": [
+[
+"E094",
+0.7735
+],
+[
+"E053",
+0.7679
+],
+[
+"E010",
+0.7194
+],
+[
+"E109",
+0.6861
+],
+[
+"E072",
+0.6629
+],
+[
+"E123",
+0.6477
+],
+[
+"E137",
+0.6442
+],
+[
+"E142",
+0.64
+],
+[
+"C01",
+0.6364
+],
+[
+"E005",
+0.6352
+],
+[
+"E102",
+0.6326
+],
+[
+"E023",
+0.6325
+],
+[
+"E066",
+0.6323
+],
+[
+"E099",
+0.632
+],
+[
+"E065",
+0.6314
+],
+[
+"E018",
+0.6312
+]
+],
+"category": "needle",
+"id": "Q-needle-04",
+"relevant": [
+[
+"E094"
+]
+],
+"text": "Which part does Bryony Dunmore sing in the choir?"
+},
+{
+"candidates": [
+[
+"E179",
+0.7777
+],
+[
+"E093",
+0.7644
+],
+[
+"E005",
+0.7117
+],
+[
+"E167",
+0.6913
+],
+[
+"E016",
+0.6899
+],
+[
+"E123",
+0.6788
+],
+[
+"E164",
+0.6779
+],
+[
+"E026",
+0.6777
+],
+[
+"E152",
+0.6719
+],
+[
+"E166",
+0.669
+],
+[
+"E137",
+0.6687
+],
+[
+"E104",
+0.6633
+],
+[
+"E048",
+0.6602
+],
+[
+"E129",
+0.6583
+],
+[
+"E133",
+0.653
+],
+[
+"E050",
+0.6517
+]
+],
+"category": "needle",
+"id": "Q-needle-05",
+"relevant": [
+[
+"E179"
+]
+],
+"text": "What is Soren Lockyer's boat called?"
+},
+{
+"candidates": [
+[
+"E148",
+0.7435
+],
+[
+"E030",
+0.7333
+],
+[
+"E155",
+0.6986
+],
+[
+"E145",
+0.6755
+],
+[
+"E133",
+0.6574
+],
+[
+"E018",
+0.6472
+],
+[
+"E090",
+0.643
+],
+[
+"E024",
+0.6288
+],
+[
+"E023",
+0.6276
+],
+[
+"E137",
+0.6256
+],
+[
+"E042",
+0.6252
+],
+[
+"E072",
+0.6245
+],
+[
+"E010",
+0.6231
+],
+[
+"E166",
+0.6229
+],
+[
+"E106",
+0.6227
+],
+[
+"E109",
+0.6209
+]
+],
+"category": "needle",
+"id": "Q-needle-06",
+"relevant": [
+[
+"E030"
+]
+],
+"text": "Which chess opening does Nyle Ingleby always play?"
+},
+{
+"candidates": [
+[
+"E061",
+0.7806
+],
+[
+"E023",
+0.7431
+],
+[
+"E105",
+0.742
+],
+[
+"E149",
+0.7123
+],
+[
+"E129",
+0.6704
+],
+[
+"E161",
+0.666
+],
+[
+"E032",
+0.6642
+],
+[
+"E050",
+0.6584
+],
+[
+"E007",
+0.6546
+],
+[
+"E099",
+0.6545
+],
+[
+"E137",
+0.653
+],
+[
+"E003",
+0.6529
+],
+[
+"E041",
+0.652
+],
+[
+"E164",
+0.6515
+],
+[
+"E130",
+0.651
+],
+[
+"E064",
+0.6508
+]
+],
+"category": "needle",
+"id": "Q-needle-07",
+"relevant": [
+[
+"E061"
+]
+],
+"text": "Which weaving pattern is Mirela Stanforth working on?"
+},
+{
+"candidates": [
+[
+"E159",
+0.8176
+],
+[
+"E165",
+0.7997
+],
+[
+"E064",
+0.7649
+],
+[
+"E084",
+0.7222
+],
+[
+"E166",
+0.7077
+],
+[
+"E003",
+0.6937
+],
+[
+"E015",
+0.6793
+],
+[
+"E095",
+0.6783
+],
+[
+"E151",
+0.6737
+],
+[
+"E018",
+0.673
+],
+[
+"E139",
+0.6725
+],
+[
+"E104",
+0.6719
+],
+[
+"E005",
+0.6711
+],
+[
+"E179",
+0.6705
+],
+[
+"E065",
+0.6689
+],
+[
+"E077",
+0.668
+]
+],
+"category": "needle",
+"id": "Q-needle-08",
+"relevant": [
+[
+"E159"
+],
+[
+"E165"
+]
+],
+"text": "Which ferry crossing does Hesper Gilchrist take on Thursdays?"
+},
+{
+"candidates": [
+[
+"E029",
+0.79
+],
+[
+"E024",
+0.7748
+],
+[
+"E164",
+0.7273
+],
+[
+"E116",
+0.6996
+],
+[
+"E095",
+0.662
+],
+[
+"E054",
+0.6568
+],
+[
+"E176",
+0.65
+],
+[
+"E042",
+0.6425
+],
+[
+"E047",
+0.6339
+],
+[
+"E102",
+0.6325
+],
+[
+"E017",
+0.6307
+],
+[
+"E127",
+0.6291
+],
+[
+"E130",
+0.629
+],
+[
+"E167",
+0.6268
+],
+[
+"E080",
+0.6256
+],
+[
+"E139",
+0.6254
+]
+],
+"category": "needle",
+"id": "Q-needle-09",
+"relevant": [
+[
+"E029"
+]
+],
+"text": "Which apple variety does Quill Prideaux grow?"
+},
+{
+"candidates": [
+[
+"E022",
+0.7776
+],
+[
+"E057",
+0.7442
+],
+[
+"E015",
+0.7328
+],
+[
+"E074",
+0.6869
+],
+[
+"E066",
+0.6829
+],
+[
+"E005",
+0.6797
+],
+[
+"E064",
+0.6778
+],
+[
+"E018",
+0.6761
+],
+[
+"E133",
+0.6757
+],
+[
+"E172",
+0.669
+],
+[
+"E077",
+0.669
+],
+[
+"E090",
+0.6688
+],
+[
+"E165",
+0.6688
+],
+[
+"E024",
+0.6684
+],
+[
+"E170",
+0.6678
+],
+[
+"E065",
+0.6669
+]
+],
+"category": "deletion",
+"id": "Q-needle-10",
+"relevant": [],
+"text": "Which lighthouse shift does Caspian Juxon cover?"
+},
+{
+"candidates": [
+[
+"E123",
+0.7739
+],
+[
+"E068",
+0.748
+],
+[
+"E142",
+0.7064
+],
+[
+"E099",
+0.694
+],
+[
+"E126",
+0.6848
+],
+[
+"E010",
+0.663
+],
+[
+"E094",
+0.6289
+],
+[
+"E109",
+0.6256
+],
+[
+"E090",
+0.6224
+],
+[
+"E164",
+0.6197
+],
+[
+"E116",
+0.618
+],
+[
+"E042",
+0.6144
+],
+[
+"E023",
+0.6134
+],
+[
+"E127",
+0.61
+],
+[
+"E007",
+0.6085
+],
+[
+"E026",
+0.607
+]
+],
+"category": "needle",
+"id": "Q-needle-11",
+"relevant": [
+[
+"E123"
+]
+],
+"text": "Who made Alder Blakemore's violin?"
+},
+{
+"candidates": [
+[
+"E032",
+0.7922
+],
+[
+"E092",
+0.776
+],
+[
+"E134",
+0.7327
+],
+[
+"E157",
+0.7086
+],
+[
+"E005",
+0.6908
+],
+[
+"E116",
+0.6839
+],
+[
+"E129",
+0.6811
+],
+[
+"C01",
+0.6803
+],
+[
+"E102",
+0.6784
+],
+[
+"E126",
+0.6778
+],
+[
+"E066",
+0.6774
+],
+[
+"E106",
+0.6763
+],
+[
+"E047",
+0.6756
+],
+[
+"C02",
+0.6753
+],
+[
+"E145",
+0.6748
+],
+[
+"E094",
+0.6735
+]
+],
+"category": "needle",
+"id": "Q-needle-12",
+"relevant": [
+[
+"E032"
+]
+],
+"text": "What does Fenella Corrigan call their bread starter?"
+},
+{
+"candidates": [
+[
+"E090",
+0.803
+],
+[
+"E107",
+0.7846
+],
+[
+"E021",
+0.7298
+],
+[
+"E007",
+0.7296
+],
+[
+"E170",
+0.6623
+],
+[
+"E147",
+0.6563
+],
+[
+"E116",
+0.647
+],
+[
+"C03",
+0.6421
+],
+[
+"E005",
+0.6387
+],
+[
+"E016",
+0.6367
+],
+[
+"E039",
+0.6357
+],
+[
+"E050",
+0.6345
+],
+[
+"E003",
+0.6343
+],
+[
+"E022",
+0.6341
+],
+[
+"E077",
+0.6333
+],
+[
+"E180",
+0.6331
+]
+],
+"category": "paraphrase",
+"id": "Q-needle-13",
+"relevant": [
+[
+"E090"
+]
+],
+"text": "What kind of telescope does Evander Halloran use?"
+},
+{
+"candidates": [
+[
+"E147",
+0.817
+],
+[
+"E158",
+0.7566
+],
+[
+"E170",
+0.7465
+],
+[
+"E077",
+0.7287
+],
+[
+"E149",
+0.7236
+],
+[
+"C03",
+0.7202
+],
+[
+"E090",
+0.6941
+],
+[
+"E023",
+0.692
+],
+[
+"E064",
+0.6919
+],
+[
+"E015",
+0.6873
+],
+[
+"E005",
+0.6792
+],
+[
+"E031",
+0.6791
+],
+[
+"E140",
+0.6758
+],
+[
+"E069",
+0.6733
+],
+[
+"E043",
+0.6732
+],
+[
+"E053",
+0.673
+]
+],
+"category": "needle",
+"id": "Q-needle-14",
+"relevant": [
+[
+"E158"
+]
+],
+"text": "Which map projection does Tamsin Fennimore prefer?"
+},
+{
+"candidates": [
+[
+"E048",
+0.7505
+],
+[
+"E016",
+0.7236
+],
+[
+"E026",
+0.6791
+],
+[
+"E095",
+0.6666
+],
+[
+"E166",
+0.6663
+],
+[
+"E054",
+0.6578
+],
+[
+"E167",
+0.656
+],
+[
+"E093",
+0.6559
+],
+[
+"E010",
+0.6521
+],
+[
+"E053",
+0.6517
+],
+[
+"E155",
+0.6513
+],
+[
+"C01",
+0.651
+],
+[
+"E084",
+0.6503
+],
+[
+"E116",
+0.6502
+],
+[
+"E149",
+0.6485
+],
+[
+"E090",
+0.6485
+]
+],
+"category": "needle",
+"id": "Q-needle-15",
+"relevant": [
+[
+"E048"
+]
+],
+"text": "Which seat does Ivo Wenlock row in the club eight?"
+},
+{
+"candidates": [
+[
+"E102",
+0.8026
+],
+[
+"C01",
+0.8022
+],
+[
+"E066",
+0.7744
+],
+[
+"E042",
+0.722
+],
+[
+"E080",
+0.7142
+],
+[
+"E116",
+0.678
+],
+[
+"E164",
+0.6741
+],
+[
+"E111",
+0.6722
+],
+[
+"E095",
+0.6438
+],
+[
+"E032",
+0.6429
+],
+[
+"E018",
+0.6406
+],
+[
+"E092",
+0.6386
+],
+[
+"E025",
+0.6367
+],
+[
+"E127",
+0.6366
+],
+[
+"E054",
+0.6362
+],
+[
+"E005",
+0.6357
+]
+],
+"category": "correction",
+"id": "Q-needle-16",
+"relevant": [
+[
+"C01"
+]
+],
+"text": "What type of hive does Lucan Pennick keep?"
+},
+{
+"candidates": [
+[
+"E130",
+0.7784
+],
+[
+"E050",
+0.777
+],
+[
+"E137",
+0.724
+],
+[
+"E072",
+0.6841
+],
+[
+"E142",
+0.684
+],
+[
+"E015",
+0.6787
+],
+[
+"E024",
+0.6739
+],
+[
+"E123",
+0.6732
+],
+[
+"E164",
+0.6722
+],
+[
+"E099",
+0.6687
+],
+[
+"E042",
+0.6684
+],
+[
+"E179",
+0.6673
+],
+[
+"E005",
+0.667
+],
+[
+"E023",
+0.6657
+],
+[
+"E090",
+0.6634
+],
+[
+"E104",
+0.663
+]
+],
+"category": "needle",
+"id": "Q-needle-17",
+"relevant": [
+[
+"E130"
+]
+],
+"text": "What kind of kite does Delphine Yardley fly?"
+},
+{
+"candidates": [
+[
+"E020",
+0.8215
+],
+[
+"E150",
+0.7841
+],
+[
+"E152",
+0.7228
+],
+[
+"E099",
+0.7044
+],
+[
+"E005",
+0.6962
+],
+[
+"E142",
+0.6961
+],
+[
+"E126",
+0.6815
+],
+[
+"E121",
+0.6803
+],
+[
+"E172",
+0.6786
+],
+[
+"E056",
+0.6785
+],
+[
+"E106",
+0.6768
+],
+[
+"E068",
+0.6762
+],
+[
+"E123",
+0.6723
+],
+[
+"E047",
+0.6706
+],
+[
+"E161",
+0.6702
+],
+[
+"E129",
+0.6701
+]
+],
+"category": "needle",
+"id": "Q-needle-18",
+"relevant": [
+[
+"E020"
+]
+],
+"text": "In which month is Rosalind Merriman's birthday?"
+},
+{
+"candidates": [
+[
+"E065",
+0.7785
+],
+[
+"E074",
+0.7638
+],
+[
+"E018",
+0.6988
+],
+[
+"E133",
+0.6625
+],
+[
+"E137",
+0.6308
+],
+[
+"E005",
+0.63
+],
+[
+"E179",
+0.6289
+],
+[
+"E104",
+0.6274
+],
+[
+"E015",
+0.6273
+],
+[
+"E123",
+0.6232
+],
+[
+"E022",
+0.6232
+],
+[
+"E161",
+0.622
+],
+[
+"E134",
+0.6194
+],
+[
+"E003",
+0.6181
+],
+[
+"E066",
+0.6175
+],
+[
+"E129",
+0.6166
+]
+],
+"category": "needle",
+"id": "Q-needle-19",
+"relevant": [
+[
+"E065"
+]
+],
+"text": "Where does Jessamy Larkham swim in the sea?"
+},
+{
+"candidates": [
+[
+"E129",
+0.8122
+],
+[
+"E161",
+0.8025
+],
+[
+"C02",
+0.7568
+],
+[
+"E106",
+0.7553
+],
+[
+"E047",
+0.7532
+],
+[
+"E005",
+0.7066
+],
+[
+"E116",
+0.7023
+],
+[
+"E092",
+0.6998
+],
+[
+"E024",
+0.6984
+],
+[
+"E080",
+0.6928
+],
+[
+"E149",
+0.6909
+],
+[
+"E050",
+0.6891
+],
+[
+"E164",
+0.689
+],
+[
+"E166",
+0.6884
+],
+[
+"E032",
+0.6846
+],
+[
+"E041",
+0.6843
+]
+],
+"category": "correction",
+"id": "Q-needle-20",
+"relevant": [
+[
+"C02"
+]
+],
+"text": "What is Mirela Darnell's favourite tea?"
+},
+{
+"candidates": [
+[
+"E003",
+0.8058
+],
+[
+"E151",
+0.8015
+],
+[
+"E144",
+0.7823
+],
+[
+"E104",
+0.7681
+],
+[
+"E041",
+0.7527
+],
+[
+"E159",
+0.7208
+],
+[
+"E090",
+0.6957
+],
+[
+"E165",
+0.6954
+],
+[
+"E064",
+0.6841
+],
+[
+"E023",
+0.6785
+],
+[
+"E164",
+0.6769
+],
+[
+"E116",
+0.6762
+],
+[
+"E117",
+0.6749
+],
+[
+"E077",
+0.6745
+],
+[
+"E179",
+0.6729
+],
+[
+"E098",
+0.6724
+]
+],
+"category": "needle",
+"id": "Q-needle-21",
+"relevant": [
+[
+"E003"
+]
+],
+"text": "What colour is Hesper Esterby's bicycle?"
+},
+{
+"candidates": [
+[
+"E095",
+0.7801
+],
+[
+"E176",
+0.7796
+],
+[
+"E054",
+0.7478
+],
+[
+"E139",
+0.6914
+],
+[
+"E127",
+0.6887
+],
+[
+"C04",
+0.6859
+],
+[
+"E024",
+0.6513
+],
+[
+"E029",
+0.6468
+],
+[
+"E073",
+0.6411
+],
+[
+"E180",
+0.6352
+],
+[
+"E066",
+0.6338
+],
+[
+"E058",
+0.6312
+],
+[
+"E039",
+0.6302
+],
+[
+"E164",
+0.6291
+],
+[
+"E036",
+0.6288
+],
+[
+"E123",
+0.6279
+]
+],
+"category": "needle",
+"id": "Q-needle-22",
+"relevant": [
+[
+"E095"
+],
+[
+"E176"
+]
+],
+"text": "Which allotment plot does Quill Castellow rent?"
+},
+{
+"candidates": [
+[
+"E172",
+0.781
+],
+[
+"E019",
+0.7665
+],
+[
+"E056",
+0.7013
+],
+[
+"E121",
+0.6907
+],
+[
+"E022",
+0.6614
+],
+[
+"E005",
+0.6608
+],
+[
+"E179",
+0.6598
+],
+[
+"E042",
+0.6505
+],
+[
+"E164",
+0.6499
+],
+[
+"E066",
+0.6471
+],
+[
+"E024",
+0.647
+],
+[
+"E093",
+0.6454
+],
+[
+"E116",
+0.6451
+],
+[
+"E016",
+0.6407
+],
+[
+"E090",
+0.6406
+],
+[
+"E137",
+0.6398
+]
+],
+"category": "needle",
+"id": "Q-needle-23",
+"relevant": [
+[
+"E172"
+]
+],
+"text": "What is the name of Caspian Rendell's dog?"
+},
+{
+"candidates": [
+[
+"E010",
+0.8038
+],
+[
+"E109",
+0.7534
+],
+[
+"E053",
+0.6836
+],
+[
+"E123",
+0.6736
+],
+[
+"E094",
+0.6727
+],
+[
+"E068",
+0.6581
+],
+[
+"E176",
+0.6352
+],
+[
+"E042",
+0.6334
+],
+[
+"E142",
+0.6328
+],
+[
+"E024",
+0.6303
+],
+[
+"C01",
+0.6274
+],
+[
+"E080",
+0.6264
+],
+[
+"E056",
+0.6247
+],
+[
+"E095",
+0.6245
+],
+[
+"E127",
+0.6242
+],
+[
+"E054",
+0.6235
+]
+],
+"category": "needle",
+"id": "Q-needle-24",
+"relevant": [
+[
+"E010"
+]
+],
+"text": "Which part does Alder Uttley sing in the choir?"
+},
+{
+"candidates": [
+[
+"E005",
+0.7828
+],
+[
+"E179",
+0.7368
+],
+[
+"E093",
+0.7291
+],
+[
+"E129",
+0.7278
+],
+[
+"E016",
+0.7233
+],
+[
+"E167",
+0.7174
+],
+[
+"E032",
+0.716
+],
+[
+"E164",
+0.7113
+],
+[
+"E123",
+0.7081
+],
+[
+"E104",
+0.7042
+],
+[
+"E092",
+0.7033
+],
+[
+"E166",
+0.6939
+],
+[
+"E147",
+0.6918
+],
+[
+"E065",
+0.6915
+],
+[
+"E161",
+0.6911
+],
+[
+"E048",
+0.69
+]
+],
+"category": "deletion",
+"id": "Q-needle-25",
+"relevant": [],
+"text": "What is Fenella Rookwood's boat called?"
+},
+{
+"candidates": [
+[
+"E155",
+0.7356
+],
+[
+"E145",
+0.7197
+],
+[
+"E148",
+0.6735
+],
+[
+"E030",
+0.6611
+],
+[
+"E090",
+0.6432
+],
+[
+"E093",
+0.6185
+],
+[
+"E116",
+0.6171
+],
+[
+"E026",
+0.6166
+],
+[
+"E056",
+0.6143
+],
+[
+"E022",
+0.6134
+],
+[
+"E016",
+0.6133
+],
+[
+"E024",
+0.6093
+],
+[
+"E023",
+0.6091
+],
+[
+"E161",
+0.6083
+],
+[
+"E019",
+0.6082
+],
+[
+"E080",
+0.608
+]
+],
+"category": "needle",
+"id": "Q-needle-26",
+"relevant": [
+[
+"E155"
+]
+],
+"text": "Which chess opening does Evander Northam always play?"
+},
+{
+"candidates": [
+[
+"E023",
+0.7908
+],
+[
+"E149",
+0.7622
+],
+[
+"E061",
+0.716
+],
+[
+"E105",
+0.7008
+],
+[
+"E164",
+0.6683
+],
+[
+"E147",
+0.6591
+],
+[
+"E142",
+0.6557
+],
+[
+"E137",
+0.6556
+],
+[
+"E158",
+0.6541
+],
+[
+"E116",
+0.654
+],
+[
+"E099",
+0.6539
+],
+[
+"E151",
+0.6478
+],
+[
+"E104",
+0.647
+],
+[
+"E126",
+0.6465
+],
+[
+"E041",
+0.6456
+],
+[
+"E005",
+0.6455
+]
+],
+"category": "paraphrase",
+"id": "Q-needle-27",
+"relevant": [
+[
+"E023"
+]
+],
+"text": "Which weaving pattern is Tamsin Ashdown working on?"
+},
+{
+"candidates": [
+[
+"E166",
+0.7816
+],
+[
+"E084",
+0.7786
+],
+[
+"E165",
+0.7148
+],
+[
+"E159",
+0.7136
+],
+[
+"E064",
+0.7123
+],
+[
+"E016",
+0.6947
+],
+[
+"E048",
+0.6847
+],
+[
+"E091",
+0.676
+],
+[
+"E167",
+0.6742
+],
+[
+"E093",
+0.6721
+],
+[
+"E015",
+0.6717
+],
+[
+"E133",
+0.6704
+],
+[
+"E005",
+0.6696
+],
+[
+"E018",
+0.6692
+],
+[
+"E026",
+0.6675
+],
+[
+"E099",
+0.6616
+]
+],
+"category": "needle",
+"id": "Q-needle-28",
+"relevant": [
+[
+"E084"
+]
+],
+"text": "Which ferry crossing does Ivo Garroway take on Thursdays?"
+},
+{
+"candidates": [
+[
+"E164",
+0.7977
+],
+[
+"E116",
+0.7732
+],
+[
+"E029",
+0.6883
+],
+[
+"E024",
+0.6829
+],
+[
+"E102",
+0.6647
+],
+[
+"C01",
+0.6579
+],
+[
+"E066",
+0.651
+],
+[
+"E047",
+0.6328
+],
+[
+"E042",
+0.6281
+],
+[
+"E127",
+0.6231
+],
+[
+"E129",
+0.6186
+],
+[
+"E054",
+0.6182
+],
+[
+"E094",
+0.6177
+],
+[
+"E123",
+0.6177
+],
+[
+"E080",
+0.6151
+],
+[
+"E090",
+0.6149
+]
+],
+"category": "needle",
+"id": "Q-needle-29",
+"relevant": [
+[
+"E164"
+]
+],
+"text": "Which apple variety does Lucan Trevelyan grow?"
+},
+{
+"candidates": [
+[
+"E057",
+0.7926
+],
+[
+"E015",
+0.7754
+],
+[
+"E022",
+0.7078
+],
+[
+"E130",
+0.6935
+],
+[
+"E005",
+0.6933
+],
+[
+"E050",
+0.6842
+],
+[
+"E137",
+0.6763
+],
+[
+"E117",
+0.6736
+],
+[
+"E161",
+0.6711
+],
+[
+"E074",
+0.6698
+],
+[
+"E147",
+0.6692
+],
+[
+"E109",
+0.6686
+],
+[
+"E133",
+0.6674
+],
+[
+"E166",
+0.6665
+],
+[
+"E116",
+0.6661
+],
+[
+"E092",
+0.6637
+]
+],
+"category": "needle",
+"id": "Q-needle-30",
+"relevant": [
+[
+"E015"
+]
+],
+"text": "Which lighthouse shift does Delphine Fairweather cover?"
+},
+{
+"candidates": [
+[
+"E099",
+0.7858
+],
+[
+"E142",
+0.7844
+],
+[
+"E126",
+0.7521
+],
+[
+"E123",
+0.7147
+],
+[
+"E068",
+0.7129
+],
+[
+"E130",
+0.6354
+],
+[
+"E005",
+0.6331
+],
+[
+"E094",
+0.6326
+],
+[
+"E023",
+0.6323
+],
+[
+"E164",
+0.6302
+],
+[
+"E020",
+0.6283
+],
+[
+"E104",
+0.6249
+],
+[
+"E179",
+0.6242
+],
+[
+"E050",
+0.6238
+],
+[
+"E107",
+0.6238
+],
+[
+"E016",
+0.6235
+]
+],
+"category": "needle",
+"id": "Q-needle-31",
+"relevant": [
+[
+"E099"
+],
+[
+"E142"
+]
+],
+"text": "Who made Rosalind Vowles's violin?"
+},
+{
+"candidates": [
+[
+"E134",
+0.7701
+],
+[
+"E157",
+0.7596
+],
+[
+"E032",
+0.7175
+],
+[
+"E092",
+0.7025
+],
+[
+"E065",
+0.6972
+],
+[
+"E074",
+0.692
+],
+[
+"E017",
+0.6875
+],
+[
+"E042",
+0.6837
+],
+[
+"E024",
+0.683
+],
+[
+"E066",
+0.6794
+],
+[
+"E080",
+0.6775
+],
+[
+"E005",
+0.6739
+],
+[
+"E126",
+0.6733
+],
+[
+"E056",
+0.6717
+],
+[
+"E116",
+0.6702
+],
+[
+"E019",
+0.6676
+]
+],
+"category": "needle",
+"id": "Q-needle-32",
+"relevant": [
+[
+"E134"
+]
+],
+"text": "What does Jessamy Jephcott call their bread starter?"
+},
+{
+"candidates": [
+[
+"E021",
+0.7861
+],
+[
+"E007",
+0.7824
+],
+[
+"E107",
+0.7465
+],
+[
+"E090",
+0.7344
+],
+[
+"E137",
+0.6708
+],
+[
+"E170",
+0.6675
+],
+[
+"E106",
+0.6634
+],
+[
+"E161",
+0.6615
+],
+[
+"E041",
+0.6578
+],
+[
+"E068",
+0.6541
+],
+[
+"E050",
+0.6536
+],
+[
+"E147",
+0.6522
+],
+[
+"E005",
+0.649
+],
+[
+"E099",
+0.6482
+],
+[
+"E166",
+0.6477
+],
+[
+"E053",
+0.6466
+]
+],
+"category": "needle",
+"id": "Q-needle-33",
+"relevant": [
+[
+"E007"
+]
+],
+"text": "What kind of telescope does Orla Brannock use?"
+},
+{
+"candidates": [
+[
+"E077",
+0.7744
+],
+[
+"C03",
+0.7634
+],
+[
+"E170",
+0.7606
+],
+[
+"E147",
+0.7516
+],
+[
+"E090",
+0.6889
+],
+[
+"E158",
+0.6688
+],
+[
+"E031",
+0.6603
+],
+[
+"E137",
+0.6601
+],
+[
+"E048",
+0.6598
+],
+[
+"E022",
+0.6579
+],
+[
+"E041",
+0.6578
+],
+[
+"E149",
+0.6572
+],
+[
+"E007",
+0.6564
+],
+[
+"E021",
+0.6564
+],
+[
+"E104",
+0.6555
+],
+[
+"E069",
+0.6554
+]
+],
+"category": "correction",
+"id": "Q-needle-34",
+"relevant": [
+[
+"C03"
+]
+],
+"text": "Which map projection does Kestrel Ivensey prefer?"
+},
+{
+"candidates": [
+[
+"E026",
+0.712
+],
+[
+"E167",
+0.7043
+],
+[
+"C04",
+0.6937
+],
+[
+"E139",
+0.677
+],
+[
+"E127",
+0.6666
+],
+[
+"E048",
+0.6594
+],
+[
+"C01",
+0.6566
+],
+[
+"E095",
+0.6537
+],
+[
+"E016",
+0.6504
+],
+[
+"E024",
+0.6501
+],
+[
+"E054",
+0.6491
+],
+[
+"E093",
+0.6406
+],
+[
+"E010",
+0.6402
+],
+[
+"E166",
+0.6383
+],
+[
+"E090",
+0.6346
+],
+[
+"E176",
+0.6342
+]
+],
+"category": "needle",
+"id": "Q-needle-35",
+"relevant": [
+[
+"E167"
+]
+],
+"text": "Which seat does Gideon Quarrie row in the club eight?"
+},
+{
+"candidates": [
+[
+"E042",
+0.7857
+],
+[
+"E080",
+0.7582
+],
+[
+"C01",
+0.7134
+],
+[
+"E102",
+0.7088
+],
+[
+"E066",
+0.7082
+],
+[
+"E111",
+0.6677
+],
+[
+"E056",
+0.6489
+],
+[
+"E095",
+0.6421
+],
+[
+"E130",
+0.6406
+],
+[
+"E121",
+0.6403
+],
+[
+"E099",
+0.6357
+],
+[
+"E090",
+0.6352
+],
+[
+"E018",
+0.6346
+],
+[
+"E168",
+0.6329
+],
+[
+"E127",
+0.6327
+],
+[
+"E025",
+0.6314
+]
+],
+"category": "paraphrase",
+"id": "Q-needle-36",
+"relevant": [
+[
+"E042"
+]
+],
+"text": "What type of hive does Peregrine Nethercott keep?"
+},
+{
+"candidates": [
+[
+"E072",
+0.7618
+],
+[
+"E137",
+0.7447
+],
+[
+"E130",
+0.7127
+],
+[
+"E050",
+0.701
+],
+[
+"E164",
+0.6731
+],
+[
+"E094",
+0.6658
+],
+[
+"E179",
+0.661
+],
+[
+"E077",
+0.6586
+],
+[
+"E047",
+0.6568
+],
+[
+"E023",
+0.6554
+],
+[
+"E024",
+0.6537
+],
+[
+"E104",
+0.6524
+],
+[
+"E053",
+0.6512
+],
+[
+"E065",
+0.6498
+],
+[
+"E007",
+0.6495
+],
+[
+"E018",
+0.6477
+]
+],
+"category": "needle",
+"id": "Q-needle-37",
+"relevant": [
+[
+"E072"
+]
+],
+"text": "What kind of kite does Bryony Mabery fly?"
+},
+{
+"candidates": [
+[
+"E152",
+0.7768
+],
+[
+"E150",
+0.7128
+],
+[
+"E020",
+0.7087
+],
+[
+"E093",
+0.6872
+],
+[
+"E179",
+0.6742
+],
+[
+"E066",
+0.6641
+],
+[
+"E106",
+0.6633
+],
+[
+"E026",
+0.658
+],
+[
+"E068",
+0.6575
+],
+[
+"E149",
+0.6571
+],
+[
+"E099",
+0.6554
+],
+[
+"E123",
+0.6551
+],
+[
+"E167",
+0.6551
+],
+[
+"E166",
+0.6541
+],
+[
+"E047",
+0.6534
+],
+[
+"E142",
+0.651
+]
+],
+"category": "deletion",
+"id": "Q-needle-38",
+"relevant": [],
+"text": "In which month is Soren Oakeshott's birthday?"
+},
+{
+"candidates": [
+[
+"E018",
+0.7951
+],
+[
+"E133",
+0.7503
+],
+[
+"E065",
+0.6721
+],
+[
+"E074",
+0.6658
+],
+[
+"E030",
+0.6399
+],
+[
+"E137",
+0.6278
+],
+[
+"E148",
+0.6271
+],
+[
+"E102",
+0.6247
+],
+[
+"E179",
+0.6223
+],
+[
+"E139",
+0.6208
+],
+[
+"E129",
+0.6207
+],
+[
+"E066",
+0.6194
+],
+[
+"E109",
+0.6182
+],
+[
+"E080",
+0.6141
+],
+[
+"E050",
+0.613
+],
+[
+"E042",
+0.6119
+]
+],
+"category": "needle",
+"id": "Q-needle-39",
+"relevant": [
+[
+"E018"
+]
+],
+"text": "Where does Nyle Hartigan swim in the sea?"
+}
+]
+}

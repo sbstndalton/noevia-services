@@ -164,6 +164,24 @@ note says the list may be incomplete.
 A short note opens the retrieved block. Messages without a name or anchor are unaffected, and
 `retrieval.entity_focus: false` turns the check off.
 
+## Score gap (services#114)
+
+A fixed `top_k` loads eight entries even when one or two are relevant. When the message names no entity (and is
+not a follow-up carrying one), `agent/score_gap.py` drops candidates that score more than `retrieval.score_gap`
+(off by default; 0.08 is the suggested value; a gap of exactly the setting is kept) below the best remaining candidate. It runs after the
+entity focus, so with a time anchor the gap is measured from the best entry dated before the anchor. When the
+message names an entity the entity focus alone decides, so an entry about an asked or mistyped name is never
+dropped for its score. The best candidate is always kept and order never changes. The setting is a number in
+(0, 1], or `off` (also `none`, `false`, 0); anything else logs a warning and leaves it off. It is off because, on the traced queries of gate run 1, it added
+no precision over the entity focus, and the query families without traces are untested; enabling it waits for a
+full gate run with traces for every family. The retrieval trace lists
+the removed candidates under `score_gap.removed`.
+
+`gate/replay_precision.py` replays the recorded candidates of synthetic gate run 1
+(`tests/fixtures/precision_replay_114.json`) through the context assembler and prints precision@8 and recall@8
+per setting and query family. It computes no embeddings, so it only shows what a setting keeps or removes from
+recorded candidates; it is not a substitute for a full gate run.
+
 ## Editing — the integrity guarantee
 
 The logger keeps the user's own words near-verbatim; that guarantee extends to

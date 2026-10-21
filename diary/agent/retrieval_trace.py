@@ -14,8 +14,9 @@ min_score; top_k * 2 requested, or top_k * 4 when the message names an entity or
 time anchor and, when some hit names an asked entity in full, hits that cannot refer to any asked
 entity and are a near spelling of it (near_name), confidently name another person (other_person) or
 score more than the margin below the best exact hit (below_margin); score order is kept, at most
-top_k * 2. Then (2) selection in score order under the token budget, capped at top_k. `candidates`
-lists what stage 1b kept (`rank` is the position there, `vector_rank` the stage 1 rank) and
+top_k * 2. Then (1c, services#114) the score gap (score_gap.py): when the message names no entity, candidates scoring more than retrieval.score_gap below the best remaining one are dropped and listed in
+`score_gap.removed`. Then (2) selection in score order under the token budget, capped at top_k. `candidates`
+lists what stages 1b and 1c kept (`rank` is the position there, `vector_rank` the stage 1 rank) and
 `focus.removed` every stage 1 candidate it dropped, with the reason; `focus.removed_by_reason` counts
 them. With no entity or time anchor in the message stage 1b does not run (`focus.checked` is false)
 and `candidates` is stage 1. `rerank.present` is false so the gate can tell "no reranker" from
@@ -59,6 +60,7 @@ class RetrievalTrace:
             "counts": {"candidates": 0, "loaded": 0, "dropped_budget": 0, "dropped_top_k": 0},
             "direct_fallback": {"used": False, "found": False, "tokens": 0},
             "focus": {"checked": False},
+            "score_gap": {"gap": None, "applied": False, "best": None, "removed": []},
         }
 
     def set_status(self, status: str) -> None:
@@ -99,6 +101,15 @@ class RetrievalTrace:
                                   for reason in sorted({r for _, _, r in focus.removed})},
             "similar_name_labelled": len(focus.similar),
             "superseded_labelled": len(focus.corrected_by),
+        }
+
+    def set_score_gap(self, gap, applied: bool, best, removed) -> None:
+        """Stage 1c (services#114). Entry refs and scores only."""
+        self.data["score_gap"] = {
+            "gap": None if gap is None else float(gap),
+            "applied": bool(applied),
+            "best": best,
+            "removed": [{"vector_rank": rank, **self._ref(row), "score": row.get("score")} for rank, row in removed],
         }
 
     def add_loaded(self, row: dict, tokens: int, chars: int) -> None:
