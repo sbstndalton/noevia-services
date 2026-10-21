@@ -2,7 +2,9 @@
 
 A call runs on a helper thread and the exchange waits for it within the budget. When the budget
 runs out the exchange stops waiting and raises ExchangeTimeout. The helper cannot be killed, so it is
-abandoned: anything it emits afterwards is dropped, and it ends by its own socket timeouts.
+abandoned: anything it emits afterwards is dropped. #127: a call can register a closer with
+`alive.on_abandon(fn)`; it runs when the call is given up, so the model call can close its upstream
+connection (and the model server stops generating) instead of reading until its own socket timeout.
 
 Only the companion's answer and the steps before its save are bounded. Once saving has begun, the
 save itself is never interrupted; a failed aux step there falls back the way its existing failure does.
@@ -38,6 +40,58 @@ class _Abandoned(BaseException):
     """Raised inside an abandoned call so it stops emitting and retrying."""
 
 
+class Liveness:
+    """The `alive` handed to a bounded call. Calling it reports provider progress (and raises inside a call
+    that was already given up). `on_abandon(fn)` registers fn to run once when the call is given up, from
+    the waiting thread, and returns a function that unregisters it; registering after the call was given
+    up runs fn at once. #127: the model client uses it to close the upstream connection."""
+
+    def __init__(self, started: threading.Event, abandoned: threading.Event):
+        self._started = started
+        self._abandoned = abandoned
+        self._lock = threading.Lock()
+        self._closers = []
+
+    def __call__(self):
+        # An abandoned call that is still reading the provider stops at its next sign of life,
+        # the same way an abandoned emit does, instead of streaming to the end unobserved.
+        if self._abandoned.is_set():
+            raise _Abandoned()
+        self._started.set()
+
+    @property
+    def abandoned(self) -> bool:
+        return self._abandoned.is_set()
+
+    def on_abandon(self, fn):
+        with self._lock:
+            run_now = self._abandoned.is_set()
+            if not run_now:
+                self._closers.append(fn)
+        if run_now:
+            _run_closer(fn)
+
+        def unregister():
+            with self._lock:
+                if fn in self._closers:
+                    self._closers.remove(fn)
+        return unregister
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned.set()
+            closers, self._closers = self._closers, []
+        for fn in closers:
+            _run_closer(fn)
+
+
+def _run_closer(fn) -> None:
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001 - closing is best effort; the exchange already failed
+        log.debug("closing an abandoned model call failed: %s", type(exc).__name__)
+
+
 class ExchangeBudget:
     def __init__(self, total_s=None, first_token_s=None, clock=time.monotonic):
         self._clock = clock
@@ -59,13 +113,7 @@ class ExchangeBudget:
             raise ExchangeTimeout("the exchange deadline passed before the companion was called")
         started, finished, abandoned = threading.Event(), threading.Event(), threading.Event()
         box = {}
-
-        def alive():
-            # An abandoned call that is still reading the provider stops at its next sign of life,
-            # the same way an abandoned emit does, instead of streaming to the end unobserved.
-            if abandoned.is_set():
-                raise _Abandoned()
-            started.set()
+        alive = Liveness(started, abandoned)
 
         def gate(event):
             if abandoned.is_set():
@@ -88,11 +136,11 @@ class ExchangeBudget:
         threading.Thread(target=target, name="diary-exchange-call", daemon=True).start()
         began = self._clock()
         if first_token and not started.wait(min(self._first_token_s, total)):
-            abandoned.set()
+            alive.abandon()
             log.warning("Diary companion sent no first token within %.0fs; giving up on it", min(self._first_token_s, total))
             raise ExchangeTimeout("no first token from the companion before its deadline")
         if not finished.wait(max(0.0, total - (self._clock() - began))):
-            abandoned.set()
+            alive.abandon()
             log.warning("Diary companion call passed its %.0fs deadline; giving up on it", total)
             raise ExchangeTimeout("the companion did not finish before its deadline")
         if "error" in box:

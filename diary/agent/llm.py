@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import logging
 import re
+import socket
 import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -43,12 +44,46 @@ def strip_reasoning(text: str, final: bool = True) -> str:
     return text
 
 
+# #127: the default answer-length cap (tokens) of the companion answer; llm.max_answer_tokens overrides it.
+DEFAULT_MAX_ANSWER_TOKENS = 1024
+# #127: appended to an answer the model server cut off at the cap, so a shortened answer is never silent.
+SHORTENED_NOTE = "(This answer was shortened: it reached the answer length limit.)"
+
+
+def with_shortened_note(text: str) -> str:
+    return (text.rstrip() + "\n\n" + SHORTENED_NOTE) if text.strip() else SHORTENED_NOTE
+
+
 class ChatReply(str):
-    """Answer text with optional provider reasoning, never part of stored prose."""
-    def __new__(cls, content: str, reasoning: str = ""):
+    """Answer text with optional provider reasoning, never part of stored prose. `truncated` is True when
+    the provider stopped at the length cap (finish_reason "length", #127)."""
+    def __new__(cls, content: str, reasoning: str = "", truncated: bool = False):
         reply = super().__new__(cls, content)
         reply.reasoning = reasoning
+        reply.truncated = truncated
         return reply
+
+
+def _shutdown_upstream(holder: Dict[str, Any]) -> None:
+    """#127: close the connection of a given-up model call so the model server notices the disconnect and
+    stops generating. A socket shutdown also wakes the thread still blocked reading it; with no socket (an
+    in-process transport) the response is closed instead."""
+    response = holder.get("response")
+    stream = holder.get("network") or (response.extensions.get("network_stream") if response is not None else None)
+    sock = None
+    if stream is not None:
+        try:
+            sock = stream.get_extra_info("socket")
+        except Exception:  # noqa: BLE001
+            sock = None
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        return
+    if response is not None:
+        response.close()
 
 
 class LLMError(RuntimeError):
@@ -374,7 +409,17 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         stop: Optional[List[str]] = None,
+        alive=None,
     ) -> str:
+        """One chat completion. With `alive` (the exchange deadline hook, #127) the request is streamed
+        internally and its connection is closed when the deadline gives the call up, so the model server
+        stops generating; the reply is the same as the non-streamed one."""
+        if alive is not None:
+            try:
+                return self._chat_cancellable(messages, model, temperature, max_tokens, stop, alive)
+            except LLMError:
+                self.invalidate_resolution()  # the served list may have changed; look again next time
+                raise
         payload: Dict[str, Any] = {
             "model": model or self.resolve_chat_model()[0],
             "messages": messages,
@@ -392,7 +437,8 @@ class LLMClient:
                 raise LLMError(f"unexpected chat response shape: {data!r}")
             message = data["choices"][0]["message"]
             reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-            return ChatReply(strip_reasoning(content), reasoning if isinstance(reasoning, str) else "")
+            return ChatReply(strip_reasoning(content), reasoning if isinstance(reasoning, str) else "",
+                             data["choices"][0].get("finish_reason") == "length")
 
         try:
             return self._post_with_retries("/chat/completions", payload, "chat", parse_chat)
@@ -400,81 +446,147 @@ class LLMClient:
             self.invalidate_resolution()  # the served list may have changed; look again next time
             raise
 
-    def chat_stream(self, messages, emit, temperature=0.7, alive=None):
+    def _chat_cancellable(self, messages, model, temperature, max_tokens, stop, alive):
+        """#127: chat() for a call bounded by the exchange deadline. Streamed internally (a model server
+        notices a client disconnect while it streams), accumulated, and closed when the call is given up.
+        A failure before the provider answered (no connection, a 5xx) is retried as chat() does; once the
+        answer has begun, or after the call was given up, nothing is sent again."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            if getattr(alive, "abandoned", False):
+                break
+            try:
+                content, reasoning, finish = self._stream_completion(messages, model, temperature, max_tokens, stop, alive, None)
+                return ChatReply(strip_reasoning(content), reasoning, finish == "length")
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.HTTPStatusError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", 500)
+                if status < 500:
+                    raise LLMError(f"chat failed: HTTP {status}") from exc
+                last_exc = exc
+                if attempt == self.max_retries - 1:
+                    break
+                wait = self.retry_backoff_s * (2**attempt)
+                log.warning("chat attempt %d failed (%s); retrying in %.1fs", attempt + 1, type(exc).__name__, wait)
+                time.sleep(wait)
+            except LLMError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - transport/parse failure after the answer began
+                raise LLMError(f"chat failed: {type(exc).__name__}") from exc
+        raise LLMError(f"chat failed after {self.max_retries} attempts: {last_exc}") from last_exc
+
+    def chat_stream(self, messages, emit, temperature=0.7, alive=None, max_tokens=None):
         """Stream real provider output once; retain log markers only for capture. `alive`, when given,
-        is called on every line the provider sends (#1505: the exchange deadline counts it as progress)."""
+        is called on every line the provider sends (#1505: the exchange deadline counts it as progress).
+        `max_tokens` caps the answer (#127); an answer cut off there ends with SHORTENED_NOTE."""
         try:
-            return self._chat_stream(messages, emit, temperature, alive)
+            return self._chat_stream(messages, emit, temperature, alive, max_tokens)
         except Exception:
             self.invalidate_resolution()  # the served list may have changed; look again next time
             raise
 
-    def _chat_stream(self, messages, emit, temperature, alive=None):
-        chat_model = self.resolve_chat_model()[0]
-        payload = {"model": chat_model, "messages": messages,
-                   "temperature": temperature, "stream": True}
-        def telemetry(data):
-            timings = data.get("timings")
-            if isinstance(timings, dict) and "draft_n" in timings and "draft_n_accepted" in timings:
-                emit({"type": "mtp", "model": data.get("model") or chat_model,
-                      "timings": {"draft_n": timings["draft_n"], "draft_n_accepted": timings["draft_n_accepted"]}})
-        content, reasoning, sent = "", "", 0
-        completed = False
-        with self._client.stream("POST", "/chat/completions", json=payload) as response:
-            response.raise_for_status()
-            if "text/event-stream" not in response.headers.get("content-type", ""):
-                data = json.loads(response.read())
-                if alive is not None:
-                    alive()
-                telemetry(data)
-                completed = True
-                message = data["choices"][0]["message"]
-                content = message.get("content") or ""
-                reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-                if not isinstance(content, str) or not isinstance(reasoning, str):
-                    raise LLMError("invalid provider answer")
-                # #1505: provider reasoning is kept request-local, never streamed or stored as the answer.
-                content = strip_reasoning(content)
-            else:
-                for line in response.iter_lines():
-                    if alive is not None:
-                        alive()
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if raw == "[DONE]":
-                        completed = True
-                        break
-                    data = json.loads(raw)
-                    telemetry(data)
-                    if data.get("error"):
-                        raise LLMError("provider stream failed")
-                    choices = data.get("choices") or []
-                    if not choices:
-                        continue
-                    if choices[0].get("finish_reason"):
-                        completed = True
-                    delta = choices[0].get("delta") or {}
-                    thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                    if isinstance(thought, str) and thought:
-                        reasoning += thought  # #1505: retained request-local only; never streamed
-                    text = delta.get("content") or ""
-                    if isinstance(text, str):
-                        content += text
-                        # Keep inline reasoning and the trailing protocol marker out of visible tokens.
-                        shown = strip_reasoning(content, final=False)
-                        end = max(sent, len(shown) - 128)
-                        if end > sent:
-                            emit({"type": "delta", "text": shown[sent:end]})
-                            sent = end
-        if not completed:
-            raise LLMError("provider stream ended before completion")
+    def _chat_stream(self, messages, emit, temperature, alive=None, max_tokens=None):
+        content, reasoning, finish = self._stream_completion(messages, None, temperature, max_tokens, None, alive, emit)
         content = strip_reasoning(content)  # #1505: the final answer never carries inline reasoning
         visible, _ = self.strip_log_marker(content)
         if not visible:
             raise LLMError("provider returned no final answer")
-        emit({"type": "answer", "text": visible})
-        return ChatReply(content, reasoning)
+        truncated = finish == "length"
+        emit({"type": "answer", "text": with_shortened_note(visible) if truncated else visible})
+        return ChatReply(content, reasoning, truncated)
+
+    def _stream_completion(self, messages, model, temperature, max_tokens, stop, alive, emit):
+        """One streamed request: (content, reasoning, finish_reason). `emit` (optional) receives deltas and
+        telemetry. #127: when `alive` offers on_abandon, the connection is shut down as soon as the
+        exchange deadline gives the call up, also while waiting for the first byte."""
+        chat_model = model or self.resolve_chat_model()[0]
+        payload: Dict[str, Any] = {"model": chat_model, "messages": messages,
+                                   "temperature": temperature, "stream": True}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if stop:
+            payload["stop"] = stop
+
+        def telemetry(data):
+            if emit is None:
+                return
+            timings = data.get("timings")
+            if isinstance(timings, dict) and "draft_n" in timings and "draft_n_accepted" in timings:
+                emit({"type": "mtp", "model": data.get("model") or chat_model,
+                      "timings": {"draft_n": timings["draft_n"], "draft_n_accepted": timings["draft_n_accepted"]}})
+        holder: Dict[str, Any] = {}
+
+        def trace(name, info):
+            # The connection, as soon as it exists: a reply that has not started yet can still be closed.
+            if name == "connection.connect_tcp.complete" and isinstance(info, dict):
+                holder["network"] = info.get("return_value")
+
+        on_abandon = getattr(alive, "on_abandon", None)
+        unregister = on_abandon(lambda: _shutdown_upstream(holder)) if callable(on_abandon) else None
+        content, reasoning, sent, finish = "", "", 0, None
+        completed = False
+        try:
+            with self._client.stream("POST", "/chat/completions", json=payload, extensions={"trace": trace}) as response:
+                holder["response"] = response
+                response.raise_for_status()
+                if "text/event-stream" not in response.headers.get("content-type", ""):
+                    data = json.loads(response.read())
+                    if alive is not None:
+                        alive()
+                    telemetry(data)
+                    completed = True
+                    choice = data["choices"][0]
+                    finish = choice.get("finish_reason")
+                    message = choice["message"]
+                    content = message.get("content") or ""
+                    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+                    if not isinstance(content, str) or not isinstance(reasoning, str):
+                        raise LLMError("invalid provider answer")
+                    # #1505: provider reasoning is kept request-local, never streamed or stored as the answer.
+                    content = strip_reasoning(content)
+                else:
+                    for line in response.iter_lines():
+                        if alive is not None:
+                            alive()
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if raw == "[DONE]":
+                            completed = True
+                            break
+                        data = json.loads(raw)
+                        telemetry(data)
+                        if data.get("error"):
+                            raise LLMError("provider stream failed")
+                        choices = data.get("choices") or []
+                        if not choices:
+                            continue
+                        if choices[0].get("finish_reason"):
+                            completed = True
+                            finish = choices[0]["finish_reason"]
+                        delta = choices[0].get("delta") or {}
+                        thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                        if isinstance(thought, str) and thought:
+                            reasoning += thought  # #1505: retained request-local only; never streamed
+                        text = delta.get("content") or ""
+                        if isinstance(text, str):
+                            content += text
+                            if emit is None:
+                                continue
+                            # Keep inline reasoning and the trailing protocol marker out of visible tokens.
+                            shown = strip_reasoning(content, final=False)
+                            end = max(sent, len(shown) - 128)
+                            if end > sent:
+                                emit({"type": "delta", "text": shown[sent:end]})
+                                sent = end
+        finally:
+            if unregister is not None:
+                unregister()
+        if not completed:
+            raise LLMError("provider stream ended before completion")
+        if finish == "length":
+            # #127: the cap is logged, never the text.
+            log.warning("Diary model answer reached its length cap (%s tokens) and was shortened", max_tokens)
+        return content, reasoning, finish
 
     # ---------------- log-marker handling ----------------
 

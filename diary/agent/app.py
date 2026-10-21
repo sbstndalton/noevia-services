@@ -46,7 +46,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
-from .streaming import MODEL_TIMEOUT_TEXT, exchange_stream
+from .streaming import MODEL_TIMEOUT_TEXT, describe_failure, exchange_stream
 from pydantic import BaseModel
 
 from . import corpus as fmt
@@ -61,7 +61,8 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import EngineUnreachable, LLMClient, ModelNotServed, one_listing_per_check, strip_reasoning
+from .llm import (DEFAULT_MAX_ANSWER_TOKENS, EngineUnreachable, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
+                  strip_reasoning, with_shortened_note)
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
 from .retrieval_trace import RetrievalTrace, attach as attach_trace, trace_requested
@@ -76,6 +77,20 @@ from . import tenant_assertion
 log = logging.getLogger("diary")
 
 # ---------------- state ----------------
+
+
+def answer_token_cap(cfg) -> int:
+    """#127: llm.max_answer_tokens (LLM_MAX_ANSWER_TOKENS), a positive whole number of tokens; anything else
+    falls back to the default with a warning, so a typo never sends an unbounded answer request."""
+    raw = cfg.get("llm.max_answer_tokens", DEFAULT_MAX_ANSWER_TOKENS)
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        log.warning("llm.max_answer_tokens is not a positive whole number; using %d", DEFAULT_MAX_ANSWER_TOKENS)
+        return DEFAULT_MAX_ANSWER_TOKENS
+    return value
 
 
 class AppState:
@@ -109,6 +124,8 @@ class AppState:
             # Same engine: when the aux model is not served either, follow the chat model's choice.
             prefer_model_from=self.llm_main if cfg.get("llm.aux.base_url") == cfg.get("llm.base_url") else None,
         )
+        # #127: the token cap sent with every companion answer.
+        self.max_answer_tokens = answer_token_cap(cfg)
         self.store = CorpusStore(cfg, self.backend, self.journal)
         # #1636: the service's one embedding configuration (shared by every tenant state).
         self.retrieval = Retriever(Path(cfg.get("retrieval.db_path")), self.llm_main,
@@ -936,20 +953,27 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     # #1505: the companion's answer and the steps before the save share one deadline. Past it the
     # exchange fails before any save began (the stream says so), instead of hanging for minutes.
     budget = ExchangeBudget()
+    # #127: every companion answer is capped, and the deadline closes the model call it gives up on.
+    cap = getattr(st, "max_answer_tokens", DEFAULT_MAX_ANSWER_TOKENS)
     if emit:
         emit({"type": "status", "text": "Generating companion response…"})
     try:
         if emit:
-            reply = budget.run(lambda gate, alive: st.llm_main.chat_stream(messages, gate, temperature=0.7, alive=alive),
+            reply = budget.run(lambda gate, alive: st.llm_main.chat_stream(messages, gate, temperature=0.7, alive=alive,
+                                                                            max_tokens=cap),
                                emit=emit, first_token=True)
         else:
-            reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7))
+            reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7, max_tokens=cap, alive=alive))
     except ExchangeTimeout as exc:
         exc.nothing_saved = True  # the answer comes first; no save has begun
         raise
 
+    # #127: an answer the model server cut off at the cap is kept, with a note saying it was shortened.
+    truncated = bool(getattr(reply, "truncated", False))
     # #1505: inline reasoning is removed again here, so neither the saved entry nor the reply can carry it.
     visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
+    if truncated and not visible:
+        raise LLMError("the answer length limit was reached before any answer text")
     if marker is None:
         marker = "ok"  # model omitted the marker — default to logging (never lose content)
 
@@ -968,7 +992,11 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
         threading.Thread(target=_reindex_today, args=(st, day), daemon=True).start()
     # #1505: "reasoning" stays in the payload for older callers but is always empty: the companion's
     # reasoning is never returned to the user.
-    return attach_trace({"reply": visible, "reasoning": "", "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}, trace)
+    result = {"reply": with_shortened_note(visible) if truncated else visible, "reasoning": "",
+              "decision": outcome.decision, "xid": outcome.xid, "reason": outcome.reason}
+    if truncated:
+        result["truncated"] = True  # #127: status only; the saved entry and session history carry no note
+    return attach_trace(result, trace)
 
 
 def _reindex_dirty(st: AppState) -> None:
@@ -1600,6 +1628,13 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day, True, optional_reference(body), **trace_kw)
     except HTTPException:
         raise
+    except ExchangeTimeout as exc:
+        # #127: a deadline is told apart from a failure by its code. The status stays 502, the one every
+        # caller already handles for a failed exchange.
+        log.error("v1 exchange passed its deadline: %s", describe_failure(exc))
+        return JSONResponse({"error": {
+            "message": "the model did not answer before the diary deadline" + ("; nothing was saved" if exc.nothing_saved else ""),
+            "type": "api_error", "code": "chat_timeout"}}, status_code=502)
     except Exception:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
@@ -1616,11 +1651,11 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": result["reply"], "reasoning_content": result.get("reasoning", "")},
-                "finish_reason": "stop",
+                "finish_reason": "length" if result.get("truncated") else "stop",
             }
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        "diary": {"decision": result["decision"], "xid": result["xid"]},
+        "diary": {"decision": result["decision"], "xid": result["xid"], **({"truncated": True} if result.get("truncated") else {})},
         **({"retrieval_trace": result["retrieval_trace"]} if "retrieval_trace" in result else {}),
     })
 
