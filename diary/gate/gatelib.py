@@ -265,6 +265,8 @@ RECHECK_S = float(os.environ.get("GATE_RECHECK_S", "5"))
 IDLE_WAIT_S = float(os.environ.get("GATE_IDLE_WAIT_S", "900"))
 IDLE_POLL_S = float(os.environ.get("GATE_IDLE_POLL_S", "5"))
 AREA_WAIT_S = float(os.environ.get("GATE_AREA_WAIT_S", "3600"))
+# The longest settle() waits for the journal and the index (restore_baseline); run_areas.py sizes its stop grace on it.
+SETTLE_TIMEOUT_S = 300.0
 # The longest the gate waits for one chat call (harness.ask). run_areas.py derives its default stop grace from it.
 CHAT_TIMEOUT_S = 600.0
 
@@ -794,7 +796,7 @@ def health(client: Client, user: str) -> dict:
     return (r.json() or {}) if r.status == 200 else {}
 
 
-def settle(client: Client, user: str, expect_chunks=None, timeout: float = 300, sleep=time.sleep) -> dict:
+def settle(client: Client, user: str, expect_chunks=None, timeout: float = SETTLE_TIMEOUT_S, sleep=time.sleep) -> dict:
     """Wait until the journal is empty and (with inference) the index holds the baseline chunk count,
     twice in a row. Returns {"ok": bool, ...}; never raises."""
     deadline, stable, last = time.monotonic() + timeout, 0, {}
