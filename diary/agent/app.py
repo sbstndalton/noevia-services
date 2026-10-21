@@ -61,7 +61,7 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
-from .llm import (DEFAULT_MAX_ANSWER_TOKENS, LENGTH_CAP_TEXT, EngineUnreachable, LengthCapError, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
+from .llm import (DEFAULT_MAX_ANSWER_TOKENS, EMPTY_ANSWER_TEXT, LENGTH_CAP_TEXT, EmptyAnswerError, EngineUnreachable, LengthCapError, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
                   strip_reasoning, with_shortened_note)
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
@@ -976,7 +976,7 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
         raise LengthCapError()  # #135: a distinct reason; nothing is saved
     if not visible:
         # #140: the streamed path already refuses an empty answer; the unstreamed path must not save one either.
-        raise LLMError("provider returned no final answer")
+        raise EmptyAnswerError()  # #146: a distinct reason; nothing is saved
     if marker is None:
         # A truncated answer is cut before its trailing log marker, so the marker is missing. That is
         # expected and defaults to logging (never lose content); #135 records it, without the answer text.
@@ -1646,6 +1646,10 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         # #135: the cap used the whole budget before any answer text; same shape as chat_timeout.
         log.error("v1 exchange hit the answer length cap before any answer text")
         return JSONResponse({"error": {"message": LENGTH_CAP_TEXT, "type": "api_error", "code": "length_cap"}}, status_code=502)
+    except EmptyAnswerError:
+        # #146: a normal stop with no answer text; nothing was saved. Same shape as length_cap.
+        log.error("v1 exchange returned no answer text")
+        return JSONResponse({"error": {"message": EMPTY_ANSWER_TEXT, "type": "api_error", "code": "empty_answer"}}, status_code=502)
     except Exception:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
@@ -1831,3 +1835,8 @@ def local_exchange(body: dict, request: Request):
         log.error("local exchange hit the answer length cap before any answer text")
         return JSONResponse({"error": LENGTH_CAP_TEXT, "detail": LENGTH_CAP_TEXT, "code": "modelFailed",
                              "reason": "length_cap", "saved": False}, status_code=503)
+    except EmptyAnswerError:
+        # #146: a normal stop with no answer text; same shape as the length-cap branch. Nothing was saved.
+        log.error("local exchange returned no answer text")
+        return JSONResponse({"error": EMPTY_ANSWER_TEXT, "detail": EMPTY_ANSWER_TEXT, "code": "modelFailed",
+                             "reason": "empty_answer", "saved": False}, status_code=503)

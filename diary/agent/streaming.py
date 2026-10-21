@@ -7,7 +7,7 @@ import threading
 from fastapi.responses import StreamingResponse
 
 from .deadline import ExchangeTimeout
-from .llm import LENGTH_CAP_TEXT, LengthCapError
+from .llm import EMPTY_ANSWER_TEXT, LENGTH_CAP_TEXT, EmptyAnswerError, LengthCapError
 
 log = logging.getLogger("diary.streaming")
 
@@ -60,6 +60,10 @@ def exchange_stream(work):
             log.error("Diary exchange failed: %s", describe_failure(exc))
             # #135: the answer cap, not a model fault; nothing was saved. `code` stays for core and web.
             emit({"type": "error", "code": "modelFailed", "reason": "length_cap", "saved": False, "text": LENGTH_CAP_TEXT})
+        except EmptyAnswerError as exc:
+            log.error("Diary exchange failed: %s", describe_failure(exc))
+            # #146: a normal stop with no answer text; nothing was saved and no diary event follows.
+            emit({"type": "error", "code": "modelFailed", "reason": "empty_answer", "saved": False, "text": EMPTY_ANSWER_TEXT})
         except Exception as exc:
             log.error("Diary exchange failed: %s", describe_failure(exc))
             # Never expose provider HTML, credentials or private prompt bodies.

@@ -150,9 +150,8 @@ TEMPLATES = {
 }
 
 
-def _exchange(upstream, stream, monkeypatch, **st_extra):
-    """One _run_exchange against the fake upstream: (result, events, store, client)."""
-    import agent.app as appmod
+def _state(upstream, **st_extra):
+    """An app state wired to the fake upstream: (st, store, client)."""
     from agent.llm import LLMClient
     from agent.pipeline import LoggingPipeline
     client = LLMClient(upstream.url, chat_model="synthetic-model", max_retries=1)
@@ -167,8 +166,19 @@ def _exchange(upstream, stream, monkeypatch, **st_extra):
     st = SimpleNamespace(
         assembler=SimpleNamespace(build=lambda day, message, session_turns=None: [{"role": "user", "content": message}]),
         llm_main=client, pipeline=pipeline, store=store, **st_extra)
+    return st, store, client
+
+
+def _exchange(upstream, stream, monkeypatch, sink=None, **st_extra):
+    """One _run_exchange against the fake upstream: (result, events, store, client). `sink`, when given, is
+    filled with the store, the events and the client before the exchange runs, so a failed exchange (which
+    raises instead of returning) can still be inspected."""
+    import agent.app as appmod
+    st, store, client = _state(upstream, **st_extra)
     monkeypatch.setattr(appmod, "_reindex_dirty", lambda s: None)
     events = []
+    if sink is not None:
+        sink.update(store=store, events=events, client=client)
     try:
         result = appmod._run_exchange(st, "Synthetic question", "cap-127", "legacy", background=False,
                                       emit=events.append if stream else None)
@@ -497,21 +507,116 @@ def test_an_ordinary_model_failure_on_the_unstreamed_local_exchange_is_unchanged
     from agent.llm import LLMError
 
     def run(*a, **k):
-        raise LLMError("provider returned no final answer")
+        raise LLMError("synthetic provider fault")
 
     r = _local_exchange(monkeypatch, run, stream=False)
     assert r.status_code == 500
-    assert "length_cap" not in r.text and "modelFailed" not in r.text
+    assert "length_cap" not in r.text and "modelFailed" not in r.text and "empty_answer" not in r.text
 
 
-# ---- #140: an empty answer that stopped normally is a plain LLMError, never the length-cap error ----------
+# ---- #140 / #146: an empty answer that stopped normally is its own coded error, never the length-cap one ---
 
 
+@pytest.mark.parametrize("marker", [False, True], ids=["empty", "marker_only"])
 @pytest.mark.parametrize("stream", [False, True])
-def test_an_empty_answer_after_a_normal_stop_is_a_plain_llm_error(upstream_factory, monkeypatch, stream):
-    from agent.llm import LengthCapError, LLMError
-    upstream = upstream_factory(finish="stop", text="", marker=False)
+def test_an_empty_answer_after_a_normal_stop_is_an_empty_answer_error(upstream_factory, monkeypatch, stream, marker):
+    from agent.llm import EMPTY_ANSWER_TEXT, EmptyAnswerError, LengthCapError, LLMError
+    upstream = upstream_factory(finish="stop", text="", marker=marker)
+    sink = {}
     with pytest.raises(LLMError) as raised:
-        _exchange(upstream, stream, monkeypatch)
-    assert not isinstance(raised.value, LengthCapError)
-    assert "LLM_MAX_ANSWER_TOKENS" not in str(raised.value)
+        _exchange(upstream, stream, monkeypatch, sink=sink)
+    sink["client"].close()
+    assert isinstance(raised.value, EmptyAnswerError) and not isinstance(raised.value, LengthCapError)
+    assert str(raised.value) == EMPTY_ANSWER_TEXT and "LLM_MAX_ANSWER_TOKENS" not in str(raised.value)
+    # #146: nothing is logged or saved, and no diary event is emitted.
+    assert sink["store"].answers == [] and sink["store"].saved == [], "log_exchange must not run"
+    assert not any(e.get("type") == "diary" for e in sink["events"])
+    assert len(upstream.requests) == 1, "one answer request: no retry and no save step (summary, gate, edit)"
+
+
+def test_v1_empty_answer_is_a_coded_502(monkeypatch):
+    from agent.llm import EMPTY_ANSWER_TEXT, EmptyAnswerError
+
+    def run(*a, **k):
+        raise EmptyAnswerError()
+
+    r = _v1(monkeypatch, run)
+    assert r.status_code == 502
+    assert r.json() == {"error": {"message": EMPTY_ANSWER_TEXT, "type": "api_error", "code": "empty_answer"}}
+    assert "nothing was saved" in r.json()["error"]["message"]
+
+
+def test_v1_empty_answer_from_a_real_exchange_is_a_coded_502_and_saves_nothing(upstream_factory, monkeypatch):
+    import agent.app as appmod
+    from fastapi.testclient import TestClient
+    upstream = upstream_factory(finish="stop", text="", marker=True)
+    st, store, client = _state(upstream)
+    monkeypatch.setattr(appmod, "check_auth", lambda r: True)
+    monkeypatch.setattr(appmod, "_tenant_state", lambda r, **k: st)
+    monkeypatch.setattr(appmod, "_reindex_dirty", lambda s: None)
+    r = TestClient(appmod.app).post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Synthetic?"}]})
+    client.close()
+    assert r.status_code == 502 and r.json()["error"]["code"] == "empty_answer"
+    assert store.saved == [] and store.answers == []
+    assert len(upstream.requests) == 1
+
+
+def test_the_streamed_empty_answer_event_names_the_reason():
+    from agent.llm import EMPTY_ANSWER_TEXT, EmptyAnswerError
+
+    def work(emit):
+        raise EmptyAnswerError()
+
+    events = _stream_events(work)
+    error = next(e for e in events if e["type"] == "error")
+    assert error == {"type": "error", "code": "modelFailed", "reason": "empty_answer", "saved": False,
+                     "text": EMPTY_ANSWER_TEXT}
+    assert not any(e["type"] in ("diary", "done") for e in events)
+
+
+def test_a_streamed_real_exchange_with_an_empty_answer_ends_in_empty_answer_and_no_diary_event(upstream_factory, monkeypatch):
+    upstream = upstream_factory(finish="stop", text="", marker=True)
+    sink = {}
+
+    def work(emit):
+        return _exchange(upstream, True, monkeypatch, sink=sink)[0]
+
+    events = _stream_events(work)
+    sink["client"].close()
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "modelFailed" and error["reason"] == "empty_answer" and error["saved"] is False
+    assert not any(e["type"] == "diary" for e in events)
+    assert sink["store"].saved == [] and sink["store"].answers == []
+
+
+def test_an_unstreamed_local_exchange_with_an_empty_answer_is_a_coded_503(monkeypatch):
+    from agent.llm import EMPTY_ANSWER_TEXT, EmptyAnswerError
+
+    def run(*a, **k):
+        raise EmptyAnswerError()
+
+    r = _local_exchange(monkeypatch, run, stream=False)
+    assert r.status_code == 503, r.text
+    assert r.json() == {"error": EMPTY_ANSWER_TEXT, "detail": EMPTY_ANSWER_TEXT, "code": "modelFailed",
+                        "reason": "empty_answer", "saved": False}
+
+
+def test_a_streamed_local_exchange_with_an_empty_answer_reports_empty_answer(monkeypatch):
+    from agent.llm import EmptyAnswerError
+
+    def run(*a, **k):
+        raise EmptyAnswerError()
+
+    r = _local_exchange(monkeypatch, run, stream=True)
+    assert r.status_code == 200
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "modelFailed" and error["reason"] == "empty_answer" and error["saved"] is False
+    assert not any(e["type"] == "diary" for e in events)
+
+
+def test_the_gate_records_the_empty_answer_code_on_every_path():
+    from gate.harness import error_code_of
+    assert error_code_of({"error": {"message": "m", "type": "api_error", "code": "empty_answer"}}) == "empty_answer"
+    assert error_code_of({"error": "m", "detail": "m", "code": "modelFailed", "reason": "empty_answer", "saved": False}) == "empty_answer"
+    assert error_code_of({"type": "error", "code": "modelFailed", "reason": "empty_answer", "saved": False}) == "empty_answer"

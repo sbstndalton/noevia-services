@@ -102,6 +102,18 @@ class LengthCapError(LLMError):
         super().__init__(message)
 
 
+# #146: the text for an answer that stopped normally but held no answer text (empty, or only the log marker).
+EMPTY_ANSWER_TEXT = "The model returned no final answer — nothing was saved. You can resend."
+
+
+class EmptyAnswerError(LLMError):
+    """#146: an empty answer after a normal stop (or a reply holding only the log marker). Nothing was saved.
+    Told apart from other model failures, and from LengthCapError (the cap is not why it is empty), so /v1,
+    the local exchange and the stream can report reason "empty_answer" with saved false."""
+    def __init__(self, message: str = EMPTY_ANSWER_TEXT):
+        super().__init__(message)
+
+
 class _Redirected(LLMError):
     """An embeddings server answered with a redirect; never retried."""
 
@@ -504,7 +516,7 @@ class LLMClient:
         if not visible and truncated:
             raise LengthCapError()  # #135: the cap, not the provider, is why there is no answer
         if not visible:
-            raise LLMError("provider returned no final answer")
+            raise EmptyAnswerError()  # #146: a normal stop with no answer text
         emit({"type": "answer", "text": with_shortened_note(visible) if truncated else visible})
         return ChatReply(content, reasoning, truncated)
 
