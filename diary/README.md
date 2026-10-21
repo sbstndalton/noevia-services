@@ -143,7 +143,9 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
 
 - `after_time_anchor`: hits dated after an explicit time anchor are dropped. A date inside a statement ("away
   until 3 March") is not an anchor.
-- A hit that could refer to an asked entity is never dropped for a name: one that names it in full, with a
+- A hit that could refer to an asked entity is never dropped for a name: one that names it in full (for a
+  name of two or more words the surname may carry a trailing "s" or a possessive, "Alder Brannocks boat" or
+  "Alder Brannock’s", which is the asked person and not a near spelling, services#148), with a
   middle name or initial or in reverse order ("Alder J. Brannock"), by first name or surname alone, by a short
   form ("Al", or one from a small table of unambiguous pairs such as "Will" for "William" or "Jan" for
   "Janet"; "Mark" is its own name, not a short form of "Marcus"), by a shared name of an entity
