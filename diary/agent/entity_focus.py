@@ -27,7 +27,15 @@ detail as competing with another's. This module needs no model call.
     near_name     a near spelling of that entity: the diary names the person, so this is someone else;
     other_person  (the asked entity is a person: a full name, or a title and a name) the entry could refer
                   to no asked entity and confidently names another person in its body: a title and a
-                  name, or a full name that is not sentence-initial and does not look like a place,
+                  name, or a full name that does not look like a place, organisation, product or work. A
+                  full name opening the entry or a sentence (after "Today", "Then" and similar words) counts
+                  only with person evidence (services#160): a known given name first ("Tom Hardy fixed the
+                  boat."), or the given name or surname (plain or with a trailing "s") of an asked person
+                  ("Wren Brannocks fixed it"); a capitalised opener such as "Harbour Lights", "New Year" or
+                  "Bank Holiday" has none and is kept, and so is a bold speaker label ("**Bryony
+                  Castellow:** went"). The asked surname alone is evidence only for a two-word run. Known
+                  limit: a capitalised verb before another person ("Met Tom Hardy.") still reads as an opener
+                  and is kept. Otherwise the full name may be anywhere and must not look like a place,
                   organisation, product or work (a whole listed place phrase such as "San Francisco" or
                   "Hong Kong", or an institutional ending such as "Orbel Maps", "Harrow Bank"). A given
                   name and surname is always a person, whatever word precedes it: "Elena Bank" and "Tom Hill"
@@ -643,13 +651,40 @@ def _body(row: dict) -> str:
     return _clean(_HEADER_LINE.sub("\n", str(row.get("text") or "")))
 
 
-def identified_people(text: str) -> List[Tuple[str, ...]]:
+def _person_word(keys: Sequence[str], asked: Sequence[Entity]) -> bool:
+    """services#160: an untitled run opening a sentence carries evidence that it is a person name: its first
+    word is a known given name (_given_name) or the given name of an asked person ("Alder Hollis"), or its
+    last word is the surname of an asked two-or-more-word person, plain or with a trailing "s" ("Wren
+    Brannocks"). A capitalised common opener ("Harbour Lights", "New Year", "Bank Holiday") has neither."""
+    if len(keys) < 2:
+        return False
+    if _given_name(keys[0]):
+        return True
+    for e in asked:
+        if len(e.keys) < 2:
+            continue
+        if keys[0] == e.keys[0]:
+            return True
+        # The surname alone is evidence only for a two-word run, so a capitalised verb in front ("Met Djordje
+        # Ilic") is never read as a given name.
+        if len(keys) == 2 and (keys[-1] == e.keys[-1] or _plural_of(keys[-1], e.keys[-1])):
+            return True
+    return False
+
+
+_LABEL_AFTER = re.compile(r"[*_]*\s*:")  # "**Bryony Castellow:** went": a speaker label, not a mention
+
+
+def identified_people(text: str, asked: Optional[Sequence[Entity]] = None) -> List[Tuple[str, ...]]:
     """The people ``text`` confidently names (see _person_keys), as comparison words.
 
-    A run that opens a sentence (after list markers, quotes, dashes and brackets) never counts unless it
-    starts with a title: "Visited Leeds", "Mum Visited Leeds", "- Called Mum" identify nobody, and so does a
-    full name opening a sentence ("Bryony Castellow came"): dropping too little is the safe side. Relation
-    words ("Mum", "Dad") are never part of a person name."""
+    A run that opens a sentence (after list markers, quotes, dashes and brackets; leading function and time
+    words such as "Then" or "Today" are skipped) counts when it starts with a title ("Then Dr Patel said").
+    Without ``asked`` nothing else there counts: "Visited Leeds", "Mum Visited Leeds", "- Called Mum" and
+    "Bryony Castellow came" identify nobody. With ``asked`` (the asked entities; services#160) an untitled
+    full name there counts too when _person_word finds person evidence for it ("Tom Hardy fixed the boat.",
+    "Today Wren Brannocks came"), so it is told apart from a capitalised opener ("Harbour Lights was busy").
+    Relation words ("Mum", "Dad") are never part of a person name."""
     text = _clean(text)
     out = []
     for run in _cap_runs(text, stop=False):
@@ -657,8 +692,13 @@ def identified_people(text: str) -> List[Tuple[str, ...]]:
         if _sentence_start(text, run[0][1]):
             while words and _key(words[0]) in _NOT_NAMES:
                 words = words[1:]  # "Then Dr Patel said": the opening function word goes, the title stays
-            if not words or _key(words[0]) not in TITLES:
+            if not words:
                 continue
+            if _key(words[0]) not in TITLES:
+                last, last_start = run[-1]
+                if not (asked and _person_word(_keys(words), asked)) \
+                        or _LABEL_AFTER.match(text, last_start + len(last)):
+                    continue
         if any(_key(w) in RELATIONS and _key(w) not in TITLES for w in words):  # "Mum", not "Aunt Peg"
             continue
         before = re.search(r"([^\W\d_]+)[ \t]+$", text[:run[0][1]])  # the word right before the run, same line
@@ -835,7 +875,7 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
                         spellings.append(shown)
                 continue
             if not could_refer(found, res.entities, res.matched, _row_text(row)) and not res.relational:
-                if people_asked and identified_people(_body(row)):
+                if people_asked and identified_people(_body(row), res.entities):
                     res.removed.append((rank, row, "other_person"))
                     continue
                 score = _score(row)

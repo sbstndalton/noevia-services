@@ -167,8 +167,7 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   entity is dropped as:
   - `near_name`: a near spelling of that entity; the diary names the person, so this is someone else;
   - `other_person`: the asked entity is a person (a full name, or a title and a name) and the hit's own body
-    confidently names another person: a title and a name, or a full name that does not open a sentence (list
-    markers, quotes and dashes are skipped: "- Visited Leeds", "1) Called Mum") and does not look like a place,
+    confidently names another person: a title and a name, or a full name that does not look like a place,
     organisation, product or work (a whole listed place phrase such as "San Francisco" or "Hong Kong", or an
     institutional ending such as "... Maps", "... Airport", "... University"). A given name and
     surname is always a person, whatever word precedes it ("visited Anna Pirelli"). That includes a surname-like
@@ -176,7 +175,13 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
     words, a first word that is no known given name ("Northgate Bank", "Hyde Park"), a listed whole place phrase,
     or "along" or "at" right before it ("along Rosa Bank", "paid at Clara Bank"; the cue decides nothing else, and
     "waved to Elena Bank" is still a person). Mostly-place endings ("Mary Street", "Ivy House", "Grace Church") always
-    mark a place. Accepted trade-off: "Rose Hill" reads as a person. Single words ("Marit", "Mum", "Leeds"), relation words
+    mark a place. Accepted trade-off: "Rose Hill" reads as a person. A full name opening the entry or a
+    sentence (list markers, quotes, dashes and words such as "Today" or "Then" are skipped) counts only with
+    person evidence the module already has (services#160): a known given name first ("Tom Hardy fixed the
+    boat."), or the asked person's given name, or for a two-word name the asked surname plain or with a
+    trailing "s" ("Wren Brannocks fixed the boat."). Capitalised openers ("Visited Leeds", "Harbour Lights",
+    "New Year", "Bank Holiday") and bold speaker labels ("**Bryony Castellow:** went") have none and are kept.
+    Known limit: a capitalised verb before another person ("Met Tom Hardy.") is still read as an opener. Single words ("Marit", "Mum", "Leeds"), relation words
     and headers never count;
   - `below_margin`: it scores more than `retrieval.entity_focus_margin` (default 0.05, `MARGIN`; a gap of exactly
     the margin is kept) below the best full exact hit. It arms only for an asked name of two or more words or a

@@ -54,6 +54,8 @@ def test_deleted_person_context_leaves_out_the_near_spelling_and_says_so(qid):
 
 
 def test_every_other_row_loads_exactly_what_main_loaded():
+    # services#160 updated the snapshot for Q-needle-35 only: C04 (another person sharing the asked given name,
+    # at a sentence start) is dropped as other_person; no gold entry is lost.
     changed = {}
     for qid, query in QUERIES.items():
         loaded, _, _ = _context(query)
