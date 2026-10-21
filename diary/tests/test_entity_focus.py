@@ -1176,6 +1176,97 @@ def test_bank_surname_rule_applies_to_the_asked_name_too():
     assert not ef.is_person(ef.Entity("First National Bank", ("first", "national", "bank")))
 
 
+# #129: the other surname-like place endings ("park", "hill", "wood", "green", "cross", ...) shielded real people the same
+# way "bank" did; each person case failed on b414e3a.
+@pytest.mark.parametrize("name", ["Elena Park", "Tom Hill", "Ann Wood", "Sam Green", "Lee Cross", "Priya Marsh",
+                                  "Rosa Field", "Anna Heath", "Carl Ward", "Dr Hill", "Dr Elena Park"])
+def test_a_given_name_and_a_place_word_surname_is_another_person(name):
+    text = f"Later we had tea with {name} at the harbour."
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), name
+    assert ef.identified_people(text) != [], name
+
+
+@pytest.mark.parametrize("name", ["Hyde Park", "Notting Hill", "Kings Cross", "Northgate Park", "Golders Green",
+                                  "Central Park", "Sherwood Forest", "Victoria Park", "Albert Hall", "Elena Marie Park",
+                                  "Dr First National Park", "Harrow Hill", "Green Park"])
+def test_a_place_ending_in_a_surname_like_word_is_not_another_person(name):
+    text = f"Later we walked round {name} for an hour."
+    assert ef.identified_people(text) == [], name
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1, 2], {}), name
+
+
+def test_place_word_surname_rule_applies_to_the_asked_name_too():
+    for name in ("Elena Park", "Tom Hill", "Lee Cross"):
+        assert ef.is_person(ef.Entity(name, tuple(name.lower().split()))), name
+    for name in ("Hyde Park", "Notting Hill", "Northgate Park"):
+        assert not ef.is_person(ef.Entity(name, tuple(name.lower().split()))), name
+
+
+# #129 (low): right after "along" or "at" a surname-like run stays a place or institution, so an entry naming only
+# it survives. The cue decides nothing else: a full name is a person after any word. "at" is a known limit.
+@pytest.mark.parametrize("text", ["Walked along Rosa Bank by the river.", "Paid at Clara Bank today.",
+                                  "Camped along Sam Green all week.", "Walked along Lee Cross and back.",
+                                  "We met at Elena Bank."])
+def test_a_surname_like_run_after_along_or_at_is_a_place(text):
+    assert ef.identified_people(text) == [], text
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1, 2], {}), text
+
+
+@pytest.mark.parametrize("text", ["Had tea with Elena Bank.", "Had tea with Elena Park.", "Talked about Tom Hill.",
+                                  "Went to see Dr Elena Bank today.", "Walked along with Elena Bank.",
+                                  "Went to Hyde Park with Lee Cross."])
+def test_a_surname_like_run_without_a_place_cue_is_still_a_person(text):
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), text
+
+
+@pytest.mark.parametrize("text", ["Went to Daniel Ostrow for advice.", "Walked along with Marcus Fenn.",
+                                  "Got a lift from Anna Pirelli.", "Drove into Wren Hollin by mistake.",
+                                  "Went at Priya Raman with a hose."])
+def test_a_place_cue_does_not_shield_a_full_name(text):
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), text
+
+
+# Review of 99269a3: "to", "from", "into" and "near" are not place cues; a person is still dropped after them.
+@pytest.mark.parametrize("text", ["Waved to Elena Bank.", "Talked to Elena Bank.", "Sent flowers to Tom Hill.",
+                                  "Heard from Ann Wood.", "Ran into Sam Green.", "Sat near Elena Park.",
+                                  "We drove from Elena Park to the coast."])
+def test_to_from_into_and_near_do_not_shield_a_person(text):
+    assert ef.identified_people(text) != [], text
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), text
+
+
+# Review of 99269a3: a given name before a mostly-place ending is a place, as on b414e3a: the entry is kept.
+@pytest.mark.parametrize("text", ["We heard Mary Street was closed.", "We saw Grace Church hold a fair.",
+                                  "We heard Ivy House was sold.", "We saw Emma Lake freeze.",
+                                  "We heard Rose Castle opened.", "We went past Anna Lane today.",
+                                  "We passed Carl Hall and Ella Bridge.", "We saw Rosa Mill and Ines Head."])
+def test_a_given_name_before_a_mostly_place_ending_is_a_place(text):
+    assert ef.identified_people(text) == [], text
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1, 2], {}), text
+    for name in ("Mary Street", "Grace Church", "Ivy House", "Emma Lake", "Rose Castle"):
+        assert not ef.is_person(ef.Entity(name, tuple(name.lower().split()))), name
+
+
+# The accepted trade-off for "hill", which is mostly a surname: a given name and "Hill" reads as a person.
+def test_a_given_name_and_hill_mid_sentence_reads_as_a_person():
+    text = "We think Rose Hill was lovely in spring."
+    rows = _rows("Went to Leeds with Bob Hale.", text)
+    assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"})
+
+
+def test_the_cue_and_ending_lists_are_the_reviewed_ones():
+    assert ef._PLACE_CUES == {"at", "along"}
+    assert ef._SURNAME_LIKE_LAST == {"bank", "park", "hill", "hills", "wood", "woods", "green", "cross", "field",
+                                     "fields", "marsh", "heath", "ward"}
+
+
 def test_mark_is_not_a_short_form_of_marcus():
     rows = _rows("Went to Leeds with Marcus Hale.", "Later Mark Hale and Bryony Castellow sailed.")
     assert _kept_reasons("Where did Marcus Hale go?", rows) == ([1], {2: "other_person"})
