@@ -12,6 +12,8 @@ llm:
     model: default
   timeout_s: 300
   max_retries: 3
+  # Token cap of each companion answer (#127); a longer answer is cut off and marked as shortened.
+  max_answer_tokens: 1024
 
 corpus:
   # Daily files are stored as Entries/YYYY/Month/Month D, YYYY.md.

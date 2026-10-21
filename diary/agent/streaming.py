@@ -51,7 +51,8 @@ def exchange_stream(work):
         except ExchangeTimeout as exc:
             log.error("Diary exchange failed: %s", describe_failure(exc))
             if exc.nothing_saved:
-                emit({"type": "error", "code": "modelFailed", "saved": False, "text": MODEL_TIMEOUT_TEXT})
+                # #127: `reason` tells a deadline apart from other model failures; `code` stays for core and web.
+                emit({"type": "error", "code": "modelFailed", "reason": "chat_timeout", "saved": False, "text": MODEL_TIMEOUT_TEXT})
             else:
                 emit({"type": "error", "text": "Diary processing failed. Saving may be incomplete; check the saved entry before sending again."})
         except Exception as exc:

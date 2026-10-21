@@ -56,6 +56,14 @@ client once and lists each engine at most once (#112). `GET /api/health` reports
 `not_served` or `none_served`). The companion has no access to noevia's per-user Auto roles (they
 live in the web server's workspace), so the fallback does not consult them.
 
+Every companion answer is capped at `LLM_MAX_ANSWER_TOKENS` tokens (`llm.max_answer_tokens`, default
+1024; anything that is not a positive whole number falls back to the default). An answer the engine cuts
+off at the cap is still returned and saved, ending with "(This answer was shortened: it reached the answer
+length limit.)"; the note is not written to the diary. The `/v1` reply then has `finish_reason: "length"`
+and `diary.truncated: true`. When the 300 s exchange deadline gives up on an answer, the diary closes the
+connection to the engine so it stops generating, and `/v1` answers 502 with `error.code: "chat_timeout"`
+(the stream error event carries `reason: "chat_timeout"`) (#127).
+
 ## Embedding model and re-indexing (#1636)
 
 Retrieval embeds each `###` subsection with the configured embedding model. `LLM_EMBED_MODEL` and
