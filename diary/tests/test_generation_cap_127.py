@@ -422,7 +422,7 @@ def test_the_streamed_length_cap_event_names_the_cap():
     error = next(e for e in events if e["type"] == "error")
     assert error["code"] == "modelFailed" and error["reason"] == "length_cap" and error["saved"] is False
     assert "LLM_MAX_ANSWER_TOKENS" in error["text"]
-    assert not any(e["type"] in ("diary", "done") and e["type"] == "diary" for e in events)
+    assert not any(e["type"] == "diary" for e in events)
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -449,3 +449,69 @@ def test_a_complete_answer_without_the_marker_logs_no_truncation_line(upstream_f
     client.close()
     assert result["decision"] == "logged"
     assert not [r for r in caplog.records if "log marker" in r.getMessage()]
+
+
+# ---- #140: the local workspace-files exchange reports a cut-to-nothing answer with its reason ------------
+
+LOCAL_TENANT = "11111111-1111-4111-8111-111111111111"
+
+
+def _local_exchange(monkeypatch, run, stream):
+    import agent.app as appmod
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(appmod, "check_auth", lambda r: True)
+    monkeypatch.setattr(appmod, "_tenant_state", lambda r: pytest.fail("local mode must not resolve remote storage"))
+    monkeypatch.setattr(appmod, "_run_exchange", run)
+    client = TestClient(appmod.app, raise_server_exceptions=False)
+    return client.post("/api/local-exchange", headers={"X-Cowork-User-ID": LOCAL_TENANT},
+                       json={"stream": stream, "files": {}, "message": "A quiet day.", "history": []})
+
+
+def test_an_unstreamed_local_exchange_cut_to_nothing_is_a_coded_length_cap_503(monkeypatch):
+    from agent.llm import LENGTH_CAP_TEXT, LengthCapError
+
+    def run(*a, **k):
+        raise LengthCapError()
+
+    r = _local_exchange(monkeypatch, run, stream=False)
+    assert r.status_code == 503, r.text
+    assert r.json() == {"error": LENGTH_CAP_TEXT, "detail": LENGTH_CAP_TEXT, "code": "modelFailed",
+                        "reason": "length_cap", "saved": False}
+    assert "LLM_MAX_ANSWER_TOKENS" in r.json()["error"]
+
+
+def test_a_streamed_local_exchange_cut_to_nothing_reports_length_cap(monkeypatch):
+    from agent.llm import LengthCapError
+
+    def run(*a, **k):
+        raise LengthCapError()
+
+    r = _local_exchange(monkeypatch, run, stream=True)
+    assert r.status_code == 200
+    events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+    error = next(e for e in events if e["type"] == "error")
+    assert error["code"] == "modelFailed" and error["reason"] == "length_cap" and error["saved"] is False
+
+
+def test_an_ordinary_model_failure_on_the_unstreamed_local_exchange_is_unchanged(monkeypatch):
+    from agent.llm import LLMError
+
+    def run(*a, **k):
+        raise LLMError("provider returned no final answer")
+
+    r = _local_exchange(monkeypatch, run, stream=False)
+    assert r.status_code == 500
+    assert "length_cap" not in r.text and "modelFailed" not in r.text
+
+
+# ---- #140: an empty answer that stopped normally is a plain LLMError, never the length-cap error ----------
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_empty_answer_after_a_normal_stop_is_a_plain_llm_error(upstream_factory, monkeypatch, stream):
+    from agent.llm import LengthCapError, LLMError
+    upstream = upstream_factory(finish="stop", text="", marker=False)
+    with pytest.raises(LLMError) as raised:
+        _exchange(upstream, stream, monkeypatch)
+    assert not isinstance(raised.value, LengthCapError)
+    assert "LLM_MAX_ANSWER_TOKENS" not in str(raised.value)

@@ -974,6 +974,9 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
     if truncated and not visible:
         raise LengthCapError()  # #135: a distinct reason; nothing is saved
+    if not visible:
+        # #140: the streamed path already refuses an empty answer; the unstreamed path must not save one either.
+        raise LLMError("provider returned no final answer")
     if marker is None:
         # A truncated answer is cut before its trailing log marker, so the marker is missing. That is
         # expected and defaults to logging (never lose content); #135 records it, without the answer text.
@@ -1822,3 +1825,9 @@ def local_exchange(body: dict, request: Request):
             raise
         return JSONResponse({"error": MODEL_TIMEOUT_TEXT, "detail": MODEL_TIMEOUT_TEXT, "code": "modelFailed", "saved": False},
                             status_code=503)
+    except LengthCapError:
+        # #140: the answer cap used the whole budget before any answer text; same shape as the stalled branch,
+        # with the reason the stream reports. Nothing was saved.
+        log.error("local exchange hit the answer length cap before any answer text")
+        return JSONResponse({"error": LENGTH_CAP_TEXT, "detail": LENGTH_CAP_TEXT, "code": "modelFailed",
+                             "reason": "length_cap", "saved": False}, status_code=503)
