@@ -718,6 +718,10 @@ def _is_non_chat_section(cp: configparser.ConfigParser, name: str) -> bool:
 # of section id -> role (e.g. {"laya_multilingual_f16": "laya"}). Nothing here writes it for the
 # operator; models.ini only ever holds keys llama.cpp accepts.
 LAYA_ROLE = "laya"
+# noevia#2093 phase 1: the system-routing role key. The legacy role key is still accepted until
+# phase 3 of noevia#2093.
+SYSTEM_ROUTING_ROLE = "system-routing"
+LEGACY_SYSTEM_ROUTING_ROLES = (LAYA_ROLE,)
 ROLES_FILENAME = "models.roles.json"
 _name_rule_logged: set[str] = set()
 _roles_bad_logged: set[str] = set()
@@ -793,7 +797,8 @@ def _is_laya_section(cp: configparser.ConfigParser, name: str) -> bool:
         return False
     role = _section_role(cp, name)
     if role:
-        return role == LAYA_ROLE
+        # Exact match on the already-normalised role: no prefix, substring or separator folding.
+        return role in {SYSTEM_ROUTING_ROLE, *LEGACY_SYSTEM_ROUTING_ROLES}
     model = cp.get(name, "model", fallback=cp.get(name, "m", fallback=""))
     matched = any(re.match(r"^laya(?:[_.-]|$)", part, re.I) for part in [name, *re.split(r"[\\/]", model)] if part)
     if matched and name not in _name_rule_logged:
