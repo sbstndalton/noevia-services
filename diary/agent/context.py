@@ -112,6 +112,9 @@ class ContextAssembler:
                 blocks.append(r["text"])
                 blocks.append("")
         else:
+            # #145: when the only candidates were near spellings of an asked person nobody names, the note
+            # telling the answer to abstain must survive an empty list.
+            blocks.extend(line for line in notes if entity_focus.ABSENT_NOTE in line)
             blocks.append("(no older entries matched this message)")
         blocks.append("=== END RETRIEVED PAST ENTRIES ===")
         if not retrieved:

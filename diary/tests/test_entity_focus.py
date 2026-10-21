@@ -269,21 +269,29 @@ def test_focus_drops_only_confirmed_near_names():
     assert "Time anchor" in ef.context_notes(anchored)[0]
 
 
-def test_focus_without_an_exact_entry_drops_nothing_and_hedges():
+def test_focus_without_an_exact_entry_drops_the_near_spelling_and_says_so():
+    """services#145: nobody names "Alder Brannock" in full, so "Alder Brennock" is someone else."""
     rows = [TEA[0], TEA[2]]
     res = ef.focus_candidates("What is Alder Brannock's favourite tea?", rows)
-    assert not res.applied and [rank for rank, _ in res.kept] == [1, 2] and res.removed == []
-    assert ef.entry_label(res, 1) == ('; names "Alder Brennock", similar to "Alder Brannock": '
-                                      "may be a different person, check the name")
+    assert not res.applied and [rank for rank, _ in res.kept] == [2]
+    assert [(rank, reason) for rank, _, reason in res.removed] == [(1, "near_name_unmatched")]
+    assert ef.entry_label(res, 2) == "" and res.similar == {}
     note = ef.context_notes(res)[0]
-    assert "No retrieved entry names" in note and "check the name" in note and "do not answer" not in note.lower()
+    assert 'The diary has no entry naming "Alder Brannock". Entries naming "Alder Brennock"' in note
+    assert 'ask whether "Alder Brennock" was meant' in note and "No retrieved entry names" not in note
 
 
-def test_typo_in_the_question_never_hides_the_entry():
-    """Review finding 2: "Alder Branock" matches nothing exactly, so both near spellings stay, hedged."""
+def test_typo_in_the_question_abstains_and_offers_the_near_spelling():
+    """services#145 (replaces review finding 2): "Alder Branock" matches nothing exactly, so every entry naming
+    a same-given-name near spelling is left out and the note offers each spelling; the rest is unchanged."""
     res = ef.focus_candidates("What is Alder Branock's favourite tea?", TEA)
-    assert res.removed == [] and len(res.kept) == len(TEA)
-    assert all("may be a different person, check the name" in ef.entry_label(res, r) for r in (1, 2, 4))
+    assert [(rank, reason) for rank, _, reason in res.removed] == [
+        (1, "near_name_unmatched"), (2, "near_name_unmatched"), (4, "near_name_unmatched")]
+    assert [rank for rank, _ in res.kept] == [3, 5]  # the studio day and "Alder called" (first name alone) stay
+    assert all(ef.entry_label(res, r) == "" for r in (3, 5))
+    note = ef.context_notes(res)[0]
+    assert 'The diary has no entry naming "Alder Branock". Entries naming "Alder Brennock" or "Alder Brannock"' in note
+    assert 'ask whether "Alder Brennock" or "Alder Brannock" was meant' in note
 
 
 def test_nickname_in_the_question_or_the_entry_is_never_dropped():
@@ -536,10 +544,14 @@ def test_title_with_or_without_a_full_stop(tmp_path):
     assert got.named == {"Clinic": "near_name"}
 
 
-def test_typo_in_the_question_keeps_and_hedges(tmp_path):
-    got = _case(tmp_path, [BOAT, COFFEE, FILLER], "What did Alder Branock show me?", ["Boat", "Coffee"])
-    assert got.removed == {} and "do not answer" not in got.block.lower()
-    assert got.block.count("may be a different person, check the name") == 2
+def test_typo_in_the_question_drops_both_near_spellings_and_offers_them(tmp_path):
+    """services#145: a misspelt real name abstains with a "did you mean" instead of answering."""
+    got = _case(tmp_path, [BOAT, COFFEE, FILLER], "What did Alder Branock show me?", ["Studio"])
+    assert got.removed == {"Boat": "near_name_unmatched", "Coffee": "near_name_unmatched"}
+    assert "the Curlew" not in got.block and "0111 222" not in got.block
+    assert '(Asked about "Alder Branock". The diary has no entry naming "Alder Branock".' in got.block
+    assert '"Alder Brannock"' in got.block and '"Alder Brennock"' in got.block and "was meant" in got.block
+    assert "check the name" not in got.block
 
 
 def test_nickname_on_either_side_is_kept(tmp_path):
@@ -599,22 +611,27 @@ NEAR_ONLY = """## Monday, January 14, 2030
 """
 
 
-def test_entry_removed_outright_context_hedges_the_near_name(tmp_path):
-    """The asked person's entry is gone entirely: nothing names them, so nothing is dropped, the near-name
-    entry is labelled as possibly someone else, and the note says to check the name or abstain."""
+def test_entry_removed_outright_context_drops_the_near_name_and_says_so(tmp_path):
+    """services#145: the asked person's entry is gone entirely and nothing names them, so the near-name entry
+    is left out, the note says the diary does not record it and offers the near spelling, and the rest of the
+    context is what plain vector search loads."""
     r = Retriever(tmp_path / "idx.db", TrigramLLM())
     _index_files(r, {"Entries/2030/January/January 14, 2030.md": NEAR_ONLY})
     question = "What is Alder Brannock's favourite tea?"
     trace = RetrievalTrace()
     block = _retrieved_block(_assembler(r).build(date(2030, 3, 7), question, trace=trace))
-    assert '(Asked about "Alder Brannock". No retrieved entry names "Alder Brannock" exactly.' in block
-    assert "if no entry records what was asked, say so" in block and "do not answer" not in block.lower()
-    header = next(line for line in block.splitlines() if "Chat with Alder Brennock" in line)
-    assert header.endswith('similar to "Alder Brannock": may be a different person, check the name) ---')
-    assert trace.data["focus"]["similar_name_labelled"] == 1 and not trace.data["focus"]["applied"]
+    assert '(Asked about "Alder Brannock". The diary has no entry naming "Alder Brannock".' in block
+    assert 'say the diary does not record this about "Alder Brannock"' in block
+    assert 'ask whether "Alder Brennock" was meant' in block
+    assert "Chat with Alder Brennock" not in block and "nettle and mint" not in block
+    focus = trace.data["focus"]
+    assert [r["reason"] for r in focus["removed"]] == ["near_name_unmatched"] and not focus["applied"]
+    assert focus["similar_name_labelled"] == 0
     off = RetrievalTrace()
     plain = _retrieved_block(_assembler(r, focus=False).build(date(2030, 3, 7), question, trace=off))
-    assert [e["id"] for e in trace.data["loaded"]] == [e["id"] for e in off.data["loaded"]] != []
+    dropped = {e["id"] for e in focus["removed"]}
+    assert [e["id"] for e in trace.data["loaded"]] == [e["id"] for e in off.data["loaded"] if e["id"] not in dropped]
+    assert "(no older entries matched this message)" in block  # the near-name entry was the only match
     assert "a different person" not in plain and "Asked about" not in plain
 
 
@@ -662,10 +679,13 @@ def test_other_people_only_entries_go_when_the_asked_person_is_named(tmp_path):
     assert "may be incomplete" in got.block
 
 
-def test_no_exact_hit_drops_nothing(tmp_path):
+def test_no_exact_hit_drops_only_the_near_spellings(tmp_path):
     got = _case(tmp_path, [BOAT, BOTH, SOLO, CASPIAN, WALK], "Where did Alder Branock go sailing?",
-                ["Boat", "Together", "Solo", "Leeds", "Walk"])
-    assert got.removed == {}  # neither other_person nor below_margin without a full exact hit
+                ["Solo", "Leeds", "Walk"])
+    # services#145: the two entries naming "Alder Brannock" go as near spellings of the asked name; neither
+    # other_person nor below_margin runs without a full exact hit, so every other entry stays.
+    assert got.removed == {"Boat": "near_name_unmatched", "Together": "near_name_unmatched"}
+    assert '"Alder Brannock"' in got.block and "was meant" in got.block
 
 
 def test_a_first_name_question_drops_no_other_people(tmp_path):
@@ -808,7 +828,9 @@ def test_margin_needs_a_full_exact_hit_and_never_touches_a_possible_mention():
     assert kept == [1, 2, 3, 5] and removed == {4: "near_name"}
     kept, removed = _kept_reasons("Where did Alder Brannock go?", rows)
     assert kept == [1, 2, 3] and removed == {4: "near_name", 5: "below_margin"}
-    assert _kept_reasons("Where did Alder Branock go?", rows) == ([1, 2, 3, 4, 5], {})  # no exact hit
+    # No exact hit: no below_margin (row 5 stays); services#145 drops only the two near spellings.
+    assert _kept_reasons("Where did Alder Branock go?", rows) == (
+        [2, 3, 5], {1: "near_name_unmatched", 4: "near_name_unmatched"})
 
 
 def test_margin_applies_to_a_non_person_match():
@@ -858,7 +880,7 @@ _NONE = "Walked along the estuary with the dog."
     ("Where did Alder Brannock go?", [_A, "Bryony Brannock went to Leeds."], {}),
     ("Where did Zoë Brännock go?", ["Zoe Brannock's boat sank.", _BC], {}),
     ("What did Ann Lee say?", ["Ann Lee said hello.", "Joanne Lee said goodbye."], {}),
-    ("Where did Alder Brannok go?", [_A, _BC], {}),
+    ("Where did Alder Brannok go?", [_A, _BC], {1: "near_name_unmatched"}),  # services#145; _BC stays
     ("Where did Alder Brannock go?", [_A, "The Brannocks visited Leeds."], {}),
     ("What did Alder Brannock say?", [_A, "Then Dr Patel said my knee is fine."], {2: "other_person"}),
     ("What did Alder Brannock say?", [_A, "Mary-Jane Watson said hi."], {}),

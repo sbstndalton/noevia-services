@@ -119,8 +119,8 @@ not change retrieval or the model input.
 - `focus` (services#116): `{"checked": false}` when the message names no entity and no time anchor; then
   `candidates` are the vector hits. Otherwise `entities` and `time_anchor` (counts and flags only, never the
   names), `applied` (some hit named an asked entity exactly), `vector_candidates`, `removed` (each dropped hit:
-  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `other_person`, `below_margin`,
-  `after_time_anchor` or
+  `vector_rank`, `id`, `day`, `time`, `score`, `reason` = `near_name`, `near_name_unmatched`, `other_person`,
+  `below_margin`, `after_time_anchor` or
   `candidate_limit`), `removed_by_reason` (counts), `carried` (the entities came from the previous
   question), `relational`, `margin`, `similar_name_labelled` and `superseded_labelled`.
 - `rerank`: `{"present": false}`. The diary has no reranker; selection is score order under the token budget.
@@ -144,7 +144,15 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
   "Janet"; "Mark" is its own name, not a short form of "Marcus"), by a shared name of an entity
   that no hit names in full, or in lower case (one-word names of three or more letters too: "saw marit"). A
   near spelling is kept (and labelled) while no hit names that entity in full; once one does, it is dropped
-  as `near_name`. A short form that is also an ordinary word ("Will", "May", "Mark", "Bill", "Jan") counts
+  as `near_name`. The one exception is `near_name_unmatched` below.
+- `near_name_unmatched` (services#145): when the asked entity is a two-word person that no hit names in full
+  (its entry was deleted, or never written) and the question is not relational ("X's sister"), a hit naming
+  the same given name with a near-spelled surname ("Caspian Juxton" for "Caspian Juxon") is dropped. The
+  note says the diary does not record that person, names the near spellings (up to three), and tells the
+  answer to ask whether one of them was meant instead of giving its details. Accepted trade-off: a misspelt
+  real name in the question gets this abstention and a "did you mean" instead of an answer. A one-word name,
+  a near given name, or a hit that also names the asked person by first name or surname alone is unaffected.
+  The note stays in the context even when no other entry is loaded. A short form that is also an ordinary word ("Will", "May", "Mark", "Bill", "Jan") counts
   only where its position and the next word read as a name: "Will you ...", "Mark the date", "Bill me" and
   "in Jan 2030" name nobody, and in a question it never counts when it opens the sentence. Names compare without case, accents or letters
   such as ø, ł and ß ("Søren" = "Soren", "Strauß" = "Strauss").

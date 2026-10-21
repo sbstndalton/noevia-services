@@ -71,6 +71,8 @@ from datetime import date
 from typing import Dict, List, Optional, Sequence, Tuple
 
 MAX_ENTITIES = 4
+MAX_NEAR_SPELLINGS = 3  # #145: near spellings a note names per asked person
+ABSENT_NOTE = "The diary has no entry naming"  # #145: opens the abstain sentence; kept even when nothing loads
 # below_margin: an entry naming no asked entity is dropped when it scores more than this below the best full
 # exact-name hit. A deliberate precision/recall trade-off (README); retrieval.entity_focus_margin overrides it.
 MARGIN = 0.05
@@ -709,7 +711,7 @@ class FocusResult:
     removed: List[Tuple[int, dict, str]] = field(default_factory=list)  # (vector rank, row, reason)
     similar: Dict[int, Tuple[str, str, str]] = field(default_factory=dict)  # rank -> (kind, name in entry, asked)
     corrected_by: Dict[int, str] = field(default_factory=dict)  # vector rank -> day of a later correction
-    absent: Dict[Entity, str] = field(default_factory=dict)  # #145: asked person nobody names -> near spelling left out
+    absent: Dict[Entity, List[str]] = field(default_factory=dict)  # #145: asked person nobody names -> near spellings left out
 
     @property
     def active(self) -> bool:
@@ -808,7 +810,9 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
             if near:
                 res.removed.append((rank, row, "near_name_unmatched"))
                 for e, shown in near:
-                    res.absent.setdefault(e, shown)
+                    spellings = res.absent.setdefault(e, [])
+                    if shown not in spellings and len(spellings) < MAX_NEAR_SPELLINGS:
+                        spellings.append(shown)
                 continue
             if not could_refer(found, res.entities, res.matched, _row_text(row)) and not res.relational:
                 if people_asked and identified_people(_body(row)):
@@ -925,11 +929,13 @@ def context_notes(res: FocusResult) -> List[str]:
                 line += (" Some entries that named none of the asked names were left out, so this list may be"
                          " incomplete: an entry about the asked person that does not name them (a pronoun or"
                          " a nickname) may be missing.")
-        for e, near in res.absent.items():
-            line += (f' The diary has no entry naming "{e.name}". Entries naming "{near}", a near spelling with the'
-                     f' same first name, were left out as a different person: say the diary does not record this'
-                     f' about "{e.name}", do not give the details of "{near}" as the answer, and ask whether'
-                     f' "{near}" was meant.')
+        for e, spellings in res.absent.items():
+            near = " or ".join(f'"{s}"' for s in spellings)
+            what, who = (("a near spelling", "a different person") if len(spellings) == 1
+                         else ("near spellings", "different people"))
+            line += (f' {ABSENT_NOTE} "{e.name}". Entries naming {near}, {what} with the same first'
+                     f' name, were left out as {who}: say the diary does not record this about "{e.name}", do not'
+                     f' give the details of {near} as the answer, and ask whether {near} was meant.')
         unmatched = [e for e in unmatched if e not in res.absent]
         if unmatched:
             line += (f" No retrieved entry names {_names(unmatched)} exactly. An entry with a similar name may be a"
