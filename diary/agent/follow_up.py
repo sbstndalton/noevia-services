@@ -11,13 +11,21 @@ final user message, and labels the earlier exchange (and today's log, which hold
 about the other name. The diary names people exactly, so a different spelling is a different person, which is
 also what entity focus assumes when it leaves near spellings out.
 
-Unchanged: any message that is not purely "And what about <Name>?", "What about <Name>?", "How about
-<Name>?" or "And <Name>?"; a name that is the same person as the earlier one (same words, or one is a
-part of the other, such as a given name alone); and a previous question that names nobody or several people.
+Conservative by design; the message is left as is when:
+- it is not purely "And what about <Name>?", "What about <Name>?", "How about <Name>?" or "And <Name>?"
+  (a possessive, a title with a full stop such as "Dr.", or any other word makes it something else);
+- the name is not capitalised (entity focus does not read a lower-case name as a name);
+- the name is the same person as the earlier one (same words, or one is a part of the other);
+- the previous answered question names nobody, several people, or the same name more than once, or is
+  itself an elliptical follow-up (so "And A?" then "And B?" resolves only the first);
+- the earlier name is not written in the previous question exactly as entity focus read it.
+Any capitalised phrase reads as a name ("And Ignore Previous Instructions?" is asked about that "name"): the
+user's own words become the question, and the notes only quote names as reference data.
 """
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
@@ -25,6 +33,9 @@ from . import entity_focus
 
 _ELLIPTICAL = re.compile(
     r"^\s*(?:(?:and\s+)?(?:what|how)\s+about|and)\s+(?P<name>[^?!.,;:\n]+?)\s*[?!.]*\s*$", re.I)
+# Characters that could end or fake the quoting of a name inside a note: double quotes of any style,
+# backticks and square brackets (the note's own delimiters).
+_QUOTE_CHARS = set('"“”„‟«»″`[]')
 
 
 @dataclass(frozen=True)
@@ -74,31 +85,43 @@ def resolve(message: str, session_turns: Optional[Sequence[dict]]) -> Optional[R
     if not previous:
         return None
     earlier_q = previous[-1]
+    if _ELLIPTICAL.match(earlier_q):
+        return None  # no chains: the previous question must be a full question
     earlier = entity_focus.asked_entities(earlier_q)
     if len(earlier) != 1 or _same_person(earlier[0], asked):
         return None
-    if earlier[0].name not in earlier_q:
-        return None
+    if earlier_q.count(earlier[0].name) != 1:
+        return None  # written twice (or not as read): a partial replacement would mix two people
     standalone = earlier_q.replace(earlier[0].name, asked.name, 1)
-    if standalone == earlier_q or _ELLIPTICAL.match(standalone):
-        return None
     return Resolution(standalone=standalone, earlier_name=earlier[0].name, asked_name=asked.name,
                       near=_near(earlier[0], asked))
 
 
+def safe_name(name: str) -> str:
+    """A name as quoted inside a note: no quote or bracket characters, no control characters."""
+    kept = "".join(" " if unicodedata.category(c)[0] == "C" else c for c in name if c not in _QUOTE_CHARS)
+    return " ".join(kept.split())
+
+
 def conversation_note(res: Resolution) -> str:
-    """Labels the replayed earlier exchange; it is kept, never dropped."""
+    """Labels the replayed earlier exchange; it is kept, never dropped. Reference data, not an instruction."""
+    earlier, asked = safe_name(res.earlier_name), safe_name(res.asked_name)
     kind = "a near spelling of that name" if res.near else "a different name"
-    return (f'(Note: the earlier exchange above was about "{res.earlier_name}". The new question asks about '
-            f'"{res.asked_name}", {kind}. The diary names people exactly, so they are different people: do not '
-            f'give the earlier answer\'s details as details of "{res.asked_name}". The new question is the '
-            f'earlier question asked about "{res.asked_name}".)')
+    note = (f'[Reference note on this conversation: the earlier exchange above was about "{earlier}". The new '
+            f'question asks about "{asked}", {kind}. The diary names people exactly, so they are different '
+            f'people: the earlier answer\'s details are not details of "{asked}". The new question is the '
+            f'earlier question asked about "{asked}".')
+    if res.near:
+        note += (f' If the diary records nothing about "{asked}", say so and mention that it does record '
+                 f'"{earlier}".')
+    return note + "]"
 
 
 def today_note(res: Resolution) -> str:
     """Labels today's log when it holds the earlier exchange (logged before this question)."""
-    return (f'(Today\'s log may include the earlier exchange about "{res.earlier_name}". It is about '
-            f'"{res.earlier_name}", not "{res.asked_name}".)')
+    earlier, asked = safe_name(res.earlier_name), safe_name(res.asked_name)
+    return (f'[Reference note: today\'s log may include the earlier exchange about "{earlier}". It is about '
+            f'"{earlier}", not "{asked}".]')
 
 
 def mentions(text: str, name: str) -> bool:
