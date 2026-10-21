@@ -620,3 +620,31 @@ def test_the_gate_records_the_empty_answer_code_on_every_path():
     assert error_code_of({"error": {"message": "m", "type": "api_error", "code": "empty_answer"}}) == "empty_answer"
     assert error_code_of({"error": "m", "detail": "m", "code": "modelFailed", "reason": "empty_answer", "saved": False}) == "empty_answer"
     assert error_code_of({"type": "error", "code": "modelFailed", "reason": "empty_answer", "saved": False}) == "empty_answer"
+
+
+# ---- #154: the unstreamed local-exchange timeout 503 has the same shape as its siblings -------------------
+
+
+def _local_timeout(*a, **k):
+    from agent.deadline import ExchangeTimeout
+    exc = ExchangeTimeout("synthetic deadline")
+    exc.nothing_saved = True
+    raise exc
+
+
+def test_an_unstreamed_local_exchange_timeout_is_a_coded_503_with_reason_and_saved_false(monkeypatch):
+    from agent.streaming import MODEL_TIMEOUT_TEXT
+
+    r = _local_exchange(monkeypatch, _local_timeout, stream=False)
+    assert r.status_code == 503, r.text
+    body = r.json()
+    assert body["reason"] == "chat_timeout" and body["saved"] is False
+    assert body == {"error": MODEL_TIMEOUT_TEXT, "detail": MODEL_TIMEOUT_TEXT, "code": "modelFailed",
+                    "reason": "chat_timeout", "saved": False}
+
+
+def test_the_gate_records_chat_timeout_for_the_unstreamed_local_exchange_timeout_body(monkeypatch):
+    from gate.harness import error_code_of
+
+    r = _local_exchange(monkeypatch, _local_timeout, stream=False)
+    assert error_code_of(r.json()) == "chat_timeout"
