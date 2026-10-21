@@ -136,11 +136,41 @@ def test_probe_asks_slots_only_for_the_models_listed_as_loaded():
     assert [u for u in requested if "/slots" in u] == ["http://router/slots?model=chat"]
 
 
-@pytest.mark.parametrize("state,why", [("loading", "loading"), ("sleeping", "not recognised")])
+@pytest.mark.parametrize("state,why", [("loading", "loading"), ("hibernating", "not recognised (hibernating)")])
 def test_probe_does_not_wake_a_model_that_is_loading_or_in_an_unknown_state(state, why):
     fetch, requested = _engine({"chat": state})
     busy, detail = g._slots_busy("http://router", "", fetch)
     assert busy is True and why in detail  # fails closed, still no slots request
+    assert requested == ["http://router/v1/models"]
+
+
+def test_a_sleeping_model_is_idle_and_never_probed():
+    """services#151: the router reports 'sleeping' for an idle model whose weights are freed. It is idle
+    like an unloaded one, and a slots request would wake it, so it is counted and never probed."""
+    fetch, requested = _engine({"chat": "sleeping"})
+    assert g._slots_busy("http://router", "", fetch) == (False, "1 model(s) sleeping, slots not probed")
+    assert requested == ["http://router/v1/models"]
+    fetch, requested = _engine({"chat": "sleeping", "other": "unloaded", "third": "unloaded"})
+    assert g._slots_busy("http://router", "", fetch) == (
+        False, "2 model(s) unloaded, slots not probed; 1 model(s) sleeping, slots not probed")
+    assert requested == ["http://router/v1/models"]
+
+
+def test_sleeping_next_to_other_states_keeps_their_behaviour():
+    fetch, requested = _engine({"chat": "sleeping", "embed": "loaded"}, slots={"embed": False})
+    assert g._slots_busy("http://router", "", fetch) == (
+        False, "1 model(s) sleeping, slots not probed; 0 slot(s) processing across 1 model(s)")
+    assert requested == ["http://router/v1/models", "http://router/slots?model=embed"]
+    fetch, requested = _engine({"chat": "sleeping", "embed": "loaded"}, slots={"embed": True})
+    assert g._slots_busy("http://router", "", fetch)[0] is True  # the loaded one is generating
+    assert all("model=chat" not in u for u in requested)
+    fetch, requested = _engine({"chat": "sleeping", "embed": "loading"})
+    busy, detail = g._slots_busy("http://router", "", fetch)
+    assert busy is True and "1 model(s) loading" in detail and "1 model(s) sleeping" in detail
+    assert requested == ["http://router/v1/models"]
+    fetch, requested = _engine({"chat": "sleeping", "odd": "hibernating"})
+    busy, detail = g._slots_busy("http://router", "", fetch)
+    assert busy is True and "not recognised (hibernating)" in detail
     assert requested == ["http://router/v1/models"]
 
 
