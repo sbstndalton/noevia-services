@@ -31,6 +31,12 @@ def default_turns(q: dict) -> list:
     return [(q["text"], q)]
 
 
+def area_row(name: str, q: dict, n: int, text: str, res: dict, sig, trace, idle_wait_s=None) -> dict:
+    return {"id": f"{name}:{q['id']}#{n}", "query": q["id"], "turn": n, "text": text, "http": res["status"],
+            "answer": res["answer"], "signals": sig, "trace": trace,
+            "idle_wait_s": res.get("idle_wait_s"), "verdict": "needs-judge", **harness.answer_extras(res)}
+
+
 def run(name: str, doc: str, select, turns=default_turns, mutate: bool = True) -> int:
     args = g.area_args(doc).parse_args()
     area = g.Area(name, args.run_dir, True)
@@ -95,9 +101,7 @@ def _run_area(area, name, args, env, select, turns, mutate, fixture) -> int:
             return area.finish({"tenant": user, "answers": str(rows), "idle_wait_s": round(idle_total[0], 3)})
         def on_row(n, text, spec, res, trace, shape, q=q):
             sig = score.answer_signals(spec, res["answer"], rubric) if res["status"] == 200 else None
-            g.append_jsonl(rows, {"id": f"{name}:{q['id']}#{n}", "query": q["id"], "turn": n, "text": text, "http": res["status"],
-                                  "answer": res["answer"], "signals": sig, "trace": trace if trace else shape,
-                                  "idle_wait_s": res.get("idle_wait_s"), "verdict": "needs-judge"})
+            g.append_jsonl(rows, area_row(name, q, n, text, res, sig, trace if trace else shape))
             if res["status"] != 200:
                 area.check(f"{q['id']}#{n}-http", False, http=res["status"])
             else:

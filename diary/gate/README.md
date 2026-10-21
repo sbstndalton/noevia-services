@@ -217,6 +217,16 @@ and after (`logs/production-*.txt`) and never touches them.
    A stage that regresses, or a workflow area that fails, blocks the release; `untested` and
    `blocked` rows are reported as such, never counted as passes.
 
+Truncation and error codes (#134): each row of `stages/answers.jsonl` and `workflows/<area>/answers.jsonl`
+records `truncated` (bool) and `finish_reason` when the reply carries them (`finish_reason: "length"` /
+`diary.truncated`: the answer was cut at the token cap), and `error_code` for a non-2xx reply: the `/v1` error
+body's `error.code` (for example `chat_timeout`), or for a stream error its `reason` when that is `chat_timeout`,
+otherwise its `code`; `null` when the reply names none. `score.py` totals them in `stages/score.json` under
+`counts` (`overall` and `by_area`, where `stages` is the stage answers): rows, truncated answers and the number
+of non-2xx rows per error code (`unknown` for a row without a code, such as one from before these fields). The
+counts are reporting only: no threshold, stage status or verdict reads them, and rows without the fields score
+exactly as before.
+
 Contamination: each `/v1/chat/completions` call is logged into the diary by design. After `mutate`
 the harness snapshots the tenant (every file, plus the settled chunk count with inference) into
 `stages/baseline.json`; after every query it PUTs back any changed file with its current version,
