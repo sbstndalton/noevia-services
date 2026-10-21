@@ -184,6 +184,38 @@ def stage_answer(queries: dict, answers: list, th: dict, rubric: dict, judgement
     return result, rows
 
 
+def answer_counts(rows: list) -> dict:
+    """#134: how many of these answers.jsonl rows were cut off at the length cap, and how many non-2xx rows
+    carry each error code ("unknown" when the row names none, as every row from before the field existed).
+    Read from the rows only; it never feeds a status, a threshold or the verdict."""
+    truncated, codes = 0, {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("truncated") is True or r.get("finish_reason") == "length":
+            truncated += 1
+        status = r.get("status", r.get("http"))
+        if isinstance(status, int) and not 200 <= status < 300:
+            code = r.get("error_code") if isinstance(r.get("error_code"), str) and r.get("error_code") else "unknown"
+            codes[code] = codes.get(code, 0) + 1
+    return {"rows": sum(1 for r in rows if isinstance(r, dict)), "truncated": truncated, "error_codes": dict(sorted(codes.items()))}
+
+
+def run_counts(run: Path, stage_answers: list) -> dict:
+    """answer_counts for the stage answers ("stages") and for every workflow area's answers.jsonl, plus the totals."""
+    by_area = {"stages": answer_counts(stage_answers)} if stage_answers else {}
+    for p in sorted((run / "workflows").glob("*/answers.jsonl")):
+        by_area[p.parent.name] = answer_counts(g.read_jsonl(p))
+    overall = {"rows": 0, "truncated": 0, "error_codes": {}}
+    for c in by_area.values():
+        overall["rows"] += c["rows"]
+        overall["truncated"] += c["truncated"]
+        for code, n in c["error_codes"].items():
+            overall["error_codes"][code] = overall["error_codes"].get(code, 0) + n
+    overall["error_codes"] = dict(sorted(overall["error_codes"].items()))
+    return {"overall": overall, "by_area": by_area}
+
+
 def area_status(result: dict, area_dir: Path, judgements: dict) -> str:
     """An area whose only open rows are needs-judge answers becomes pass (all judged pass) or fail."""
     status = result["status"]
@@ -242,6 +274,7 @@ def score(run: Path, fixture: Path, judgements_path: Path | None = None) -> dict
                       "evidence": str(p.relative_to(run))})
     passing = ("pass", th["reranking"]["not_applicable"])
     result = {"stages": stages, "areas": areas, "blended_score": None, "judgements": len(judgements),
+              "counts": run_counts(run, answers),
               "verdict": "pass" if all(s["status"] in passing for s in stages) and areas
               and all(a["status"] == "pass" for a in areas) else "not passed (see each row)"}
     g.write_json(sd / "score.json", result)
@@ -264,7 +297,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     result = score(Path(args.run_dir), Path(args.fixture), Path(args.judgements) if args.judgements else None)
     print(json.dumps({"stages": {s["stage"]: s["status"] for s in result["stages"]},
-                      "areas": {a["area"]: a["status"] for a in result["areas"]}, "verdict": result["verdict"]}, sort_keys=True))
+                      "areas": {a["area"]: a["status"] for a in result["areas"]}, "verdict": result["verdict"],
+                      "counts": result["counts"]["overall"]}, sort_keys=True))
     return 0
 
 

@@ -119,6 +119,34 @@ def normalize_trace(trace, index: dict, exclude_xid: str | None = None, exclude_
             "budget_tokens": trace.get("budget_tokens") or trace.get("max_context_tokens")}
 
 
+def error_code_of(payload):
+    """The code of a failed answer, from the /v1 error body ({"error": {"code": ...}}) or from a stream error
+    event / error body ({"code": "modelFailed", "reason": "chat_timeout"}). A reason of chat_timeout wins over
+    the generic code; None when the body names no code (or is not JSON)."""
+    if not isinstance(payload, dict):
+        return None
+    for src in (payload.get("error"), payload):
+        if not isinstance(src, dict):
+            continue
+        if src.get("reason") == "chat_timeout":
+            return "chat_timeout"
+        if isinstance(src.get("code"), str) and src["code"]:
+            return src["code"]
+    return None
+
+
+def answer_extras(res: dict) -> dict:
+    """The truncation / error-code fields of an ask() result, only those the response provided (#134), for
+    the answers.jsonl rows of every writer. Rows from before these fields stay valid without them."""
+    return {k: res[k] for k in ("truncated", "finish_reason", "error_code") if k in res}
+
+
+def stage_row(q: dict, n: int, res: dict, shape: str) -> dict:
+    return {"id": q["id"] if n == 0 else q["id"] + "#followup", "query": q["id"], "turn": n, "category": q["category"],
+            "status": res["status"], "answer": res["answer"], "ms": res["ms"], "decision": res["decision"], "trace": shape,
+            "idle_wait_s": res.get("idle_wait_s"), "verdict": "needs-judge", **answer_extras(res)}
+
+
 def ask(client: g.Client, user: str, text: str, clock: str, session: str, history=None, timeout: float = g.CHAT_TIMEOUT_S):
     body = {"model": "diary", "messages": [*(history or []), {"role": "user", "content": text}], "session_id": session,
             "entryTime": clock.replace("Z", "+00:00")}
@@ -132,8 +160,21 @@ def ask(client: g.Client, user: str, text: str, clock: str, session: str, histor
     except (KeyError, IndexError, TypeError):
         pass
     diary = (payload.get("diary") or {}) if isinstance(payload, dict) else {}
-    return {"status": r.status, "answer": answer, "ms": round((time.monotonic() - started) * 1000),
-            "decision": diary.get("decision"), "xid": diary.get("xid"), "trace": extract_trace(payload)}
+    out = {"status": r.status, "answer": answer, "ms": round((time.monotonic() - started) * 1000),
+           "decision": diary.get("decision"), "xid": diary.get("xid"), "trace": extract_trace(payload)}
+    if 200 <= r.status < 300:
+        # #127: a cut-off answer has finish_reason "length" and diary.truncated; recorded when the reply gives them.
+        try:
+            finish = payload["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            finish = None
+        if isinstance(finish, str):
+            out["finish_reason"] = finish
+        if isinstance(diary.get("truncated"), bool) or finish is not None:
+            out["truncated"] = diary.get("truncated") is True or finish == "length"
+    else:
+        out["error_code"] = error_code_of(payload)
+    return out
 
 
 def cmd_init(args) -> Path:
@@ -355,9 +396,7 @@ def cmd_queries(args, run: Path | None = None) -> int:
         def on_row(n, text, spec, res, trace, shape, q=q):
             row_id = q["id"] if n == 0 else q["id"] + "#followup"
             idle_total[0] += res.get("idle_wait_s") or 0.0
-            g.append_jsonl(answers, {"id": row_id, "query": q["id"], "turn": n, "category": q["category"], "status": res["status"],
-                                     "answer": res["answer"], "ms": res["ms"], "decision": res["decision"], "trace": shape,
-                                     "idle_wait_s": res.get("idle_wait_s"), "verdict": "needs-judge"})
+            g.append_jsonl(answers, stage_row(q, n, res, shape))
             g.append_jsonl(traces, {"id": row_id, "trace": trace, "raw": res["trace"], "note": shape})
         stop = run_turns(client, user, q, query_turns(q), env, log, index, baseline, on_row,
                          lambda row: g.append_jsonl(run / "logs" / "restore.jsonl", row))
