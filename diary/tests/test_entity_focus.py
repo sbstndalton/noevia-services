@@ -865,7 +865,9 @@ def test_people_and_places_are_told_apart():
 
 
 # The independent review's probes of af2730b (r117_probe*.py), kept as regressions: every hit scores 0.5,
-# so only the name rules act. Expected: {rank: reason} of the removed hits.
+# so only the name rules act. Expected: {rank: reason} of the removed hits. services#160 changed four of them
+# from {} to {2: "other_person"}: another person's full name opening the entry is identified like one
+# mid-sentence (decision: https://github.com/sbstndalton/noevia-services/issues/160#issuecomment-6315598860).
 _A = "Alder Brannock went sailing on the estuary."
 _BC = "Bryony Castellow started work as a dentist."
 _NONE = "Walked along the estuary with the dog."
@@ -877,13 +879,13 @@ _NONE = "Walked along the estuary with the dog."
     ("Where did Alder Brannock go?", [_A, "went sailing with alder brannock and Bryony Castellow"], {}),
     ("Where did Alder Brannock go?", [_A, "Alder and Bryony Castellow went to Leeds."], {}),
     ("Where did Alder Brannock go?", [_A, "Al and Bryony Castellow went to Leeds."], {}),
-    ("Where did Alder Brannock go?", [_A, "Bryony Brannock went to Leeds."], {}),
-    ("Where did Zoë Brännock go?", ["Zoe Brannock's boat sank.", _BC], {}),
-    ("What did Ann Lee say?", ["Ann Lee said hello.", "Joanne Lee said goodbye."], {}),
+    ("Where did Alder Brannock go?", [_A, "Bryony Brannock went to Leeds."], {2: "other_person"}),  # #160
+    ("Where did Zoë Brännock go?", ["Zoe Brannock's boat sank.", _BC], {2: "other_person"}),  # #160
+    ("What did Ann Lee say?", ["Ann Lee said hello.", "Joanne Lee said goodbye."], {2: "other_person"}),  # #160
     ("Where did Alder Brannok go?", [_A, _BC], {1: "near_name_unmatched"}),  # services#145; _BC stays
     ("Where did Alder Brannock go?", [_A, "The Brannocks visited Leeds."], {}),
     ("What did Alder Brannock say?", [_A, "Then Dr Patel said my knee is fine."], {2: "other_person"}),
-    ("What did Alder Brannock say?", [_A, "Mary-Jane Watson said hi."], {}),
+    ("What did Alder Brannock say?", [_A, "Mary-Jane Watson said hi."], {2: "other_person"}),  # #160
     ("Where did A. Brannock go?", [_A, _BC], {}),
     ("What did Dr Patel say?", ["Dr. Patel said rest.", "Then Dr Chen said exercise.", "Raj Patel said hi"],
      {2: "other_person"}),
@@ -909,7 +911,8 @@ def test_fixture_never_drops_an_entry_about_an_asked_entity(world):
             text = _text(world.retriever, r["id"])
             assert not any(ef.classify(text, e)[0] in ef.ABOUT for e in entities), (q["id"], r)
             if r["reason"] == "other_person":
-                assert ef.identified_people(ef._body({"text": text})), (q["id"], r)
+                # services#160: the same identification the drop rule uses, with the asked entities
+                assert ef.identified_people(ef._body({"text": text}), entities), (q["id"], r)
 
 
 # ---------------- re-review of d9238ff (findings 1-8), probes /tmp/rr117-probes kept as regressions ----------------

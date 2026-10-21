@@ -1,5 +1,5 @@
 {
- "_doc": "Loaded entry ids per query of precision_replay_114.json at default settings, replayed through ContextAssembler on main ec3bd47 before services#145. Synthetic ids only. Regenerate only on purpose.",
+ "_doc": "Loaded entry ids per query of precision_replay_114.json at default settings, replayed through ContextAssembler on main ec3bd47 before services#145. Synthetic ids only. Regenerate only on purpose. services#160 updated Q-needle-35 only: C04, a correction entry about another person who shares the asked given name (named after a colon, so at a sentence start), is now dropped as other_person; the gold E167 stays loaded.",
  "loaded": {
   "Q-needle-00": [
    "E047"
@@ -131,7 +131,6 @@
   ],
   "Q-needle-35": [
    "E167",
-   "C04",
    "C01"
   ],
   "Q-needle-36": [
