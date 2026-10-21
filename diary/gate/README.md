@@ -220,8 +220,8 @@ and after (`logs/production-*.txt`) and never touches them.
 Truncation and error codes (#134): each row of `stages/answers.jsonl` and `workflows/<area>/answers.jsonl`
 records `truncated` (bool) and `finish_reason` when the reply carries them (`finish_reason: "length"` /
 `diary.truncated`: the answer was cut at the token cap), and `error_code` for a non-2xx reply: the `/v1` error
-body's `error.code` (for example `chat_timeout`), or for a stream error its `reason` when that is `chat_timeout`,
-otherwise its `code`; `null` when the reply names none. `score.py` totals them in `stages/score.json` under
+body's `error.code` (for example `chat_timeout`), or for a stream error its `reason` when that is a non-empty string (for example
+`chat_timeout` or `length_cap`), otherwise its `code`; `null` when the reply names none. `score.py` totals them in `stages/score.json` under
 `counts` (`overall` and `by_area`, where `stages` is the stage answers): rows, truncated answers and the number
 of non-2xx rows per error code (`unknown` for a row without a code, such as one from before these fields). The
 counts are reporting only: no threshold, stage status or verdict reads them, and rows without the fields score
