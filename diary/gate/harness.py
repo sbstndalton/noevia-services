@@ -122,7 +122,11 @@ def normalize_trace(trace, index: dict, exclude_xid: str | None = None, exclude_
 def error_code_of(payload):
     """The code of a failed answer, from the /v1 error body ({"error": {"code": ...}}) or from a stream error
     event / error body ({"code": "modelFailed", "reason": "length_cap"}). Any non-empty string reason (such as
-    chat_timeout or length_cap) wins over the generic code; None when the body names no code (or is not JSON)."""
+    chat_timeout or length_cap) wins over the generic code; None when the body names no code (or is not JSON).
+
+    Precedence (#144): the nested `error` object is read first, then the top level. So a nested `error.code`
+    beats a top-level `reason` ({"error": {"code": "length_cap"}, "reason": "x"} gives "length_cap"), while
+    inside one object a non-empty string `reason` beats that object's `code`."""
     if not isinstance(payload, dict):
         return None
     for src in (payload.get("error"), payload):
