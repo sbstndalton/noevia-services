@@ -86,11 +86,36 @@ helper, `gatelib._slots_busy` (a test fails if any other function in the gate bu
 
 | Wait | Setting (default) | When it runs out |
 | --- | --- | --- |
-| Inference lock held by another gate process | `GATE_LOCK_TIMEOUT_S` (1800) | `blocked`, kind `lock-timeout`; the reason names the waited seconds and the holder (pid and script). The guarded call is never made. |
+| Inference lock held by another gate process | `GATE_LOCK_TIMEOUT_S` (1800) | `blocked`, kind `lock-timeout`; the reason names the waited seconds and the holder (pid and script). The guarded call is never made. A stop request ends the wait early: `blocked`, kind `stopped`, except for the restore. |
 | Load-gate re-checks | `GATE_RECHECKS` (12) x `GATE_RECHECK_S` (5) | `blocked`, kind `load-gate`, with the engines' reasons. |
-| Engines going idle before a restore and before each query turn | `GATE_IDLE_WAIT_S` (900), polled every `GATE_IDLE_POLL_S` (5) | `blocked`, kind `not-idle`. |
-| Another model area still running | `GATE_AREA_WAIT_S` (3600) | the area reports `blocked` (check `serial`) with the holder. |
-| An area overruns under `run_areas.py` | `GATE_AREA_TIMEOUT_S` (10800), then `GATE_AREA_GRACE_S` (60) | SIGTERM first: a model area (and `harness.py queries`) finishes the query it is on, restores the tenant to the baseline and stops as `blocked` ("stopped by SIGTERM"); the no-model areas simply stop. Only if it is still running after the grace period is it killed (SIGKILL). The result is `blocked`; `areas-run.json` marks `killed` and `tenant_may_be_unrestored: true` for a killed area, since a query's logged exchange may remain in its tenant (a fresh stack per run makes this harmless unless the run continues). |
+| Engines going idle before a restore and before each query turn | `GATE_IDLE_WAIT_S` (900), polled every `GATE_IDLE_POLL_S` (5) | `blocked`, kind `not-idle`; kind `stopped` ("stopped by SIGTERM") as soon as a stop request arrives, except in the wait before a restore. |
+| Another model area still running | `GATE_AREA_WAIT_S` (3600) | the area reports `blocked` (check `serial`) with the holder. A stop request ends the wait early: `blocked` (check `stopped`). |
+| An area overruns under `run_areas.py`, or the runner gets SIGTERM/SIGINT | `GATE_AREA_TIMEOUT_S` (10800), then `GATE_AREA_GRACE_S` (1200: the 600 s chat timeout plus 600 s to restore) | SIGTERM first (the stop request, see "Stopping a run" below). The area is `blocked` whatever it printed; `areas-run.json` records `timed_out: true`, the child own return code and last result line, and `tenant_may_be_unrestored: true` only when the area had to be killed (SIGKILL) after the grace period. |
+
+#### Stopping a run (services#123)
+
+SIGTERM is a request to stop at the next safe point, never a death in the middle of a query:
+
+- **Waits end early.** Once a model area, `harness.py queries` or a run of the gate has received SIGTERM, the
+  idle wait before a query turn, the inference-lock wait and the model-area lock wait return `blocked`
+  (kind `stopped`, reason "stopped by SIGTERM") at the next poll, and no new inference call starts. The
+  restore is the exception: its idle wait and its lock wait are not interrupted, because the restore is what
+  the stop is waiting for. A follow-up turn that is stopped after the first turn still gets its restore.
+- **Grace period.** `GATE_AREA_GRACE_S` defaults to the diary chat timeout (600 s) plus 600 s for the
+  restore (idle wait, writes, settle): 1200 s, so a stopped area can finish its current call and restore its
+  tenant. Set the variable to change it; only after it has run out is the area killed.
+- **The child own result is kept.** When an area exits within the grace period, `areas-run.json` keeps its last
+  stdout line (`result`) and its return code (`rc`) next to `timed_out: true` (overrun) or `interrupted: true`
+  (the runner was told to stop). `tenant_may_be_unrestored` stays `false`; it is `true` only for a kill, which
+  also records `killed: true`, `rc` 124 and a synthetic `blocked` line. An area that was stopped is blocked
+  and makes the runner exit non-zero even when it exited 0 in the meantime.
+- **No orphans.** Every area starts in its own session (so Ctrl-C and signals to the process group of the
+  runner do not reach it behind its back), and the runner terminates every child it started whatever ends it
+  (an exception, KeyboardInterrupt, SIGTERM, SIGINT): SIGTERM, the grace period, then SIGKILL of the area
+  process group. SIGTERM and SIGINT to the runner are forwarded to the running areas as SIGTERM; the runner
+  then exits with status 3 (blocked), starts nothing further, and lists the areas it did not run under
+  `interrupted.not_run` in `areas-run.json`. The runner never installs the "finish the current query" handler
+  on itself.
 
 An abandoned generation: when the diary gives up on a chat call at its timeout, the engine may keep
 generating. The query itself is recorded as it happened (its own HTTP failure). Before the restore that

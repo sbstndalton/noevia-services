@@ -119,7 +119,7 @@ def normalize_trace(trace, index: dict, exclude_xid: str | None = None, exclude_
             "budget_tokens": trace.get("budget_tokens") or trace.get("max_context_tokens")}
 
 
-def ask(client: g.Client, user: str, text: str, clock: str, session: str, history=None, timeout: float = 600):
+def ask(client: g.Client, user: str, text: str, clock: str, session: str, history=None, timeout: float = g.CHAT_TIMEOUT_S):
     body = {"model": "diary", "messages": [*(history or []), {"role": "user", "content": text}], "session_id": session,
             "entryTime": clock.replace("Z", "+00:00")}
     started = time.monotonic()
@@ -170,8 +170,10 @@ def restore_baseline(client: g.Client, user: str, baseline: dict, env: dict, gat
     recovery reindex embed). Raises GateBlocked when the engines never go idle or the load gate refuses."""
     # The idle wait runs BEFORE the inference lock is taken, so a long wait never holds up other gate
     # processes; inference_slot's require_gate then re-checks the load inside the lock.
-    idle = g.require_idle(env, gate_log, "restore")
-    with g.inference_slot(env, gate_log):
+    # Neither wait honours a stop request (stoppable=False): after SIGTERM the restore is the one thing
+    # that must still finish; run_areas.py's grace period (GATE_AREA_GRACE_S) is sized for it.
+    idle = g.require_idle(env, gate_log, "restore", stoppable=False)
+    with g.inference_slot(env, gate_log, stoppable=False):
         report = g.restore(client, user, baseline["files"])
         settled = g.settle(client, user, expect_chunks=baseline.get("chunks"))
         same = g.baseline_matches(client, user, baseline["files"])
@@ -277,8 +279,10 @@ def query_turns(q: dict) -> list:
 
 
 def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, restore_log=None) -> str | None:
-    """One query (all its turns), then the restore. Returns None, or a reason to stop the run."""
-    history, session = [], f"gate-{q['id']}-{uuid.uuid4().hex[:8]}"
+    """One query (all its turns), then the restore. Returns None, or a reason to stop the run.
+    A stop request (SIGTERM) ends the waits before a turn ("blocked", kind "stopped"); a turn after the
+    first still gets its restore, because an earlier turn's exchange is in the tenant."""
+    history, session, blocked = [], f"gate-{q['id']}-{uuid.uuid4().hex[:8]}", None
     for n, (text, spec) in enumerate(turns):
         if n and g.stop_requested():
             break  # SIGTERM: skip the follow-up turns, still restore below
@@ -289,7 +293,13 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
                 res = ask(client, user, text, q["clock"], session, history)
             res["idle_wait_s"] = idle["waited_s"]
         except g.GateBlocked as exc:
-            return f"blocked before {q['id']} turn {n}: MS-01 load gate: {exc}"
+            if exc.result.get("kind") == "stopped":
+                blocked = f"blocked: stopped by SIGTERM (area timeout) before {q['id']} turn {n}"
+            else:
+                blocked = f"blocked before {q['id']} turn {n}: MS-01 load gate: {exc}"
+            if not n:
+                return blocked  # nothing was asked yet: nothing to restore
+            break
         qday = q["clock"][:10]
         empty_day = qday if not any(k[0] == "dayhdr" and k[1] == qday for k in index) else None
         trace = normalize_trace(res["trace"], index, res["xid"], empty_day) if res["trace"] is not None else None
@@ -307,7 +317,7 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
                                                                   "idle_wait_s")}})
     if not report["ok"]:
         return f"restore after {q['id']} failed: {json.dumps({k: report[k] for k in ('failures', 'settled', 'matches')})}"
-    return None
+    return blocked and blocked + "; the tenant is restored"
 
 
 def cmd_queries(args, run: Path | None = None) -> int:
