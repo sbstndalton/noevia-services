@@ -1133,7 +1133,8 @@ def test_a_person_after_a_place_word_is_still_another_person(text):
 
 # Review of #119: given names, particles and surnames that are also place words still name people.
 @pytest.mark.parametrize("name", ["Santa Ramirez", "Le Minh", "Rio Ferdinand", "Sri Patel", "Wei Kong",
-                                  "Tom Post", "Hal Ridge", "Jo Tower", "Abu Karim", "Costa Varga"])
+                                  "Tom Post", "Hal Ridge", "Jo Tower", "Abu Karim", "Costa Varga",
+                                  "Lucia Plaza", "Paolo Arena", "Ines Mall", "Rosa Terminal"])
 def test_people_with_place_like_names_are_still_other_people(name):
     rows = _rows("Went to Leeds with Bob Hale.", f"Later we had tea with {name} at the harbour.")
     assert _kept_reasons("Where did Bob Hale go?", rows) == ([1], {2: "other_person"}), name
@@ -1157,3 +1158,10 @@ def test_docs_describe_near_spellings_the_same_way():
     for text in (ef.__doc__, readme):
         assert "A near spelling is kept (and labelled) while no hit names that entity in full" in \
             " ".join(text.split()), text[:40]
+
+
+@pytest.mark.parametrize("name", ["Lucia Plaza", "Paolo Arena"])
+def test_plaza_and_arena_surnames_are_people(name):
+    rows = _rows("Went to Leeds with Alder Brannock.", f"Had tea with {name}.")
+    assert ef.identified_people(rows[1]["text"]) == [tuple(name.lower().split())]
+    assert _kept_reasons("Where did Alder Brannock go?", rows) == ([1], {2: "other_person"})

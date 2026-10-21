@@ -484,7 +484,7 @@ _NOT_PERSON_LAST = {
     # clearly institutional or product endings ("Orbel Maps", "Fenwick Labs", "Dunmore Airport")
     "maps", "apps", "app", "labs", "lab", "software", "systems", "technologies", "airlines", "airways", "corp",
     "corporation", "gmbh", "llp", "academy", "polytechnic", "clinic", "pharmacy", "supermarket", "brewery",
-    "studios", "stadium", "arena", "terminal", "mall", "plaza", "magazine",
+    "studios", "stadium", "magazine",
 }
 # Multi-word places matched as whole phrases, never by one word ("Santa Ramirez" and "Wei Kong" are people).
 PLACE_PHRASES = {
