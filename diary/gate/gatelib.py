@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -250,15 +251,31 @@ def add_blocker(run: Path, text: str) -> None:
 MIN_MEM_AVAILABLE = 6 * 1024 ** 3
 # A private directory (mode 0700) under the gate work dir, never a predictable shared /tmp path.
 LOCK_DIR = os.path.expanduser(os.environ.get("GATE_LOCK_DIR", "~/noevia-work/diarygate-work/locks"))
+# Bounded waits. Each reports "blocked" with its reason when it runs out; none turns into a query failure.
+#   GATE_LOCK_TIMEOUT_S   wait for the cross-process inference lock held by another gate process
+#   GATE_RECHECKS/_S      load-gate re-checks (a previous turn's background reindex may still embed)
+#   GATE_IDLE_WAIT_S/_POLL_S  wait for the engines to go idle before a restore and before the next query
+#                         (a chat call the diary gave up on may still be generating upstream)
+#   GATE_AREA_WAIT_S      wait for another model area to finish (model areas run one at a time)
+#   GATE_MODEL_AREAS_PARALLEL=1  opt in to running model areas at the same time
 LOCK_TIMEOUT_S = float(os.environ.get("GATE_LOCK_TIMEOUT_S", "1800"))
 RECHECKS = int(os.environ.get("GATE_RECHECKS", "12"))
 RECHECK_S = float(os.environ.get("GATE_RECHECK_S", "5"))
+IDLE_WAIT_S = float(os.environ.get("GATE_IDLE_WAIT_S", "900"))
+IDLE_POLL_S = float(os.environ.get("GATE_IDLE_POLL_S", "5"))
+AREA_WAIT_S = float(os.environ.get("GATE_AREA_WAIT_S", "3600"))
+
+
+def model_areas_parallel() -> bool:
+    """Model areas run serially unless GATE_MODEL_AREAS_PARALLEL is 1/true/yes."""
+    return os.environ.get("GATE_MODEL_AREAS_PARALLEL", "").strip().lower() in ("1", "true", "yes")
 
 
 class GateBlocked(Exception):
     """The load gate refused (after its bounded re-checks). result holds the reasons."""
 
     def __init__(self, result: dict):
+        result.setdefault("status", "blocked")  # a refusal is "blocked" with a reason, never a failed query
         self.result = result
         super().__init__("; ".join(result.get("reasons") or ["load gate refused"]))
 
@@ -269,39 +286,82 @@ def _get_json(url: str, token: str = "", timeout: float = 5.0):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def engine_models(base: str, token: str = "", fetch=_get_json) -> tuple:
+    """([(model id, state)], routed) from the engine's model list. This is the only thing the gate may ask
+    of an engine that might be asleep: listing models never wakes one. state is 'loaded', 'unloaded',
+    'loading' or whatever the router reports; an engine without a router (no status on its models) has
+    one model, always 'loaded'. routed is True when the models carry a status. Raises when unreadable."""
+    data = fetch(base.rstrip("/") + "/v1/models", token).get("data") or []
+    models, routed = [], False
+    for m in data:
+        if not isinstance(m, dict):
+            models.append((None, "unknown"))
+            continue
+        status = m.get("status")
+        value = status.get("value") if isinstance(status, dict) else (status if isinstance(status, str) else None)
+        routed = routed or value is not None
+        models.append((m.get("id"), value if value is not None else "loaded"))
+    return models, routed
+
+
+def _count_processing(slots: list) -> int:
+    return sum(1 for s in slots if not isinstance(s, dict) or s.get("is_processing") is not False)
+
+
 def _slots_busy(base: str, token: str = "", fetch=_get_json) -> tuple:
-    """(busy, detail) from an engine's /slots; a router needs ?model= for each loaded model.
-    Fails closed: anything unreadable counts as busy."""
+    """(busy, detail) for one engine. EVERY load-gate probe goes through here: it reads the model list
+    first and requests /slots ONLY for a model the list says is loaded, because a slots request sent to a
+    sleeping model on the router wakes it. An unloaded model is idle by definition (nothing to wait for);
+    a loading model counts as busy; anything unreadable or unrecognised fails closed."""
     base = base.rstrip("/")
     try:
-        slots = fetch(base + "/slots", token)
-        if isinstance(slots, list):
-            n = sum(1 for s in slots if not isinstance(s, dict) or s.get("is_processing") is not False)
-            return n > 0, f"{n} slot(s) processing or unreadable of {len(slots)}"
-    except Exception:  # noqa: BLE001 - any failure falls through to the per-model probe
-        pass
-    try:
-        models = fetch(base + "/v1/models", token).get("data") or []
+        models, routed = engine_models(base, token, fetch)
     except Exception as exc:  # noqa: BLE001
-        return True, f"load unknown ({type(exc).__name__}); refusing to start"
-    busy, seen, unread = 0, 0, 0
-    for m in models:
-        state = (m.get("status") or {}).get("value") if isinstance(m, dict) else "unknown"
-        if state not in (None, "loaded"):
-            continue
-        try:
-            slots = fetch(base + "/slots?model=" + urllib.parse.quote(str(m.get("id"))), token)
-        except Exception:  # noqa: BLE001
-            unread += 1
-            continue
-        if not isinstance(slots, list):
-            unread += 1
-            continue
-        seen += 1
-        busy += sum(1 for s in slots if not isinstance(s, dict) or s.get("is_processing") is not False)
-    if unread or not seen:
-        return True, f"slots unreadable for {unread} loaded model(s), readable for {seen}; refusing to start"
-    return busy > 0, f"{busy} slot(s) processing across {seen} model(s)"
+        return True, f"load unknown ({type(exc).__name__}, model list unreadable); refusing to start"
+    if not models:
+        return True, "load unknown (model list empty); refusing to start"
+    loaded = [mid for mid, state in models if state == "loaded"]
+    unloaded = sum(1 for _, state in models if state == "unloaded")
+    loading = sum(1 for _, state in models if state == "loading")
+    other = sorted({str(state) for _, state in models if state not in ("loaded", "unloaded", "loading")})
+    notes, busy = [], False
+    if loading:
+        busy = True
+        notes.append(f"{loading} model(s) loading")
+    if other:
+        busy = True
+        notes.append(f"model state not recognised ({', '.join(other)})")
+    if unloaded:
+        notes.append(f"{unloaded} model(s) unloaded, slots not probed")
+    if loaded:
+        processing, seen, unread = 0, 0, 0
+        plain = None
+        if not routed:  # a single engine answers /slots itself
+            try:
+                plain = fetch(base + "/slots", token)
+            except Exception:  # noqa: BLE001 - fall through to the per-model probe
+                plain = None
+        if isinstance(plain, list):
+            processing, seen = _count_processing(plain), len(loaded)
+        else:
+            for mid in loaded:  # loaded per the model list, so this cannot wake anything
+                try:
+                    slots = fetch(base + "/slots?model=" + urllib.parse.quote(str(mid)), token)
+                except Exception:  # noqa: BLE001
+                    unread += 1
+                    continue
+                if not isinstance(slots, list):
+                    unread += 1
+                    continue
+                seen += 1
+                processing += _count_processing(slots)
+        if unread or not seen:
+            busy = True
+            notes.append(f"slots unreadable for {unread} loaded model(s), readable for {seen}; refusing to start")
+        else:
+            busy = busy or processing > 0
+            notes.append(f"{processing} slot(s) processing across {seen} model(s)")
+    return busy, "; ".join(notes)
 
 
 def mem_available(path: str = "/proc/meminfo"):
@@ -331,6 +391,22 @@ def load_targets(env: dict) -> list:
     return targets
 
 
+def engine_load(env: dict, fetch=_get_json) -> tuple:
+    """(ok, reasons, details): every engine the diary calls is idle and readable. Fails closed."""
+    ok, reasons, details = True, [], {}
+    for role, url, token in load_targets(env):
+        if not url:
+            ok = False
+            reasons.append(f"{role}: no load URL; cannot check its load")
+            continue
+        busy, detail = _slots_busy(url, token, fetch)
+        details[role] = detail
+        if busy:
+            ok = False
+            reasons.append(f"{role}: {detail}")
+    return ok, reasons, details
+
+
 def load_gate(env: dict, fetch=_get_json, meminfo: str = "/proc/meminfo") -> dict:
     """ok=False when MemAvailable is under 6 GiB or unreadable, or any engine has a request in flight or
     cannot be read. Fails closed."""
@@ -344,16 +420,10 @@ def load_gate(env: dict, fetch=_get_json, meminfo: str = "/proc/meminfo") -> dic
         if mem < MIN_MEM_AVAILABLE:
             result["ok"] = False
             result["reasons"].append(f"MemAvailable {result['mem_available_gib']} GiB < 6 GiB")
-    for role, url, token in load_targets(env):
-        if not url:
-            result["ok"] = False
-            result["reasons"].append(f"{role}: no load URL; cannot check its load")
-            continue
-        busy, detail = _slots_busy(url, token, fetch)
-        result[role] = detail
-        if busy:
-            result["ok"] = False
-            result["reasons"].append(f"{role}: {detail}")
+    ok, reasons, details = engine_load(env, fetch)
+    result.update(details)
+    result["ok"] = result["ok"] and ok
+    result["reasons"].extend(reasons)
     return result
 
 
@@ -368,41 +438,106 @@ def require_gate(env: dict, rechecks: int = RECHECKS, wait: float = RECHECK_S, c
             return result
         if attempt < rechecks:
             sleep(wait)
+    result.setdefault("kind", "load-gate")
     raise GateBlocked(result)
 
 
-def _lock_path(lock_file: str | None) -> str:
+def wait_for_idle(env: dict, timeout: float | None = None, poll: float | None = None, fetch=None,
+                  sleep=None, clock=None) -> dict:
+    """Poll the engines (model list first, slots only for loaded models) until none has a request in
+    flight, for at most `timeout` seconds (GATE_IDLE_WAIT_S). A chat call the diary gave up on can keep
+    generating upstream, so the next restore write or query would be refused while it runs. Returns
+    {"idle", "waited_s", "polls", "reasons"}; never raises. Does nothing when inference is disabled."""
+    if not inference_enabled(env):
+        return {"idle": True, "waited_s": 0.0, "polls": 0, "reasons": [], "skipped": "inference disabled"}
+    fetch, sleep, clock = fetch or _get_json, sleep or time.sleep, clock or time.monotonic
+    timeout = IDLE_WAIT_S if timeout is None else timeout
+    poll = max(IDLE_POLL_S if poll is None else poll, 0.1)
+    start, polls = clock(), 0
+    while True:
+        polls += 1
+        ok, reasons, _ = engine_load(env, fetch)
+        waited = clock() - start
+        if ok:
+            return {"idle": True, "waited_s": round(waited, 3), "polls": polls, "reasons": []}
+        if waited >= timeout:
+            return {"idle": False, "waited_s": round(waited, 3), "polls": polls, "reasons": reasons}
+        sleep(min(poll, timeout - waited))
+
+
+def require_idle(env: dict, log=None, before: str = "", **kw) -> dict:
+    """wait_for_idle, recorded in the evidence (`log` gets {"kind": "idle-wait", "before", "waited_s", ...}),
+    and a GateBlocked (status "blocked", kind "not-idle") when the engines never go idle."""
+    res = wait_for_idle(env, **kw)
+    if res.get("skipped"):
+        return res
+    record = {"kind": "idle-wait", "before": before, "idle": res["idle"], "waited_s": res["waited_s"], "polls": res["polls"]}
+    if not res["idle"]:
+        record["reasons"] = res["reasons"]
+    if log:
+        log(record)
+    if not res["idle"]:
+        limit = IDLE_WAIT_S if kw.get("timeout") is None else kw["timeout"]
+        raise GateBlocked({"ok": False, "kind": "not-idle", "idle_wait_s": res["waited_s"],
+                           "reasons": [f"engines not idle after {res['waited_s']:.0f} s (limit {limit:.0f} s, "
+                                       f"GATE_IDLE_WAIT_S): " + "; ".join(res["reasons"])]})
+    return res
+
+
+def _lock_path(lock_file: str | None, name: str = "inference.lock") -> str:
     if lock_file:
         return lock_file
     os.makedirs(LOCK_DIR, mode=0o700, exist_ok=True)
     os.chmod(LOCK_DIR, 0o700)
-    return os.path.join(LOCK_DIR, "inference.lock")
+    return os.path.join(LOCK_DIR, name)
 
 
-def _acquire(fh, timeout: float, sleep=time.sleep) -> None:
-    """flock with a bounded wait; fails closed with GateBlocked when another gate process holds it too long."""
-    deadline = time.monotonic() + timeout
+def _holder(path: str) -> str:
+    """Who last took the lock (pid and script), for the blocked reason; empty when unknown."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()[:120]
+    except OSError:
+        return ""
+
+
+def _acquire(fh, path: str, timeout: float, sleep=time.sleep, clock=time.monotonic, what: str = "inference lock",
+             kind: str = "lock-timeout", env_name: str = "GATE_LOCK_TIMEOUT_S") -> float:
+    """flock with a bounded wait; returns the seconds waited. Fails closed with GateBlocked (status
+    "blocked", with the holder when known) when another gate process holds it too long."""
+    start = clock()
     while True:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
+            fh.seek(0)
+            fh.truncate(0)
+            fh.write(f"pid={os.getpid()} {os.path.basename(sys.argv[0] or 'gate')}\n")
+            fh.flush()
+            return clock() - start
         except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise GateBlocked({"ok": False, "reasons": [f"inference lock still held after {timeout:.0f} s"]})
+            waited = clock() - start
+            if waited >= timeout:
+                holder = _holder(path)
+                raise GateBlocked({"ok": False, "kind": kind, "lock_wait_s": round(waited, 3),
+                                   "reasons": [f"{what} still held after {waited:.0f} s (limit {timeout:.0f} s, {env_name})"
+                                               + (f" by {holder}" if holder else "")]})
             sleep(0.5)
 
 
 @contextmanager
 def inference_slot(env: dict, log=None, lock_file: str | None = None, lock_timeout: float | None = None):
     """Hold a cross-process lock around the load check AND the call it guards, so no two gate processes
-    start inference work at once. A no-op when inference is disabled (nothing can reach a model)."""
+    start inference work at once. A no-op when inference is disabled (nothing can reach a model).
+    The lock wait is bounded (GATE_LOCK_TIMEOUT_S): when it runs out the slot raises GateBlocked (status
+    "blocked", kind "lock-timeout", who holds it) before the guarded call is made, so callers report the
+    work as blocked, not as a query that timed out."""
     if not inference_enabled(env):
         yield None
         return
-    fd = os.open(_lock_path(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a") as fh:
+    path = _lock_path(lock_file)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as fh:
         try:
-            _acquire(fh, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout)
+            lock_wait = _acquire(fh, path, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout)
         except GateBlocked as exc:
             if log:
                 log(exc.result)
@@ -411,12 +546,39 @@ def inference_slot(env: dict, log=None, lock_file: str | None = None, lock_timeo
             try:
                 result = require_gate(env)
             except GateBlocked as exc:
+                exc.result["lock_wait_s"] = round(lock_wait, 3)
                 if log:
                     log(exc.result)
                 raise
+            result["lock_wait_s"] = round(lock_wait, 3)
             if log:
                 log(result)
             yield result
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+@contextmanager
+def model_area_slot(name: str, log=None, lock_file: str | None = None, timeout: float | None = None):
+    """Model areas run one at a time: four of them sharing the engines starve each other on the inference
+    lock and their queries time out. The area holds this lock for its whole run. Waiting is bounded
+    (GATE_AREA_WAIT_S); when it runs out GateBlocked (status "blocked", kind "area-wait-timeout") names the
+    holder. GATE_MODEL_AREAS_PARALLEL=1 skips the lock."""
+    if model_areas_parallel():
+        yield {"serial": False, "waited_s": 0.0}
+        return
+    path = _lock_path(lock_file, "model-area.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as fh:
+        try:
+            waited = _acquire(fh, path, AREA_WAIT_S if timeout is None else timeout, what=f"model-area lock (area {name} waiting)",
+                              kind="area-wait-timeout", env_name="GATE_AREA_WAIT_S")
+        except GateBlocked as exc:
+            if log:
+                log(exc.result)
+            raise
+        try:
+            yield {"serial": True, "waited_s": round(waited, 3)}
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
