@@ -15,8 +15,10 @@ inside gatelib.inference_slot: a cross-process lock around the MS-01 load check 
 fail closed) and the call. After every query the tenant is restored to the post-mutation baseline
 (changed files PUT back; new files moved to Trash, or emptied when they are protected diary day files)
 and the index settles, so no query sees an earlier
-query's logged exchange. Retrieval traces are recorded when the diary returns a known shape;
-otherwise each row says "trace unavailable".
+query's logged exchange. Before each query turn and before each restore the harness waits (bounded,
+GATE_IDLE_WAIT_S) for the engines to go idle, because a chat call the diary gave up on can keep generating
+upstream; the wait is recorded (`idle_wait_s`) and a wait that runs out is "blocked", not a failed query.
+Retrieval traces are recorded when the diary returns a known shape; otherwise each row says "trace unavailable".
 """
 from __future__ import annotations
 
@@ -163,13 +165,17 @@ def take_baseline(client: g.Client, user: str, env: dict, gate_log) -> dict:
 
 
 def restore_baseline(client: g.Client, user: str, baseline: dict, env: dict, gate_log) -> dict:
-    """Restore, settle the index and verify, all inside ONE inference slot (the restore's writes and the
-    recovery reindex embed). Raises GateBlocked when the load gate refuses."""
+    """Wait for idle (an abandoned upstream generation would make the load gate refuse the writes), then
+    restore, settle the index and verify, all inside ONE inference slot (the restore's writes and the
+    recovery reindex embed). Raises GateBlocked when the engines never go idle or the load gate refuses."""
+    # The idle wait runs BEFORE the inference lock is taken, so a long wait never holds up other gate
+    # processes; inference_slot's require_gate then re-checks the load inside the lock.
+    idle = g.require_idle(env, gate_log, "restore")
     with g.inference_slot(env, gate_log):
         report = g.restore(client, user, baseline["files"])
         settled = g.settle(client, user, expect_chunks=baseline.get("chunks"))
         same = g.baseline_matches(client, user, baseline["files"])
-    report.update(settled=settled, matches=same, ok=report["ok"] and settled["ok"] and same)
+    report.update(settled=settled, matches=same, ok=report["ok"] and settled["ok"] and same, idle_wait_s=idle["waited_s"])
     return report
 
 
@@ -251,7 +257,12 @@ def cmd_restore_selftest(args, run: Path | None = None) -> int:
         w2 = client.request("PUT", "/api/file", user=user, json_body={"path": old, "content": (cur.get("content") or "") + "\nextra\n",
                                                                         "version": cur.get("version")})
     contaminated = w1.status == 200 and w2.status == 200 and not g.baseline_matches(client, user, baseline["files"])
-    report = restore_baseline(client, user, baseline, env, log)
+    try:
+        report = restore_baseline(client, user, baseline, env, log)
+    except g.GateBlocked as exc:
+        g.add_blocker(run, f"restore self-test stopped: {exc}")
+        print(json.dumps({"stage": "restore-selftest", "ok": False, "blocked": str(exc)}))
+        return 3
     ok = contaminated and report["ok"] and {d["path"] for d in report["deleted"] + report["emptied"]} == {new} and \
         {r["path"] for r in report["rewritten"]} == {old}
     g.write_json(run / "stages" / "restore-selftest.json", {"ok": ok, "contaminated": contaminated, **report})
@@ -269,11 +280,16 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
     """One query (all its turns), then the restore. Returns None, or a reason to stop the run."""
     history, session = [], f"gate-{q['id']}-{uuid.uuid4().hex[:8]}"
     for n, (text, spec) in enumerate(turns):
+        if n and g.stop_requested():
+            break  # SIGTERM: skip the follow-up turns, still restore below
         try:
+            # Idle wait first, outside the inference lock (see restore_baseline); require_gate re-checks inside it.
+            idle = g.require_idle(env, gate_log, f"{q['id']} turn {n}")
             with g.inference_slot(env, gate_log):
                 res = ask(client, user, text, q["clock"], session, history)
+            res["idle_wait_s"] = idle["waited_s"]
         except g.GateBlocked as exc:
-            return f"stopped before {q['id']} turn {n}: MS-01 load gate: {exc}"
+            return f"blocked before {q['id']} turn {n}: MS-01 load gate: {exc}"
         qday = q["clock"][:10]
         empty_day = qday if not any(k[0] == "dayhdr" and k[1] == qday for k in index) else None
         trace = normalize_trace(res["trace"], index, res["xid"], empty_day) if res["trace"] is not None else None
@@ -285,9 +301,10 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
     try:
         report = restore_baseline(client, user, baseline, env, gate_log)
     except g.GateBlocked as exc:
-        return f"restore after {q['id']} stopped by the MS-01 load gate: {exc}"
+        return f"blocked at the restore after {q['id']}: MS-01 load gate: {exc}"
     if restore_log:
-        restore_log({"query": q["id"], **{k: report[k] for k in ("deleted", "emptied", "rewritten", "failures", "settled", "matches", "ok")}})
+        restore_log({"query": q["id"], **{k: report[k] for k in ("deleted", "emptied", "rewritten", "failures", "settled", "matches", "ok",
+                                                                  "idle_wait_s")}})
     if not report["ok"]:
         return f"restore after {q['id']} failed: {json.dumps({k: report[k] for k in ('failures', 'settled', 'matches')})}"
     return None
@@ -316,22 +333,31 @@ def cmd_queries(args, run: Path | None = None) -> int:
     answers, traces = run / "stages" / "answers.jsonl", run / "stages" / "traces.jsonl"
     for path in (answers, traces):
         path.write_text("", encoding="utf-8")
-    done = 0
+    done, idle_total = 0, [0.0]
+    g.install_stop_handler()
     for q in queries:
+        if g.stop_requested():
+            stop = f"blocked: stopped by SIGTERM (area timeout) before {q['id']}; the tenant is restored"
+            g.add_blocker(run, stop)
+            print(json.dumps({"stage": "queries", "status": "blocked", "done": done, "reason": stop,
+                              "idle_wait_s": round(idle_total[0], 3)}))
+            return 3
         def on_row(n, text, spec, res, trace, shape, q=q):
             row_id = q["id"] if n == 0 else q["id"] + "#followup"
+            idle_total[0] += res.get("idle_wait_s") or 0.0
             g.append_jsonl(answers, {"id": row_id, "query": q["id"], "turn": n, "category": q["category"], "status": res["status"],
                                      "answer": res["answer"], "ms": res["ms"], "decision": res["decision"], "trace": shape,
-                                     "verdict": "needs-judge"})
+                                     "idle_wait_s": res.get("idle_wait_s"), "verdict": "needs-judge"})
             g.append_jsonl(traces, {"id": row_id, "trace": trace, "raw": res["trace"], "note": shape})
         stop = run_turns(client, user, q, query_turns(q), env, log, index, baseline, on_row,
                          lambda row: g.append_jsonl(run / "logs" / "restore.jsonl", row))
         if stop:
             g.add_blocker(run, stop)
-            print(json.dumps({"stage": "queries", "status": "blocked", "done": done, "reason": stop}))
+            print(json.dumps({"stage": "queries", "status": "blocked", "done": done, "reason": stop,
+                              "idle_wait_s": round(idle_total[0], 3)}))
             return 3
         done += 1
-    print(json.dumps({"stage": "queries", "status": "done", "queries": done}))
+    print(json.dumps({"stage": "queries", "status": "done", "queries": done, "idle_wait_s": round(idle_total[0], 3)}))
     return 0
 
 

@@ -28,6 +28,9 @@ def meminfo(tmp_path, kib):
 
 
 def idle(url, token=""):
+    """A single engine (no router): one model, plain /slots."""
+    if url.endswith("/v1/models"):
+        return {"data": [{"id": "m"}]}
     if url.endswith("/slots"):
         return [{"is_processing": False}]
     raise AssertionError(url)
@@ -38,7 +41,8 @@ def test_load_gate_ok_when_idle_and_checks_aux_separately(tmp_path):
     r = g.load_gate(ENV, fetch=lambda u, t="": seen.append((u, t)) or idle(u), meminfo=meminfo(tmp_path, 8 * 1024 ** 2))
     assert r["ok"] and r["reasons"] == []
     assert all(t == "k" for _, t in seen)  # the token goes to the embed probe too
-    assert {u for u, _ in seen} == {"http://e/slots", "http://kev/slots"}  # aux is the chat engine here
+    assert {u for u, _ in seen if u.endswith("/slots")} == {"http://e/slots", "http://kev/slots"}  # aux is the chat engine here
+    assert {u for u, _ in seen if u.endswith("/v1/models")} == {"http://e/v1/models", "http://kev/v1/models"}
     r = g.load_gate({**ENV, "LLM_AUX_BASE_URL": "http://aux/v1"}, fetch=lambda u, t="": seen.append((u, t)) or idle(u),
                     meminfo=meminfo(tmp_path, 8 * 1024 ** 2))
     assert "aux" in r and ("http://aux/slots", "k") in seen
@@ -49,7 +53,7 @@ def test_load_gate_fails_closed(tmp_path, case):
     mem = meminfo(tmp_path, 8 * 1024 ** 2)
     env, fetch = dict(ENV), idle
     if case == "busy":
-        fetch = lambda u, t="": [{"is_processing": True}]  # noqa: E731
+        fetch = lambda u, t="": {"data": [{"id": "m"}]} if u.endswith("/v1/models") else [{"is_processing": True}]  # noqa: E731
     elif case == "fetch-error":
         def fetch(u, t=""):
             raise OSError("refused")
@@ -72,14 +76,169 @@ def test_load_gate_fails_closed(tmp_path, case):
 
 def test_slots_busy_router_and_missing_flag():
     def router(u, t=""):
-        if u.endswith("/slots"):
-            raise OSError("needs model")
         if u.endswith("/v1/models"):
             return {"data": [{"id": "m1", "status": {"value": "loaded"}}, {"id": "m2", "status": {"value": "unloaded"}}]}
-        return [{"is_processing": False}]
+        if u.endswith("/slots?model=m1"):
+            return [{"is_processing": False}]
+        raise OSError("needs a loaded model")
     assert g._slots_busy("http://x", "", router)[0] is False
-    assert g._slots_busy("http://x", "", lambda u, t="": [{"id": 0}])[0] is True  # no is_processing flag: busy
+
+    def no_flag(u, t=""):  # a slot without is_processing counts as busy
+        return {"data": [{"id": "m"}]} if u.endswith("/v1/models") else [{"id": 0}]
+    assert g._slots_busy("http://x", "", no_flag)[0] is True
     assert g._slots_busy("http://x", "", lambda u, t="": {"data": []} if "models" in u else (_ for _ in ()).throw(OSError()))[0] is True
+
+
+# ---------------- services#113 item 3: a load-gate probe never wakes a sleeping model ----------------
+
+def _engine(models, slots=None, requested=None, routed=True):
+    """A fake engine: /v1/models lists `models` ({id: state}); /slots?model=<id> answers only for ids in `slots`.
+    Records every URL asked."""
+    slots = slots or {}
+    requested = requested if requested is not None else []
+
+    def fetch(url, token=""):
+        requested.append(url)
+        if url.endswith("/v1/models"):
+            return {"data": [({"id": i, "status": {"value": st}} if routed else {"id": i}) for i, st in models.items()]}
+        if "/slots" in url:
+            mid = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("model", [next(iter(models))])[0]
+            if mid not in slots:
+                raise AssertionError(f"slots requested for {mid}")
+            return [{"is_processing": slots[mid]}]
+        raise AssertionError(url)
+    return fetch, requested
+
+
+@pytest.mark.parametrize("models", [{"chat": "unloaded"}, {"chat": "unloaded", "embed": "unloaded"}])
+def test_probe_never_requests_slots_when_the_model_list_says_unloaded(models, tmp_path):
+    fetch, requested = _engine(models)
+    busy, detail = g._slots_busy("http://router", "tok", fetch)
+    assert busy is False and "unloaded" in detail and "not probed" in detail
+    assert requested == ["http://router/v1/models"]  # the model list and nothing else
+    # The whole load gate, every role: no URL ending in or containing /slots is ever requested.
+    seen = []
+    def fetch_all(url, token=""):
+        seen.append(url)
+        return _engine(models)[0](url, token)
+    r = g.load_gate({**ENV, "LLM_AUX_BASE_URL": "http://aux/v1"}, fetch=fetch_all, meminfo=meminfo(tmp_path, 8 * 1024 ** 2))
+    assert r["ok"] and r["reasons"] == []
+    assert seen and all(u.endswith("/v1/models") for u in seen), seen
+    assert all("/slots" not in u for u in seen)
+
+
+def test_probe_asks_slots_only_for_the_models_listed_as_loaded():
+    fetch, requested = _engine({"chat": "unloaded", "embed": "loaded", "rerank": "unloaded"}, slots={"embed": False})
+    assert g._slots_busy("http://router", "", fetch) == (False, "2 model(s) unloaded, slots not probed; 0 slot(s) processing across 1 model(s)")
+    assert requested == ["http://router/v1/models", "http://router/slots?model=embed"]
+    fetch, requested = _engine({"chat": "loaded", "embed": "unloaded"}, slots={"chat": True})
+    assert g._slots_busy("http://router", "", fetch)[0] is True  # loaded and generating
+    assert [u for u in requested if "/slots" in u] == ["http://router/slots?model=chat"]
+
+
+@pytest.mark.parametrize("state,why", [("loading", "loading"), ("sleeping", "not recognised")])
+def test_probe_does_not_wake_a_model_that_is_loading_or_in_an_unknown_state(state, why):
+    fetch, requested = _engine({"chat": state})
+    busy, detail = g._slots_busy("http://router", "", fetch)
+    assert busy is True and why in detail  # fails closed, still no slots request
+    assert requested == ["http://router/v1/models"]
+
+
+def test_probe_with_an_unreadable_model_list_refuses_without_asking_slots():
+    seen = []
+    def fetch(url, token=""):
+        seen.append(url)
+        raise OSError("down")
+    busy, detail = g._slots_busy("http://router", "", fetch)
+    assert busy is True and "model list unreadable" in detail
+    assert seen == ["http://router/v1/models"]
+
+
+def test_single_engine_without_a_router_uses_plain_slots_once_loaded():
+    fetch, requested = _engine({"m": "loaded"}, slots={"m": False}, routed=False)
+    assert g._slots_busy("http://engine", "", fetch)[0] is False
+    assert requested == ["http://engine/v1/models", "http://engine/slots"]
+
+
+def test_status_less_list_with_two_models_never_falls_back_to_per_model_probes():
+    """No status anywhere and more than one model: we cannot tell which are loaded (a router would be
+    woken by a per-model probe). Busy, and no /slots?model= request."""
+    requested = []
+
+    def fetch(url, token=""):
+        requested.append(url)
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": "a"}, {"id": "b"}]}
+        raise OSError("plain /slots needs a model on a router")
+    busy, detail = g._slots_busy("http://router", "", fetch)
+    assert busy is True and "cannot tell which models are loaded" in detail
+    assert not any("/slots?model=" in u for u in requested)
+    assert requested == ["http://router/v1/models"]  # more than one model: not even the plain probe
+    # One status-less model whose plain /slots fails: busy, still no per-model fallback.
+    requested.clear()
+
+    def one(url, token=""):
+        requested.append(url)
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": "a"}]}
+        raise OSError("nope")
+    busy, detail = g._slots_busy("http://router", "", one)
+    assert busy is True and "cannot tell which models are loaded" in detail
+    assert requested == ["http://router/v1/models", "http://router/slots"]
+
+
+@pytest.mark.parametrize("odd", [{}, {"status": None}, {"status": 5}, {"status": {}}, {"status": {"value": 3}}, {"status": ""}])
+def test_routed_list_entry_without_a_valid_status_is_unknown_and_never_probed(odd):
+    """Once any entry has a status the list is routed: a missing or malformed status is unknown (busy), not loaded."""
+    requested = []
+
+    def fetch(url, token=""):
+        requested.append(url)
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": "a", "status": {"value": "loaded"}}, {"id": "b", **odd}]}
+        if url.endswith("/slots?model=a"):
+            return [{"is_processing": False}]
+        raise AssertionError(url)
+    assert g.engine_models("http://router", "", fetch) == ([("a", "loaded"), ("b", "unknown")], True)
+    busy, detail = g._slots_busy("http://router", "", fetch)
+    assert busy is True and "not recognised (unknown)" in detail
+    assert all("model=b" not in u for u in requested)  # b is never asked for
+    assert [u for u in requested if "/slots" in u] == ["http://router/slots?model=a"]
+
+
+def test_a_list_where_every_status_is_malformed_is_routed_and_never_probed():
+    requested = []
+
+    def fetch(url, token=""):
+        requested.append(url)
+        return {"data": [{"id": "a", "status": 5}, {"id": "b", "status": []}]}
+    busy, _ = g._slots_busy("http://router", "", fetch)
+    assert busy is True and requested == ["http://router/v1/models"]
+
+
+def test_slots_endpoint_is_requested_from_one_helper_only():
+    """Every probe call site is _slots_busy: no other code in the gate mentions slots (any case) outside a
+    docstring, module level included, and no shell script mentions it at all."""
+    import ast
+    sites = {}
+
+    def visit(node, scope, path, docs):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                docs.add(id(first.value))
+            if not isinstance(node, ast.Module):
+                scope = node.name
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and "slots" in node.value.lower() and id(node) not in docs:
+            sites.setdefault(path.name, set()).add(scope)
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope, path, docs)
+    for path in sorted(GATE.rglob("*.py")):
+        visit(ast.parse(path.read_text(encoding="utf-8")), "<module>", path, set())
+    assert sites == {"gatelib.py": {"_slots_busy"}}, sites
+    scripts = sorted(GATE.rglob("*.sh"))
+    assert scripts  # smoke.sh, up.sh, down.sh, make_env.sh
+    assert [p.name for p in scripts if "slots" in p.read_text(encoding="utf-8").lower()] == []
 
 
 def test_require_gate_rechecks_then_blocks():
@@ -441,3 +600,416 @@ def test_gate_ports_are_pinned_to_the_gate_band(monkeypatch, gate, nomodel, ok):
         with pytest.raises(SystemExit):
             g.check_base_url(f"http://127.0.0.1:{gate}")
     assert not set(g.GATE_PORT_RANGE) & g.PRODUCTION_PORTS
+
+
+# ---------------- services#113 item 1: model areas run one at a time; bounded waits report "blocked" ----------------
+
+import run_areas  # noqa: E402
+
+
+class FakeTime:
+    """Stands in for gatelib's time module: sleeping advances the clock, nothing really waits."""
+
+    def __init__(self):
+        self.now, self.sleeps = 1000.0, []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def __getattr__(self, name):
+        import time
+        return getattr(time, name)
+
+
+def test_plan_runs_model_areas_one_at_a_time_and_no_model_areas_together():
+    stages = run_areas.plan()
+    assert stages[0] == ["capture", "tenancy"]  # no model: parallel
+    assert stages[1:6] == [[a] for a in ("semantic", "temporal", "corrections", "follow_ups", "confirmed_vs_inferred")]
+    assert stages[6:] == [["error_paths"], ["restart"], ["budgets"]]
+    assert all(len(st) == 1 for st in stages[1:])  # nothing else runs beside a model area or an alone area
+    assert run_areas.plan(parallel_model=True)[1] == list(run_areas.MODEL_AREAS)  # opt-in only
+    assert run_areas.plan(only={"semantic", "capture"}) == [["capture"], ["semantic"]]
+
+
+def _run_args(tmp_path, **kw):
+    import argparse
+    return argparse.Namespace(run_dir=str(tmp_path), fixture="fx", env_file="env", base_url=None, only="",
+                              parallel_model_areas=False, **kw)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_runner_executes_model_areas_serially_by_default(tmp_path, parallel):
+    import threading
+    import time
+    lock, active, peak, started = threading.Lock(), set(), {}, []
+
+    def runner(area, args, parallel_model):
+        with lock:
+            active.add(area)
+            started.append(area)
+            peak[area] = set(active)
+        time.sleep(0.05)
+        with lock:
+            active.discard(area)
+        return {"rc": 0, "out": json.dumps({"area": area, "status": "pass", "parallel_model": parallel_model})}
+
+    args = _run_args(tmp_path)
+    args.parallel_model_areas = parallel
+    assert run_areas.run_all(args, runner=runner) == 0
+    model = set(run_areas.MODEL_AREAS)
+    if parallel:
+        assert any(len(peak[a] & model) > 1 for a in model)  # the opt-in really overlaps
+    else:
+        assert all(peak[a] == {a} for a in model | set(run_areas.ALONE))  # no overlap at all
+        assert started[2:7] == list(run_areas.MODEL_AREAS)  # semantic first, confirmed_vs_inferred last, in this order
+    record = json.loads((tmp_path / "workflows" / "areas-run.json").read_text())
+    assert record["parallel_model_areas"] is parallel and len(record["order"]) == 10
+    assert record["order"][-3:] == ["error_paths", "restart", "budgets"]
+
+
+def test_runner_continues_after_a_blocked_area_and_reports_nonzero(tmp_path, capsys):
+    def runner(area, args, parallel_model):
+        return {"rc": 1 if area == "temporal" else 0, "out": json.dumps({"area": area, "status": "blocked" if area == "temporal" else "pass"})}
+    assert run_areas.run_all(_run_args(tmp_path), runner=runner) == 1
+    ran = [json.loads(line)["area"] for line in capsys.readouterr().out.splitlines()]
+    assert ran.index("corrections") > ran.index("temporal") and len(ran) == 10
+
+
+def test_runner_children_get_the_parallel_switch_only_when_asked(tmp_path, monkeypatch):
+    seen = []
+    class Done:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return '{"area": "x"}', ""
+    monkeypatch.setenv("GATE_MODEL_AREAS_PARALLEL", "1")  # an inherited opt-in must not leak into a serial run
+    monkeypatch.setattr(run_areas.subprocess, "Popen", lambda cmd, **kw: seen.append((cmd, kw["env"].get("GATE_MODEL_AREAS_PARALLEL"))) or Done())
+    args = _run_args(tmp_path)
+    run_areas.subprocess_runner("semantic", args, False)
+    run_areas.subprocess_runner("semantic", args, True)
+    assert [flag for _, flag in seen] == [None, "1"]
+    cmd = seen[0][0]
+    assert cmd[1] == "-I" and cmd[2].endswith("areas/semantic.py") and "--fixture" in cmd
+    run_areas.subprocess_runner("capture", args, False)
+    assert "--fixture" not in seen[-1][0]
+
+
+def test_model_area_lock_blocks_a_second_area_with_the_holder_and_can_be_opted_out(tmp_path, monkeypatch):
+    lock = str(tmp_path / "area.lock")
+    logged = []
+    monkeypatch.delenv("GATE_MODEL_AREAS_PARALLEL", raising=False)
+    with g.model_area_slot("semantic", lock_file=lock) as first:
+        assert first["serial"] is True
+        with pytest.raises(g.GateBlocked) as exc:
+            with g.model_area_slot("temporal", logged.append, lock_file=lock, timeout=0.2):
+                pytest.fail("two model areas must not run at once")
+        assert exc.value.result["status"] == "blocked" and exc.value.result["kind"] == "area-wait-timeout"
+        reason = exc.value.result["reasons"][0]
+        assert "temporal" in reason and "GATE_AREA_WAIT_S" in reason and f"pid={__import__('os').getpid()}" in reason
+        assert logged[-1]["status"] == "blocked"
+        monkeypatch.setenv("GATE_MODEL_AREAS_PARALLEL", "1")
+        with g.model_area_slot("temporal", lock_file=lock, timeout=0.2) as second:
+            assert second["serial"] is False
+    monkeypatch.delenv("GATE_MODEL_AREAS_PARALLEL")
+    with g.model_area_slot("temporal", lock_file=lock, timeout=0.2) as third:  # free again once the first area finished
+        assert third["serial"] is True
+
+
+def test_a_model_area_that_cannot_get_its_turn_reports_blocked_and_touches_nothing(fixture_dir, tmp_path, monkeypatch, capsys):
+    sys.path.insert(0, str(GATE / "areas"))
+    import contextlib
+    import _model
+    env = tmp_path / "env"
+    env.write_text("LLM_BASE_URL=http://10.0.0.9:11435/v1\nDIARY_AUTH_TOKEN=t\n")
+    monkeypatch.setattr(sys, "argv", ["semantic.py", "--run-dir", str(tmp_path / "run"), "--env-file", str(env), "--fixture", str(fixture_dir)])
+
+    @contextlib.contextmanager
+    def busy(name, log=None, **kw):
+        exc = g.GateBlocked({"ok": False, "kind": "area-wait-timeout", "reasons": ["model-area lock still held by pid=1 corrections.py"]})
+        log and log(exc.result)
+        raise exc
+        yield  # pragma: no cover
+    monkeypatch.setattr(g, "model_area_slot", busy)
+    monkeypatch.setattr(g, "Client", lambda *a, **k: pytest.fail("no request may be made while another model area runs"))
+    assert _model.run("semantic", "doc", lambda q: True) == 1
+    result = json.loads((tmp_path / "run" / "workflows" / "semantic" / "result.json").read_text())
+    assert result["status"] == "blocked" and result["checks"][0]["check"] == "serial"
+    assert "corrections.py" in result["checks"][0]["reason"]
+
+
+def test_inference_lock_timeout_is_blocked_with_the_holder_and_wait(tmp_path):
+    import fcntl
+    import os
+    fake = FakeTime()
+    path = tmp_path / "inference.lock"
+    with open(path, "a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        holder.write("pid=4242 semantic.py\n")
+        holder.flush()
+        fd = os.open(path, os.O_RDWR)
+        with os.fdopen(fd, "r+") as fh:
+            with pytest.raises(g.GateBlocked) as exc:
+                g._acquire(fh, str(path), 3.0, sleep=fake.sleep, clock=fake.monotonic)
+    r = exc.value.result
+    assert r["status"] == "blocked" and r["kind"] == "lock-timeout" and r["lock_wait_s"] >= 3.0
+    assert "pid=4242 semantic.py" in r["reasons"][0] and "GATE_LOCK_TIMEOUT_S" in r["reasons"][0]
+    assert len(fake.sleeps) == 6 and set(fake.sleeps) == {0.5}  # bounded: polls every 0.5 s until the limit
+
+
+def test_inference_slot_records_how_long_it_waited_for_the_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(g, "require_gate", lambda env: {"ok": True, "reasons": []})
+    logged = []
+    with g.inference_slot(ENV, logged.append, lock_file=str(tmp_path / "lock")) as r:
+        assert r["lock_wait_s"] >= 0
+    assert "lock_wait_s" in logged[-1]
+
+
+# ---------------- services#113 item 2: wait for idle before a restore and before the next query ----------------
+
+def _busy_then_idle(busy_polls, clock):
+    """engine_load fake: not ok for `busy_polls` polls, then ok."""
+    polls = []
+
+    def engine_load(env, fetch=None):
+        polls.append(clock.now)
+        if len(polls) <= busy_polls:
+            return False, ["kev: 1 slot(s) processing across 1 model(s)"], {}
+        return True, [], {}
+    return engine_load, polls
+
+
+def test_wait_for_idle_polls_until_the_abandoned_generation_ends(monkeypatch):
+    clock = FakeTime()
+    engine_load, polls = _busy_then_idle(3, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    res = g.wait_for_idle(ENV, timeout=60, poll=5, sleep=clock.sleep, clock=clock.monotonic)
+    assert res["idle"] is True and res["polls"] == 4 and res["waited_s"] == 15.0
+    assert clock.sleeps == [5, 5, 5]
+
+
+def test_wait_for_idle_is_bounded_and_the_last_sleep_never_overshoots(monkeypatch):
+    clock = FakeTime()
+    engine_load, polls = _busy_then_idle(10 ** 6, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    res = g.wait_for_idle(ENV, timeout=12, poll=5, sleep=clock.sleep, clock=clock.monotonic)
+    assert res["idle"] is False and res["waited_s"] == 12.0 and clock.sleeps == [5, 5, 2]
+    assert "processing" in res["reasons"][0]
+
+
+def test_wait_for_idle_does_nothing_without_inference(monkeypatch):
+    monkeypatch.setattr(g, "engine_load", lambda *a, **k: pytest.fail("no probe when inference is disabled"))
+    res = g.wait_for_idle({"LLM_BASE_URL": g.DISABLED_INFERENCE}, timeout=5)
+    assert res["idle"] is True and res["waited_s"] == 0.0 and res["polls"] == 0
+
+
+def test_wait_for_idle_probes_through_the_fake_http_without_waking_models():
+    clock = FakeTime()
+    states = iter([True, True, False])  # the abandoned generation ends on the third look
+    requested = []
+
+    def fetch_models(url):
+        if url.endswith("/v1/models"):
+            return {"data": [{"id": "chat", "status": {"value": "loaded"}}, {"id": "other", "status": {"value": "unloaded"}}]}
+        raise AssertionError(url)
+
+    # The kev engine is the only one generating; embed is unloaded.
+    def per_engine(url, token=""):
+        requested.append(url)
+        if url.startswith("http://e"):
+            return {"data": [{"id": "emb", "status": {"value": "unloaded"}}]}
+        if url.endswith("slots?model=chat"):
+            return [{"is_processing": next(states)}]
+        return fetch_models(url)
+    res = g.wait_for_idle(ENV, timeout=60, poll=5, fetch=per_engine, sleep=clock.sleep, clock=clock.monotonic)
+    assert res["idle"] is True and res["polls"] == 3 and res["waited_s"] == 10.0
+    assert [u for u in requested if u.startswith("http://e")] == ["http://e/v1/models"] * 3  # embed is unloaded: models only
+    assert all("model=other" not in u and not u.endswith("/slots") for u in requested)
+
+
+def test_require_idle_records_the_wait_and_raises_blocked_when_it_never_ends(monkeypatch):
+    clock = FakeTime()
+    engine_load, _ = _busy_then_idle(2, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    logged = []
+    ok = g.require_idle(ENV, logged.append, "restore", timeout=60, poll=5, sleep=clock.sleep, clock=clock.monotonic)
+    assert ok["waited_s"] == 10.0
+    assert logged == [{"kind": "idle-wait", "before": "restore", "idle": True, "waited_s": 10.0, "polls": 3}]
+    engine_load, _ = _busy_then_idle(10 ** 6, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    with pytest.raises(g.GateBlocked) as exc:
+        g.require_idle(ENV, logged.append, "next query", timeout=20, poll=5, sleep=clock.sleep, clock=clock.monotonic)
+    r = exc.value.result
+    assert r["status"] == "blocked" and r["kind"] == "not-idle" and r["idle_wait_s"] == 20.0
+    assert "not idle after 20 s" in str(exc.value) and "GATE_IDLE_WAIT_S" in str(exc.value)
+    assert logged[-1]["idle"] is False and logged[-1]["before"] == "next query" and logged[-1]["reasons"]
+
+
+BASE_FILES = {"Entries/2030/January/January 6, 2030.md": "b\n"}
+
+
+def _patch_restore_pieces(monkeypatch, events):
+    monkeypatch.setattr(g, "restore", lambda c, u, files: events.append("restore") or {"ok": True, "deleted": [], "emptied": [],
+                                                                                       "rewritten": [], "failures": []})
+    monkeypatch.setattr(g, "settle", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(g, "baseline_matches", lambda *a, **k: True)
+    monkeypatch.setattr(g, "require_gate", lambda env: {"ok": True, "reasons": []})
+
+
+def test_restore_waits_for_idle_before_its_first_write(tmp_path, monkeypatch):
+    clock = FakeTime()
+    events = []
+    engine_load, polls = _busy_then_idle(2, clock)
+    monkeypatch.setattr(g, "engine_load", lambda env, fetch=None: events.append("poll") or engine_load(env, fetch))
+    monkeypatch.setattr(g, "time", clock)
+    _patch_restore_pieces(monkeypatch, events)
+    monkeypatch.setattr(g, "_lock_path", lambda lock_file, name="inference.lock": str(tmp_path / "lock"))
+    logged = []
+    report = harness.restore_baseline(FakeDiary(BASE_FILES), "u", {"files": BASE_FILES, "chunks": None}, ENV, logged.append)
+    assert events == ["poll", "poll", "poll", "restore"]  # every poll happened before the restore wrote anything
+    assert report["ok"] and report["idle_wait_s"] == 10.0
+    assert any(r.get("kind") == "idle-wait" and r["before"] == "restore" and r["waited_s"] == 10.0 for r in logged)
+
+
+def test_restore_that_never_sees_idle_is_blocked_and_writes_nothing(tmp_path, monkeypatch):
+    clock = FakeTime()
+    events = []
+    monkeypatch.setattr(g, "engine_load", lambda env, fetch=None: (False, ["kev: 1 slot(s) processing"], {}))
+    monkeypatch.setattr(g, "time", clock)
+    monkeypatch.setattr(g, "IDLE_WAIT_S", 30.0)
+    _patch_restore_pieces(monkeypatch, events)
+    with pytest.raises(g.GateBlocked) as exc:
+        harness.restore_baseline(FakeDiary(BASE_FILES), "u", {"files": BASE_FILES, "chunks": None}, ENV, None)
+    assert exc.value.result["kind"] == "not-idle" and events == []
+
+
+QUERY = {"id": "Q1", "clock": "2030-03-07T12:00:00Z"}
+
+
+def test_next_query_waits_for_idle_and_is_blocked_not_failed(tmp_path, monkeypatch):
+    clock = FakeTime()
+    order, rows, restores = [], [], []
+    engine_load, _ = _busy_then_idle(2, clock)
+    monkeypatch.setattr(g, "engine_load", lambda env, fetch=None: order.append("poll") or engine_load(env, fetch))
+    monkeypatch.setattr(g, "time", clock)
+    monkeypatch.setattr(g, "require_gate", lambda env: {"ok": True, "reasons": []})
+    monkeypatch.setattr(g, "_lock_path", lambda lock_file, name="inference.lock": str(tmp_path / "lock"))
+    monkeypatch.setattr(harness, "ask", lambda *a, **k: order.append("ask") or {"status": 200, "answer": "a", "ms": 1, "decision": None,
+                                                                                 "xid": None, "trace": None})
+    monkeypatch.setattr(harness, "restore_baseline", lambda *a, **k: order.append("restore") or
+                        {"ok": True, "deleted": [], "emptied": [], "rewritten": [], "failures": [], "settled": {}, "matches": True,
+                         "idle_wait_s": 0.0})
+    stop = harness.run_turns(object(), "u", QUERY, [("hello", QUERY)], ENV, None, {}, {"files": {}},
+                             lambda n, text, spec, res, trace, shape: rows.append(res), restores.append)
+    assert stop is None and order == ["poll", "poll", "poll", "ask", "restore"]
+    assert rows[0]["idle_wait_s"] == 10.0 and restores[0]["query"] == "Q1"
+
+    # Never idle: the turn is not asked at all and the stop reason says blocked (no failed http row is produced).
+    order.clear(), rows.clear()
+    monkeypatch.setattr(g, "engine_load", lambda env, fetch=None: (False, ["kev: 1 slot(s) processing"], {}))
+    monkeypatch.setattr(g, "IDLE_WAIT_S", 30.0)
+    stop = harness.run_turns(object(), "u", QUERY, [("hello", QUERY)], ENV, None, {}, {"files": {}}, lambda *a: rows.append(a), None)
+    assert stop.startswith("blocked before Q1 turn 0") and "not idle after 30 s" in stop
+    assert order == [] and rows == []
+
+
+def test_restore_after_an_abandoned_generation_is_blocked_while_the_answer_row_stays_recorded(tmp_path, monkeypatch):
+    rows = []
+    monkeypatch.setattr(g, "require_idle", lambda env, log=None, before="", **kw: {"idle": True, "waited_s": 0.0})
+    monkeypatch.setattr(g, "inference_slot", lambda *a, **k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(harness, "ask", lambda *a, **k: {"status": 504, "answer": "", "ms": 600000, "decision": None, "xid": None,
+                                                         "trace": None})
+
+    def refuse(*a, **k):
+        raise g.GateBlocked({"ok": False, "kind": "not-idle", "reasons": ["engines not idle after 900 s"]})
+    monkeypatch.setattr(harness, "restore_baseline", refuse)
+    stop = harness.run_turns(object(), "u", QUERY, [("hello", QUERY)], ENV, None, {}, {"files": {}},
+                             lambda n, text, spec, res, trace, shape: rows.append(res["status"]), None)
+    assert rows == [504]  # the query's own timeout is recorded as it happened ...
+    assert stop.startswith("blocked at the restore after Q1") and "not idle" in stop  # ... the restore is blocked, not failed
+
+
+# ---------------- review fixes: overdue areas get SIGTERM first; SIGTERM finishes the restore ----------------
+
+class FakeProc:
+    def __init__(self, hang_after_term):
+        self.hang_after_term, self.events, self.returncode = hang_after_term, [], None
+
+    def communicate(self, timeout=None):
+        if "kill" in self.events:
+            return "", ""
+        if "terminate" in self.events and not self.hang_after_term:
+            self.returncode = -15
+            return "", ""
+        self.events.append(f"wait {timeout}")
+        raise run_areas.subprocess.TimeoutExpired("area", timeout)
+
+    def terminate(self):
+        self.events.append("terminate")
+
+    def kill(self):
+        self.events.append("kill")
+        self.returncode = -9
+
+
+@pytest.mark.parametrize("hang", [False, True])
+def test_overdue_area_gets_sigterm_then_a_grace_period_then_sigkill(tmp_path, monkeypatch, hang):
+    proc = FakeProc(hang)
+    monkeypatch.setattr(run_areas.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(run_areas, "AREA_TIMEOUT_S", 100.0)
+    monkeypatch.setattr(run_areas, "AREA_GRACE_S", 30.0)
+    res = run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
+    out = json.loads(res["out"])
+    assert res["rc"] == 124 and out["status"] == "blocked" and res["killed"] is hang
+    if hang:
+        assert proc.events == ["wait 100.0", "terminate", "wait 30.0", "kill"]
+        assert out["tenant_may_be_unrestored"] is True and "may be unrestored" in out["reason"]
+    else:
+        assert proc.events == ["wait 100.0", "terminate"]
+        assert out["tenant_may_be_unrestored"] is False and "after SIGTERM" in out["reason"]
+
+
+def test_runner_evidence_marks_a_killed_area_as_possibly_unrestored(tmp_path):
+    def runner(area, args, parallel_model):
+        killed = area == "semantic"
+        return {"rc": 124 if killed else 0, "killed": killed, "out": "{}"}
+    run_areas.run_all(_run_args(tmp_path), runner=runner)
+    runs = {r["area"]: r for r in json.loads((tmp_path / "workflows" / "areas-run.json").read_text())["runs"]}
+    assert runs["semantic"]["killed"] is True and runs["semantic"]["tenant_may_be_unrestored"] is True
+    assert runs["temporal"]["killed"] is False and runs["temporal"]["tenant_may_be_unrestored"] is False
+
+
+def test_sigterm_is_a_stop_request_not_a_death(monkeypatch):
+    import os
+    import signal
+    monkeypatch.setitem(g._STOP, "requested", False)
+    old = signal.getsignal(signal.SIGTERM)
+    try:
+        g.install_stop_handler()
+        assert g.stop_requested() is False
+        os.kill(os.getpid(), signal.SIGTERM)  # the process survives
+        assert g.stop_requested() is True
+    finally:
+        signal.signal(signal.SIGTERM, old)
+
+
+def test_stop_request_skips_the_follow_up_turn_but_still_restores(monkeypatch):
+    monkeypatch.setitem(g._STOP, "requested", False)
+    calls = []
+    monkeypatch.setattr(g, "require_idle", lambda env, log=None, before="", **kw: {"idle": True, "waited_s": 0.0})
+    monkeypatch.setattr(g, "inference_slot", lambda *a, **k: __import__("contextlib").nullcontext())
+
+    def ask(*a, **k):
+        calls.append("ask")
+        g._STOP["requested"] = True  # SIGTERM arrives while the first turn is running
+        return {"status": 200, "answer": "a", "ms": 1, "decision": None, "xid": None, "trace": None}
+    monkeypatch.setattr(harness, "ask", ask)
+    monkeypatch.setattr(harness, "restore_baseline", lambda *a, **k: calls.append("restore") or
+                        {"ok": True, "deleted": [], "emptied": [], "rewritten": [], "failures": [], "settled": {}, "matches": True,
+                         "idle_wait_s": 0.0})
+    stop = harness.run_turns(object(), "u", QUERY, [("one", QUERY), ("two", QUERY)], ENV, None, {}, {"files": {}},
+                             lambda *a: None, None)
+    assert stop is None and calls == ["ask", "restore"]
