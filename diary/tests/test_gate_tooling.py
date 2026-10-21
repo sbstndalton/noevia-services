@@ -1217,7 +1217,7 @@ def test_a_model_area_stopped_while_waiting_for_its_turn_reports_blocked(fixture
 def test_the_default_grace_covers_a_chat_call_and_a_restore_and_keeps_its_override(monkeypatch):
     import importlib.util
     assert g.CHAT_TIMEOUT_S == 600.0 and harness.ask.__defaults__[-1] == g.CHAT_TIMEOUT_S  # the diary chat timeout
-    assert run_areas.AREA_GRACE_S == g.CHAT_TIMEOUT_S + run_areas.RESTORE_ALLOWANCE_S == 1200.0
+    assert run_areas.AREA_GRACE_S == g.CHAT_TIMEOUT_S + run_areas.RESTORE_ALLOWANCE_S == 3960.0
     assert run_areas.AREA_GRACE_S >= 420.0
 
     def fresh():
@@ -1226,7 +1226,7 @@ def test_the_default_grace_covers_a_chat_call_and_a_restore_and_keeps_its_overri
         spec.loader.exec_module(mod)
         return mod
     monkeypatch.delenv("GATE_AREA_GRACE_S", raising=False)
-    assert fresh().AREA_GRACE_S == 1200.0
+    assert fresh().AREA_GRACE_S == 3960.0
     monkeypatch.setenv("GATE_AREA_GRACE_S", "45")
     assert fresh().AREA_GRACE_S == 45.0
 
@@ -1437,3 +1437,37 @@ def test_an_exception_in_a_parallel_stage_stops_the_other_children_before_the_po
         run_areas.run_all(_run_args(tmp_path), runner=runner)
     assert seen == [("tenancy", True)]  # the sibling saw the stop request, so its real child would have been stopped
     assert (tmp_path / "workflows" / "areas-run.json").exists()  # the evidence is written even on the way out
+
+
+# ---------------- services#125: the stop grace covers a chat call plus a worst-case tenant restore ----------------
+
+def _worst_case_restore_s() -> float:
+    """Idle wait, then (inside the restore slot) the lock wait and the load-gate re-checks, then settle."""
+    import inspect
+    settle_s = inspect.signature(g.settle).parameters["timeout"].default
+    return g.IDLE_WAIT_S + g.LOCK_TIMEOUT_S + g.RECHECKS * g.RECHECK_S + settle_s
+
+
+def test_default_area_grace_covers_chat_call_and_worst_case_restore():
+    need = g.CHAT_TIMEOUT_S + _worst_case_restore_s()
+    assert run_areas.area_grace_s({}) > need  # a stated margin on top, never below
+    assert run_areas.RESTORE_MARGIN_S > 0
+    assert run_areas.RESTORE_ALLOWANCE_S >= _worst_case_restore_s() + run_areas.RESTORE_MARGIN_S
+    assert run_areas.AREA_GRACE_S > need or "GATE_AREA_GRACE_S" in __import__("os").environ
+
+
+def test_area_grace_follows_the_restore_constants(monkeypatch):
+    base = run_areas.area_grace_s({})
+    for name, bump in (("IDLE_WAIT_S", 7.0), ("LOCK_TIMEOUT_S", 11.0), ("RECHECKS", 2), ("SETTLE_TIMEOUT_S", 13.0)):
+        with monkeypatch.context() as m:
+            m.setattr(g, name, getattr(g, name) + bump)
+            assert run_areas.area_grace_s({}) > base, name  # derived, not a copied number
+
+
+def test_area_grace_env_override_wins():
+    assert run_areas.area_grace_s({"GATE_AREA_GRACE_S": "42"}) == 42.0
+    assert run_areas.area_grace_s({"GATE_AREA_GRACE_S": ""}) == run_areas.area_grace_s({})
+
+
+def test_run_areas_defines_command_once():
+    assert Path(run_areas.__file__).read_text().count("def _command(") == 1

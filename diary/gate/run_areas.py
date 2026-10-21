@@ -54,11 +54,33 @@ ALONE = ("error_paths", "restart", "budgets")
 NEEDS_FIXTURE = frozenset(MODEL_AREAS) | {"budgets"}
 AREA_TIMEOUT_S = float(os.environ.get("GATE_AREA_TIMEOUT_S", "10800"))
 # After the timeout (or a stop of this runner) the area gets SIGTERM and this long to stop: a model area
-# finishes the chat call it is on (up to the diary chat timeout) and then restores its tenant (idle wait,
-# writes, settle), and only after that is it killed. The default is that chat timeout plus RESTORE_ALLOWANCE_S
-# (1200 s); GATE_AREA_GRACE_S overrides it.
-RESTORE_ALLOWANCE_S = 600.0
-AREA_GRACE_S = float(os.environ.get("GATE_AREA_GRACE_S", g.CHAT_TIMEOUT_S + RESTORE_ALLOWANCE_S))
+# finishes the chat call it is on (up to g.CHAT_TIMEOUT_S) and then restores its tenant, and only after that is
+# it killed. The restore (harness.restore_baseline) waits for the engines to go idle (g.IDLE_WAIT_S), then in
+# ONE inference slot waits for the lock (g.LOCK_TIMEOUT_S) and the load gate (g.RECHECKS * g.RECHECK_S), writes,
+# and settles the index (g.SETTLE_TIMEOUT_S). The default grace is therefore
+#   g.CHAT_TIMEOUT_S + RESTORE_ALLOWANCE_S, with
+#   RESTORE_ALLOWANCE_S = IDLE_WAIT_S + LOCK_TIMEOUT_S + RECHECKS * RECHECK_S + SETTLE_TIMEOUT_S + RESTORE_MARGIN_S
+# (the margin is for the restore's own writes), all taken from gatelib. With the stock values the allowance is
+# 900 + 1800 + 60 + 300 + 300 = 3360 s and the default grace 600 + 3360 = 3960 s. GATE_AREA_GRACE_S overrides it.
+RESTORE_MARGIN_S = 300.0
+
+
+def restore_allowance_s() -> float:
+    return g.IDLE_WAIT_S + g.LOCK_TIMEOUT_S + g.RECHECKS * g.RECHECK_S + g.SETTLE_TIMEOUT_S + RESTORE_MARGIN_S
+
+
+RESTORE_ALLOWANCE_S = restore_allowance_s()
+
+
+def area_grace_s(environ=None) -> float:
+    """GATE_AREA_GRACE_S when set and non-empty, else the chat timeout plus the restore allowance."""
+    raw = (os.environ if environ is None else environ).get("GATE_AREA_GRACE_S")
+    if raw not in (None, ""):
+        return float(raw)
+    return g.CHAT_TIMEOUT_S + restore_allowance_s()
+
+
+AREA_GRACE_S = area_grace_s()
 POLL_S = 1.0  # how often a waiting runner looks at the overdue deadline and at a stop request
 BLOCKED_EXIT = 3  # the runner stopped before every area finished (SIGTERM/SIGINT); same code as harness.py blocked
 
@@ -77,15 +99,6 @@ def plan(parallel_model: bool = False, only=None) -> list:
     if only:
         stages = [[a for a in st if a in only] for st in stages]
     return [st for st in stages if st]
-
-
-def _command(area: str, args) -> list:
-    cmd = [sys.executable, "-I", str(HERE / "areas" / f"{area}.py"), "--run-dir", args.run_dir, "--env-file", args.env_file]
-    if args.fixture and area in NEEDS_FIXTURE:
-        cmd += ["--fixture", args.fixture]
-    if args.base_url:
-        cmd += ["--base-url", args.base_url]
-    return cmd
 
 
 def _command(area: str, args) -> list:
@@ -149,7 +162,6 @@ def _kill(proc) -> None:
         proc.kill()
     except OSError:
         pass
-
 
 
 def _stop_child(proc, area: str, cause: str) -> dict:
