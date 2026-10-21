@@ -77,7 +77,38 @@ def test_stream_error_reason_chat_timeout_wins_over_model_failed():
 
 def test_stream_error_without_the_timeout_reason_uses_its_code():
     assert ask(504, {"type": "error", "code": "modelFailed", "saved": False})["error_code"] == "modelFailed"
-    assert ask(504, {"type": "error", "code": "modelFailed", "reason": "other"})["error_code"] == "modelFailed"
+    
+
+def test_v1_502_length_cap_code_is_recorded():
+    body = {"error": {"message": "the answer hit the length cap", "type": "api_error", "code": "length_cap"}}
+    assert ask(502, body)["error_code"] == "length_cap"
+
+
+@pytest.mark.parametrize("reason", ["length_cap", "chat_timeout", "anything_else"])
+def test_any_non_empty_stream_reason_wins_over_the_code(reason):
+    res = ask(504, {"type": "error", "code": "modelFailed", "reason": reason, "saved": False})
+    assert res["error_code"] == reason
+
+
+@pytest.mark.parametrize("reason", ["", None, 5, ["length_cap"], {"a": 1}, True])
+def test_an_empty_or_non_string_stream_reason_falls_back_to_the_code(reason):
+    assert ask(504, {"type": "error", "code": "modelFailed", "reason": reason})["error_code"] == "modelFailed"
+
+
+def test_error_code_of_reads_the_reason_from_the_nested_error_too():
+    assert harness.error_code_of({"error": {"code": "modelFailed", "reason": "length_cap"}}) == "length_cap"
+    assert harness.error_code_of({"error": {"code": "length_cap"}}) == "length_cap"
+    assert harness.error_code_of({"error": {"code": "modelFailed", "reason": ""}}) == "modelFailed"
+
+
+@pytest.mark.parametrize("diary", ["oops", 7, ["x"], True])
+def test_a_truthy_non_object_diary_field_does_not_raise(diary):
+    body = ok_body()
+    body["diary"] = diary
+    res = ask(200, body)
+    assert res["status"] == 200 and res["answer"] == "an answer" and res["decision"] is None and res["xid"] is None
+    err = ask(502, {"error": {"code": "length_cap"}, "diary": diary})
+    assert err["error_code"] == "length_cap" and err["decision"] is None
 
 
 def test_a_transport_failure_has_status_0_and_no_code():

@@ -121,15 +121,15 @@ def normalize_trace(trace, index: dict, exclude_xid: str | None = None, exclude_
 
 def error_code_of(payload):
     """The code of a failed answer, from the /v1 error body ({"error": {"code": ...}}) or from a stream error
-    event / error body ({"code": "modelFailed", "reason": "chat_timeout"}). A reason of chat_timeout wins over
-    the generic code; None when the body names no code (or is not JSON)."""
+    event / error body ({"code": "modelFailed", "reason": "length_cap"}). Any non-empty string reason (such as
+    chat_timeout or length_cap) wins over the generic code; None when the body names no code (or is not JSON)."""
     if not isinstance(payload, dict):
         return None
     for src in (payload.get("error"), payload):
         if not isinstance(src, dict):
             continue
-        if src.get("reason") == "chat_timeout":
-            return "chat_timeout"
+        if isinstance(src.get("reason"), str) and src["reason"]:
+            return src["reason"]
         if isinstance(src.get("code"), str) and src["code"]:
             return src["code"]
     return None
@@ -159,7 +159,9 @@ def ask(client: g.Client, user: str, text: str, clock: str, session: str, histor
         answer = payload["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
         pass
-    diary = (payload.get("diary") or {}) if isinstance(payload, dict) else {}
+    diary = payload.get("diary") if isinstance(payload, dict) else None
+    if not isinstance(diary, dict):
+        diary = {}
     out = {"status": r.status, "answer": answer, "ms": round((time.monotonic() - started) * 1000),
            "decision": diary.get("decision"), "xid": diary.get("xid"), "trace": extract_trace(payload)}
     if 200 <= r.status < 300:
