@@ -265,6 +265,8 @@ RECHECK_S = float(os.environ.get("GATE_RECHECK_S", "5"))
 IDLE_WAIT_S = float(os.environ.get("GATE_IDLE_WAIT_S", "900"))
 IDLE_POLL_S = float(os.environ.get("GATE_IDLE_POLL_S", "5"))
 AREA_WAIT_S = float(os.environ.get("GATE_AREA_WAIT_S", "3600"))
+# The longest the gate waits for one chat call (harness.ask). run_areas.py derives its default stop grace from it.
+CHAT_TIMEOUT_S = 600.0
 
 
 def model_areas_parallel() -> bool:
@@ -278,6 +280,14 @@ _STOP = {"requested": False}
 def stop_requested() -> bool:
     """True once SIGTERM arrived after install_stop_handler (run_areas.py sends it when an area overruns)."""
     return _STOP["requested"]
+
+
+STOPPED_REASON = "stopped by SIGTERM"
+
+
+def stopped_block() -> "GateBlocked":
+    """The blocked result for a wait that a stop request cut short (kind "stopped")."""
+    return GateBlocked({"ok": False, "kind": "stopped", "reasons": [STOPPED_REASON]})
 
 
 def install_stop_handler() -> None:
@@ -474,11 +484,14 @@ def require_gate(env: dict, rechecks: int = RECHECKS, wait: float = RECHECK_S, c
 
 
 def wait_for_idle(env: dict, timeout: float | None = None, poll: float | None = None, fetch=None,
-                  sleep=None, clock=None) -> dict:
+                  sleep=None, clock=None, stoppable: bool = True) -> dict:
     """Poll the engines (model list first, slots only for loaded models) until none has a request in
     flight, for at most `timeout` seconds (GATE_IDLE_WAIT_S). A chat call the diary gave up on can keep
     generating upstream, so the next restore write or query would be refused while it runs. Returns
-    {"idle", "waited_s", "polls", "reasons"}; never raises. Does nothing when inference is disabled."""
+    {"idle", "waited_s", "polls", "reasons"}; never raises. Does nothing when inference is disabled.
+    With `stoppable` (the default) a stop request (SIGTERM after install_stop_handler) ends the wait at the
+    next poll: idle is False, "stopped" is True and the reason is "stopped by SIGTERM". The wait before a
+    restore passes stoppable=False: the restore is what a stop request is waiting for."""
     if not inference_enabled(env):
         return {"idle": True, "waited_s": 0.0, "polls": 0, "reasons": [], "skipped": "inference disabled"}
     fetch, sleep, clock = fetch or _get_json, sleep or time.sleep, clock or time.monotonic
@@ -487,6 +500,9 @@ def wait_for_idle(env: dict, timeout: float | None = None, poll: float | None = 
     start, polls = clock(), 0
     while True:
         polls += 1
+        if stoppable and stop_requested():
+            return {"idle": False, "stopped": True, "waited_s": round(clock() - start, 3), "polls": polls,
+                    "reasons": [STOPPED_REASON]}
         ok, reasons, _ = engine_load(env, fetch)
         waited = clock() - start
         if ok:
@@ -498,15 +514,20 @@ def wait_for_idle(env: dict, timeout: float | None = None, poll: float | None = 
 
 def require_idle(env: dict, log=None, before: str = "", **kw) -> dict:
     """wait_for_idle, recorded in the evidence (`log` gets {"kind": "idle-wait", "before", "waited_s", ...}),
-    and a GateBlocked (status "blocked", kind "not-idle") when the engines never go idle."""
+    and a GateBlocked (status "blocked", kind "not-idle") when the engines never go idle, or kind "stopped"
+    ("stopped by SIGTERM") when a stop request ended the wait (stoppable=True, the default)."""
     res = wait_for_idle(env, **kw)
     if res.get("skipped"):
         return res
     record = {"kind": "idle-wait", "before": before, "idle": res["idle"], "waited_s": res["waited_s"], "polls": res["polls"]}
+    if res.get("stopped"):
+        record["stopped"] = True
     if not res["idle"]:
         record["reasons"] = res["reasons"]
     if log:
         log(record)
+    if res.get("stopped"):
+        raise stopped_block()
     if not res["idle"]:
         limit = IDLE_WAIT_S if kw.get("timeout") is None else kw["timeout"]
         raise GateBlocked({"ok": False, "kind": "not-idle", "idle_wait_s": res["waited_s"],
@@ -532,9 +553,11 @@ def _holder(path: str) -> str:
 
 
 def _acquire(fh, path: str, timeout: float, sleep=time.sleep, clock=time.monotonic, what: str = "inference lock",
-             kind: str = "lock-timeout", env_name: str = "GATE_LOCK_TIMEOUT_S") -> float:
+             kind: str = "lock-timeout", env_name: str = "GATE_LOCK_TIMEOUT_S", stoppable: bool = True) -> float:
     """flock with a bounded wait; returns the seconds waited. Fails closed with GateBlocked (status
-    "blocked", with the holder when known) when another gate process holds it too long."""
+    "blocked", with the holder when known) when another gate process holds it too long. While the lock is
+    held by someone else, a stop request ends the wait at the next poll with kind "stopped"
+    ("stopped by SIGTERM"); stoppable=False (the restore path) keeps waiting for the bound."""
     start = clock()
     while True:
         try:
@@ -546,6 +569,10 @@ def _acquire(fh, path: str, timeout: float, sleep=time.sleep, clock=time.monoton
             return clock() - start
         except BlockingIOError:
             waited = clock() - start
+            if stoppable and stop_requested():
+                exc = stopped_block()
+                exc.result["lock_wait_s"] = round(waited, 3)
+                raise exc
             if waited >= timeout:
                 holder = _holder(path)
                 raise GateBlocked({"ok": False, "kind": kind, "lock_wait_s": round(waited, 3),
@@ -555,20 +582,27 @@ def _acquire(fh, path: str, timeout: float, sleep=time.sleep, clock=time.monoton
 
 
 @contextmanager
-def inference_slot(env: dict, log=None, lock_file: str | None = None, lock_timeout: float | None = None):
+def inference_slot(env: dict, log=None, lock_file: str | None = None, lock_timeout: float | None = None,
+                   stoppable: bool = True):
     """Hold a cross-process lock around the load check AND the call it guards, so no two gate processes
     start inference work at once. A no-op when inference is disabled (nothing can reach a model).
     The lock wait is bounded (GATE_LOCK_TIMEOUT_S): when it runs out the slot raises GateBlocked (status
     "blocked", kind "lock-timeout", who holds it) before the guarded call is made, so callers report the
-    work as blocked, not as a query that timed out."""
+    work as blocked, not as a query that timed out. A stop request ends the lock wait early (kind "stopped")
+    unless stoppable=False, which the restore path uses: a restore must finish after a stop request."""
     if not inference_enabled(env):
         yield None
         return
+    if stoppable and stop_requested():  # no new inference work once a stop was asked for (the fixture load, a query)
+        exc = stopped_block()
+        if log:
+            log(exc.result)
+        raise exc
     path = _lock_path(lock_file)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(fd, "r+") as fh:
         try:
-            lock_wait = _acquire(fh, path, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout)
+            lock_wait = _acquire(fh, path, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout, stoppable=stoppable)
         except GateBlocked as exc:
             if log:
                 log(exc.result)

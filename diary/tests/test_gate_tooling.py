@@ -935,17 +935,32 @@ def test_restore_after_an_abandoned_generation_is_blocked_while_the_answer_row_s
 # ---------------- review fixes: overdue areas get SIGTERM first; SIGTERM finishes the restore ----------------
 
 class FakeProc:
-    def __init__(self, hang_after_term):
-        self.hang_after_term, self.events, self.returncode = hang_after_term, [], None
+    """Stands in for Popen. communicate() advances the fake clock, so nothing really waits. The child exits
+    cleanly on SIGTERM (printing `stdout`, returning `rc_after_term`) unless hang_after_term. It has no
+    pid: nothing here can ever signal a real process group."""
+
+    def __init__(self, clock, hang_after_term=False, stdout="", rc_after_term=-15, exits_at=None):
+        self.clock, self.hang_after_term, self.stdout = clock, hang_after_term, stdout
+        self.rc_after_term, self.exits_at = rc_after_term, exits_at
+        self.events, self.returncode = [], None
 
     def communicate(self, timeout=None):
         if "kill" in self.events:
             return "", ""
         if "terminate" in self.events and not self.hang_after_term:
-            self.returncode = -15
-            return "", ""
+            self.returncode = self.rc_after_term
+            return self.stdout, ""
+        assert timeout is not None, "would wait forever"
+        if self.exits_at is not None and self.clock.now + timeout >= self.exits_at:
+            self.clock.now = self.exits_at
+            self.returncode = 0
+            return self.stdout, ""
         self.events.append(f"wait {timeout}")
+        self.clock.now += timeout
         raise run_areas.subprocess.TimeoutExpired("area", timeout)
+
+    def poll(self):
+        return self.returncode
 
     def terminate(self):
         self.events.append("terminate")
@@ -955,20 +970,43 @@ class FakeProc:
         self.returncode = -9
 
 
-@pytest.mark.parametrize("hang", [False, True])
-def test_overdue_area_gets_sigterm_then_a_grace_period_then_sigkill(tmp_path, monkeypatch, hang):
-    proc = FakeProc(hang)
-    monkeypatch.setattr(run_areas.subprocess, "Popen", lambda *a, **k: proc)
+@pytest.fixture
+def sandbox(monkeypatch):
+    """Nothing real can start or be signalled: Popen refuses, killpg records, the clock is fake, the
+    timeouts are 100 s (area), 30 s (grace) and a 40 s poll."""
+    import types
+    clock, killpg = FakeTime(), []
+
+    def no_popen(*a, **k):
+        raise AssertionError("a test tried to start a real process")
+    monkeypatch.setattr(run_areas.subprocess, "Popen", no_popen)
+    monkeypatch.setattr(run_areas.os, "killpg", lambda pgid, sig: killpg.append((pgid, sig)))
+    monkeypatch.setattr(run_areas, "_clock", clock.monotonic)
     monkeypatch.setattr(run_areas, "AREA_TIMEOUT_S", 100.0)
     monkeypatch.setattr(run_areas, "AREA_GRACE_S", 30.0)
+    monkeypatch.setattr(run_areas, "POLL_S", 40.0)
+    run_areas._INTERRUPT.clear()
+    run_areas._INTERRUPT_SIGNAL[0] = None
+    yield types.SimpleNamespace(clock=clock, killpg=killpg, popen=lambda proc: monkeypatch.setattr(
+        run_areas.subprocess, "Popen", lambda *a, **k: (proc.__dict__.setdefault("kw", k), proc)[1]))
+    run_areas._INTERRUPT.clear()
+    run_areas._INTERRUPT_SIGNAL[0] = None
+    assert not run_areas._ACTIVE  # no child is left registered
+
+
+@pytest.mark.parametrize("hang", [False, True])
+def test_overdue_area_gets_sigterm_then_a_grace_period_then_sigkill(tmp_path, sandbox, hang):
+    proc = FakeProc(sandbox.clock, hang)
+    sandbox.popen(proc)
     res = run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
     out = json.loads(res["out"])
-    assert res["rc"] == 124 and out["status"] == "blocked" and res["killed"] is hang
+    assert out["status"] == "blocked" and res["killed"] is hang and res["timed_out"] is True
+    assert proc.events[:3] == ["wait 40.0", "wait 40.0", "wait 20.0"]  # the 100 s of the area, in slices of the poll
     if hang:
-        assert proc.events == ["wait 100.0", "terminate", "wait 30.0", "kill"]
+        assert proc.events[3:] == ["terminate", "wait 30.0", "kill"] and res["rc"] == 124
         assert out["tenant_may_be_unrestored"] is True and "may be unrestored" in out["reason"]
     else:
-        assert proc.events == ["wait 100.0", "terminate"]
+        assert proc.events[3:] == ["terminate"] and res["rc"] == -15  # the return code of the child, not a synthetic one
         assert out["tenant_may_be_unrestored"] is False and "after SIGTERM" in out["reason"]
 
 
@@ -1013,3 +1051,389 @@ def test_stop_request_skips_the_follow_up_turn_but_still_restores(monkeypatch):
     stop = harness.run_turns(object(), "u", QUERY, [("one", QUERY), ("two", QUERY)], ENV, None, {}, {"files": {}},
                              lambda *a: None, None)
     assert stop is None and calls == ["ask", "restore"]
+
+
+# ---------------- services#123 item 1: a stop request ends the long waits; the grace period fits a restore ----------------
+
+@pytest.fixture
+def stop_flag(monkeypatch):
+    monkeypatch.setitem(g._STOP, "requested", False)
+    return g._STOP
+
+
+def _stop_after(clock, flag, sleeps):
+    """A sleep that sets the stop flag once `sleeps` sleeps have happened (the SIGTERM arrives mid-wait)."""
+    def sleep(seconds):
+        clock.sleep(seconds)
+        if len(clock.sleeps) >= sleeps:
+            flag["requested"] = True
+    return sleep
+
+
+def test_wait_for_idle_ends_early_as_stopped_when_a_stop_is_requested(monkeypatch, stop_flag):
+    clock = FakeTime()
+    engine_load, polls = _busy_then_idle(10 ** 6, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    res = g.wait_for_idle(ENV, timeout=900, poll=5, sleep=_stop_after(clock, stop_flag, 2), clock=clock.monotonic)
+    assert res["idle"] is False and res["stopped"] is True and res["reasons"] == ["stopped by SIGTERM"]
+    assert res["waited_s"] == 10.0 and clock.sleeps == [5, 5] and len(polls) == 2  # nowhere near the 900 s limit
+
+
+def test_wait_for_idle_checks_the_stop_flag_before_the_first_probe(monkeypatch, stop_flag):
+    stop_flag["requested"] = True
+    monkeypatch.setattr(g, "engine_load", lambda *a, **k: pytest.fail("no probe once a stop was requested"))
+    assert g.wait_for_idle(ENV, timeout=60)["stopped"] is True
+
+
+def test_require_idle_raises_blocked_stopped_and_logs_it(monkeypatch, stop_flag):
+    clock = FakeTime()
+    engine_load, _ = _busy_then_idle(10 ** 6, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    logged = []
+    with pytest.raises(g.GateBlocked) as exc:
+        g.require_idle(ENV, logged.append, "Q1 turn 0", timeout=900, poll=5, sleep=_stop_after(clock, stop_flag, 1), clock=clock.monotonic)
+    assert exc.value.result["status"] == "blocked" and exc.value.result["kind"] == "stopped"
+    assert str(exc.value) == "stopped by SIGTERM"
+    assert logged[-1]["kind"] == "idle-wait" and logged[-1]["stopped"] is True and logged[-1]["idle"] is False
+
+
+def test_the_wait_before_a_restore_is_not_cut_short_by_a_stop_request(monkeypatch, stop_flag):
+    """A stop request is asking for the restore: its idle wait must run on until the engines are idle."""
+    clock = FakeTime()
+    engine_load, polls = _busy_then_idle(3, clock)
+    monkeypatch.setattr(g, "engine_load", engine_load)
+    stop_flag["requested"] = True
+    res = g.require_idle(ENV, None, "restore", timeout=60, poll=5, sleep=clock.sleep, clock=clock.monotonic, stoppable=False)
+    assert res["idle"] is True and res["polls"] == 4
+
+
+def test_lock_acquire_ends_early_as_stopped_while_another_process_holds_it(tmp_path, stop_flag):
+    import fcntl
+    path = tmp_path / "held.lock"
+    clock = FakeTime()
+    with open(path, "a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with open(path, "r+") as fh:
+            with pytest.raises(g.GateBlocked) as exc:
+                g._acquire(fh, str(path), 1800, sleep=_stop_after(clock, stop_flag, 3), clock=clock.monotonic)
+            assert exc.value.result["kind"] == "stopped" and exc.value.result["status"] == "blocked"
+            assert str(exc.value) == "stopped by SIGTERM" and exc.value.result["lock_wait_s"] == 1.5
+            assert clock.sleeps == [0.5, 0.5, 0.5]  # three polls, not the 1800 s limit
+            # The restore path keeps waiting for the lock up to its own bound, stop request or not.
+            clock2 = FakeTime()
+            with pytest.raises(g.GateBlocked) as exc:
+                g._acquire(fh, str(path), 2, sleep=clock2.sleep, clock=clock2.monotonic, stoppable=False)
+            assert exc.value.result["kind"] == "lock-timeout"
+
+
+def test_inference_slot_and_model_area_slot_stop_as_blocked(tmp_path, monkeypatch, stop_flag):
+    import fcntl
+    monkeypatch.setattr(g, "require_gate", lambda env: {"ok": True, "reasons": []})
+    lock = str(tmp_path / "inference.lock")
+    area_lock = str(tmp_path / "area.lock")
+    monkeypatch.delenv("GATE_MODEL_AREAS_PARALLEL", raising=False)
+    stop_flag["requested"] = True
+    logged = []
+    with pytest.raises(g.GateBlocked) as exc:  # no new inference work after a stop request
+        with g.inference_slot(ENV, logged.append, lock_file=lock):
+            pytest.fail("no new inference work after a stop request")
+    assert exc.value.result["kind"] == "stopped" and logged[-1]["kind"] == "stopped"
+    with g.inference_slot(ENV, None, lock_file=lock, stoppable=False) as ok:  # the restore still gets its slot
+        assert ok["ok"] is True
+    with open(area_lock, "a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(g.GateBlocked) as exc:
+            with g.model_area_slot("temporal", lock_file=area_lock, timeout=3600):
+                pytest.fail("must not run while another model area holds the lock")
+        assert exc.value.result["kind"] == "stopped"
+
+
+def test_restore_baseline_waits_are_not_stoppable(monkeypatch):
+    seen = []
+    monkeypatch.setattr(g, "require_idle", lambda env, log=None, before="", **kw: seen.append(("idle", kw)) or {"idle": True, "waited_s": 0.0})
+    monkeypatch.setattr(g, "inference_slot", lambda env, log=None, **kw: seen.append(("slot", kw)) or __import__("contextlib").nullcontext())
+    monkeypatch.setattr(g, "restore", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(g, "settle", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(g, "baseline_matches", lambda *a, **k: True)
+    report = harness.restore_baseline(object(), "u", {"files": {}}, ENV, None)
+    assert report["ok"] is True
+    assert seen == [("idle", {"stoppable": False}), ("slot", {"stoppable": False})]
+
+
+def test_a_stop_before_a_follow_up_turn_still_restores_the_tenant(monkeypatch, stop_flag):
+    calls = []
+
+    def require_idle(env, log=None, before="", **kw):
+        calls.append(f"idle {before}")
+        if before.endswith("turn 1"):
+            raise g.stopped_block()  # SIGTERM arrives while waiting for the follow-up turn
+        return {"idle": True, "waited_s": 0.0}
+    monkeypatch.setattr(g, "require_idle", require_idle)
+    monkeypatch.setattr(g, "inference_slot", lambda *a, **k: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(harness, "ask", lambda *a, **k: calls.append("ask") or
+                        {"status": 200, "answer": "a", "ms": 1, "decision": None, "xid": None, "trace": None})
+    monkeypatch.setattr(harness, "restore_baseline", lambda *a, **k: calls.append("restore") or
+                        {"ok": True, "deleted": [], "emptied": [], "rewritten": [], "failures": [], "settled": {}, "matches": True,
+                         "idle_wait_s": 0.0})
+    stop = harness.run_turns(object(), "u", QUERY, [("one", QUERY), ("two", QUERY)], ENV, None, {}, {"files": {}},
+                             lambda *a: None, None)
+    assert calls == ["idle Q1 turn 0", "ask", "idle Q1 turn 1", "restore"]  # the first turn left an exchange: restore it
+    assert stop.startswith("blocked: stopped by SIGTERM") and "turn 1" in stop and stop.endswith("the tenant is restored")
+
+
+def test_a_stop_before_the_first_turn_asks_nothing_and_restores_nothing(monkeypatch, stop_flag):
+    def stopped(*a, **k):
+        raise g.stopped_block()
+    monkeypatch.setattr(g, "require_idle", stopped)
+    monkeypatch.setattr(harness, "ask", lambda *a, **k: pytest.fail("nothing may be asked after a stop"))
+    monkeypatch.setattr(harness, "restore_baseline", lambda *a, **k: pytest.fail("nothing was changed, nothing to restore"))
+    stop = harness.run_turns(object(), "u", QUERY, [("one", QUERY)], ENV, None, {}, {"files": {}}, lambda *a: None, None)
+    assert stop.startswith("blocked: stopped by SIGTERM") and "turn 0" in stop
+
+
+def test_a_model_area_stopped_while_waiting_for_its_turn_reports_blocked(fixture_dir, tmp_path, monkeypatch, stop_flag):
+    sys.path.insert(0, str(GATE / "areas"))
+    import contextlib
+    import _model
+    env = tmp_path / "env"
+    env.write_text(chr(10).join(["LLM_BASE_URL=http://10.0.0.9:11435/v1", "DIARY_AUTH_TOKEN=t", ""]))
+    monkeypatch.setattr(sys, "argv", ["semantic.py", "--run-dir", str(tmp_path / "run"), "--env-file", str(env), "--fixture", str(fixture_dir)])
+    installed = []
+    monkeypatch.setattr(g, "install_stop_handler", lambda: installed.append("handler"))
+
+    @contextlib.contextmanager
+    def stopped(name, log=None, **kw):
+        assert installed == ["handler"]  # the handler is in place before the lock wait starts
+        raise g.stopped_block()
+        yield  # pragma: no cover
+    monkeypatch.setattr(g, "model_area_slot", stopped)
+    monkeypatch.setattr(g, "Client", lambda *a, **k: pytest.fail("no request may be made after a stop"))
+    assert _model.run("semantic", "doc", lambda q: True) == 1
+    result = json.loads((tmp_path / "run" / "workflows" / "semantic" / "result.json").read_text())
+    assert result["status"] == "blocked" and result["checks"][0]["check"] == "stopped"
+    assert "stopped by SIGTERM" in result["checks"][0]["reason"]
+
+
+def test_the_default_grace_covers_a_chat_call_and_a_restore_and_keeps_its_override(monkeypatch):
+    import importlib.util
+    assert g.CHAT_TIMEOUT_S == 600.0 and harness.ask.__defaults__[-1] == g.CHAT_TIMEOUT_S  # the diary chat timeout
+    assert run_areas.AREA_GRACE_S == g.CHAT_TIMEOUT_S + run_areas.RESTORE_ALLOWANCE_S == 1200.0
+    assert run_areas.AREA_GRACE_S >= 420.0
+
+    def fresh():
+        spec = importlib.util.spec_from_file_location("run_areas_fresh", GATE / "run_areas.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    monkeypatch.delenv("GATE_AREA_GRACE_S", raising=False)
+    assert fresh().AREA_GRACE_S == 1200.0
+    monkeypatch.setenv("GATE_AREA_GRACE_S", "45")
+    assert fresh().AREA_GRACE_S == 45.0
+
+
+# ---------------- services#123 item 2: a child that stops cleanly keeps its own result ----------------
+
+CHILD_LINE = json.dumps({"area": "semantic", "status": "blocked", "counts": {"blocked": 1}})
+
+
+def test_a_clean_stop_keeps_the_child_line_and_return_code_and_the_tenant_restored(tmp_path, sandbox):
+    proc = FakeProc(sandbox.clock, stdout="progress line" + chr(10) + CHILD_LINE + chr(10), rc_after_term=1)
+    sandbox.popen(proc)
+    res = run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
+    assert res["out"] == CHILD_LINE and res["rc"] == 1  # the child own last stdout line and return code
+    assert res["timed_out"] is True and res["killed"] is False
+    assert proc.events[-1] == "terminate" and sandbox.killpg == []
+
+    def runner(area, args, parallel_model):
+        return res if area == "semantic" else {"rc": 0, "out": "{}"}
+    assert run_areas.run_all(_run_args(tmp_path), runner=runner) == 1  # blocked: the exit status is not 0
+    runs = {r["area"]: r for r in json.loads((tmp_path / "workflows" / "areas-run.json").read_text())["runs"]}
+    row = runs["semantic"]
+    assert row["rc"] == 1 and row["result"] == CHILD_LINE and row["timed_out"] is True
+    assert row["killed"] is False and row["tenant_may_be_unrestored"] is False
+    assert runs["temporal"]["timed_out"] is False
+
+
+def test_a_stopped_area_that_exited_zero_is_still_blocked_never_a_pass(tmp_path, sandbox):
+    proc = FakeProc(sandbox.clock, stdout=CHILD_LINE, rc_after_term=0)
+    sandbox.popen(proc)
+    res = run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
+    assert res["rc"] == 0 and res["timed_out"] is True
+    assert run_areas.run_all(_run_args(tmp_path), runner=lambda area, args, pm: res if area == "semantic" else {"rc": 0, "out": "{}"}) == 1
+
+
+def test_a_child_that_dies_on_sigterm_without_a_line_gets_a_blocked_line_not_unrestored(tmp_path, sandbox):
+    proc = FakeProc(sandbox.clock, stdout="", rc_after_term=-15)
+    sandbox.popen(proc)
+    res = run_areas.subprocess_runner("capture", _run_args(tmp_path), False)
+    out = json.loads(res["out"])
+    assert res["rc"] == -15 and out["status"] == "blocked" and out["timed_out"] is True and out["tenant_may_be_unrestored"] is False
+    assert "printed no result line" in out["reason"]
+
+
+def test_a_kill_after_the_grace_period_records_unrestored_true(tmp_path, sandbox):
+    proc = FakeProc(sandbox.clock, hang_after_term=True, stdout=CHILD_LINE)
+    sandbox.popen(proc)
+    res = run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
+    assert res["killed"] is True and res["timed_out"] is True and res["rc"] == 124
+    assert json.loads(res["out"])["status"] == "blocked" and "may be unrestored" in res["out"]
+    assert proc.events[-3:] == ["terminate", "wait 30.0", "kill"]
+    run_areas.run_all(_run_args(tmp_path), runner=lambda area, args, pm: res if area == "semantic" else {"rc": 0, "out": "{}"})
+    row = {r["area"]: r for r in json.loads((tmp_path / "workflows" / "areas-run.json").read_text())["runs"]}["semantic"]
+    assert row["killed"] is True and row["timed_out"] is True and row["tenant_may_be_unrestored"] is True and row["rc"] == 124
+
+
+# ---------------- services#123 item 3: no orphaned children; the parent forwards SIGTERM ----------------
+
+class SignalingProc(FakeProc):
+    """The runner gets SIGTERM/SIGINT while it waits for this child (the handler is called as the interpreter would)."""
+
+    def __init__(self, clock, signum, **kw):
+        super().__init__(clock, **kw)
+        self.signum = signum
+
+    def communicate(self, timeout=None):
+        if "signal" not in self.events and "terminate" not in self.events and self.events:
+            self.events.append("signal")
+            run_areas._on_signal(self.signum, None)
+        return super().communicate(timeout)
+
+
+def test_every_area_child_starts_in_its_own_session(tmp_path, sandbox):
+    proc = FakeProc(sandbox.clock, exits_at=sandbox.clock.now + 1)
+    sandbox.popen(proc)
+    run_areas.subprocess_runner("capture", _run_args(tmp_path), False)
+    assert proc.kw["start_new_session"] is True  # own session and process group: Ctrl-C and group signals miss it
+
+
+def test_a_kill_takes_the_process_group_of_the_child_but_never_ours(sandbox, monkeypatch):
+    import signal
+    proc = FakeProc(sandbox.clock)
+    proc.pid = 4242
+    monkeypatch.setattr(run_areas.os, "getpgrp", lambda: 1)
+    monkeypatch.setattr(run_areas.os, "getpgid", lambda pid: 4242)  # the child leads its own group
+    run_areas._kill(proc)
+    assert sandbox.killpg == [(4242, signal.SIGKILL)] and proc.events == ["kill"]
+    monkeypatch.setattr(run_areas.os, "getpgid", lambda pid: 1)  # same group as the runner: only the child is killed
+    run_areas._kill(proc)
+    assert sandbox.killpg == [(4242, signal.SIGKILL)]
+
+
+@pytest.mark.parametrize("hang", [False, True])
+def test_parent_sigterm_is_forwarded_to_the_child_which_is_stopped_and_the_run_is_blocked(tmp_path, sandbox, hang):
+    import signal
+    proc = SignalingProc(sandbox.clock, signal.SIGTERM, hang_after_term=hang, stdout=CHILD_LINE, rc_after_term=1)
+    sandbox.popen(proc)
+    args = _run_args(tmp_path)
+    args.only = "semantic,temporal"
+    assert run_areas.run_all(args) == run_areas.BLOCKED_EXIT == 3
+    assert proc.events[:3] == ["wait 40.0", "signal", "terminate"]  # forwarded the moment the signal arrived
+    record = json.loads((tmp_path / "workflows" / "areas-run.json").read_text())
+    assert record["order"] == ["semantic"] and record["interrupted"] == {"signal": "SIGTERM", "not_run": ["temporal"]}
+    row = record["runs"][0]
+    assert row["interrupted"] is True and row["timed_out"] is False
+    if hang:  # the child ignores the stop: grace period, then kill
+        assert proc.events[3:] == ["wait 40.0", "terminate", "wait 30.0", "kill"]
+        assert row["killed"] is True and row["tenant_may_be_unrestored"] is True and row["rc"] == 124
+    else:
+        assert row["rc"] == 1 and row["result"] == CHILD_LINE and row["killed"] is False and row["tenant_may_be_unrestored"] is False
+
+
+def test_parallel_children_all_get_the_forwarded_stop_and_nothing_else_starts(tmp_path, sandbox, monkeypatch):
+    import signal
+    monkeypatch.setattr(run_areas, "AREA_TIMEOUT_S", 10 ** 6)
+    procs = {"capture": SignalingProc(sandbox.clock, signal.SIGINT, stdout=CHILD_LINE, rc_after_term=3),
+             "tenancy": FakeProc(sandbox.clock, stdout=CHILD_LINE, rc_after_term=3)}
+    started, tenancy_up = [], __import__("threading").Event()
+
+    def popen(cmd, **kw):
+        name = next(a for a in procs if cmd[2].endswith(f"{a}.py"))
+        if name == "capture":
+            tenancy_up.wait(10)  # both children are running when the signal arrives
+        else:
+            tenancy_up.set()
+        started.append(name)
+        return procs[name]
+    monkeypatch.setattr(run_areas.subprocess, "Popen", popen)
+    assert run_areas.run_all(_run_args(tmp_path)) == 3
+    assert sorted(started) == ["capture", "tenancy"]  # the later stages were never started
+    assert all("terminate" in p.events for p in procs.values())
+    record = json.loads((tmp_path / "workflows" / "areas-run.json").read_text())
+    assert record["interrupted"]["signal"] == "SIGINT" and "semantic" in record["interrupted"]["not_run"]
+    assert len(record["interrupted"]["not_run"]) == 8
+
+
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT"])
+def test_a_real_signal_to_the_runner_is_handled_without_the_child_stop_handler(tmp_path, sandbox, monkeypatch, signame):
+    import os
+    import signal
+    sig = getattr(signal, signame)
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    monkeypatch.setitem(g._STOP, "requested", False)
+    monkeypatch.setattr(g, "install_stop_handler", lambda: pytest.fail("the runner must not install the stop handler of the areas"))
+    seen = {}
+
+    def runner(area, args, parallel_model):
+        seen.setdefault("handler", signal.getsignal(sig))
+        os.kill(os.getpid(), sig)  # the real signal, delivered to the main thread
+        assert run_areas._INTERRUPT.wait(10)
+        return {"rc": 1, "interrupted": True, "out": CHILD_LINE}
+    args = _run_args(tmp_path)
+    args.only = "semantic,temporal,corrections"
+    assert run_areas.run_all(args, runner=runner) == 3
+    assert seen["handler"] is run_areas._on_signal and g.stop_requested() is False
+    assert {s: signal.getsignal(s) for s in before} == before  # the handlers are back as they were
+    record = json.loads((tmp_path / "workflows" / "areas-run.json").read_text())
+    assert record["order"] == ["semantic"] and record["interrupted"]["signal"] == signame
+    assert record["interrupted"]["not_run"] == ["temporal", "corrections"]
+
+
+@pytest.mark.parametrize("hang", [False, True])
+def test_the_child_is_terminated_in_finally_when_the_runner_exits_for_any_reason(tmp_path, sandbox, hang):
+    class Exploding(FakeProc):
+        def communicate(self, timeout=None):
+            if not self.events:
+                self.events.append("running")
+                raise RuntimeError("the runner fell over")
+            return super().communicate(timeout)
+    proc = Exploding(sandbox.clock, hang_after_term=hang)
+    sandbox.popen(proc)
+    with pytest.raises(RuntimeError):
+        run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
+    assert proc.events == (["running", "terminate", "wait 30.0", "kill"] if hang else ["running", "terminate"])
+    assert proc.returncode is not None and not run_areas._ACTIVE  # reaped and unregistered
+
+
+def test_keyboard_interrupt_without_the_handler_still_reaps_the_child(tmp_path, sandbox):
+    class Interrupted(FakeProc):
+        def communicate(self, timeout=None):
+            if not self.events:
+                self.events.append("running")
+                raise KeyboardInterrupt
+            return super().communicate(timeout)
+    proc = Interrupted(sandbox.clock)
+    sandbox.popen(proc)
+    with pytest.raises(KeyboardInterrupt):
+        run_areas.subprocess_runner("semantic", _run_args(tmp_path), False)
+    assert proc.events == ["running", "terminate"] and not run_areas._ACTIVE
+
+
+def test_an_exception_in_a_parallel_stage_stops_the_other_children_before_the_pool_waits(tmp_path, sandbox, monkeypatch):
+    import threading
+    release, started = threading.Event(), threading.Event()
+    seen = []
+
+    def runner(area, args, parallel_model):
+        if area == "capture":
+            started.wait(10)  # the sibling is running before this one fails
+            raise RuntimeError("boom")
+        started.set()
+        release.wait(10)
+        seen.append((area, run_areas._INTERRUPT.is_set()))
+        return {"rc": 0, "out": "{}"}
+    original = run_areas._forward_stop
+    monkeypatch.setattr(run_areas, "_forward_stop", lambda: (release.set(), original()))
+    with pytest.raises(RuntimeError):
+        run_areas.run_all(_run_args(tmp_path), runner=runner)
+    assert seen == [("tenancy", True)]  # the sibling saw the stop request, so its real child would have been stopped
+    assert (tmp_path / "workflows" / "areas-run.json").exists()  # the evidence is written even on the way out

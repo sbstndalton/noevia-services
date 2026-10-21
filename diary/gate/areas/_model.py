@@ -43,19 +43,25 @@ def run(name: str, doc: str, select, turns=default_turns, mutate: bool = True) -
         return area.finish()
     fixture = Path(args.fixture)
     g.verify_fixture(fixture)
+    # Installed before the model-area lock wait: a SIGTERM while this area waits for the area before it
+    # ends the wait as blocked ("stopped by SIGTERM") instead of killing the process mid-way.
+    g.install_stop_handler()
     try:
         with g.model_area_slot(name, lambda r: g.append_jsonl(area.dir / "load-gate.jsonl", r)):
             return _run_area(area, name, args, env, select, turns, mutate, fixture)
     except g.GateBlocked as exc:  # waited too long for another model area (or a gate refusal outside the setup)
-        serial = exc.result.get("kind") == "area-wait-timeout"
-        area.mark("serial" if serial else "load-gate", "blocked",
-                  ("model areas run one at a time: " if serial else "MS-01 load gate: ") + str(exc))
+        kind = exc.result.get("kind")
+        if kind == "stopped":
+            area.mark("stopped", "blocked", "stopped by SIGTERM (area timeout) while waiting for the model-area lock; nothing was loaded")
+        else:
+            serial = kind == "area-wait-timeout"
+            area.mark("serial" if serial else "load-gate", "blocked",
+                      ("model areas run one at a time: " if serial else "MS-01 load gate: ") + str(exc))
         return area.finish()
 
 
 def _run_area(area, name, args, env, select, turns, mutate, fixture) -> int:
     idle_total = [0.0]
-    g.install_stop_handler()
     user = g.tenant_id(args.tenant_label or f"area-{name}")
     c = g.Client(args.base_url, env, log=area.log_request)
 
@@ -74,7 +80,8 @@ def _run_area(area, name, args, env, select, turns, mutate, fixture) -> int:
                 return area.finish({"tenant": user, "idle_wait_s": round(idle_total[0], 3)})
         baseline = harness.take_baseline(c, user, env, log)
     except g.GateBlocked as exc:
-        area.mark("setup", "blocked", f"MS-01 load gate: {exc}")
+        area.mark("setup", "blocked", f"stopped by SIGTERM (area timeout) during setup" if exc.result.get("kind") == "stopped"
+                  else f"MS-01 load gate: {exc}")
         return area.finish({"tenant": user, "idle_wait_s": round(idle_total[0], 3)})
     if not area.check("baseline-settled", baseline["ok"], files=len(baseline["files"])):
         return area.finish({"tenant": user, "idle_wait_s": round(idle_total[0], 3)})
