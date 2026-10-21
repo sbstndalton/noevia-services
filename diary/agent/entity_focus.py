@@ -10,7 +10,8 @@ detail as competing with another's. This module needs no model call.
   email?") carries the entities of the previous question in the same conversation.
 - Each candidate is classified per asked entity. Names compare case-, accent-, title- and
   punctuation-insensitively; "**Me:**"-style role labels and function words ("We", "So") are never names:
-    match     names the entity in full;
+    match     names the entity in full; the surname of a name of two or more words may carry a trailing
+              "s" or a possessive ("Alder Brannocks boat", "Alder Brannock's", services#148);
     extended  names it with a middle name or initial, or in reverse order ("Alder J. Brannock");
     partial   names only part of a multi-word name on its own ("Alder called", "Dr. Brannock");
     near      names a similar but different spelling (every word equal or within a small edit distance);
@@ -432,6 +433,23 @@ def _clean(text: str) -> str:
     return _ROLE_LABEL.sub("\n", _norm(text))
 
 
+def _plural_of(word: str, surname: str) -> bool:
+    """services#148: ``word`` is ``surname`` plus a trailing "s" ("brannocks" for "brannock"), a possessive
+    written without the apostrophe or a plural. ``_words`` already strips "'s" and "’s". One direction
+    only: "evan" for "evans" stays a near spelling."""
+    return len(surname) >= 2 and word == surname + "s"
+
+
+def _names_in_full(window: Sequence[str], entity_keys: Sequence[str]) -> bool:
+    """``window`` names the entity in full: every word equal, except that the surname of a name of two or
+    more words may carry a trailing "s" (services#148). A one-word name still compares exactly."""
+    window, entity_keys = tuple(window), tuple(entity_keys)
+    if window == entity_keys:
+        return True
+    return (len(entity_keys) >= 2 and len(window) == len(entity_keys) and window[:-1] == entity_keys[:-1]
+            and _plural_of(window[-1], entity_keys[-1]))
+
+
 def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
     """(kind, the name as written) of the strongest mention of ``entity`` in ``text``; kind is one of match,
     extended, partial, near, variant, shared or None (see the module docstring)."""
@@ -443,7 +461,7 @@ def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
         if not keys:
             continue
         shown = " ".join(words)
-        if any(keys[i:i + n] == e for i in range(len(keys) - n + 1)):
+        if any(_names_in_full(keys[i:i + n], e) for i in range(len(keys) - n + 1)):
             return "match", shown
         kinds = []
         if n >= 2 and len(keys) >= n and (_subsequence(e, keys) or set(e) <= set(keys)):
@@ -451,7 +469,9 @@ def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
         if len(keys) < n and _subsequence(keys, e):
             kinds.append("partial")  # "Alder called", "Dr. Brannock": part of a longer name on its own
         windows = [keys[i:i + n] for i in range(len(keys) - n + 1)]
-        if n >= 2 and len(keys) == 1 and len(keys[0]) > 1:  # a lone word (not a lone letter) vs each name
+        if n >= 2 and len(keys) == 1 and _plural_of(keys[0], e[-1]):
+            kinds.append("partial")  # "the Brannocks": the surname on its own with a trailing "s" (#148)
+        elif n >= 2 and len(keys) == 1 and len(keys[0]) > 1:  # a lone word (not a lone letter) vs each name
             rel = [_relation(keys[0], e[0]), _relation(keys[0], e[-1])]
             if "near" in rel:
                 kinds.append("near")
@@ -752,7 +772,7 @@ def _same_given_near_surname(text: str, entity: Entity) -> Optional[str]:
         if len(keys) != len(words):
             continue
         for i in range(len(keys) - 1):
-            if keys[i] == given and near_word(keys[i + 1], surname):
+            if keys[i] == given and near_word(keys[i + 1], surname) and not _plural_of(keys[i + 1], surname):
                 return f"{words[i]} {words[i + 1]}"
     return None
 
