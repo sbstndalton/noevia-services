@@ -90,6 +90,7 @@ helper, `gatelib._slots_busy` (a test fails if any other function in the gate bu
 | Load-gate re-checks | `GATE_RECHECKS` (12) x `GATE_RECHECK_S` (5) | `blocked`, kind `load-gate`, with the engines' reasons. |
 | Engines going idle before a restore and before each query turn | `GATE_IDLE_WAIT_S` (900), polled every `GATE_IDLE_POLL_S` (5) | `blocked`, kind `not-idle`. |
 | Another model area still running | `GATE_AREA_WAIT_S` (3600) | the area reports `blocked` (check `serial`) with the holder. |
+| An area overruns under `run_areas.py` | `GATE_AREA_TIMEOUT_S` (10800), then `GATE_AREA_GRACE_S` (60) | SIGTERM first: a model area (and `harness.py queries`) finishes the query it is on, restores the tenant to the baseline and stops as `blocked` ("stopped by SIGTERM"); the no-model areas simply stop. Only if it is still running after the grace period is it killed (SIGKILL). The result is `blocked`; `areas-run.json` marks `killed` and `tenant_may_be_unrestored: true` for a killed area, since a query's logged exchange may remain in its tenant (a fresh stack per run makes this harmless unless the run continues). |
 
 An abandoned generation: when the diary gives up on a chat call at its timeout, the engine may keep
 generating. The query itself is recorded as it happened (its own HTTP failure). Before the restore that

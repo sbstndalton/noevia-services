@@ -39,6 +39,9 @@ MODEL_AREAS = ("semantic", "temporal", "corrections", "follow_ups", "confirmed_v
 ALONE = ("error_paths", "restart", "budgets")
 NEEDS_FIXTURE = frozenset(MODEL_AREAS) | {"budgets"}
 AREA_TIMEOUT_S = float(os.environ.get("GATE_AREA_TIMEOUT_S", "10800"))
+# After the timeout the area gets SIGTERM and this long to stop (a model area then finishes its restore
+# and writes its result); only after that is it killed.
+AREA_GRACE_S = float(os.environ.get("GATE_AREA_GRACE_S", "60"))
 
 
 def plan(parallel_model: bool = False, only=None) -> list:
@@ -66,13 +69,31 @@ def subprocess_runner(area: str, args, parallel_model: bool) -> dict:
         env["GATE_MODEL_AREAS_PARALLEL"] = "1"
     else:
         env.pop("GATE_MODEL_AREAS_PARALLEL", None)
+    proc = subprocess.Popen(_command(area, args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     try:
-        done = subprocess.run(_command(area, args), capture_output=True, text=True, env=env, timeout=AREA_TIMEOUT_S)
+        stdout, stderr = proc.communicate(timeout=AREA_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return {"rc": 124, "out": json.dumps({"area": area, "status": "blocked",
-                                              "reason": f"area still running after {AREA_TIMEOUT_S:.0f} s (GATE_AREA_TIMEOUT_S); stopped"})}
-    return {"rc": done.returncode, "out": (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else
-            (done.stderr or "").strip()[-300:]}
+        return _stop_overdue(proc, area)
+    return {"rc": proc.returncode, "out": (stdout or "").strip().splitlines()[-1] if (stdout or "").strip() else
+            (stderr or "").strip()[-300:]}
+
+
+def _stop_overdue(proc, area: str) -> dict:
+    """Timeout: SIGTERM first with a grace period (the area can finish its restore), then SIGKILL. The
+    result is blocked; when the area had to be killed the evidence says its tenant may be unrestored."""
+    killed = False
+    proc.terminate()
+    try:
+        proc.communicate(timeout=AREA_GRACE_S)
+    except subprocess.TimeoutExpired:
+        killed = True
+        proc.kill()
+        proc.communicate()
+    reason = f"area still running after {AREA_TIMEOUT_S:.0f} s (GATE_AREA_TIMEOUT_S); "
+    reason += (f"did not stop within {AREA_GRACE_S:.0f} s of SIGTERM (GATE_AREA_GRACE_S) and was killed: "
+               "its tenant may be unrestored (a query's logged exchange may remain)") if killed else "stopped after SIGTERM"
+    return {"rc": 124, "killed": killed, "out": json.dumps({"area": area, "status": "blocked", "killed": killed,
+                                                            "tenant_may_be_unrestored": killed, "reason": reason})}
 
 
 def run_all(args, runner=subprocess_runner, clock=time.time) -> int:
@@ -83,7 +104,8 @@ def run_all(args, runner=subprocess_runner, clock=time.time) -> int:
         def one(area):
             started = clock()
             res = runner(area, args, parallel_model)
-            return {"area": area, "rc": res["rc"], "started": started, "finished": clock(), "result": res.get("out", "")}
+            return {"area": area, "rc": res["rc"], "started": started, "finished": clock(), "result": res.get("out", ""),
+                    "killed": bool(res.get("killed")), "tenant_may_be_unrestored": bool(res.get("killed"))}
         if len(stage) == 1:
             done = [one(stage[0])]
         else:

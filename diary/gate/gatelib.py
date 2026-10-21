@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import secrets
+import signal
 import sys
 import time
 import urllib.error
@@ -271,6 +272,26 @@ def model_areas_parallel() -> bool:
     return os.environ.get("GATE_MODEL_AREAS_PARALLEL", "").strip().lower() in ("1", "true", "yes")
 
 
+_STOP = {"requested": False}
+
+
+def stop_requested() -> bool:
+    """True once SIGTERM arrived after install_stop_handler (run_areas.py sends it when an area overruns)."""
+    return _STOP["requested"]
+
+
+def install_stop_handler() -> None:
+    """Make SIGTERM a request to stop at the next safe point instead of an immediate death: the running
+    query finishes and its tenant is restored to the baseline, then the area stops as blocked. Only the
+    entry points that restore a tenant (model areas, harness queries) install it."""
+    def handler(signum, frame):  # noqa: ARG001
+        _STOP["requested"] = True
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except ValueError:  # not the main thread
+        pass
+
+
 class GateBlocked(Exception):
     """The load gate refused (after its bounded re-checks). result holds the reasons."""
 
@@ -289,18 +310,23 @@ def _get_json(url: str, token: str = "", timeout: float = 5.0):
 def engine_models(base: str, token: str = "", fetch=_get_json) -> tuple:
     """([(model id, state)], routed) from the engine's model list. This is the only thing the gate may ask
     of an engine that might be asleep: listing models never wakes one. state is 'loaded', 'unloaded',
-    'loading' or whatever the router reports; an engine without a router (no status on its models) has
-    one model, always 'loaded'. routed is True when the models carry a status. Raises when unreadable."""
+    'loading' or whatever the router reports. Only a list in which NO entry has a status key means an engine
+    without a router (routed False; a single engine answers plain /slots). As soon as any entry carries a
+    status the list is routed, and an entry with a missing or malformed status is 'unknown' (busy, never
+    probed). Raises when unreadable."""
     data = fetch(base.rstrip("/") + "/v1/models", token).get("data") or []
-    models, routed = [], False
+    routed = any(isinstance(m, dict) and "status" in m for m in data)
+    models = []
     for m in data:
         if not isinstance(m, dict):
             models.append((None, "unknown"))
             continue
         status = m.get("status")
         value = status.get("value") if isinstance(status, dict) else (status if isinstance(status, str) else None)
-        routed = routed or value is not None
-        models.append((m.get("id"), value if value is not None else "loaded"))
+        if routed:
+            models.append((m.get("id"), value if isinstance(value, str) and value else "unknown"))
+        else:
+            models.append((m.get("id"), "loaded"))
     return models, routed
 
 
@@ -335,14 +361,19 @@ def _slots_busy(base: str, token: str = "", fetch=_get_json) -> tuple:
         notes.append(f"{unloaded} model(s) unloaded, slots not probed")
     if loaded:
         processing, seen, unread = 0, 0, 0
-        plain = None
-        if not routed:  # a single engine answers /slots itself
-            try:
-                plain = fetch(base + "/slots", token)
-            except Exception:  # noqa: BLE001 - fall through to the per-model probe
-                plain = None
-        if isinstance(plain, list):
-            processing, seen = _count_processing(plain), len(loaded)
+        if not routed:
+            # No status anywhere: a single engine, which answers plain /slots itself. Never fall back to
+            # per-model probes here: on a router they would wake every listed model. More than one model, or
+            # a plain /slots that fails, means we cannot tell which models are loaded: fail closed.
+            plain = None
+            if len(models) == 1:
+                try:
+                    plain = fetch(base + "/slots", token)
+                except Exception:  # noqa: BLE001
+                    plain = None
+            if not isinstance(plain, list):
+                return True, "; ".join(notes + ["cannot tell which models are loaded (model list has no status); refusing to start"])
+            processing, seen = _count_processing(plain), 1
         else:
             for mid in loaded:  # loaded per the model list, so this cannot wake anything
                 try:

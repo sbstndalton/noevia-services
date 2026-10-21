@@ -55,6 +55,7 @@ def run(name: str, doc: str, select, turns=default_turns, mutate: bool = True) -
 
 def _run_area(area, name, args, env, select, turns, mutate, fixture) -> int:
     idle_total = [0.0]
+    g.install_stop_handler()
     user = g.tenant_id(args.tenant_label or f"area-{name}")
     c = g.Client(args.base_url, env, log=area.log_request)
 
@@ -82,6 +83,9 @@ def _run_area(area, name, args, env, select, turns, mutate, fixture) -> int:
     rows = area.dir / "answers.jsonl"
     rows.write_text("", encoding="utf-8")
     for q in [q for q in g.read_jsonl(fixture / "truth" / "queries.jsonl") if select(q)]:
+        if g.stop_requested():
+            area.mark(q["id"], "blocked", "stopped by SIGTERM (area timeout); the tenant is restored")
+            return area.finish({"tenant": user, "answers": str(rows), "idle_wait_s": round(idle_total[0], 3)})
         def on_row(n, text, spec, res, trace, shape, q=q):
             sig = score.answer_signals(spec, res["answer"], rubric) if res["status"] == 200 else None
             g.append_jsonl(rows, {"id": f"{name}:{q['id']}#{n}", "query": q["id"], "turn": n, "text": text, "http": res["status"],

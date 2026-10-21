@@ -168,6 +168,8 @@ def restore_baseline(client: g.Client, user: str, baseline: dict, env: dict, gat
     """Wait for idle (an abandoned upstream generation would make the load gate refuse the writes), then
     restore, settle the index and verify, all inside ONE inference slot (the restore's writes and the
     recovery reindex embed). Raises GateBlocked when the engines never go idle or the load gate refuses."""
+    # The idle wait runs BEFORE the inference lock is taken, so a long wait never holds up other gate
+    # processes; inference_slot's require_gate then re-checks the load inside the lock.
     idle = g.require_idle(env, gate_log, "restore")
     with g.inference_slot(env, gate_log):
         report = g.restore(client, user, baseline["files"])
@@ -278,7 +280,10 @@ def run_turns(client, user, q, turns, env, gate_log, index, baseline, on_row, re
     """One query (all its turns), then the restore. Returns None, or a reason to stop the run."""
     history, session = [], f"gate-{q['id']}-{uuid.uuid4().hex[:8]}"
     for n, (text, spec) in enumerate(turns):
+        if n and g.stop_requested():
+            break  # SIGTERM: skip the follow-up turns, still restore below
         try:
+            # Idle wait first, outside the inference lock (see restore_baseline); require_gate re-checks inside it.
             idle = g.require_idle(env, gate_log, f"{q['id']} turn {n}")
             with g.inference_slot(env, gate_log):
                 res = ask(client, user, text, q["clock"], session, history)
@@ -329,7 +334,14 @@ def cmd_queries(args, run: Path | None = None) -> int:
     for path in (answers, traces):
         path.write_text("", encoding="utf-8")
     done, idle_total = 0, [0.0]
+    g.install_stop_handler()
     for q in queries:
+        if g.stop_requested():
+            stop = f"blocked: stopped by SIGTERM (area timeout) before {q['id']}; the tenant is restored"
+            g.add_blocker(run, stop)
+            print(json.dumps({"stage": "queries", "status": "blocked", "done": done, "reason": stop,
+                              "idle_wait_s": round(idle_total[0], 3)}))
+            return 3
         def on_row(n, text, spec, res, trace, shape, q=q):
             row_id = q["id"] if n == 0 else q["id"] + "#followup"
             idle_total[0] += res.get("idle_wait_s") or 0.0
