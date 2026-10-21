@@ -8,9 +8,18 @@ can only ever receive the trace of its own exchange.
 A trace carries ids, scores, counts and budget figures only. Never entry text, entry headers,
 embeddings, the query or credentials.
 
-The diary has no reranker. The stages are (1) vector-search candidates (top_k * 2 requested, cosine
-similarity, at least min_score), then (2) selection in score order under the token budget, capped at
-top_k. `rerank.present` is false so the gate can tell "no reranker" from "reranker returned nothing".
+The diary has no reranker. The stages are (1) vector-search candidates (cosine similarity, at least
+min_score; top_k * 2 requested, or top_k * 4 when the message names an entity or a time anchor), then
+(1b, services#116) the entity focus (entity_focus.py): a lexical check that drops hits dated after a
+time anchor and, when some hit names an asked entity in full, hits that cannot refer to any asked
+entity and are a near spelling of it (near_name), confidently name another person (other_person) or
+score more than the margin below the best exact hit (below_margin); score order is kept, at most
+top_k * 2. Then (2) selection in score order under the token budget, capped at top_k. `candidates`
+lists what stage 1b kept (`rank` is the position there, `vector_rank` the stage 1 rank) and
+`focus.removed` every stage 1 candidate it dropped, with the reason; `focus.removed_by_reason` counts
+them. With no entity or time anchor in the message stage 1b does not run (`focus.checked` is false)
+and `candidates` is stage 1. `rerank.present` is false so the gate can tell "no reranker" from
+"reranker returned nothing": the focus filters and never reorders.
 """
 from __future__ import annotations
 
@@ -49,6 +58,7 @@ class RetrievalTrace:
             "budget": {},
             "counts": {"candidates": 0, "loaded": 0, "dropped_budget": 0, "dropped_top_k": 0},
             "direct_fallback": {"used": False, "found": False, "tokens": 0},
+            "focus": {"checked": False},
         }
 
     def set_status(self, status: str) -> None:
@@ -66,10 +76,30 @@ class RetrievalTrace:
         m = _TIME_RE.match(str(row.get("header") or ""))
         return {"id": row.get("id"), "day": row.get("day"), "time": m.group(1) if m else None}
 
-    def add_candidate(self, rank: int, row: dict) -> dict:
-        item = {"rank": rank, **self._ref(row), "score": row.get("score"), "loaded": False, "dropped": None}
+    def add_candidate(self, rank: int, row: dict, vector_rank: Optional[int] = None) -> dict:
+        item = {"rank": rank, **self._ref(row), "score": row.get("score"), "loaded": False, "dropped": None,
+                "vector_rank": rank if vector_rank is None else vector_rank}
         self.data["candidates"].append(item)
         return item
+
+    def set_focus(self, focus, vector_candidates: int) -> None:
+        """Stage 1b (services#116). Counts and entry refs only: never the asked names or entry text."""
+        self.data["focus"] = {
+            "checked": True,
+            "entities": len(focus.entities),
+            "carried": bool(focus.carried),
+            "relational": bool(focus.relational),
+            "margin": float(focus.margin),
+            "time_anchor": focus.anchor is not None,
+            "applied": bool(focus.applied),
+            "vector_candidates": vector_candidates,
+            "removed": [{"vector_rank": rank, **self._ref(row), "score": row.get("score"), "reason": reason}
+                        for rank, row, reason in focus.removed],
+            "removed_by_reason": {reason: sum(1 for _, _, r in focus.removed if r == reason)
+                                  for reason in sorted({r for _, _, r in focus.removed})},
+            "similar_name_labelled": len(focus.similar),
+            "superseded_labelled": len(focus.corrected_by),
+        }
 
     def add_loaded(self, row: dict, tokens: int, chars: int) -> None:
         self.data["loaded"].append({**self._ref(row), "score": row.get("score"), "tokens": tokens, "chars": chars})
