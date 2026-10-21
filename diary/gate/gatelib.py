@@ -322,7 +322,7 @@ def _get_json(url: str, token: str = "", timeout: float = 5.0):
 def engine_models(base: str, token: str = "", fetch=_get_json) -> tuple:
     """([(model id, state)], routed) from the engine's model list. This is the only thing the gate may ask
     of an engine that might be asleep: listing models never wakes one. state is 'loaded', 'unloaded',
-    'loading' or whatever the router reports. Only a list in which NO entry has a status key means an engine
+    'loading', 'sleeping' or whatever the router reports. Only a list in which NO entry has a status key means an engine
     without a router (routed False; a single engine answers plain /slots). As soon as any entry carries a
     status the list is routed, and an entry with a missing or malformed status is 'unknown' (busy, never
     probed). Raises when unreadable."""
@@ -349,8 +349,9 @@ def _count_processing(slots: list) -> int:
 def _slots_busy(base: str, token: str = "", fetch=_get_json) -> tuple:
     """(busy, detail) for one engine. EVERY load-gate probe goes through here: it reads the model list
     first and requests /slots ONLY for a model the list says is loaded, because a slots request sent to a
-    sleeping model on the router wakes it. An unloaded model is idle by definition (nothing to wait for);
-    a loading model counts as busy; anything unreadable or unrecognised fails closed."""
+    sleeping model on the router wakes it. An unloaded or sleeping model is idle by definition (nothing is
+    generating; a sleeping model has freed its weights and only the next request wakes it), so neither is
+    probed; a loading model counts as busy; anything unreadable or unrecognised fails closed."""
     base = base.rstrip("/")
     try:
         models, routed = engine_models(base, token, fetch)
@@ -360,8 +361,9 @@ def _slots_busy(base: str, token: str = "", fetch=_get_json) -> tuple:
         return True, "load unknown (model list empty); refusing to start"
     loaded = [mid for mid, state in models if state == "loaded"]
     unloaded = sum(1 for _, state in models if state == "unloaded")
+    sleeping = sum(1 for _, state in models if state == "sleeping")
     loading = sum(1 for _, state in models if state == "loading")
-    other = sorted({str(state) for _, state in models if state not in ("loaded", "unloaded", "loading")})
+    other = sorted({str(state) for _, state in models if state not in ("loaded", "unloaded", "sleeping", "loading")})
     notes, busy = [], False
     if loading:
         busy = True
@@ -371,6 +373,8 @@ def _slots_busy(base: str, token: str = "", fetch=_get_json) -> tuple:
         notes.append(f"model state not recognised ({', '.join(other)})")
     if unloaded:
         notes.append(f"{unloaded} model(s) unloaded, slots not probed")
+    if sleeping:
+        notes.append(f"{sleeping} model(s) sleeping, slots not probed")
     if loaded:
         processing, seen, unread = 0, 0, 0
         if not routed:

@@ -79,8 +79,9 @@ helper, `gatelib._slots_busy` (a test fails if any other function in the gate bu
 1. It reads the engine's model list (`/v1/models`), which never wakes anything.
 2. It requests `/slots?model=<id>` **only for a model the list says is `loaded`** (an engine without a
    router has one always-loaded model and answers plain `/slots`).
-3. `unloaded` counts as idle and its slots are not asked for; `loading` or an unrecognised state counts
-   as busy; an unreadable or empty model list fails closed. None of these sends a slots request.
+3. `unloaded` and `sleeping` (idle, weights freed; the next request wakes it) count as idle and their
+   slots are not asked for; `loading` or an unrecognised state counts as busy; an unreadable or empty
+   model list fails closed. None of these sends a slots request.
 
 ### Bounded waits: always `blocked`, never a failed query
 
