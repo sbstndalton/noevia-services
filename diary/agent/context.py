@@ -18,7 +18,7 @@ import logging
 import re
 from typing import List, Optional
 
-from . import entity_focus, score_gap
+from . import entity_focus, follow_up, score_gap
 from .corpus_store import CorpusStore
 from .retrieval import Retriever
 from .retrieval_trace import RetrievalTrace, SafeTrace
@@ -76,6 +76,10 @@ class ContextAssembler:
         system_prompt = self._system_prompt()
         # #1505: only answered exchanges are replayed; the new message is appended below, always last.
         session_turns = completed_exchanges(session_turns)
+        # #173: "And what about <other name>?" becomes the earlier question asked about that name. It is used
+        # for retrieval and as the final user message; the earlier exchange is kept and labelled.
+        resolved = follow_up.resolve(user_message, session_turns)
+        question = resolved.standalone if resolved is not None else user_message
         blocks: List[str] = [REF_HEADER, ""]
 
         # 1. Today's log (budget enforced here too — a store may ignore max_chars)
@@ -84,6 +88,8 @@ class ContextAssembler:
         if len(today_text) > today_budget_chars:
             today_text = "(earlier exchanges today truncated)\n…" + today_text[-today_budget_chars:]
         blocks.append(f"=== TODAY'S LOG — {today_header or day.isoformat()} ===")
+        if resolved is not None and follow_up.mentions(today_text, resolved.earlier_name):
+            blocks.append(follow_up.today_note(resolved))  # #173: the logged earlier exchange is about them
         blocks.append(today_text if today_text else "(nothing logged yet today)")
         blocks.append("=== END TODAY'S LOG ===")
         blocks.append("")
@@ -103,7 +109,9 @@ class ContextAssembler:
         blocks.append("=== END MEMORY / CONTEXT ===")
 
         # 3. Retrieved past entries
-        retrieved, labels, notes = self._retrieve_focused(user_message, session_turns, trace)
+        # #173: a standalone question needs no earlier turns; they would pull in the earlier person's entries.
+        retrieved, labels, notes = self._retrieve_focused(question, [] if resolved is not None else session_turns,
+                                                          trace)
         blocks.append("=== RETRIEVED PAST ENTRIES (semantic matches; reference material) ===")
         if retrieved:
             blocks.extend(notes)
@@ -119,7 +127,7 @@ class ContextAssembler:
         blocks.append("=== END RETRIEVED PAST ENTRIES ===")
         if not retrieved:
             blocks.append("=== DIRECT PAST ENTRY FALLBACK (limited file reads; reference material, not semantic matches) ===")
-            direct = self._direct_past_entries(day, user_message)
+            direct = self._direct_past_entries(day, question)
             if trace is not None:
                 trace.set_direct_fallback(bool(direct), estimate_tokens(direct) if direct else 0)
             blocks.append(direct or "(no entries found within the limited date lookup; this is not a search of the whole diary)")
@@ -136,10 +144,11 @@ class ContextAssembler:
                     "Acknowledge nothing; this block is background. The conversation follows.\n\n"
                     "Conversation so far (may be empty):\n"
                     + self._render_session(session_turns)
+                    + ("\n\n" + follow_up.conversation_note(resolved) if resolved is not None else "")
                 ),
             }
         )
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": question})
         return messages
 
     # ---------------- helpers ----------------
