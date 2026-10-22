@@ -125,6 +125,9 @@ class ContextAssembler:
             blocks.extend(line for line in notes if entity_focus.ABSENT_NOTE in line)
             blocks.append("(no older entries matched this message)")
         blocks.append("=== END RETRIEVED PAST ENTRIES ===")
+        # #179: whether an entry naming the asked name exactly was loaded decides the conversation note's form.
+        exact_loaded = resolved is not None and any(
+            entity_focus.names_exactly(r, resolved.asked_name) for r in retrieved)
         if not retrieved:
             blocks.append("=== DIRECT PAST ENTRY FALLBACK (limited file reads; reference material, not semantic matches) ===")
             direct = self._direct_past_entries(day, question)
@@ -144,7 +147,7 @@ class ContextAssembler:
                     "Acknowledge nothing; this block is background. The conversation follows.\n\n"
                     "Conversation so far (may be empty):\n"
                     + self._render_session(session_turns)
-                    + ("\n\n" + follow_up.conversation_note(resolved) if resolved is not None else "")
+                    + ("\n\n" + follow_up.conversation_note(resolved, exact_loaded) if resolved is not None else "")
                 ),
             }
         )

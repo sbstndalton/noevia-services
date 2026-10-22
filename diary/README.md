@@ -204,6 +204,9 @@ vector pool (4x top_k) lexically, with no model call, and never reorders it:
 - With no full exact hit nothing is dropped for a name (a typo or a short form in the question); similar names
   are labelled "may be a different person, check the name". A relational question ("Alder Brannock's sister",
   "sister-in-law", "the wife of Alder Brannock") drops nothing for not naming the asked entity.
+- An entry naming an asked person in full is labelled "names the asked person ... exactly" (services#178); a
+  near spelling never gets that label. A name-less follow-up that refers back to the previous exchange ("and
+  her email?", "Is that written in my diary?") carries the person of the previous question (services#177).
 - An earlier entry is labelled superseded only by an explicit correction of the same entity that replaces a
   value found in it ("..., not smoked lapsang").
 

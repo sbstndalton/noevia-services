@@ -7,7 +7,10 @@ detail as competing with another's. This module needs no model call.
 - Asked entities: capitalised name phrases in the user's message (question words, pronouns, common verbs,
   months and weekdays are not names; a single capitalised word that only starts a sentence is ignored;
   titles such as "Dr" or "Dr." are not part of the name). A follow-up that names nobody ("and her
-  email?") carries the entities of the previous question in the same conversation.
+  email?", "Is that written in my diary?") carries the entities of the previous question in the same
+  conversation (services#177: a message that refers back to the earlier exchange with "that", "this" or
+  "it" is a follow-up too; a name-less message that refers back to nothing, such as "How has the week
+  been?", carries nothing, and a message naming anyone never carries).
 - Each candidate is classified per asked entity. Names compare case-, accent-, title- and
   punctuation-insensitively; "**Me:**"-style role labels and function words ("We", "So") are never names:
     match     names the entity in full; the surname of a name of two or more words may carry a trailing
@@ -298,12 +301,26 @@ def asked_entities(message: str) -> List[Entity]:
 
 _FOLLOW_UP = re.compile(r"^\s*(?:and|also|plus|so|then|what about|how about)\b|\b(?:he|she|they|him|her|them|his|hers|"
                         r"their|theirs|that person)\b", re.I)
+# services#177: a reference back to the previous exchange ("Is that written in my diary?", "Where is this
+# recorded?", "Are you sure about it?"). A demonstrative that only qualifies a time word ("this week", "that
+# morning") opens a new topic and refers back to nothing.
+_TIME_WORDS = (r"(?:week|weekend|morning|afternoon|evening|night|day|month|year|time|summer|winter|spring|"
+               r"autumn|fall|season|term|quarter|" + "|".join(_WEEKDAYS) + "|" + "|".join(MONTHS) + r")s?")
+_REFERS_BACK = re.compile(r"\b(?:that|this|it|those|these)\b(?!\s+" + _TIME_WORDS + r"\b)", re.I)
+
+
+def refers_back(message: str) -> bool:
+    """The message is worded as a follow-up to the previous exchange: an opener such as "and" or "what
+    about", a personal pronoun, or a demonstrative such as "that" or "it" that is not a time phrase."""
+    text = _norm(message)
+    return bool(_FOLLOW_UP.search(text) or _REFERS_BACK.search(text))
 
 
 def carried_entities(message: str, earlier: Sequence[str]) -> List[Entity]:
     """For a follow-up that names nobody ("and her email?"): the entities of the latest earlier user message
-    of the same conversation that named any. A message that is not worded as a follow-up carries nothing."""
-    if asked_entities(message) or not _FOLLOW_UP.search(_norm(message)):
+    of the same conversation that named any. A message that is not worded as a follow-up (refers_back)
+    carries nothing, and neither does one that names anybody itself."""
+    if asked_entities(message) or not refers_back(message):
         return []
     for text in reversed(list(earlier or [])):
         found = asked_entities(text)
@@ -772,6 +789,7 @@ class FocusResult:
     similar: Dict[int, Tuple[str, str, str]] = field(default_factory=dict)  # rank -> (kind, name in entry, asked)
     corrected_by: Dict[int, str] = field(default_factory=dict)  # vector rank -> day of a later correction
     absent: Dict[Entity, List[str]] = field(default_factory=dict)  # #145: asked person nobody names -> near spellings left out
+    exact: Dict[int, List[str]] = field(default_factory=dict)  # #178: vector rank -> asked names it names in full
 
     @property
     def active(self) -> bool:
@@ -860,6 +878,9 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
             found = kinds[rank]
             if any(kind in ABOUT for kind, _ in found):
                 survivors.append((rank, row))
+                named = [res.entities[i].name for i, (kind, _) in enumerate(found) if kind == "match"]
+                if named:
+                    res.exact[rank] = named
                 continue
             if any(kind == "near" and res.entities[i] in res.matched for i, (kind, _) in enumerate(found)):
                 res.removed.append((rank, row, "near_name"))  # a near spelling of a name the diary has in full
@@ -893,6 +914,7 @@ def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None
         ranked = ranked[:limit]
         kept_ranks = {rank for rank, _ in ranked}
         res.similar = {rank: s for rank, s in res.similar.items() if rank in kept_ranks}
+        res.exact = {rank: s for rank, s in res.exact.items() if rank in kept_ranks}
     res.kept = ranked
     res.corrected_by = _superseded(ranked, res.matched)
     res.removed.sort(key=lambda r: r[0])
@@ -1005,10 +1027,24 @@ def context_notes(res: FocusResult) -> List[str]:
     return lines
 
 
+def names_exactly(row: dict, name: str) -> bool:
+    """services#179: the entry (header and text) names ``name`` in full, as entity focus reads a match."""
+    entities = asked_entities(name)
+    return bool(entities) and classify(_row_text(row), entities[0])[0] == "match"
+
+
 def entry_label(res: Optional[FocusResult], vector_rank: int) -> str:
-    """Suffix for one retrieved entry's header line ('' when there is nothing to say)."""
+    """Suffix for one retrieved entry's header line ('' when there is nothing to say). services#178: an entry
+    naming an asked person in full says so; a near spelling is never a match, so it never gets that label."""
     if res is None:
         return ""
+    if vector_rank in res.exact:
+        names = res.exact[vector_rank]
+        who = "the asked person" if len(names) == 1 else "the asked people"
+        label = f"; names {who} {_names([Entity(n, ()) for n in names])} exactly"
+        if vector_rank in res.corrected_by:
+            label += f"; dated before the correction of {res.corrected_by[vector_rank]}, which wins where they disagree"
+        return label
     if vector_rank in res.similar:
         kind, found, asked = res.similar[vector_rank]
         if kind == "shared":
