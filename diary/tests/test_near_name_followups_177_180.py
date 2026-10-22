@@ -128,7 +128,9 @@ def _header(retrieved, value):
 # ---------------- #177: name-less follow-ups inherit the asked person ----------------
 
 @pytest.mark.parametrize("given,surname,near", PAIRS)
-@pytest.mark.parametrize("message", [META, "Where is that recorded?", "Are you sure about it?"])
+@pytest.mark.parametrize("message", [META, "Where is that recorded?", "Are you sure about it?", "Is that true?",
+                                     "Where did you get that?", "Is it written in my diary?",
+                                     "Did you infer this?"])
 def test_a_name_less_follow_up_carries_the_previous_person(given, surname, near, message):
     asked = f"{given} {surname}"
     res = ef.analyse(message, [_q(asked)])
@@ -154,7 +156,8 @@ def test_a_message_naming_someone_new_never_inherits(given, surname, near):
     assert not res.carried and [e.name for e in res.entities] == [new]
 
 
-@pytest.mark.parametrize("message", ["How has the week been?", "How has this week been?",
+@pytest.mark.parametrize("message", ["How has the week been?", "How has this week been?", "Is it going to rain?",
+                                     "What is this?", "Tell me about it",
                                      "What did I do that morning?", "Summarise my month."])
 def test_a_message_referring_back_to_nothing_carries_nothing(message):
     given, surname, _ = PAIRS[0]
@@ -234,6 +237,7 @@ def test_the_note_never_holds_both_forms(near):
                                near=near)
     with_exact, without = follow_up.conversation_note(res, True), follow_up.conversation_note(res, False)
     assert ANSWER_FROM in with_exact and ABSTAIN not in with_exact
+    assert "latest-record and withdrawn rules" in with_exact
     assert ANSWER_FROM not in without and (ABSTAIN in without) == near
 
 
@@ -252,6 +256,10 @@ def test_system_prompt_states_the_exact_record_and_missing_detail_rules():
     detail = _rule(text, "Missing detail, not missing fact")
     assert "weekday" in detail and "recorded value" in detail and "day of the entry" in detail
     assert "not recorded" in detail and "rather than abstaining" in detail
+    # Review of #181: the exact-name rule covers the current record only and yields to the withdrawn and
+    # latest-record (correction) rules.
+    assert "current record" in exact and "withdrawn" in exact and "latest-record" in exact
+    assert "correction" in exact
     # The earlier rules stay, in order, ahead of the new ones where they belong.
     for rule in ("Keep people apart", "Similar names: check, do not assume", "The latest record wins",
                  "Withdrawn means not recorded", "Abstain plainly", "Time-anchored questions", "Shared first names"):

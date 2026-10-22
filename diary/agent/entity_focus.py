@@ -301,19 +301,28 @@ def asked_entities(message: str) -> List[Entity]:
 
 _FOLLOW_UP = re.compile(r"^\s*(?:and|also|plus|so|then|what about|how about)\b|\b(?:he|she|they|him|her|them|his|hers|"
                         r"their|theirs|that person)\b", re.I)
-# services#177: a reference back to the previous exchange ("Is that written in my diary?", "Where is this
-# recorded?", "Are you sure about it?"). A demonstrative that only qualifies a time word ("this week", "that
+# services#177: a reference back to the previous exchange. "that", "those" and "these" count on their own
+# ("Is that true?", "Where did you get that?"); "it" and "this" are too common ("Is it going to rain?", "What
+# is this?") and count only beside a word asking where an answer came from (META: "Is it written in my
+# diary?", "Did you infer this?"). A demonstrative that only qualifies a time word ("this week", "that
 # morning") opens a new topic and refers back to nothing.
 _TIME_WORDS = (r"(?:week|weekend|morning|afternoon|evening|night|day|month|year|time|summer|winter|spring|"
                r"autumn|fall|season|term|quarter|" + "|".join(_WEEKDAYS) + "|" + "|".join(MONTHS) + r")s?")
-_REFERS_BACK = re.compile(r"\b(?:that|this|it|those|these)\b(?!\s+" + _TIME_WORDS + r"\b)", re.I)
+_NOT_TIME = r"\b(?!\s+" + _TIME_WORDS + r"\b)"
+_REFERS_BACK = re.compile(r"\b(?:that|those|these)" + _NOT_TIME, re.I)
+_WEAK_BACK = re.compile(r"\b(?:it|this)" + _NOT_TIME, re.I)
+_META = re.compile(r"\b(?:written|write|wrote|recorded|record|records|noted|logged|sure|true|correct|right|"
+                   r"infer|inferred|inferring|guess|guessed|guessing|assume|assumed|assuming|source|sources|"
+                   r"diary|entry|entries|made\s+up|make\s+up|making\s+up|come\s+from|came\s+from|get|got|"
+                   r"know|knew|say|said|mention|mentioned|confirm|confirmed|certain)\b", re.I)
 
 
 def refers_back(message: str) -> bool:
     """The message is worded as a follow-up to the previous exchange: an opener such as "and" or "what
     about", a personal pronoun, or a demonstrative such as "that" or "it" that is not a time phrase."""
     text = _norm(message)
-    return bool(_FOLLOW_UP.search(text) or _REFERS_BACK.search(text))
+    return bool(_FOLLOW_UP.search(text) or _REFERS_BACK.search(text)
+                or (_WEAK_BACK.search(text) and _META.search(text)))
 
 
 def carried_entities(message: str, earlier: Sequence[str]) -> List[Entity]:

@@ -116,7 +116,7 @@ def conversation_note(res: Resolution, exact_loaded: bool = False) -> str:
             f'people: the earlier answer\'s details are not details of "{asked}". The new question is the '
             f'earlier question asked about "{asked}".')
     if exact_loaded:
-        note += f' Retrieved entries that name "{asked}" exactly are about "{asked}": answer from them.'
+        note += f' Retrieved entries that name "{asked}" exactly are about "{asked}": answer from them, following the latest-record and withdrawn rules.'
     elif res.near:
         note += (f' If the diary records nothing about "{asked}", say so and mention that it does record '
                  f'"{earlier}".')
