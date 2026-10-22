@@ -9,8 +9,11 @@ import logging
 import pytest
 
 from conftest import ROOT  # noqa: F401  (sets up the synthetic model folders before app imports)
+from fastapi.testclient import TestClient
+
 from app import ini
 from app.config import settings
+from app.main import app
 
 
 @pytest.fixture(autouse=True)
@@ -120,3 +123,72 @@ def test_models_ini_never_gains_a_key_llama_cpp_does_not_accept(roles_file):
     assert not unknown, f"keys outside the llama.cpp option set in models.ini: {sorted(unknown)}"
     assert "role" not in settings.models_ini_path.read_text()
     assert "role" not in ini.ALL_KNOWN_KEYS
+
+
+# noevia#2093 phase 1: the services reader accepts the system-routing role key as well as the legacy
+# role key (noevia-core#227 and noevia-rs#271 read it the same way). The legacy key is accepted until
+# phase 3 of noevia#2093. Synthetic sections only.
+LEGACY_ROLE = ini.LAYA_ROLE
+NEW_ROLE = "system-routing"
+
+
+@pytest.fixture
+def api_client():
+    with TestClient(app) as c:
+        yield c
+
+
+def _api_code(client, name: str):
+    return client.get(f"/api/v1/sections/{name}/autoconfig").json().get("code")
+
+
+def test_the_system_routing_role_is_read_after_trim_and_case(roles_file):
+    roles_file.write_text(json.dumps({"system-box": " System-Routing "}))
+    settings.models_ini_path.write_text("[system-box]\nmodel = /models/system-box/synthetic.gguf\n")
+    assert ini.is_laya_section("system-box") is True
+    assert ini._is_laya_section(ini.read_ini(), "system-box") is True
+    assert ini._is_chat_section(ini.read_ini(), "system-box") is False
+
+
+def test_the_system_routing_role_returns_the_laya_section_code_from_the_api(roles_file, api_client):
+    roles_file.write_text(json.dumps({"system-box": " System-Routing "}))
+    settings.models_ini_path.write_text("[system-box]\nmodel = /models/system-box/synthetic.gguf\n")
+    r = api_client.get("/api/v1/sections/system-box/autoconfig").json()
+    assert r["code"] == "laya_section" and "No model file" not in r["error"]
+
+
+def test_the_legacy_role_key_still_marks_a_system_section(roles_file, api_client):
+    roles_file.write_text(json.dumps({"legacy-box": LEGACY_ROLE}))
+    settings.models_ini_path.write_text("[legacy-box]\nmodel = /models/legacy-box/synthetic.gguf\n")
+    assert ini.is_laya_section("legacy-box") is True
+    assert _api_code(api_client, "legacy-box") == "laya_section"
+
+
+@pytest.mark.parametrize("role", ["system-routing-x", "system_routing", "systemrouting"])
+def test_roles_that_only_resemble_the_system_routing_key_do_not_count(roles_file, api_client, role):
+    roles_file.write_text(json.dumps({"near-box": role}))
+    settings.models_ini_path.write_text("[near-box]\nmodel = /models/near-box/synthetic.gguf\n")
+    assert ini.is_laya_section("near-box") is False
+    assert ini._is_chat_section(ini.read_ini(), "near-box") is True
+    assert _api_code(api_client, "near-box") != "laya_section"
+
+
+def test_a_legacy_prefixed_name_with_a_chat_role_is_not_a_system_section(roles_file, api_client):
+    name = f"{LEGACY_ROLE}-prefixed-chat"
+    roles_file.write_text(json.dumps({name: "chat"}))
+    settings.models_ini_path.write_text(f"[{name}]\nmodel = /models/{name}/synthetic.gguf\n")
+    assert ini.is_laya_section(name) is False, "an explicit role beats the name-prefix fallback"
+    assert ini._is_chat_section(ini.read_ini(), name) is True
+    assert _api_code(api_client, name) != "laya_section"
+
+
+def test_renaming_and_deleting_a_system_routing_section_moves_and_drops_its_exact_role(roles_file):
+    settings.models_ini_path.write_text("[box]\nmodel = /models/box/synthetic.gguf\n[keep]\nmodel = /models/keep/synthetic.gguf\n")
+    roles_file.write_text(json.dumps({"box": NEW_ROLE, "keep": "chat"}, indent=2, sort_keys=True) + "\n")
+    assert ini.rename_section("box", "renamed") is True
+    assert roles_file.read_bytes() == b'{\n  "keep": "chat",\n  "renamed": "system-routing"\n}\n'
+    assert ini.is_laya_section("renamed") is True
+    assert ini.delete_section("renamed") is True
+    assert roles_file.read_bytes() == b'{\n  "keep": "chat"\n}\n'
+    assert ini.delete_section("keep") is True
+    assert not roles_file.exists()
