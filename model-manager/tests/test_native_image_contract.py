@@ -64,6 +64,12 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert "native_features=$(./target/release/noevia-model-manager --features)" in builder
     build = next(line for line in builder.splitlines() if "cargo build --release --locked" in line)
     assert "-p gguf-meta -p model-files-cli -p model-autoconfig-cli -p noevia-model-manager" in build
+    # The inference gate (noevia#2115) is its own cargo invocation: building it beside the model
+    # manager would unify its dependencies' features into the model manager's binary.
+    assert "noevia-inference-gate" not in build
+    gate_builds = [line for line in builder.splitlines() if "cargo build" in line and "noevia-inference-gate" in line]
+    assert gate_builds == [" && cargo build --release --locked -p noevia-inference-gate \\"]
+    assert '| grep -q "GATE_UPSTREAM is required"' in builder
     for capability in NATIVE_CAPABILITIES:
         assert f"printf '%s\\n' \"$native_features\" | grep -Fx {capability} >/dev/null" in builder
         if capability != "native-logs":
@@ -108,6 +114,7 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert "apt-get install -y --no-install-recommends ca-certificates libgcc-s1" in runtime
     assert re.findall(r"^COPY .+$", runtime, re.M) == [
         "COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager",
+        "COPY --from=gguf-meta /src/target/release/noevia-inference-gate /usr/local/bin/noevia-inference-gate",
         "COPY LICENSE ./",
     ]
     assert 'HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["noevia-model-manager", "--healthcheck"]' in runtime

@@ -7,9 +7,11 @@
 # Python and the previous supervisor binary exist only in the qualification targets.
 # The bookworm builder and runtime use compatible glibc versions.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS gguf-meta
-# Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=88f50c5c65a166c08bd27c736ce1aef69ba38f32
-ARG NOEVIA_RS_SHA256=05061596a9146b28952182a9e0747c17f4b72ed387feebdde3cb8c2983235fa2
+# Merged Rust runtime dependency; checksum verified below. The inference gate (noevia#2115)
+# is built from the same source in its own cargo invocation, so its dependencies' features never
+# unify into the model manager's build.
+ARG NOEVIA_RS_REF=bac2f3e1dd56b079cd02d2be3333bc7b6db2e12d
+ARG NOEVIA_RS_SHA256=d059969eba60f0993cd64655e539edb93fc323a476ef09a310f8b92686db6281
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=8
@@ -53,7 +55,9 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && printf '%s\n' "$native_features" | grep -Fx native-routing >/dev/null \
  && ./target/release/gguf-meta --help 2>&1 | grep -q usage \
  && ./target/release/model-files --help 2>&1 | grep -q usage \
- && ./target/release/model-autoconfig --help 2>&1 | grep -q usage
+ && ./target/release/model-autoconfig --help 2>&1 | grep -q usage \
+ && cargo build --release --locked -p noevia-inference-gate \
+ && { env -u GATE_UPSTREAM ./target/release/noevia-inference-gate 2>&1 || true; } | grep -q "GATE_UPSTREAM is required"
 
 # Test-only frozen supervisor oracle. It must never supply the production binary.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS legacy-builder
@@ -112,6 +116,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv
 COPY --from=gguf-meta /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager
+# The inference gate runs from this image as its own compose service (command override);
+# the image's default process stays the model manager.
+COPY --from=gguf-meta /src/target/release/noevia-inference-gate /usr/local/bin/noevia-inference-gate
 COPY LICENSE ./
 EXPOSE 8090
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["noevia-model-manager", "--healthcheck"]

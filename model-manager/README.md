@@ -41,6 +41,18 @@ process exit. A forced deadline exit must not release a lease while another
 same-process worker can still mutate its store. See the pinned Rust
 `bins/noevia-model-manager/docs/native-service.md` for the exact process contract.
 
+### Inference gate (noevia#2115)
+
+The image also carries `noevia-inference-gate`, built from the same pinned source in
+its own cargo invocation. It is not started by this image's default command: noevia's
+inference compose runs it as a separate service (`command: ["noevia-inference-gate"]`)
+in front of the engine router, which is then reachable only on the private network.
+Every chat client reaches the router through it, so one client can no longer unload a
+model another client is using. Its configuration is the `GATE_*` environment; an
+invalid value stops it before it listens. The image healthcheck probes the model
+manager, so the gate service overrides it; see the pinned Rust
+`bins/noevia-inference-gate` crate docs for the contract.
+
 ### Qualification and historical oracles
 
 The `native-qualification` image target adds only the Rust shipping-process test
