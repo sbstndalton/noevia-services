@@ -258,7 +258,8 @@ def test_focus_drops_only_confirmed_near_names():
     assert [(rank, reason) for rank, _, reason in res.removed] == [(1, "near_name")]
     assert res.corrected_by == {2: "2030-01-30"}  # the entry holding the corrected value
     assert "dated before the correction of 2030-01-30" in ef.entry_label(res, 2)
-    assert ef.entry_label(res, 5) == "" and ef.entry_label(res, 4) == ""
+    assert ef.entry_label(res, 5) == ""  # a first name alone gets no label
+    assert ef.entry_label(res, 4) == '; names the asked person "Alder Brannock" exactly'  # services#178
     note = ef.context_notes(res)[0]
     assert '"Alder Brannock"' in note and "near spelling of that name were left out" in note
     assert "do not answer" not in note.lower()

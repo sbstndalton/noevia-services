@@ -103,15 +103,21 @@ def safe_name(name: str) -> str:
     return " ".join(kept.split())
 
 
-def conversation_note(res: Resolution) -> str:
-    """Labels the replayed earlier exchange; it is kept, never dropped. Reference data, not an instruction."""
+def conversation_note(res: Resolution, exact_loaded: bool = False) -> str:
+    """Labels the replayed earlier exchange; it is kept, never dropped. Reference data, not an instruction.
+
+    services#179: ``exact_loaded`` says whether a retrieved entry naming the asked name exactly is shown. Then
+    the note says to answer from those entries; only without one does a near spelling get the sentence about
+    saying the diary records nothing. The note never holds both."""
     earlier, asked = safe_name(res.earlier_name), safe_name(res.asked_name)
     kind = "a near spelling of that name" if res.near else "a different name"
     note = (f'[Reference note on this conversation: the earlier exchange above was about "{earlier}". The new '
             f'question asks about "{asked}", {kind}. The diary names people exactly, so they are different '
             f'people: the earlier answer\'s details are not details of "{asked}". The new question is the '
             f'earlier question asked about "{asked}".')
-    if res.near:
+    if exact_loaded:
+        note += f' Retrieved entries that name "{asked}" exactly are about "{asked}": answer from them, following the latest-record and withdrawn rules.'
+    elif res.near:
         note += (f' If the diary records nothing about "{asked}", say so and mention that it does record '
                  f'"{earlier}".')
     return note + "]"
