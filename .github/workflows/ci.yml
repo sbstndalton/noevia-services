@@ -202,10 +202,20 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/docling-rs
+      - name: Retired Python HTTP server, pinned as the test oracle (noevia#1071)
+        # The Python server is gone from this service; the native tests compare against the merged
+        # copy they were qualified with, and the worker shipped here must be the one they run.
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/docling-oracle.tgz https://codeload.github.com/sbstndalton/noevia-services/tar.gz/bbed9b8a5af9f66ea3133fd8ee5495013d11d6c7
+          echo 'd35a0351a98514411a0e87f112d041e53096b1cda6d3e3b409a4765f9601d9bb  /tmp/docling-oracle.tgz' | sha256sum -c -
+          mkdir "$RUNNER_TEMP/docling-oracle"
+          tar -xzf /tmp/docling-oracle.tgz -C "$RUNNER_TEMP/docling-oracle" --strip-components=1
+          cmp isolated_worker.py "$RUNNER_TEMP/docling-oracle/docling/isolated_worker.py"
       - name: Actual HTTP worker binary default/native/featureless contracts
         working-directory: ${{ runner.temp }}/docling-rs
         env:
-          NOEVIA_DOCLING_REFERENCE: ${{ github.workspace }}/ws/services/docling
+          NOEVIA_DOCLING_REFERENCE: ${{ runner.temp }}/docling-oracle/docling
         run: |
           cargo test --locked -p docling-service -p noevia-docling
           cargo test --locked -p noevia-docling --features native-docling
@@ -228,16 +238,16 @@ jobs:
           load: true
           tags: noevia-docling:omission-ci
           cache-from: type=gha,scope=docling-native
-      - name: Both image owners and specific capability omission (synthetic only)
+      - name: Native owner by default and when set, and specific capability omission (synthetic only)
         run: |
           set -euo pipefail
           compose=(docker compose -p docling-native-ci -f tests/native-runtime.compose.yml)
           cleanup() { "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true; docker rm -f docling-omission-ci >/dev/null 2>&1 || true; }
           trap cleanup EXIT
           "${compose[@]}" up -d --wait --wait-timeout 60 --no-build
-          "${compose[@]}" exec -T python native-image-probe python
-          "${compose[@]}" exec -T rust native-image-probe rust
-          if timeout --kill-after=2s 10s docker run --rm --name docling-omission-ci --network none --read-only --memory 1g --cpus 1 --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --tmpfs /tmp:rw,size=536870912,mode=1777 -e NOEVIA_DOCLING_IMPL=rust noevia-docling:omission-ci > "$RUNNER_TEMP/docling-omission.log" 2>&1; then
+          "${compose[@]}" exec -T default native-image-probe default
+          "${compose[@]}" exec -T explicit native-image-probe explicit
+          if timeout --kill-after=2s 10s docker run --rm --name docling-omission-ci --network none --read-only --memory 1g --cpus 1 --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 --tmpfs /tmp:rw,size=536870912,mode=1777 noevia-docling:omission-ci > "$RUNNER_TEMP/docling-omission.log" 2>&1; then
             echo 'featureless native image incorrectly started'; exit 1
           fi
           grep -Fq 'native-docling feature required' "$RUNNER_TEMP/docling-omission.log"
