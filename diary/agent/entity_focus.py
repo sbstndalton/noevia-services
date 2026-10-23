@@ -810,11 +810,16 @@ class FocusResult:
         return bool(self.matched)
 
 
-def analyse(message: str, earlier: Sequence[str] = ()) -> FocusResult:
+_ANCHOR_UNSET = object()
+
+
+def analyse(message: str, earlier: Sequence[str] = (), *, anchor=_ANCHOR_UNSET) -> FocusResult:
     entities = asked_entities(message)
     carried = [] if entities else carried_entities(message, earlier)
     found = entities or carried
-    return FocusResult(entities=found, carried=bool(carried), anchor=time_anchor(message),
+    if anchor is _ANCHOR_UNSET:
+        anchor = time_anchor(message)
+    return FocusResult(entities=found, carried=bool(carried), anchor=anchor,
                        relational=relational(message if entities else (list(earlier) or [""])[-1], found))
 
 
@@ -845,15 +850,20 @@ def _same_given_near_surname(text: str, entity: Entity) -> Optional[str]:
 
 
 def focus_candidates(message: str, rows: List[dict], limit: Optional[int] = None,
-                     earlier: Sequence[str] = (), margin: float = MARGIN) -> FocusResult:
+                     earlier: Sequence[str] = (), margin: float = MARGIN, *,
+                     analysed: Optional[FocusResult] = None, temporal_partition=None) -> FocusResult:
     """Check vector candidates (``rows`` in score order) against ``message``; keep at most ``limit``.
 
     Removal reasons (module docstring): ``after_time_anchor``, ``near_name``, ``near_name_unmatched``,
     ``other_person``, ``below_margin`` and ``candidate_limit``. Kept rows stay in score order."""
-    res = analyse(message, earlier)
+    res = analysed if analysed is not None else analyse(message, earlier)
     res.margin = margin = parse_margin(margin)  # never nan, negative or above 1, wherever it came from
     ranked = list(enumerate(rows, 1))
-    if res.anchor is not None:
+    if temporal_partition is not None:
+        kept_ranks, removed_ranks = temporal_partition
+        ranked = [(rank, rows[rank - 1]) for rank in kept_ranks]
+        res.removed.extend((rank, rows[rank - 1], "after_time_anchor") for rank in removed_ranks)
+    elif res.anchor is not None:
         cutoff, inclusive = res.anchor
         survivors = []
         for rank, row in ranked:

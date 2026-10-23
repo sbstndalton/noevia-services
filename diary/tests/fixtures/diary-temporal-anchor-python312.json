@@ -1,0 +1,214 @@
+[
+  {
+    "query": "As of January 20, 2030, what had I written?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "as at 3rd February 2030 what was it?",
+    "anchor": {
+      "day": "2030-02-03",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "Before 2030-02-10, what did I note?",
+    "anchor": {
+      "day": "2030-02-10",
+      "inclusive": false
+    }
+  },
+  {
+    "query": "Up to Sept 9, 2030, who visited?",
+    "anchor": {
+      "day": "2030-09-09",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of January 20, 2030, what did Dr. Patel say?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of today, how am I?",
+    "anchor": null
+  },
+  {
+    "query": "As of February 30, 2030, what then?",
+    "anchor": null
+  },
+  {
+    "query": "What happened on January 20, 2030?",
+    "anchor": null
+  },
+  {
+    "query": "Sam is away until 3 March 2030. Is Sam back yet?",
+    "anchor": null
+  },
+  {
+    "query": "What did I note before 2030-02-10?",
+    "anchor": null
+  },
+  {
+    "query": "As of 3 March 2030 I live in Leeds. Where did Sam move?",
+    "anchor": null
+  },
+  {
+    "query": "Is Sam back? Sam is away until 3 March 2030.",
+    "anchor": null
+  },
+  {
+    "query": "Before January 20th, 2030, what changed?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": false
+    }
+  },
+  {
+    "query": "As of Jan. 20, 2030, what?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of ٢٠٣٠-٠١-٢٠, what?",
+    "anchor": null
+  },
+  {
+    "query": "As of January 20, 2030? Before 2030-02-10, what?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "Before 2030-02-10, what was it as of March 1, 2030?",
+    "anchor": {
+      "day": "2030-02-10",
+      "inclusive": false
+    }
+  },
+  {
+    "query": "As of Jan. 20, 2030, what was Dr. X seeing?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "How are things? ‘As of February 3, 2030, what happened?’",
+    "anchor": {
+      "day": "2030-02-03",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "Until January 20th, 2030, what changed?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "Till 20 Jan. 2030, who came?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of February 30, 2030, what? As of March 3, 2030, what then?",
+    "anchor": {
+      "day": "2030-03-03",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of Jan. 20, 2030, what was Alder Brannock\\u2019s tea?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of January 20, 2030, what? Before February 10, 2030, what?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "Up to March 3, 2030, who visited?",
+    "anchor": {
+      "day": "2030-03-03",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of 0000-01-01, what?",
+    "anchor": null
+  },
+  {
+    "query": "As of 0001-01-01, what?",
+    "anchor": {
+      "day": "0001-01-01",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "Before 0000-01-01, what?",
+    "anchor": null
+  },
+  {
+    "query": "As of January 20, 2030, what did Ｄｒ. Patel say?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of January 20, 2030, what did Dŕ. Patel say?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of January 20, 2030, what happened on Ｓｅｐｔ. 9?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of January 20, 2030, what happened on Dŕ. 9?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "As of January ٢٠, ٢٠٣٠, what happened?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  },
+  {
+    "query": "٢٠ Jan ٢٠٣٠, what happened?",
+    "anchor": null
+  },
+  {
+    "query": "As of January 20, 2030, what did Prøf. Patel say?",
+    "anchor": {
+      "day": "2030-01-20",
+      "inclusive": true
+    }
+  }
+]
