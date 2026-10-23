@@ -1,23 +1,8 @@
-"""Preview a portable ZIP; restore only to a new directory, never a live corpus.
+"""Preview a portable workspace archive and restore only to a new directory.
 
-python -m agent.workspace_restore ARCHIVE.zip
-python -m agent.workspace_restore ARCHIVE.zip --destination NEW --fingerprint REVIEWED_SHA256
-
-`verify` is the gate for this restore, its preview and the in-app ZIP import
-(workspace_import.prepare). WORKSPACE_RESTORE_VERIFY_IMPL selects it (noevia#982):
-
-- python (default; also empty, unset or any unknown value, with one warning): `_verify` below.
-- rust: the bounded Rust leaf from sbstndalton/noevia-rs (`workspace-restore-verify verify`,
-  built into the image at the Dockerfile's pinned NOEVIA_RS_REF) checks the archive FIRST, so its
-  stricter container checks run before `zipfile` parses anything; then `_verify` runs as well and
-  the two verified listings (paths, sizes, checksums, directories, totals) must hash identically.
-  It FAILS CLOSED: a Rust refusal is answered with Python's message for that check; a missing
-  binary, a nonzero exit other than a well-formed refusal, a timeout, unexpected output or a
-  listing mismatch refuses the archive as "verification unavailable". The archive goes to the
-  child on stdin only, with a minimal environment; logs carry codes only, never names.
-
-The shared differential fixtures (tests/fixtures/workspace-restore.v1.json, generated in noevia-rs
-by tools/gen-workspace-restore.py from this module) are the contract between the two.
+The explicit Rust selector uses the bounded decode-v1 content protocol. It never
+opens the archive with Python ZIP. The Python path remains the current image
+baseline until the paired reviewed native image and release pin are ready.
 """
 import argparse
 import hashlib
@@ -26,12 +11,9 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
-import subprocess
 import threading
-import time
 import zipfile
 import zlib
 from .managed_storage import safe_key
@@ -39,7 +21,6 @@ from .workspace_export import MAX_ARCHIVE, MAX_FILE, MAX_TOTAL
 
 
 INVALID = 'Invalid workspace archive or manifest'
-UNAVAILABLE = 'Workspace archive verification is unavailable. Try again later.'
 # Every refusal `_verify` raises, by the code the Rust leaf prints for the same check.
 MESSAGES = {
     'archive_too_large': 'Archive exceeds 272 MiB',
@@ -65,12 +46,6 @@ MESSAGES = {
     'totals_mismatch': 'Manifest totals mismatch',
 }
 IMPLS = ('python', 'rust')
-DEFAULT_BIN = '/usr/local/bin/workspace-restore-verify'
-# 272 MiB of SHA-256 plus inflate is a few seconds; this only bounds a hung child.
-RUST_TIMEOUT_S = 120
-_RUST_STDOUT_CAP = 256
-_ACCEPT_RE = re.compile(rb'accept ([0-9a-f]{64})\n')
-_REJECT_RE = re.compile(rb'reject: ([a-z_]{1,32})\n')
 _log = logging.getLogger(__name__)
 _logged = set()
 _logged_lock = threading.Lock()
@@ -88,105 +63,9 @@ def impl_choice():
     """The configured implementation: "python" (default) or "rust". Anything else is python."""
     value = (os.environ.get('WORKSPACE_RESTORE_VERIFY_IMPL') or 'python').strip().lower() or 'python'
     if value not in IMPLS:
-        _log_once('invalid_setting', f'WORKSPACE_RESTORE_VERIFY_IMPL={value[:32]!r} is not one of {", ".join(IMPLS)}; using python')
+        _log_once('invalid_setting', 'Invalid WORKSPACE_RESTORE_VERIFY_IMPL; using python')
         return 'python'
     return value
-
-
-def _rust_binary():
-    # A fixed absolute path by default (never a PATH lookup). WORKSPACE_RESTORE_VERIFY_BIN (tests,
-    # operators) is honoured only as an absolute path to an existing, executable regular file;
-    # anything else, including a bare name, is ignored with one warning and the default is used (#1813).
-    configured = (os.environ.get('WORKSPACE_RESTORE_VERIFY_BIN') or '').strip()
-    binary = DEFAULT_BIN
-    if configured:
-        if os.path.isabs(configured) and os.path.isfile(configured) and os.access(configured, os.X_OK):
-            binary = configured
-        else:
-            _log_once('rust:bad_override', 'WORKSPACE_RESTORE_VERIFY_BIN is not an absolute path to an executable file; ignoring it')
-    return binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None
-
-
-def _rust_verdict(body):
-    """The Rust leaf's listing digest for an accepted archive. Raises ValueError with Python's
-    message for a refusal, or UNAVAILABLE for any fault (fails closed)."""
-    if type(body) is not bytes:  # bytes is already immutable: no 272 MiB copy
-        body = bytes(body)
-    binary = _rust_binary()
-    if binary is None:
-        _log_once('rust:missing_binary', 'workspace-restore-verify binary not found; refusing archives (WORKSPACE_RESTORE_VERIFY_IMPL=rust)')
-        raise ValueError(UNAVAILABLE)
-    try:
-        proc = subprocess.Popen([binary, 'verify'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, close_fds=True,
-                                env={'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')})
-    except OSError as exc:
-        _log_once('rust:spawn', f'workspace-restore-verify could not start ({type(exc).__name__}); refusing the archive')
-        raise ValueError(UNAVAILABLE) from None
-    out = bytearray()
-    overflow = threading.Event()
-
-    def feed():
-        try:
-            proc.stdin.write(body)
-        except (OSError, ValueError):
-            pass  # The child exited early; its exit status decides.
-        finally:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-
-    def drain():
-        # At most cap+1 bytes are kept; the child is killed on overflow.
-        try:
-            while len(out) <= _RUST_STDOUT_CAP:
-                chunk = proc.stdout.read1(_RUST_STDOUT_CAP + 1 - len(out))
-                if not chunk:
-                    return
-                out.extend(chunk)
-            overflow.set()
-        except (OSError, ValueError):
-            return
-
-    threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain, daemon=True)]
-    for t in threads:
-        t.start()
-    deadline = time.monotonic() + RUST_TIMEOUT_S
-    fault = None
-    while True:
-        try:
-            code = proc.wait(timeout=0.05)
-            break
-        except subprocess.TimeoutExpired:
-            if overflow.is_set():
-                fault = 'output_too_large'
-            elif time.monotonic() >= deadline:
-                fault = 'timeout'
-            if fault:
-                proc.kill()
-                code = proc.wait()
-                break
-    for t in threads:
-        t.join(timeout=1)
-    try:
-        proc.stdout.close()
-    except OSError:
-        pass
-    if fault or overflow.is_set():
-        fault = fault or 'output_too_large'
-        _log_once(f'rust:{fault}', f'workspace-restore-verify failed ({fault}); refusing the archive')
-        raise ValueError(UNAVAILABLE)
-    out = bytes(out)
-    if len(out) <= _RUST_STDOUT_CAP:
-        accepted = _ACCEPT_RE.fullmatch(out) if code == 0 else None
-        if accepted:
-            return accepted.group(1).decode('ascii')
-        refused = _REJECT_RE.fullmatch(out) if code == 1 else None
-        if refused and refused.group(1).decode('ascii') in MESSAGES:
-            raise ValueError(MESSAGES[refused.group(1).decode('ascii')])
-    _log_once(f'rust:exit:{code}', f'workspace-restore-verify failed (exit {code}); refusing the archive')
-    raise ValueError(UNAVAILABLE)
 
 
 def listing_sha256(files, dirs):
@@ -202,25 +81,15 @@ def listing_sha256(files, dirs):
 
 
 def verify(body):
-    choice = impl_choice()
-    expected = _rust_verdict(body) if choice == 'rust' else None
+    if impl_choice() == 'rust':
+        from .workspace_decode import decode
+        return decode(body, MESSAGES)
+    # The legacy default remains until the paired native image/pin is reviewed.
     try:
-        result = _verify(body)
-    # zlib.error (corrupt DEFLATE), EOFError (DEFLATE ending early), NotImplementedError (newer ZIP
-    # version or feature) and RecursionError (deeply nested manifest) used to escape as server
-    # errors (noevia#982); they are invalid archives like every other parse failure.
+        return _verify(body)
     except (zipfile.BadZipFile, KeyError, TypeError, AttributeError, UnicodeError, json.JSONDecodeError,
             zlib.error, EOFError, NotImplementedError, RecursionError) as exc:
         raise ValueError(INVALID) from exc
-    if expected is not None:
-        try:
-            same = listing_sha256(result[0], result[1]) == expected
-        except UnicodeError:
-            same = False
-        if not same:
-            _log_once('rust:listing_mismatch', 'workspace-restore-verify and Python verified different listings; refusing the archive')
-            raise ValueError(UNAVAILABLE)
-    return result
 
 
 def _verify(body):
