@@ -50,6 +50,7 @@ from .streaming import MODEL_TIMEOUT_TEXT, describe_failure, exchange_stream
 from pydantic import BaseModel
 
 from . import corpus as fmt
+from .corpus_write_native import NativeWriteUnavailable
 from .config import load_config
 from .context import ContextAssembler, completed_exchanges
 from .deadline import ExchangeBudget, ExchangeTimeout
@@ -953,6 +954,7 @@ def _replayable_history(messages) -> list:
 
 def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = "legacy", entry_time=None, entry_day=None, background=True, extra_context="", emit=None, retrieval_trace=False) -> dict:
     """One full exchange: context build -> main model -> strip marker -> log -> return payload."""
+    st.store.require_write_transform()
     if emit:
         emit({"type": "status", "text": "Reading diary entries and memory…"})
     _reindex_dirty(st)
@@ -1138,7 +1140,7 @@ def api_entries_append(body: dict, request: Request) -> JSONResponse:
     st = _tenant_state(request)
     try:
         xid = st.store.log_exchange(day=day, sub_header=title.strip(), me_text=text, claude_text="", now=now, xid=request_id)
-    except CorpusError as exc:
+    except (CorpusError, NativeWriteUnavailable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     document = st.store.document_path(day)
     try:
@@ -1179,6 +1181,8 @@ def api_entries_edit(req: EditEntryRequest, request: Request) -> JSONResponse:
         path, day_iso, new_hash = st.store.edit_exchange(xid, req.me, req.assistant, req.month, req.base_hash)
     except EditConflict as exc:
         return JSONResponse({"error": str(exc), "conflict": True, "current_hash": exc.current_hash, "current_text": exc.current_text}, status_code=409)
+    except NativeWriteUnavailable as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
     except CorpusError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503 if "queued" in str(exc) else 404)
     except Exception as exc:  # noqa: BLE001 — persistent write conflict etc.
@@ -1667,6 +1671,8 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         # #146: a normal stop with no answer text; nothing was saved. Same shape as length_cap.
         log.error("v1 exchange returned no answer text")
         return JSONResponse({"error": {"message": EMPTY_ANSWER_TEXT, "type": "api_error", "code": "empty_answer"}}, status_code=502)
+    except NativeWriteUnavailable:
+        return JSONResponse({"error": {"message": "diary write transform unavailable", "type": "api_error"}}, status_code=503)
     except Exception:  # noqa: BLE001
         log.exception("v1 exchange failed")
         return JSONResponse(
