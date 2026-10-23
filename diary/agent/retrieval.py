@@ -143,21 +143,8 @@ class Retriever:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def _parse_chunks(self, month_text: Optional[str]) -> List[Tuple[str, str, str, str]]:
-        rows: List[Tuple[str, str, str, str]] = []  # (day, header, body, hash)
-        for d in fmt.parse_diary(month_text or ""):
-            if d.date is None:
-                continue
-            day_iso = d.date.isoformat()
-            for sub in d.subsections:
-                body = "\n".join(
-                    (f"**Me:** {ex.me}\n\n**Assistant:** {ex.claude}" if ex.claude else f"**Me:** {ex.me}")
-                    for ex in sub.exchanges
-                ).strip()
-                if not body:
-                    continue
-                chunk_text = f"[{day_iso}] {d.header}\n### {sub.header}\n{body}"
-                rows.append((day_iso, sub.header, chunk_text, self._hash(chunk_text)))
-        return rows
+        from .corpus_parse import parse
+        return parse(month_text).chunks
 
     def _indexed(self, file_name: str, target: Optional[Target] = None) -> dict:
         """{content_hash: (chunk id, has a current vector for ``target``)} for one file. Read-only."""
