@@ -16,15 +16,19 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
 COPY tests/native_image.rs /build/native_image.rs
 RUN rustc --edition=2021 /build/native_image.rs -o /out/native-image-probe
 
-# CI-only target: actual HTTP/isolation/worker with a synthetic engine. No model or
+# CI-only target: the native HTTP server and the actual worker with a synthetic engine. No model or
 # extraction dependencies are installed. This does not qualify the production engine.
 FROM python:3.12-slim-bookworm AS native-contract
 WORKDIR /app
 COPY --from=native-docling /out/noevia-docling /usr/local/bin/noevia-docling
 COPY --from=native-docling /out/native-image-probe /usr/local/bin/native-image-probe
-COPY server.py isolation.py isolated_worker.py fake_converter.py ./
+COPY isolated_worker.py fake_converter.py ./
 COPY tests/fixtures/native_extract.py ./extract.py
-ENV NOEVIA_DOCLING_IMPL=python PYTHONDONTWRITEBYTECODE=1
+# noevia#1071: the native server is the only owner; the Python HTTP server is retired and gone.
+# The pinned noevia-docling still reads the retired selector (unset meant Python), so the image fixes
+# it to the native value. A binary built after the retirement ignores it and only warns about any
+# other value, so an older .env cannot bring the Python server back.
+ENV NOEVIA_DOCLING_IMPL=rust PYTHONDONTWRITEBYTECODE=1
 USER 65534:65534
 HEALTHCHECK --interval=1s --timeout=6s --start-period=1s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health',timeout=5)"
@@ -89,13 +93,17 @@ RUN HF_HUB_OFFLINE=0 python /build/download_models.py /opt/docling-models \
     && chmod -R a+rX /opt/docling-models && rm -rf /build
 
 COPY --from=native-docling /out/noevia-docling /usr/local/bin/noevia-docling
-ENV NOEVIA_DOCLING_IMPL=python
+# noevia#1071: the native server is the only owner; the Python HTTP server is retired and gone.
+# The pinned noevia-docling still reads the retired selector (unset meant Python), so the image fixes
+# it to the native value. A binary built after the retirement ignores it and only warns about any
+# other value, so an older .env cannot bring the Python server back.
+ENV NOEVIA_DOCLING_IMPL=rust
 WORKDIR /app
-# isolation.py + isolated_worker.py run each conversion in a child process the server can kill
-# on a deadline or client disconnect (#854); the server cannot start without them.
+# isolated_worker.py runs each conversion in a child process the native server (noevia-docling)
+# kills on a deadline or client disconnect (#854, #1322); conversions cannot start without it.
 # synthetic_pdfs.py builds the #700 fixtures so selftest.py can be pointed at a
 # known text-over-picture page on the host without any real document.
-COPY server.py extract.py isolation.py isolated_worker.py selftest.py synthetic_pdfs.py ./
+COPY extract.py isolated_worker.py selftest.py synthetic_pdfs.py ./
 USER 65534:65534
 EXPOSE 8031
 HEALTHCHECK --interval=30s --timeout=6s --start-period=120s --retries=3 \

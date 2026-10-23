@@ -42,11 +42,11 @@ PAGE_CAP = 300
 # frames as pages there and, unlike `page_range` (which only trims what is
 # converted), a document over `max_num_pages` is REJECTED before any work is
 # done. PDFs keep today's behaviour of converting the first PAGE_CAP pages of
-# any length of book. The wall-clock limit lives in server.py/isolation.py.
+# any length of book. The wall-clock limit lives in the native server (noevia-docling), which kills the worker.
 FILE_SIZE_CAP = 25 * 1024 * 1024
 NON_PDF_MAX_PAGES = 1000
-# #1864: a page-range conversion of a PDF (server.py X-Document-Pages) may come from a larger file; only
-# the range is converted. Defence in depth behind server.py's RANGED_LIMIT (same variable, same default;
+# #1864: a page-range conversion of a PDF (the native server's X-Document-Pages) may come from a larger file; only
+# the range is converted. Defence in depth behind the native server's ranged cap (same variable, same default;
 # assigned below, once _env_int exists).
 RANGED_FILE_SIZE_CAP = 96 * 1024 * 1024
 
