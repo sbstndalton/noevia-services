@@ -312,3 +312,22 @@ storage headers, over-long fields (the tenant ids web signs are UUIDs). A `secre
 mismatch (400), a non-ASCII one no longer an error. The key and headers reach the child on stdin only, with a
 `PATH`-only environment. With `DIARY_TENANT_KEY` set and no usable binary the service logs an error at start and
 refuses every tenant request. `TENANT_ASSERTION_BIN` overrides the binary path (tests).
+
+### Workspace archive decoder source pairing
+
+The standalone Diary image pins noevia-rs `4d18712c75be72f209af47ea420bfeb25da3dca3`
+(noevia-rs#301) with verified codeload SHA-256
+`0eedcd57b1852e4ed91c4db5d7cb5360a7656cc1849c3095b0760953d1015831`.
+This supplies the `decode-v1` command required by the explicit Rust restore/import
+path. Its versioned frame, successful exit and exact EOF are mandatory; an older
+verify-only binary fails closed without Python ZIP fallback.
+
+Both image construction and CI run `scripts/smoke_workspace_decode.py` against the
+installed binary using synthetic source bytes, settings, an empty folder and an
+invalid archive. The smoke disables the Python parser and selects Rust only in its
+own process. The service selector default remains Python.
+
+The existing CI gate requires Diary and OCR source pins/checksums to match. This
+Diary pairing depends on the coordinated source-pin update for the other images
+and release lock; the gate is expected to reject a standalone mismatched pairing
+until that dependency is integrated. Do not bypass that check.

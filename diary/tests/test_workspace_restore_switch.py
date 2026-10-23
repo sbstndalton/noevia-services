@@ -223,3 +223,11 @@ def test_protocol_fault_creates_no_destination_or_managed_receipt(bundle, tmp_pa
                  db.execute('SELECT count(*) FROM workspace_imports').fetchone()[0],
                  db.execute('SELECT count(*) FROM workspace_index_outbox').fetchone()[0])
     assert before == after
+
+
+def test_legacy_verify_only_binary_fails_closed(bundle, tmp_path, monkeypatch):
+    # An older verifier's valid text decision is not a decode-v1 capability.
+    use(monkeypatch, emit(tmp_path, b'accept ' + b'0' * 64 + b'\n'))
+    monkeypatch.setattr(wr, '_verify', lambda _: pytest.fail('Python ZIP fallback called'))
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.verify(bundle)
