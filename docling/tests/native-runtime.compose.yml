@@ -1,5 +1,7 @@
 services:
-  python:
+  # noevia#1071: the native server is the only owner, with the image's own setting (default)
+  # and with the selector set explicitly the way the deployment sets it (explicit).
+  default:
     image: noevia-docling:ci
     network_mode: none
     read_only: true
@@ -10,7 +12,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs: ["/tmp:rw,size=536870912,mode=1777"]
-  rust:
+  explicit:
     image: noevia-docling:ci
     network_mode: none
     read_only: true

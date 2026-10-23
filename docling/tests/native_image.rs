@@ -114,24 +114,20 @@ fn pid(reply: &Reply) -> Result<u32, Error> {
     if pid <= 1 {
         return Err("invalid worker PID".into());
     }
-    let python = format!(
-        r#"{{"pages":[{{"number":1,"text":"ok","status":"native","method":"docling","truncated":false}}],"total":1,"truncatedPages":false,"pid":{pid}}}"#
-    );
     let native = format!(
         r#"{{"pages":[{{"method":"docling","number":1,"status":"native","text":"ok","truncated":false}}],"pid":{pid},"total":1,"truncatedPages":false}}"#
     );
-    if body != python && body != native {
+    if body != native {
         return Err("synthetic extraction shape drift".into());
     }
     Ok(pid)
 }
 fn health_valid(reply: &Reply) -> Result<bool, Error> {
     let formats = r#"[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]"#;
-    // noevia#1867: both owners advertise page ranges and the ranged body cap (default 96 MiB).
-    let python = format!(r#"{{"service":"docling","formats":{formats},"ranges":true,"rangedMaxBytes":100663296}}"#);
+    // noevia#1867: the native server advertises page ranges and the ranged body cap (default 96 MiB).
     let native = format!(r#"{{"formats":{formats},"rangedMaxBytes":100663296,"ranges":true,"service":"docling"}}"#);
     let body = compact_json(&reply.body)?;
-    Ok(reply.status == 200 && (body == python || body == native))
+    Ok(reply.status == 200 && body == native)
 }
 fn cpu_valid(cpu: &str) -> bool {
     let mut fields = cpu.split_whitespace();
@@ -204,20 +200,20 @@ fn isolate() -> Result<(), Error> {
     Ok(())
 }
 fn check(owner: &str) -> Result<(), Error> {
-    if !matches!(owner, "python" | "rust") {
-        return Err("fixed owner required".into());
+    // noevia#1071: the native server is the only owner, whether the selector is left to the
+    // image (default) or set explicitly (explicit).
+    if !matches!(owner, "default" | "explicit") {
+        return Err("fixed service required".into());
     }
     isolate()?;
     let process = std::fs::read("/proc/1/cmdline")?;
     let command = String::from_utf8(process)?;
-    if (owner == "python" && !command.starts_with("python\0server.py\0"))
-        || (owner == "rust"
-            && !command
-                .split('\0')
-                .next()
-                .is_some_and(|s| s.ends_with("noevia-docling")))
+    if !command
+        .split('\0')
+        .next()
+        .is_some_and(|s| s.ends_with("noevia-docling"))
     {
-        return Err("selected/default owner not PID1".into());
+        return Err("native owner not PID1".into());
     }
     let health = response(request(None)?)?;
     if !health_valid(&health)? {
@@ -296,13 +292,13 @@ mod tests {
             std::env::temp_dir().join(format!("docling-overlay-guard-{}", std::process::id()));
         std::fs::create_dir_all(directory.join("services/docling")).expect("owned fixture");
         std::fs::create_dir_all(directory.join("docs")).expect("owned docs");
-        std::fs::write(directory.join("docs/deployment.md"), "COPY server.py extract.py isolation.py isolated_worker.py selftest.py synthetic_pdfs.py /app/\n").expect("overlay docs");
+        std::fs::write(directory.join("docs/deployment.md"), "COPY extract.py isolated_worker.py selftest.py synthetic_pdfs.py /app/\n").expect("overlay docs");
         let loader = "import runpy,sys; from pathlib import Path; g=runpy.run_path(sys.argv[1]); f=g['test_overlay_docs_list_exactly_the_files_the_dockerfile_copies_to_app']; f.__globals__['HERE']=Path(sys.argv[2]); f()";
         let test = std::path::Path::new(file!())
             .parent()
             .expect("test directory")
             .join("../test_requirements_pinned.py");
-        let production_copy = "COPY server.py extract.py isolation.py isolated_worker.py selftest.py synthetic_pdfs.py ./";
+        let production_copy = "COPY extract.py isolated_worker.py selftest.py synthetic_pdfs.py ./";
         let controls = [
             (DOCKER.to_owned(), true),
             (
@@ -386,9 +382,15 @@ mod tests {
             "rustc --edition=2021 --test tests/native_image.rs",
             "working-directory: self/docling",
             "--wait --wait-timeout 60 --no-build",
-            "exec -T python native-image-probe python",
-            "exec -T rust native-image-probe rust",
+            "exec -T default native-image-probe default",
+            "exec -T explicit native-image-probe explicit",
             "native-docling feature required",
+            // noevia#1071: the native tests run against the retired Python server, pinned as the
+            // test oracle, and the shipped worker is the one they run.
+            "tar.gz/bbed9b8a5af9f66ea3133fd8ee5495013d11d6c7",
+            "d35a0351a98514411a0e87f112d041e53096b1cda6d3e3b409a4765f9601d9bb",
+            "cmp isolated_worker.py \"$RUNNER_TEMP/docling-oracle/docling/isolated_worker.py\"",
+            "NOEVIA_DOCLING_REFERENCE: ${{ runner.temp }}/docling-oracle/docling",
         ] {
             assert!(job.contains(line), "required image gate missing: {line}");
         }
@@ -407,7 +409,7 @@ mod tests {
         }
         assert_eq!(compose.matches("NOEVIA_DOCLING_IMPL: rust").count(), 1);
         assert!(!compose
-            .split_once("  rust:\n")
+            .split_once("  explicit:\n")
             .expect("native service")
             .0
             .contains("NOEVIA_DOCLING_IMPL"));
@@ -436,9 +438,11 @@ mod tests {
     #[test]
     fn fixed_shapes_and_resource_bounds_refuse_partial_proofs() {
         assert!(cpu_valid("100000 100000\n"));
-        assert_eq!(pid(&Reply { status: 200, body: r#"{"pages":[{"number":1,"text":"ok","status":"native","method":"docling","truncated":false}],"total":1,"truncatedPages":false,"pid":42}"#.into() }).expect("complete extraction"), 42);
-        assert!(health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"],"ranges":true,"rangedMaxBytes":100663296}"#.into() }).expect("complete health"));
+        assert_eq!(pid(&Reply { status: 200, body: r#"{"pages":[{"method":"docling","number":1,"status":"native","text":"ok","truncated":false}],"pid":42,"total":1,"truncatedPages":false}"#.into() }).expect("complete extraction"), 42);
         assert!(health_valid(&Reply { status: 200, body: r#"{"formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"],"rangedMaxBytes":100663296,"ranges":true,"service":"docling"}"#.into() }).expect("native health"));
+        // noevia#1071: the retired Python server's key order is not the native owner's answer.
+        assert!(pid(&Reply { status: 200, body: r#"{"pages":[{"number":1,"text":"ok","status":"native","method":"docling","truncated":false}],"total":1,"truncatedPages":false,"pid":42}"#.into() }).is_err());
+        assert!(!health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"],"ranges":true,"rangedMaxBytes":100663296}"#.into() }).expect("python-shaped health"));
         // noevia#1867: an image that does not advertise page ranges is stale.
         assert!(!health_valid(&Reply { status: 200, body: r#"{"service":"docling","formats":[".bmp",".csv",".docx",".epub",".htm",".html",".jpeg",".jpg",".odp",".ods",".odt",".pdf",".png",".pptx",".tif",".tiff",".xlsx"]}"#.into() }).expect("pre-range health"));
         // #1711: .md is no longer advertised; an image still listing it is stale.
@@ -460,6 +464,20 @@ mod tests {
             compact_json(" { \"text\": \"two words\" } ").expect("shape"),
             r#"{"text":"two words"}"#
         );
+    }
+    #[test]
+    fn the_retired_python_http_owner_is_gone() {
+        // noevia#1071: neither image ships the Python HTTP server or its supervisor, the images fix
+        // the retired selector to the native value, and the files are gone from the service.
+        for retired in ["server.py", "isolation.py", "NOEVIA_DOCLING_IMPL=python"] {
+            assert!(!DOCKER.contains(retired), "{retired}");
+        }
+        assert_eq!(DOCKER.lines().filter(|l| l.starts_with("ENV NOEVIA_DOCLING_IMPL=rust")).count(), 2);
+        let here = std::path::Path::new(file!()).parent().expect("test directory");
+        for retired in ["../server.py", "../isolation.py", "../test_server.py"] {
+            assert!(!here.join(retired).exists(), "{retired}");
+        }
+        assert!(here.join("../isolated_worker.py").exists());
     }
     #[test]
     fn truncated_response_is_refused() {

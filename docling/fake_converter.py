@@ -1,7 +1,7 @@
-"""A stand-in conversion target for the server and isolation tests.
+"""A stand-in conversion target for the native image contract tests.
 
-Runs inside the child process (`IsolatedExtractor("fake_converter:extract")`), so
-the real kill/timeout/disconnect machinery is exercised without Docling. The
+Runs inside the worker child process (isolated_worker.py, started by the native
+server), so the real kill/timeout/disconnect machinery is exercised without Docling. The
 document body is a directive:
 
     SLEEP <seconds>     block, like a conversion that never finishes

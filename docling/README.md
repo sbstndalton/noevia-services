@@ -204,8 +204,8 @@ also carries the document's figures, and every page says whether its text came f
 ### Per-document limits (#854)
 
 Every input type has a wall-clock limit, enforced by **killing the conversion**, not by asking
-Docling nicely: each conversion runs in a long-lived child process (`isolation.py`,
-`isolated_worker.py`) that holds the converter and its models, so they load once. The server kills
+Docling nicely: each conversion runs in a long-lived child process (`isolated_worker.py`, started
+by the native server) that holds the converter and its models, so they load once. The server kills
 the child's whole process group (taking any `tesseract` it started with it) when
 
 - the deadline passes: **3600 s** for `.pdf`/`.tif`/`.tiff` (`DOCLING_DOCUMENT_TIMEOUT_SECONDS`,
@@ -230,8 +230,8 @@ converted, and the reply holds only those pages; `total` is still the whole docu
 of 25 MB, streamed to `/tmp` in 1 MiB chunks (30 s per read, and 30 s plus one second per 256 KiB in all),
 never held in memory. `/health` answers `"ranges": true` and `"rangedMaxBytes"`; noevia-core asks before
 it sends a range, so a worker without this is never sent one. noevia-core reads a PDF over 25 MB, and the
-pages of any PDF past the first 300, this way. The native (Rust) worker (`NOEVIA_DOCLING_IMPL=rust`,
-noevia-rs `docling-service`) implements the same contract (#1867).
+pages of any PDF past the first 300, this way. The native server (noevia-rs `docling-service`)
+implements this contract (#1867).
 
 `status` ∈ `native | blank | truncated | degraded`. A `degraded` page also
 carries `"reason": "native-fallback"` and `"method": "pdfium"` (see below). 415 = format this worker cannot read,
@@ -244,11 +244,16 @@ failure, keep the original — and everything else as retryable.
 The checksum-pinned `native-docling` Docker stage produces
 `/out/noevia-docling` with `native-docling` compiled, plus
 `/out/noevia-docling-omission` without that capability. The production image
-uses `noevia-docling` as its entrypoint. `NOEVIA_DOCLING_IMPL` defaults to
-`python`, which execs the existing `python server.py`; `rust` selects the native
-HTTP server and process-group worker supervisor. The Python extraction engine
+uses `noevia-docling` as its entrypoint: the native HTTP server and process-group
+worker supervisor, the only owner since noevia#1071. The Python HTTP server
+(`server.py`) and its supervisor (`isolation.py`) are retired and deleted; they
+survive only as the test oracle, the merged copy at services `bbed9b8` that the
+noevia-rs differential and recorded goldens run against. `NOEVIA_DOCLING_IMPL`
+is retired: the images fix it to `rust`, which the pinned binary still reads,
+and a binary built after the retirement ignores it, warning once about any
+other value. The Python extraction engine (`extract.py`, `isolated_worker.py`)
 remains the same. Missing native capability refuses before binding or spawning
-a worker, and never falls back to Python HTTP.
+a worker.
 
 The existing engine/dependency/model-download layers are unchanged. Ordinary
 release packaging must use the documented app overlay onto the existing engine
@@ -256,8 +261,8 @@ image, with the Bookworm-compatible compiled binary; rebuilding model layers is
 not part of native interface qualification.
 
 The unconditional Docling CI job builds only `native-contract` and
-`omission-contract`, using the actual HTTP/isolation/worker source and a fixed
-synthetic converter. It checks default Python exec, native warm-worker reuse,
+`omission-contract`, using the native server, the actual worker and a fixed
+synthetic converter. It checks the native owner by default and when set, warm-worker reuse,
 generic conversion errors, full/half-close cancellation, temporary-file cleanup,
 nonroot/read-only/network-none/resource isolation, and specific feature omission.
 The Rust host guards run from `self/docling` so they inspect the actual PR
@@ -268,5 +273,4 @@ the interface and supervisor, not production ML extraction accuracy.
 Native admission is deliberately bounded: 25 MiB input, 200-byte document names,
 32 MiB framed output, one conversion and eight admitted connections. Existing
 Rust worker/oracle tests cover output/depth/deadline limits and the stricter
-refusal boundaries. Production Python remains the default until a separately
-reviewed deployment selects native HTTP.
+refusal boundaries.
