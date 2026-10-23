@@ -443,7 +443,7 @@ class CorpusStore:
         # Existing journals/corpora are not migrated. Persist the decision with
         # the exchange so partial scaffold writes are retried after a crash.
         scaffold = not self.journal.has_exchange() and not self.list_months()
-        self.journal.enqueue(
+        exchange_jid = self.journal.enqueue(
             "exchange",
             {
                 "scaffold": scaffold,
@@ -464,6 +464,10 @@ class CorpusStore:
                 {"month": self.month_filename(day), "label": self.month_label(day)},
             )
         self.apply_pending()
+        if self._corpus_write_impl == "rust" and not self.journal.is_applied(exchange_jid):
+            raise native_write.NativeWriteUnavailable(
+                "Diary exchange is pending; the save outcome is uncertain until journal replay"
+            )
         return xid
 
     @serialized

@@ -1636,8 +1636,13 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         # remote writes, reindex) can take minutes, so it stays inside the
         # stream, where keep-alives cover it, exactly as before.
         st = await run_in_threadpool(_tenant_state, request, recover=False)
+        try:
+            await run_in_threadpool(st.store.require_write_transform)
+        except NativeWriteUnavailable:
+            return JSONResponse({"error": {"message": "diary write transform unavailable", "type": "api_error"}}, status_code=503)
         def work(emit):
             _recover_state(st)
+            st.store.require_write_transform()
             sess = _session(session_id, tenant_id)
             if prior and not sess["turns"]:
                 sess["turns"].extend(prior)
@@ -1646,6 +1651,10 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         return exchange_stream(work)
     # Tenant recovery does remote writes and embeddings: never on the event loop (#805).
     st = await run_in_threadpool(_tenant_state, request)
+    try:
+        await run_in_threadpool(st.store.require_write_transform)
+    except NativeWriteUnavailable:
+        return JSONResponse({"error": {"message": "diary write transform unavailable", "type": "api_error"}}, status_code=503)
     sess = _session(session_id, tenant_id)
     if prior and not sess["turns"]:
         sess["turns"].extend(prior)  # seed short client-thread context

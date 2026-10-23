@@ -1,5 +1,6 @@
 """Opt-in native write transport and journal semantics; synthetic backend only."""
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+import uuid
 from pathlib import Path
 import os
 import stat
@@ -109,8 +110,10 @@ def test_outage_after_enqueue_remains_pending_past_twenty_attempts(tmp_path, rus
             raise native.NativeWriteUnavailable("synthetic child failure")
         return original(op, **fields)
     monkeypatch.setattr(native, "transform", fail_apply)
-    xid = st.log_exchange(DAY, "topic", "me", "assistant", now=datetime(2026, 10, 23, 14, 32))
-    assert xid and st.journal.pending_count() >= 1
+    xid = "fa2b8150-24d1-45a0-ae21-bbe06834fa2b"
+    with pytest.raises(native.NativeWriteUnavailable, match="pending"):
+        st.log_exchange(DAY, "topic", "me", "assistant", now=datetime(2026, 10, 23, 14, 32), xid=xid)
+    assert st.journal.pending_count() >= 1
     assert st.document_path(DAY) not in backend.files
     for _ in range(25):
         st.apply_pending(force=True)
@@ -120,6 +123,40 @@ def test_outage_after_enqueue_remains_pending_past_twenty_attempts(tmp_path, rus
     st.apply_pending(force=True)
     assert fmt.has_marker(st.read_month(DAY)[0], xid)
     assert st.journal.pending_count() == 0
+
+
+def test_direct_append_native_fault_after_enqueue_returns_503(client, rust, monkeypatch):
+    from agent import app as appmod
+    original = native.transform
+    def fail_apply(op, **fields):
+        if op == "apply_append":
+            raise native.NativeWriteUnavailable("synthetic child failure")
+        return original(op, **fields)
+    monkeypatch.setattr(native, "transform", fail_apply)
+    request_id = str(uuid.uuid4())
+    response = client.post("/api/entries/append", json={"text": "synthetic approved note", "requestId": request_id,
+                                                         "entryTime": datetime.now(timezone.utc).astimezone().isoformat()})
+    assert response.status_code == 503 and "pending" in response.json()["error"]
+    st = next(iter(appmod._tenant_states.values()))
+    assert st.journal.pending_count() >= 1
+    text, _ = st.store.read_month(datetime.now().date())
+    assert text is None or not fmt.has_marker(text, request_id)
+
+
+def test_chat_native_fault_after_enqueue_returns_503_without_new_history(client, rust, monkeypatch):
+    from agent import app as appmod
+    original = native.transform
+    def fail_apply(op, **fields):
+        if op == "apply_append":
+            raise native.NativeWriteUnavailable("synthetic child failure")
+        return original(op, **fields)
+    monkeypatch.setattr(native, "transform", fail_apply)
+    response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "synthetic question"}],
+                                                           "session_id": "native-pending"})
+    assert response.status_code == 503
+    st = next(iter(appmod._tenant_states.values()))
+    assert st.journal.pending_count() >= 1
+    assert all(not item["turns"] for item in appmod.SESSIONS.values())
 
 
 def test_native_edit_preflight_outage_does_not_enqueue(tmp_path, rust, monkeypatch):
@@ -168,6 +205,10 @@ def test_unavailable_native_refuses_before_model_and_history(client, monkeypatch
     def no_model(*args, **kwargs):
         pytest.fail("model ran while native write was unavailable")
     monkeypatch.setattr(editing._StubMain, "chat", no_model)
-    response = client.post("/v1/chat/completions", json={"messages":[{"role":"user","content":"synthetic"}], "session_id":"native-fault"})
+    response = client.post("/v1/chat/completions", json={"messages": [
+        {"role": "user", "content": "synthetic earlier"},
+        {"role": "assistant", "content": "synthetic answer"},
+        {"role": "user", "content": "synthetic now"},
+    ], "session_id": "native-fault"})
     assert response.status_code == 503
-    assert all(not item["turns"] for item in appmod.SESSIONS.values())
+    assert not appmod.SESSIONS
