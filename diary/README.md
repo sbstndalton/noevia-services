@@ -312,3 +312,41 @@ storage headers, over-long fields (the tenant ids web signs are UUIDs). A `secre
 mismatch (400), a non-ASCII one no longer an error. The key and headers reach the child on stdin only, with a
 `PATH`-only environment. With `DIARY_TENANT_KEY` set and no usable binary the service logs an error at start and
 refuses every tenant request. `TENANT_ASSERTION_BIN` overrides the binary path (tests).
+
+### Opt-in native managed ZIP import transaction
+
+The default import APPLY implementation remains Python. Explicit
+`WORKSPACE_IMPORT_APPLY_IMPL=rust` selects the fixed installed
+`/usr/local/bin/diary-workspace-import-apply apply-v1` transaction CLI from
+noevia-rs#311; this source-only adapter does not build/install that binary, change
+an image pin or activate the selector. Missing/incompatible native binaries fail
+closed. There is no environment-selected executable or Python mutation fallback.
+
+Python preview and review validation finish their SQLite contexts before spawning
+Rust. `ManagedCorpusBackend.close()` is a no-op and is not used for this purpose.
+The application keeps its existing store write/migration/journal exclusions until
+the child exits and is reaped. Rust receives the original ZIP, reviewed fingerprint,
+normalized destination and the backend-derived database path/tenant/debounce;
+verified source application belongs to its single SQLite transaction.
+
+The versioned IPC caps metadata at 1 MiB, original ZIP at the existing 272 MiB
+limit, and stdout/stderr at 4096 bytes each. Browser uploads retain their 32 MiB
+limit. Nonblocking pipes concurrently feed input and drain output under a
+120-second monotonic deadline; faults kill/reap only the owned child. Responses
+require exact fields, version, destination/count, EOF and successful exit.
+Child output and private paths/bytes are never logged.
+
+Preview validation remains HTTP 400; APPLY validation/conflicts remain 409.
+Native unavailability and uncertain outcomes return 503 without draining the
+index outbox or claiming success. An uncertain outcome clears the recovery flag
+because a receipt/outbox may already have committed. Retry the same archive,
+destination and reviewed fingerprint: the durable receipt makes that retry
+idempotent. Normal later recovery transfers/indexes pending outbox entries; the
+import itself never invokes a model.
+
+Synthetic tests in `tests/test_workspace_import_native.py` use the reviewed Rust
+binary when `WORKSPACE_IMPORT_APPLY_TEST_BIN` is supplied to pytest. That variable
+is test-only and never changes production executable selection. The tests cover
+transaction closure, locks through reap, tenant/deleted/replaced databases,
+rollback, lost replies/idempotent retry, bounded child failures, HTTP status and
+exactly-once later outbox transfer. No real Diary data is required.
