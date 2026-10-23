@@ -52,6 +52,7 @@ from pydantic import BaseModel
 from . import corpus as fmt
 from .config import load_config
 from .context import ContextAssembler, completed_exchanges
+from .temporal_native import TemporalUnavailable, UNAVAILABLE_TEXT as TEMPORAL_UNAVAILABLE_TEXT
 from .deadline import ExchangeBudget, ExchangeTimeout
 from .corpus_store import MONTH_ID_RE, CorpusError, CorpusStore, EditConflict
 from .external_sources import (
@@ -1652,6 +1653,9 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day, True, optional_reference(body), **trace_kw)
     except HTTPException:
         raise
+    except TemporalUnavailable:
+        return JSONResponse({"error": {"message": TEMPORAL_UNAVAILABLE_TEXT, "type": "api_error",
+                                       "code": "context_unavailable"}}, status_code=503)
     except ExchangeTimeout as exc:
         # #127: a deadline is told apart from a failure by its code. The status stays 502, the one every
         # caller already handles for a failed exchange.
@@ -1840,6 +1844,9 @@ def local_exchange(body: dict, request: Request):
         return exchange_stream(work)
     try:
         return work()
+    except TemporalUnavailable:
+        return JSONResponse({"error": TEMPORAL_UNAVAILABLE_TEXT, "detail": TEMPORAL_UNAVAILABLE_TEXT,
+                             "code": "contextUnavailable", "saved": False}, status_code=503)
     except ExchangeTimeout as exc:
         # #1505: a stalled model is a coded failure the caller can act on, not a bare 500.
         if not exc.nothing_saved:

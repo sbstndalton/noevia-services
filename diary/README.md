@@ -218,6 +218,10 @@ note says the list may be incomplete.
 A short note opens the retrieved block. Messages without a name or anchor are unaffected, and
 `retrieval.entity_focus: false` turns the check off.
 
+`DIARY_TEMPORAL_FOCUS_IMPL=rust` opts the date-anchor and candidate cutoff within that check into the pinned `diary-temporal-cli` binary at `/usr/local/bin/diary-temporal-cli`. The default remains Python. The service passes the one validated native anchor to both pool selection and post-search cutoff; content/name matching remains in Python. Native capacity, protocol, process, or missing-binary failures make the exchange context unavailable before model delivery or saving, with no Python fallback. The Rust binary must be supplied and pinned separately before the selector is enabled. This adapter does not change images, pins, or runtime selection.
+
+
+
 ## Score gap (services#114)
 
 A fixed `top_k` loads eight entries even when one or two are relevant. When the message names no entity (and is
