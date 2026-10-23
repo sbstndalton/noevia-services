@@ -1481,6 +1481,9 @@ async def api_workspace_import(request: Request):
                     result['indexPending'] = True
                 return JSONResponse(result, headers={'Cache-Control': 'no-store'})
             except ValueError as exc:
+                from .workspace_decode import DecodeUnavailable
+                if isinstance(exc, DecodeUnavailable):
+                    raise HTTPException(503, str(exc))
                 raise HTTPException(409 if action == 'apply' else 400, str(exc))
     return await run_in_threadpool(perform)
 

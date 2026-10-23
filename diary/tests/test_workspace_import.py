@@ -133,3 +133,34 @@ def test_http_preview_apply_scope_pending_and_no_inference(volume, monkeypatch, 
     assert client.post(url + 'invalid', content=body, headers=headers).status_code == 400
     monkeypatch.setattr(appmod, 'check_auth', lambda r: False)
     assert client.post(url + 'preview', content=body, headers=headers).status_code == 401
+
+
+def test_native_verifier_unavailable_returns_503_without_import_writes(volume, setup, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    import agent.app as appmod
+    from agent import workspace_decode as wd
+    from tests.test_dedicated_storage import request
+
+    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_IMPL', 'rust')
+    monkeypatch.setattr(wd, 'DEFAULT_BIN', str(tmp_path / 'missing-decoder'))
+    monkeypatch.setattr(appmod, '_reindex_dirty', lambda st: pytest.fail('Import must not call embeddings'))
+    state = appmod._tenant_state(request(B), recover=False)
+    with state.managed.db() as db:
+        before = (state.managed.meta(db, 'generation'),
+                  db.execute('SELECT count(*) FROM files').fetchone()[0],
+                  db.execute('SELECT count(*) FROM directories').fetchone()[0],
+                  db.execute('SELECT count(*) FROM workspace_imports').fetchone()[0],
+                  db.execute('SELECT count(*) FROM workspace_index_outbox').fetchone()[0])
+    client = TestClient(appmod.app)
+    headers = {'X-Cowork-User-ID': B, 'Content-Type': 'application/zip'}
+    url = '/api/workspace-import?name=Synthetic&action='
+    for action in ('preview', 'apply&fingerprint=' + '0' * 64):
+        response = client.post(url + action, content=setup[1], headers=headers)
+        assert response.status_code == 503, response.text
+    with state.managed.db() as db:
+        after = (state.managed.meta(db, 'generation'),
+                 db.execute('SELECT count(*) FROM files').fetchone()[0],
+                 db.execute('SELECT count(*) FROM directories').fetchone()[0],
+                 db.execute('SELECT count(*) FROM workspace_imports').fetchone()[0],
+                 db.execute('SELECT count(*) FROM workspace_index_outbox').fetchone()[0])
+    assert before == after
