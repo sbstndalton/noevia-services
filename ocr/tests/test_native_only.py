@@ -48,7 +48,11 @@ def test_no_stage_ships_retired_files_or_fixes_a_selector():
 
 
 def test_ci_tests_the_native_server_against_the_pinned_oracle_not_this_tree():
-    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    # This checkout, or (in CI's noevia-shaped workspace, which omits .github) the raw `self` one.
+    candidates = [ROOT, ROOT.parent.parent / "self"]
+    found = [c / ".github" / "workflows" / "ci.yml" for c in candidates if (c / ".github" / "workflows" / "ci.yml").is_file()]
+    assert found, candidates
+    workflow = found[0].read_text()
     assert "NOEVIA_OCR_REFERENCE: ${{ runner.temp }}/ocr-oracle/ocr" in workflow
     assert "NOEVIA_OCR_REFERENCE: ${{ github.workspace }}/ws/services/ocr" not in workflow
     assert "tar.gz/bbed9b8a5af9f66ea3133fd8ee5495013d11d6c7" in workflow
