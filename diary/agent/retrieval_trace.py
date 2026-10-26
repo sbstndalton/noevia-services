@@ -103,7 +103,7 @@ class RetrievalTrace:
             "superseded_labelled": len(focus.corrected_by),
         }
 
-    def set_score_gap(self, gap, applied: bool, best, removed) -> None:
+    def set_score_gap(self, gap, applied: bool, best, removed, *, diagnostics=None) -> None:
         """Stage 1c (services#114). Entry refs and scores only."""
         self.data["score_gap"] = {
             "gap": None if gap is None else float(gap),
@@ -111,6 +111,9 @@ class RetrievalTrace:
             "best": best,
             "removed": [{"vector_rank": rank, **self._ref(row), "score": row.get("score")} for rank, row in removed],
         }
+
+        if diagnostics:
+            self.data["score_gap"].update(diagnostics)
 
     def add_loaded(self, row: dict, tokens: int, chars: int) -> None:
         self.data["loaded"].append({**self._ref(row), "score": row.get("score"), "tokens": tokens, "chars": chars})
