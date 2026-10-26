@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from .deadline import ExchangeTimeout
 from .llm import EMPTY_ANSWER_TEXT, LENGTH_CAP_TEXT, EmptyAnswerError, LengthCapError
+from .temporal_native import TemporalUnavailable, UNAVAILABLE_TEXT as TEMPORAL_UNAVAILABLE_TEXT
 
 log = logging.getLogger("diary.streaming")
 
@@ -49,6 +50,9 @@ def exchange_stream(work):
             result = work(emit)
             emit({"type": "diary", **result})
             emit({"type": "done"})
+        except TemporalUnavailable:
+            emit({"type": "error", "code": "contextUnavailable", "saved": False,
+                  "text": TEMPORAL_UNAVAILABLE_TEXT})
         except ExchangeTimeout as exc:
             log.error("Diary exchange failed: %s", describe_failure(exc))
             if exc.nothing_saved:
