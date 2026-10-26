@@ -69,6 +69,69 @@ def snapshot(target):
                 for table in ('files', 'directories', 'meta', 'workspace_imports', 'workspace_index_outbox')}
 
 
+@pytest.mark.parametrize('failure', ['constructor', 'spawn', 'register', 'cancel', 'wait'])
+def test_whole_child_lifetime_cleanup_and_uncertainty(bundle, tmp_path, monkeypatch, caplog, failure):
+    monkeypatch.setenv('WORKSPACE_IMPORT_APPLY_IMPL', 'rust')
+    monkeypatch.setattr(native, 'DEFAULT_BIN', str(fake(tmp_path, 'import sys\nsys.stdin.buffer.read()\n')))
+    before = snapshot(bundle[0])
+    processes, selectors_seen = [], []
+    popen = native.subprocess.Popen
+    selector_type = native.selectors.DefaultSelector
+
+    class TrackedSelector(selector_type):
+        def __init__(self):
+            if failure == 'constructor':
+                raise RuntimeError('private setup detail')
+            super().__init__()
+            self.closed_seen = False
+            selectors_seen.append(self)
+
+        def register(self, *args, **kwargs):
+            if failure == 'register':
+                raise RuntimeError('private setup detail')
+            return super().register(*args, **kwargs)
+
+        def select(self, *args, **kwargs):
+            if failure == 'cancel':
+                raise KeyboardInterrupt('private cancellation detail')
+            return super().select(*args, **kwargs)
+
+        def close(self):
+            self.closed_seen = True
+            return super().close()
+
+    def tracked_spawn(*args, **kwargs):
+        if failure == 'spawn':
+            raise OSError('private spawn detail')
+        child = popen(*args, **kwargs)
+        processes.append(child)
+        if failure == 'wait':
+            wait = child.wait
+
+            def completed_wait(*args, **kwargs):
+                wait(*args, **kwargs)
+                raise RuntimeError('private wait detail')
+
+            child.wait = completed_wait
+        return child
+
+    monkeypatch.setattr(native.selectors, 'DefaultSelector', TrackedSelector)
+    monkeypatch.setattr(native.subprocess, 'Popen', tracked_spawn)
+    expected = KeyboardInterrupt if failure == 'cancel' else (
+        native.ImportUnavailable if failure in ('constructor', 'spawn') else native.ImportUncertain)
+    with pytest.raises(expected) as raised:
+        apply(bundle)
+    assert type(raised.value) is expected
+    assert len(processes) == (0 if failure in ('constructor', 'spawn') else 1)
+    assert len(selectors_seen) == (0 if failure == 'constructor' else 1)
+    for child in processes:
+        assert child.returncode is not None
+        assert all(stream.closed for stream in (child.stdin, child.stdout, child.stderr))
+    assert all(selector.closed_seen for selector in selectors_seen)
+    assert snapshot(bundle[0]) == before
+    assert 'private' not in caplog.text
+
+
 def test_default_and_invalid_selection_never_spawn(bundle, monkeypatch):
     monkeypatch.setattr(native.subprocess, 'Popen', lambda *a, **k: pytest.fail('native child spawned'))
     assert imports.impl_choice() == 'python'
@@ -270,6 +333,70 @@ def test_http_auth_lock_scope_statuses_and_no_drain_on_failure(volume, bundle, b
     assert client.post(url, content=body, headers=headers).json()['alreadyApplied']
     monkeypatch.setattr(app, 'check_auth', lambda _: False)
     assert client.post(url, content=body, headers=headers).status_code == 401
+
+
+def test_caller_cancellation_marks_recovery_after_reap_under_locks(volume, bundle, tmp_path, monkeypatch):
+    import asyncio
+    import agent.app as app
+    from agent import managed_storage
+    from starlette.requests import Request
+    from tests.test_dedicated_storage import request
+
+    body = bundle[1]
+    state = app._tenant_state(request(B), recover=False)
+    state.recovered = True
+    monkeypatch.setenv('WORKSPACE_IMPORT_APPLY_IMPL', 'rust')
+    monkeypatch.setattr(native, 'DEFAULT_BIN', str(fake(tmp_path, 'import time\ntime.sleep(30)\n')))
+    monkeypatch.setattr(imports, 'drain_index_outbox', lambda *a: pytest.fail('drain on cancellation'))
+    processes, waits = [], []
+    popen = native.subprocess.Popen
+    selector_type = native.selectors.DefaultSelector
+
+    class CancelledSelector(selector_type):
+        def select(self, *args, **kwargs):
+            raise KeyboardInterrupt('synthetic cancellation')
+
+    def tracked_spawn(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        processes.append(child)
+        wait = child.wait
+
+        def tracked_wait(*args, **kwargs):
+            assert state.store._write_lock._is_owned()
+            assert managed_storage._migration_depth.paths[str(state.managed.root)] > 0
+            waits.append(True)
+            return wait(*args, **kwargs)
+
+        child.wait = tracked_wait
+        return child
+
+    async def inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    async def receive():
+        return {'type': 'http.request', 'body': body, 'more_body': False}
+
+    scope = dict(request(B).scope)
+    scope['method'] = 'POST'
+    scope['path'] = '/api/workspace-import'
+    reviewed = imports.fingerprint(body, 'Imports/Copy')
+    scope['query_string'] = f'action=apply&name=Copy&fingerprint={reviewed}'.encode()
+    monkeypatch.setattr(app, 'run_in_threadpool', inline)
+    monkeypatch.setattr(native.subprocess, 'Popen', tracked_spawn)
+
+    async def invoke():
+        # Construct asyncio's own selector before injecting the native fault.
+        monkeypatch.setattr(native.selectors, 'DefaultSelector', CancelledSelector)
+        return await app.api_workspace_import(Request(scope, receive))
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(invoke())
+    assert waits and len(processes) == 1
+    assert processes[0].returncode is not None
+    assert all(stream.closed for stream in (processes[0].stdin, processes[0].stdout, processes[0].stderr))
+    assert not state.recovered
+    assert not state.store._write_lock._is_owned()
+    assert not managed_storage._migration_depth.paths.get(str(state.managed.root), 0)
 
 
 def test_http_real_uncertain_commit_and_later_recovery_exactly_once(volume, bundle, binary, tmp_path, monkeypatch):

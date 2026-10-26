@@ -109,16 +109,6 @@ def apply_native(backend, body, report):
     binary = DEFAULT_BIN
     if not (os.path.isabs(binary) and os.path.isfile(binary) and os.access(binary, os.X_OK)):
         raise _fault('missing_binary', uncertain=False)
-    selector = None
-    try:
-        selector = selectors.DefaultSelector()
-        child = subprocess.Popen([binary, 'apply-v1'], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-                                 close_fds=True, env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
-    except OSError:
-        if selector is not None:
-            selector.close()
-        raise _fault('spawn', uncertain=False) from None
     segments = [memoryview(part) for part in (
         MAGIC, struct.pack('<I', len(metadata)), metadata,
         struct.pack('<Q', len(body)), body)]
@@ -129,6 +119,9 @@ def apply_native(backend, body, report):
     input_error = False
     fault = None
     deadline = time.monotonic() + TIMEOUT_S
+    selector = None
+    child = None
+    code = None
 
     def close(stream):
         try:
@@ -138,6 +131,10 @@ def apply_native(backend, body, report):
         stream.close()
 
     try:
+        selector = selectors.DefaultSelector()
+        child = subprocess.Popen([binary, 'apply-v1'], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+                                 close_fds=True, env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
         for stream, kind, event in ((child.stdin, 'input', selectors.EVENT_WRITE),
                                     (child.stdout, 'output', selectors.EVENT_READ),
                                     (child.stderr, 'error', selectors.EVENT_READ)):
@@ -188,21 +185,39 @@ def apply_native(backend, body, report):
                         break
             if fault:
                 break
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         fault = 'io'
     finally:
-        if child.poll() is None:
+        # Cover selector construction, spawn and setup, as well as caller
+        # cancellation during IO. No caller can observe success before reap.
+        try:
+            if child is not None:
+                try:
+                    if child.poll() is None:
+                        try:
+                            child.kill()  # Only this owned direct child.
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    code = child.wait()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            fault = fault or 'cleanup'
+        finally:
             try:
-                child.kill()  # Only this owned process; no group/other-runtime action.
-            except ProcessLookupError:
-                pass
-        code = child.wait()
-        for stream in (child.stdin, child.stdout, child.stderr):
-            if not stream.closed:
-                stream.close()
-        selector.close()
+                if child is not None:
+                    for stream in (child.stdin, child.stdout, child.stderr):
+                        try:
+                            stream.close()
+                        except (OSError, ValueError, RuntimeError):
+                            fault = fault or 'cleanup'
+            finally:
+                if selector is not None:
+                    try:
+                        selector.close()
+                    except (OSError, ValueError, RuntimeError):
+                        fault = fault or 'cleanup'
     if time.monotonic() >= deadline:
         fault = fault or 'timeout'
     if fault or not fed or input_error or stderr_bytes:
-        raise _fault(fault or 'input_or_stderr')
+        raise _fault(fault or 'input_or_stderr', uncertain=child is not None)
     return _response(code, bytes(output), report)

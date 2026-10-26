@@ -1490,6 +1490,13 @@ async def api_workspace_import(request: Request):
                 raise HTTPException(503, str(exc))
             except ValueError as exc:
                 raise HTTPException(409 if action == 'apply' else 400, str(exc))
+            except BaseException:
+                # Cancellation or an unexpected failure may follow COMMIT. The
+                # native adapter reaps before unwinding these locks; leave any
+                # receipt/outbox for ordinary recovery, without draining here.
+                if action == 'apply':
+                    st.recovered = False
+                raise
     return await run_in_threadpool(perform)
 
 
