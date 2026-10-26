@@ -157,6 +157,13 @@ def test_success_frame_requires_exit_zero(child):
         native.archive({}, [], [], [])
 
 
+def test_success_frame_requires_empty_stderr(child, caplog):
+    child(f"import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write({frame(b'archive')!r}); sys.stderr.write('private-child-detail')")
+    with pytest.raises(ValueError, match='Workspace export could not'):
+        native.archive({}, [], [], [])
+    assert 'private-child-detail' not in caplog.text
+
+
 def test_success_frame_requires_eof_and_exit(child, monkeypatch):
     monkeypatch.setattr(native, 'TIMEOUT', .15)
     child(f"import sys, time; sys.stdin.buffer.read(); sys.stdout.buffer.write({frame(b'archive')!r}); sys.stdout.flush(); time.sleep(30)")

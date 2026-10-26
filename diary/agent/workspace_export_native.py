@@ -94,7 +94,7 @@ def archive(settings, directories, files, bodies):
                         if len(target) > (limit if stream is process.stdout else 4096):
                             raise ValueError(ERROR)
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or process.wait(timeout=remaining) != 0:
+            if remaining <= 0 or process.wait(timeout=remaining) != 0 or stderr:
                 raise ValueError(ERROR)
         header_size = len(OUTPUT_MAGIC) + 8 + 32
         if len(output) < header_size + len(OUTPUT_END) or not output.startswith(OUTPUT_MAGIC):
