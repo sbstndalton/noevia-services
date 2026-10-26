@@ -67,6 +67,101 @@ def test_actual_cli_python312_anchor_and_cutoff_fixtures(monkeypatch):
     assert native.cutoff(None, ROWS) == ([1, 2], [])
 
 
+@pytest.mark.parametrize('failure', ['constructor', 'spawn', 'blocking', 'register',
+                                      'cancel', 'wait', 'selector_close'])
+def test_complete_child_lifetime_cleanup(tmp_path, monkeypatch, caplog, failure):
+    payload = frame({'version': 1, 'op': 'anchor', 'anchor': None})
+    use(monkeypatch, emitting(tmp_path, payload))
+    processes, selectors_seen = [], []
+    popen = native.subprocess.Popen
+    selector_type = native.selectors.DefaultSelector
+    set_blocking = native.os.set_blocking
+
+    class TrackedSelector(selector_type):
+        def __init__(self):
+            if failure == 'constructor':
+                raise RuntimeError('private constructor detail')
+            super().__init__()
+            self.closed_seen = False
+            selectors_seen.append(self)
+
+        def register(self, *args, **kwargs):
+            if failure == 'register':
+                raise RuntimeError('private register detail')
+            return super().register(*args, **kwargs)
+
+        def select(self, *args, **kwargs):
+            if failure == 'cancel':
+                raise KeyboardInterrupt('private cancellation detail')
+            return super().select(*args, **kwargs)
+
+        def close(self):
+            self.closed_seen = True
+            result = super().close()
+            if failure == 'selector_close':
+                raise RuntimeError('private selector close detail')
+            return result
+
+    def tracked_spawn(*args, **kwargs):
+        if failure == 'spawn':
+            raise OSError('private spawn detail')
+        child = popen(*args, **kwargs)
+        processes.append(child)
+        if failure == 'wait':
+            wait = child.wait
+
+            def completed_wait(*args, **kwargs):
+                wait(*args, **kwargs)
+                raise RuntimeError('private wait detail')
+
+            child.wait = completed_wait
+        return child
+
+    def tracked_blocking(*args, **kwargs):
+        if failure == 'blocking':
+            raise RuntimeError('private setup detail')
+        return set_blocking(*args, **kwargs)
+
+    monkeypatch.setattr(native.selectors, 'DefaultSelector', TrackedSelector)
+    monkeypatch.setattr(native.subprocess, 'Popen', tracked_spawn)
+    monkeypatch.setattr(native.os, 'set_blocking', tracked_blocking)
+    expected = KeyboardInterrupt if failure == 'cancel' else native.TemporalUnavailable
+    with pytest.raises(expected) as raised:
+        native.anchor('No dated question.')
+    assert type(raised.value) is expected
+    assert len(processes) == (0 if failure in ('constructor', 'spawn') else 1)
+    assert len(selectors_seen) == (0 if failure == 'constructor' else 1)
+    for child in processes:
+        assert child.returncode is not None
+        assert all(stream.closed for stream in (child.stdin, child.stdout, child.stderr))
+    assert all(selector.closed_seen for selector in selectors_seen)
+    assert 'private' not in caplog.text
+    if failure != 'cancel':
+        assert 'private' not in str(raised.value)
+
+
+@pytest.mark.skipif(not REAL_BIN, reason='paired Rust CLI binary required')
+def test_actual_cli_corrected_date_and_unicode_edges(monkeypatch):
+    use(monkeypatch, REAL_BIN)
+    for query in [
+            'Dr\u0345. Before January 20, 2030, what?',
+            'Sept\u0345. Before January 20, 2030, what?',
+            'Dr. Before January 20, 2030, what?',
+            'As of January \U00010d42\U00010d40, 2030, what happened?']:
+        assert native.anchor(query) == entity_focus.time_anchor(query)
+    rows = [{'day': day} for day in ['2030-1-20', '+10000-01-01', '9999-W52-7',
+                                    '2030W011', '2030-W01-1', '0000-01-01',
+                                    '2030-01-20', '2024-02-29', ' 2030-01-20']]
+    kept, removed = [], []
+    for rank, row in enumerate(rows, 1):
+        try:
+            day = date.fromisoformat(row['day'])
+        except ValueError:
+            day = None
+        (removed if day is not None and day > ANCHOR[0] else kept).append(rank)
+    assert native.cutoff(ANCHOR, rows) == (kept, removed)
+
+
 @pytest.mark.parametrize('damage', ['truncated', 'magic', 'length', 'version', 'extra', 'nonzero',
                                      'wrong_anchor', 'wrong_rank', 'duplicate_rank', 'duplicate_key', 'stderr',
                                      'overflow', 'timeout'])

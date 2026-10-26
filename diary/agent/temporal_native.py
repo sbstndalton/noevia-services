@@ -110,21 +110,15 @@ def _call(request):
     binary = DEFAULT_BIN
     if not (os.path.isabs(binary) and os.path.isfile(binary) and os.access(binary, os.X_OK)):
         raise _fault('missing_binary')
-    try:
-        selector = selectors.DefaultSelector()
-        proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, bufsize=0, close_fds=True,
-                                env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
-    except OSError:
-        if 'selector' in locals():
-            selector.close()
-        raise _fault('spawn') from None
     output = bytearray()
     stderr_bytes = 0
     offset = 0
     fed = False
     fault = None
     deadline = time.monotonic() + TIMEOUT_S
+    selector = None
+    proc = None
+    code = None
 
     def close(stream):
         try:
@@ -134,6 +128,10 @@ def _call(request):
         stream.close()
 
     try:
+        selector = selectors.DefaultSelector()
+        proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=0, close_fds=True,
+                                env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
         for stream, event, kind in ((proc.stdin, selectors.EVENT_WRITE, 'input'),
                                     (proc.stdout, selectors.EVENT_READ, 'output'),
                                     (proc.stderr, selectors.EVENT_READ, 'error')):
@@ -177,19 +175,37 @@ def _call(request):
                     break
             if fault:
                 break
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         fault = 'io'
     finally:
-        if proc.poll() is None:
+        # Own the complete selector/spawn/setup/IO lifetime. Cancellation must
+        # reap this fixed direct child before it can leave the transport.
+        try:
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    code = proc.wait()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            fault = fault or 'cleanup'
+        finally:
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        code = proc.wait()
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            if not stream.closed:
-                stream.close()
-        selector.close()
+                if proc is not None:
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        try:
+                            stream.close()
+                        except (OSError, ValueError, RuntimeError):
+                            fault = fault or 'cleanup'
+            finally:
+                if selector is not None:
+                    try:
+                        selector.close()
+                    except (OSError, ValueError, RuntimeError):
+                        fault = fault or 'cleanup'
     if fault or not fed or time.monotonic() >= deadline:
         raise _fault(fault or 'transport', capacity=fault == 'output_overflow')
     if code != 0:
