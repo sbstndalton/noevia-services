@@ -1,31 +1,29 @@
-"""WORKSPACE_RESTORE_VERIFY_IMPL switch (noevia#982): python stays the default and never spawns
-anything; rust runs the Rust leaf first, then Python, requires identical listings and fails closed
-on every fault; the archive reaches the child on stdin only, with a minimal environment.
-
-Fake `workspace-restore-verify` binaries stand in for the Rust leaf here; the real binary is
-exercised by test_workspace_restore_differential.py when WORKSPACE_RESTORE_VERIFY_BIN is set.
-Synthetic archives only."""
+"""Synthetic decode-v1 adapter checks, including adversarial child processes."""
 import hashlib
 import json
 import logging
+import os
+from pathlib import Path
+import struct
 import sys
 import time
 
 import pytest
 
+from agent import workspace_decode as wd
 from agent import workspace_restore as wr
 from agent.managed_storage import ManagedCorpusBackend
 from agent.workspace_export import archive
 from tests.test_dedicated_storage import B
 
-NOTE = b'# Synthetic switch note\n'
+REAL_BIN = os.environ.get('WORKSPACE_RESTORE_VERIFY_BIN')
 
 
 @pytest.fixture(autouse=True)
 def clean(monkeypatch):
     wr._logged.clear()
-    for k in ('WORKSPACE_RESTORE_VERIFY_IMPL', 'WORKSPACE_RESTORE_VERIFY_BIN'):
-        monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv('WORKSPACE_RESTORE_VERIFY_IMPL', raising=False)
+    monkeypatch.delenv('WORKSPACE_RESTORE_VERIFY_BIN', raising=False)
     yield
     wr._logged.clear()
 
@@ -33,224 +31,309 @@ def clean(monkeypatch):
 @pytest.fixture
 def bundle(tmp_path):
     backend = ManagedCorpusBackend(tmp_path / 'source', B)
-    backend.activate({'raw/note.md': NOTE}, {}, ['empty'])
-    return archive(backend, '', {})
+    backend.activate({'raw/note.md': b'# Synthetic note\r\n', 'unicodé/empty.bin': b''}, {}, ['empty'])
+    return archive(backend, '', {'theme': 'synthetic'})
 
 
-def listing(body):
-    files, dirs, _ = wr._verify(body)
-    return wr.listing_sha256(files, dirs)
+def frame(body, edit=None):
+    files, dirs, manifest = wr._verify(body)  # Test reference, never production Rust path.
+    metadata = {'version': 1, 'fingerprint': hashlib.sha256(body).hexdigest(),
+                'listingSha256': wr.listing_sha256(files, dirs), 'bytes': sum(map(len, files.values())),
+                'settings': manifest.get('settings', {}),
+                'files': [{'path': p, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                          for p, data in sorted(files.items())],
+                'directories': sorted(dirs)}
+    if edit:
+        edit(metadata)
+    raw = json.dumps(metadata, ensure_ascii=False).encode()
+    payload = b''.join(struct.pack('<Q', len(files[row['path']])) + files[row['path']]
+                       for row in metadata['files'] if row['path'] in files)
+    return wd.MAGIC + struct.pack('<I', len(raw)) + raw + payload + wd.END
 
 
-def fake(tmp_path, body, name='workspace-restore-verify'):
-    """An executable that records argv, env and the stdin digest, then runs `body` (Python)."""
-    path = tmp_path / name
-    record = tmp_path / f'{name}.json'
-    path.write_text(f'#!{sys.executable}\n'
-                    'import hashlib, json, os, sys\n'
-                    'data = sys.stdin.buffer.read()\n'
-                    f'open({str(record)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ), '
-                    '"stdin_sha256": hashlib.sha256(data).hexdigest(), "stdin_len": len(data)}))\n'
-                    + body)
+def fake(tmp_path, script):
+    path = tmp_path / 'fake-decode'
+    path.write_text(f'#!{sys.executable}\n' + script)
     path.chmod(0o755)
-    return path, record
+    return path
 
 
 def use(monkeypatch, path):
     monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_IMPL', 'rust')
-    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', str(path))
+    monkeypatch.setattr(wd, 'DEFAULT_BIN', str(path))
 
 
-def test_default_is_python_and_never_spawns(bundle, monkeypatch):
-    monkeypatch.setattr(wr.subprocess, 'Popen', lambda *a, **k: pytest.fail('spawned under python'))
-    for value in (None, '', '  ', 'python', 'PYTHON'):
-        if value is None:
-            monkeypatch.delenv('WORKSPACE_RESTORE_VERIFY_IMPL', raising=False)
-        else:
-            monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_IMPL', value)
-        assert wr.impl_choice() == 'python'
-        assert sorted(wr.verify(bundle)[0]) == ['raw/note.md']
+def emit(tmp_path, payload, suffix=''):
+    return fake(tmp_path, 'import os, sys\n'
+                'source = sys.stdin.buffer.read()\n'
+                f'sys.stdout.buffer.write(bytes.fromhex({payload.hex()!r}))\n'
+                f'{suffix}\n')
 
 
-def test_unknown_value_is_python_with_one_warning(monkeypatch, caplog):
-    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_IMPL', 'fortran')
-    with caplog.at_level(logging.WARNING):
-        assert wr.impl_choice() == 'python'
-        assert wr.impl_choice() == 'python'
-    assert sum('WORKSPACE_RESTORE_VERIFY_IMPL' in r.getMessage() for r in caplog.records) == 1
-
-
-@pytest.mark.parametrize('value', ['rust', 'RUST', ' rust '])
-def test_rust_values_select_rust(monkeypatch, value):
-    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_IMPL', value)
-    assert wr.impl_choice() == 'rust'
-
-
-def test_rust_accept_with_the_same_listing_accepts(bundle, tmp_path, monkeypatch):
-    path, record = fake(tmp_path, f'sys.stdout.write("accept {listing(bundle)}\\n"); sys.exit(0)\n')
-    use(monkeypatch, path)
+def test_python_default_and_explicit_rust_never_calls_python_parser(bundle, monkeypatch, tmp_path):
+    assert wr.impl_choice() == 'python'
+    assert wr.verify(bundle)[0]['raw/note.md'] == b'# Synthetic note\r\n'
+    use(monkeypatch, emit(tmp_path, frame(bundle)))
+    monkeypatch.setattr(wr, '_verify', lambda _: pytest.fail('Python ZIP parser called'))
     files, dirs, manifest = wr.verify(bundle)
-    assert files == {'raw/note.md': NOTE} and dirs == {'empty', 'raw'}
-    seen = json.loads(record.read_text())
-    assert seen['argv'] == ['verify']
-    assert seen['stdin_sha256'] == hashlib.sha256(bundle).hexdigest() and seen['stdin_len'] == len(bundle)
-    # Minimal environment: nothing of the Diary's (tokens, keys) reaches the child.
-    assert set(seen['env']) - {'PATH', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'} == set()
+    assert files['raw/note.md'] == b'# Synthetic note\r\n'
+    assert files['unicodé/empty.bin'] == b''
+    assert dirs == {'empty', 'raw', 'unicodé'}
+    assert manifest['settings'] == {'theme': 'synthetic'}
+    assert wr.preview(bundle)['fingerprint'] == hashlib.sha256(bundle).hexdigest()
 
 
-def test_listing_mismatch_fails_closed(bundle, tmp_path, monkeypatch, caplog):
-    path, _ = fake(tmp_path, 'sys.stdout.write("accept " + "0" * 64 + "\\n"); sys.exit(0)\n')
-    use(monkeypatch, path)
-    with caplog.at_level(logging.WARNING), pytest.raises(ValueError, match='unavailable'):
-        wr.verify(bundle)
-    assert any('different listings' in r.getMessage() for r in caplog.records)
+@pytest.mark.parametrize('settings', [None, False, 17, 'str', ['a'], {'nested': True}])
+def test_settings_json_value_is_preserved(tmp_path, monkeypatch, settings):
+    backend = ManagedCorpusBackend(tmp_path / 'source', B)
+    backend.activate({'a.md': b'hello'}, {}, [])
+    body = archive(backend, '', settings)
+    use(monkeypatch, emit(tmp_path, frame(body)))
+    assert wr.preview(body)['settings'] == settings
 
 
-@pytest.mark.parametrize('code', sorted(wr.MESSAGES))
-def test_rust_refusal_answers_with_pythons_message(bundle, tmp_path, monkeypatch, code):
-    path, _ = fake(tmp_path, f'sys.stdout.write("reject: {code}\\n"); sys.exit(1)\n')
-    use(monkeypatch, path)
-    with pytest.raises(ValueError) as caught:
-        wr.verify(bundle)
-    assert str(caught.value) == wr.MESSAGES[code]
-
-
-@pytest.mark.parametrize('body', [
-    'sys.exit(0)\n',                                              # accept with no output
-    'sys.stdout.write("accept\\n"); sys.exit(0)\n',              # no digest
-    'sys.stdout.write("accept " + "A" * 64 + "\\n"); sys.exit(0)\n',  # not lowercase hex
-    'sys.stdout.write("reject: invalid\\n"); sys.exit(0)\n',     # refusal with exit 0
-    'sys.stdout.write("reject: no_such_code\\n"); sys.exit(1)\n',  # unknown code
-    'sys.stdout.write("accept " + "0" * 64 + "\\n"); sys.exit(1)\n',  # accept with exit 1
-    'sys.exit(2)\n',
-    'sys.exit(3)\n',
-    'import os, signal; os.kill(os.getpid(), signal.SIGKILL)\n',
+@pytest.mark.parametrize('mutation', [
+    lambda b: b'bad' + b[3:],
+    lambda b: b[:len(wd.MAGIC)] + struct.pack('<I', wd.MAX_METADATA + 1) + b[len(wd.MAGIC) + 4:],
+    lambda b: b[:-len(wd.END)],
+    lambda b: b + b'x',
+    lambda b: b[:-1] + b'X',
+    lambda b: b[:len(wd.MAGIC) + 4] + b'\xff' + b[len(wd.MAGIC) + 5:],
 ])
-def test_every_fault_fails_closed(bundle, tmp_path, monkeypatch, body):
-    path, _ = fake(tmp_path, body)
-    use(monkeypatch, path)
-    with pytest.raises(ValueError, match='unavailable|Invalid workspace archive'):
+def test_truncated_or_corrupt_frames_fail_closed(bundle, tmp_path, monkeypatch, mutation):
+    use(monkeypatch, emit(tmp_path, mutation(frame(bundle))))
+    with pytest.raises(wd.DecodeUnavailable):
         wr.verify(bundle)
 
 
-def test_missing_or_non_executable_binary_fails_closed(bundle, tmp_path, monkeypatch, caplog):
-    use(monkeypatch, tmp_path / 'absent')
-    with caplog.at_level(logging.WARNING), pytest.raises(ValueError, match='unavailable'):
-        wr.verify(bundle)
-    plain = tmp_path / 'plain'
-    plain.write_text('not executable')
-    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', str(plain))
-    with pytest.raises(ValueError, match='unavailable'):
-        wr.verify(bundle)
-    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', 'no-such-workspace-restore-verify-on-path')
-    with pytest.raises(ValueError, match='unavailable'):
-        wr.verify(bundle)
-    assert any('not found' in r.getMessage() for r in caplog.records)
-
-
-def test_default_binary_is_the_fixed_image_path(monkeypatch):
-    assert wr.DEFAULT_BIN == '/usr/local/bin/workspace-restore-verify'
-    seen = []
-    monkeypatch.setattr(wr.os.path, 'isfile', lambda p: seen.append(p) or False)
-    assert wr._rust_binary() is None
-    assert seen == [wr.DEFAULT_BIN]
-
-
-def test_timeout_kills_the_child(bundle, tmp_path, monkeypatch):
-    path, _ = fake(tmp_path, 'import time; time.sleep(30)\n')
-    use(monkeypatch, path)
-    monkeypatch.setattr(wr, 'RUST_TIMEOUT_S', 0.5)
-    started = time.monotonic()
-    with pytest.raises(ValueError, match='unavailable'):
-        wr.verify(bundle)
-    assert time.monotonic() - started < 5
-
-
-def test_endless_stdout_is_capped_and_the_child_killed(bundle, tmp_path, monkeypatch):
-    path, _ = fake(tmp_path, 'while True:\n    sys.stdout.write("x" * 65536); sys.stdout.flush()\n')
-    use(monkeypatch, path)
-    started = time.monotonic()
-    with pytest.raises(ValueError, match='unavailable'):
-        wr.verify(bundle)
-    assert time.monotonic() - started < 5
-
-
-def test_child_that_never_reads_stdin_cannot_block(tmp_path, monkeypatch):
-    big = b'\0' * (8 * 1024 * 1024)  # far past any pipe buffer
-    path = tmp_path / 'deaf'
-    path.write_text(f'#!{sys.executable}\nimport sys; sys.stdout.write("reject: invalid\\n"); sys.exit(1)\n')
-    path.chmod(0o755)
-    use(monkeypatch, path)
-    with pytest.raises(ValueError, match='Invalid workspace archive'):
-        wr.verify(big)
-
-
-def test_logs_carry_no_archive_names(tmp_path, monkeypatch, caplog):
-    backend = ManagedCorpusBackend(tmp_path / 'secret-src', B)
-    backend.activate({'Private-Name-XYZ.md': b'private synthetic'}, {}, [])
-    body = archive(backend, '', {})
-    for script in ('sys.exit(3)\n', 'sys.stdout.write("accept " + "0" * 64 + "\\n"); sys.exit(0)\n'):
-        wr._logged.clear()
-        path, _ = fake(tmp_path, script)
-        use(monkeypatch, path)
-        with caplog.at_level(logging.DEBUG), pytest.raises(ValueError):
-            wr.verify(body)
-    assert 'Private-Name-XYZ' not in caplog.text
-
-
-def test_import_and_restore_callers_fail_closed_under_rust(bundle, tmp_path, monkeypatch):
-    use(monkeypatch, tmp_path / 'absent')
-    with pytest.raises(ValueError, match='unavailable'):
+@pytest.mark.parametrize('edit', [
+    lambda m: m.update(version=2),
+    lambda m: m.update(fingerprint='0' * 64),
+    lambda m: m.update(listingSha256='0' * 64),
+    lambda m: m.update(bytes=m['bytes'] + 1),
+    lambda m: m.pop('settings'),
+    lambda m: m.update(directories=list(reversed(m['directories']))),
+    lambda m: m['files'][0].update(sha256='0' * 64),
+    lambda m: m['files'][0].update(bytes=m['files'][0]['bytes'] + 1),
+    lambda m: m['files'][0].update(path='../escape'),
+    lambda m: m['files'].append(dict(m['files'][0])),
+    lambda m: m.update(files=[]),
+    lambda m: m.update(bytes=True),
+])
+def test_bad_metadata_refuses_before_preview(bundle, tmp_path, monkeypatch, edit):
+    use(monkeypatch, emit(tmp_path, frame(bundle, edit)))
+    with pytest.raises(wd.DecodeUnavailable):
         wr.preview(bundle)
-    target = tmp_path / 'restored'
-    with pytest.raises(ValueError, match='unavailable'):
-        wr.restore(bundle, target, hashlib.sha256(bundle).hexdigest())
-    assert not target.exists()
 
 
-def test_verify_bin_override_needs_an_absolute_executable_regular_file(tmp_path, monkeypatch, caplog):
-    # #1813: a bare name is never resolved through PATH; a relative path, a directory, a non-executable
-    # file and a missing path are all ignored (default used) with ONE warning.
-    path, _ = fake(tmp_path, 'print("accept " + "0" * 64)\n')
-    bindir = tmp_path / 'bindir'
-    bindir.mkdir()
-    monkeypatch.setenv('PATH', f'{tmp_path}:{__import__("os").environ["PATH"]}')
-    seen = []
-    monkeypatch.setattr(wr.os.path, 'isfile', lambda p, _f=wr.os.path.isfile: seen.append(p) or (False if p == wr.DEFAULT_BIN else _f(p)))
-    plain = tmp_path / 'plain'
-    plain.write_text('x')
-    with caplog.at_level(logging.WARNING):
-        for bad in (path.name, f'./{path.name}', str(bindir), str(plain), str(tmp_path / 'absent')):
-            monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', bad)
-            assert wr._rust_binary() is None, bad  # default is absent here, so nothing is honoured
-    assert sum('ignoring it' in r.getMessage() for r in caplog.records) == 1
-    monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_BIN', str(path))
-    assert wr._rust_binary() == str(path)
+def test_child_refusal_and_fault_statuses(bundle, tmp_path, monkeypatch):
+    for script, expected in (
+        ('import sys\nsys.stdout.write("reject: invalid\\n")\nsys.exit(1)\n', ValueError),
+        ('import sys\nsys.stdout.write("reject: invalid\\n")\nsys.exit(0)\n', wd.DecodeUnavailable),
+        ('import sys\nsys.stdout.write("reject: unknown\\n")\nsys.exit(1)\n', wd.DecodeUnavailable),
+        ('import sys\nsys.exit(3)\n', wd.DecodeUnavailable),
+        ('import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n', wd.DecodeUnavailable),
+    ):
+        use(monkeypatch, fake(tmp_path, script))
+        with pytest.raises(expected):
+            wr.verify(bundle)
 
 
-def test_bytes_body_reaches_the_child_without_a_copy(monkeypatch, tmp_path):
-    body = b'synthetic archive bytes'
-    written = []
+def test_exit_nonzero_even_after_complete_frame(bundle, tmp_path, monkeypatch):
+    use(monkeypatch, emit(tmp_path, frame(bundle), 'sys.exit(3)'))
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.verify(bundle)
 
-    class Proc:
-        class stdin:
-            write = staticmethod(written.append)
-            close = staticmethod(lambda: None)
 
-        class stdout:
-            read1 = staticmethod(lambda n: b'')
-            close = staticmethod(lambda: None)
+def test_missing_binary_is_unavailable(bundle, monkeypatch, tmp_path):
+    use(monkeypatch, tmp_path / 'absent')
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.verify(bundle)
 
-        def wait(self, timeout=None):
-            return 3
 
-    path, _ = fake(tmp_path, '')
-    use(monkeypatch, path)
-    monkeypatch.setattr(wr.subprocess, 'Popen', lambda *a, **k: Proc())
-    with pytest.raises(ValueError, match='unavailable'):
-        wr._rust_verdict(body)
-    assert written and written[0] is body
-    written.clear()
-    with pytest.raises(ValueError, match='unavailable'):
-        wr._rust_verdict(bytearray(body))
-    assert written[0] == body and type(written[0]) is bytes
+def test_fixed_binary_and_minimal_child_environment(bundle, monkeypatch, tmp_path):
+    record = tmp_path / 'record.json'
+    payload = frame(bundle)
+    script = ('import hashlib, json, os, sys\n'
+              'data = sys.stdin.buffer.read()\n'
+              f'open({str(record)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ), "sha": hashlib.sha256(data).hexdigest()}}))\n'
+              f'sys.stdout.buffer.write(bytes.fromhex({payload.hex()!r}))\n')
+    use(monkeypatch, fake(tmp_path, script))
+    monkeypatch.setenv('SYNTHETIC_SECRET', 'must-not-pass')
+    wr.verify(bundle)
+    seen = json.loads(record.read_text())
+    assert seen['argv'] == ['decode-v1']
+    assert seen['sha'] == hashlib.sha256(bundle).hexdigest()
+    assert set(seen['env']) - {'PATH', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'} == set()
+    assert seen['env']['PATH'] == '/usr/local/bin:/usr/bin:/bin'
+
+
+def test_timeout_and_endless_output_reap_owned_child(bundle, monkeypatch, tmp_path):
+    use(monkeypatch, fake(tmp_path, 'import time\ntime.sleep(30)\n'))
+    monkeypatch.setattr(wd, 'TIMEOUT_S', 0.4)
+    started = time.monotonic()
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.verify(bundle)
+    assert time.monotonic() - started < 5
+    use(monkeypatch, fake(tmp_path, 'import sys\nwhile True:\n sys.stdout.buffer.write(b"x" * 65536); sys.stdout.flush()\n'))
+    monkeypatch.setattr(wd, 'MAX_FRAME', 1024)
+    started = time.monotonic()
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.verify(bundle)
+    assert time.monotonic() - started < 5
+
+
+def test_nonreading_child_and_logs_do_not_expose_source(bundle, monkeypatch, tmp_path, caplog):
+    use(monkeypatch, fake(tmp_path, 'import sys\nsys.stdout.write("reject: invalid\\n")\nsys.exit(1)\n'))
+    with caplog.at_level(logging.WARNING), pytest.raises(ValueError, match='Invalid workspace archive'):
+        wr.verify(bundle)
+    assert 'note.md' not in caplog.text
+    assert 'Synthetic note' not in caplog.text
+
+
+@pytest.mark.skipif(not REAL_BIN, reason='paired Rust binary not supplied')
+def test_real_decode_binary(bundle, monkeypatch):
+    use(monkeypatch, Path(REAL_BIN))
+    assert wr.verify(bundle)[0]['raw/note.md'] == b'# Synthetic note\r\n'
+
+
+def test_protocol_fault_creates_no_destination_or_managed_receipt(bundle, tmp_path, monkeypatch):
+    from agent.workspace_import import apply, prepare
+    use(monkeypatch, emit(tmp_path, frame(bundle)[:-len(wd.END)]))
+    destination = tmp_path / 'restored'
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.restore(bundle, destination, hashlib.sha256(bundle).hexdigest())
+    assert not destination.exists()
+    backend = ManagedCorpusBackend(tmp_path / 'target', B)
+    backend.activate({'keep.md': b'keep'}, {}, [])
+    with backend.db() as db:
+        before = (backend.meta(db, 'generation'),
+                  db.execute('SELECT count(*) FROM files').fetchone()[0],
+                  db.execute('SELECT count(*) FROM directories').fetchone()[0],
+                  db.execute('SELECT count(*) FROM workspace_imports').fetchone()[0],
+                  db.execute('SELECT count(*) FROM workspace_index_outbox').fetchone()[0])
+    with pytest.raises(wd.DecodeUnavailable):
+        prepare(backend, bundle, 'Copy')
+    with pytest.raises(wd.DecodeUnavailable):
+        apply(backend, bundle, 'Copy', '0' * 64)
+    with backend.db() as db:
+        after = (backend.meta(db, 'generation'),
+                 db.execute('SELECT count(*) FROM files').fetchone()[0],
+                 db.execute('SELECT count(*) FROM directories').fetchone()[0],
+                 db.execute('SELECT count(*) FROM workspace_imports').fetchone()[0],
+                 db.execute('SELECT count(*) FROM workspace_index_outbox').fetchone()[0])
+    assert before == after
+
+
+def test_legacy_verify_only_binary_fails_closed(bundle, tmp_path, monkeypatch):
+    # An older verifier's valid text decision is not a decode-v1 capability.
+    use(monkeypatch, emit(tmp_path, b'accept ' + b'0' * 64 + b'\n'))
+    monkeypatch.setattr(wr, '_verify', lambda _: pytest.fail('Python ZIP fallback called'))
+    with pytest.raises(wd.DecodeUnavailable):
+        wr.verify(bundle)
+
+
+def test_cancellation_after_spawn_reaps_child(bundle, tmp_path, monkeypatch):
+    use(monkeypatch, fake(tmp_path, 'import sys, time\nsys.stdin.buffer.read()\ntime.sleep(30)\n'))
+    real_spawn = wd.subprocess.Popen
+    real_clock = time.monotonic
+    children = []
+    interrupted = False
+
+    def spawn(*args, **kwargs):
+        child = real_spawn(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def clock():
+        nonlocal interrupted
+        if children and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt('synthetic caller cancellation')
+        return real_clock()
+
+    monkeypatch.setattr(wd.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(wd.time, 'monotonic', clock)
+    try:
+        with pytest.raises(KeyboardInterrupt, match='synthetic caller cancellation'):
+            wr.verify(bundle)
+        assert len(children) == 1
+        assert children[0].poll() is not None, 'decode returned while its direct child was live'
+    finally:
+        monkeypatch.setattr(wd.time, 'monotonic', real_clock)
+        for child in children:
+            if child.poll() is None:
+                child.kill()  # Only this test-created process, including old-code negative controls.
+            child.wait()
+            for stream in (child.stdin, child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+
+
+@pytest.mark.parametrize('stage', ['selector', 'nonblocking', 'register', 'read', 'write'])
+def test_setup_and_io_faults_reap_child_and_close_pipes(bundle, tmp_path, monkeypatch, stage):
+    use(monkeypatch, fake(tmp_path, 'import sys, time\nsys.stdout.write("x"); sys.stdout.flush()\nsys.stdin.buffer.read()\ntime.sleep(30)\n'))
+    real_spawn = wd.subprocess.Popen
+    children = []
+
+    def spawn(*args, **kwargs):
+        child = real_spawn(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def refuse(*_args, **_kwargs):
+        raise OSError('synthetic IPC fault')
+
+    monkeypatch.setattr(wd.subprocess, 'Popen', spawn)
+    if stage == 'selector':
+        monkeypatch.setattr(wd.selectors, 'DefaultSelector', refuse)
+    elif stage == 'nonblocking':
+        monkeypatch.setattr(wd.os, 'set_blocking', refuse)
+    elif stage == 'register':
+        selector = wd.selectors.DefaultSelector()
+        monkeypatch.setattr(wd.selectors, 'DefaultSelector', lambda: selector)
+        monkeypatch.setattr(selector, 'register', refuse)
+    else:
+        original = getattr(wd.os, stage)
+
+        def fail_pipe(fd, *args):
+            if children:
+                stream = children[0].stdout if stage == 'read' else children[0].stdin
+                if not stream.closed and fd == stream.fileno():
+                    raise OSError('synthetic pipe fault')
+            return original(fd, *args)
+
+        monkeypatch.setattr(wd.os, stage, fail_pipe)
+        monkeypatch.setattr(wd, 'TIMEOUT_S', 0.2)
+    try:
+        with pytest.raises(wd.DecodeUnavailable):
+            wr.verify(bundle)
+        assert len(children) == (0 if stage == 'selector' else 1)
+        for child in children:
+            assert child.poll() is not None
+            assert child.stdin.closed and child.stdout.closed
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+            for stream in (child.stdin, child.stdout):
+                stream.close()
+
+
+def test_inherited_output_pipe_is_bounded_without_daemon_workers(bundle, tmp_path, monkeypatch):
+    # The synthetic descendant exits itself and holds only the test output pipe.
+    script = ('import subprocess, sys\n'
+              'sys.stdin.buffer.read()\n'
+              'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"], '
+              'stdin=subprocess.DEVNULL, close_fds=True)\n')
+    use(monkeypatch, fake(tmp_path, script))
+    monkeypatch.setattr(wd, 'TIMEOUT_S', 0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(wd.DecodeUnavailable):
+            wr.verify(bundle)
+        assert time.monotonic() - started < 1.5, 'pipe close waited for the descendant'
+    finally:
+        # Let the test descendant exit before deleting its fixture. No group kill.
+        time.sleep(max(0, 2.3 - (time.monotonic() - started)))
