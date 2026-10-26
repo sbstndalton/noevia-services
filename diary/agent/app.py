@@ -52,6 +52,7 @@ from pydantic import BaseModel
 from . import corpus as fmt
 from .config import load_config
 from .context import ContextAssembler, completed_exchanges
+from .temporal_native import TemporalUnavailable, UNAVAILABLE_TEXT as TEMPORAL_UNAVAILABLE_TEXT
 from .deadline import ExchangeBudget, ExchangeTimeout
 from .corpus_store import MONTH_ID_RE, CorpusError, CorpusStore, EditConflict
 from .external_sources import (
@@ -1461,6 +1462,7 @@ async def api_workspace_import(request: Request):
     st = await run_in_threadpool(_tenant_state, request, recover=False)
     def perform():
         from .workspace_import import prepare, apply, drain_index_outbox
+        from .workspace_import_native import ImportUnavailable, ImportUncertain
         with st.store._write_lock, st.managed.migration_lock():
             if not isinstance(st.backend, ManagedCorpusBackend):
                 raise HTTPException(409, 'ZIP import requires app-managed Diary storage. Use isolated operator restore for legacy storage.')
@@ -1480,11 +1482,25 @@ async def api_workspace_import(request: Request):
                     st.recovered = False
                     result['indexPending'] = True
                 return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+            except ImportUncertain as exc:
+                # A committed receipt/outbox may exist despite a lost child reply.
+                # Normal later recovery must inspect it; do not drain on failure.
+                st.recovered = False
+                raise HTTPException(503, str(exc))
+            except ImportUnavailable as exc:
+                raise HTTPException(503, str(exc))
             except ValueError as exc:
                 from .workspace_decode import DecodeUnavailable
                 if isinstance(exc, DecodeUnavailable):
                     raise HTTPException(503, str(exc))
                 raise HTTPException(409 if action == 'apply' else 400, str(exc))
+            except BaseException:
+                # Cancellation or an unexpected failure may follow COMMIT. The
+                # native adapter reaps before unwinding these locks; leave any
+                # receipt/outbox for ordinary recovery, without draining here.
+                if action == 'apply':
+                    st.recovered = False
+                raise
     return await run_in_threadpool(perform)
 
 
@@ -1655,6 +1671,9 @@ async def v1_chat_completions(request: Request) -> JSONResponse:
         result = await run_in_threadpool(_run_exchange, st, last, session_id, tenant_id, entry_time, entry_day, True, optional_reference(body), **trace_kw)
     except HTTPException:
         raise
+    except TemporalUnavailable:
+        return JSONResponse({"error": {"message": TEMPORAL_UNAVAILABLE_TEXT, "type": "api_error",
+                                       "code": "context_unavailable"}}, status_code=503)
     except ExchangeTimeout as exc:
         # #127: a deadline is told apart from a failure by its code. The status stays 502, the one every
         # caller already handles for a failed exchange.
@@ -1843,6 +1862,9 @@ def local_exchange(body: dict, request: Request):
         return exchange_stream(work)
     try:
         return work()
+    except TemporalUnavailable:
+        return JSONResponse({"error": TEMPORAL_UNAVAILABLE_TEXT, "detail": TEMPORAL_UNAVAILABLE_TEXT,
+                             "code": "contextUnavailable", "saved": False}, status_code=503)
     except ExchangeTimeout as exc:
         # #1505: a stalled model is a coded failure the caller can act on, not a bare 500.
         if not exc.nothing_saved:

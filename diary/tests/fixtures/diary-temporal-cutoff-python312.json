@@ -1,0 +1,105 @@
+{
+  "query": "Before 2029-12-31, what happened?",
+  "rows": [
+    {
+      "id": "old",
+      "day": "2030-01-19"
+    },
+    {
+      "id": "compact",
+      "day": "20300119"
+    },
+    {
+      "id": "week-sunday",
+      "day": "2030-W03-7"
+    },
+    {
+      "id": "week-no-day",
+      "day": "2030-W03"
+    },
+    {
+      "id": "same",
+      "day": "2030-01-20"
+    },
+    {
+      "id": "future",
+      "day": "2030-01-21"
+    },
+    {
+      "id": "missing"
+    },
+    {
+      "id": "invalid",
+      "day": "n/a"
+    },
+    {
+      "id": "year-zero",
+      "day": "0000-01-01"
+    },
+    {
+      "id": "week-compact-day",
+      "day": "2030W011"
+    },
+    {
+      "id": "week-compact-no-day",
+      "day": "2030W01"
+    },
+    {
+      "id": "week-mixed-compact",
+      "day": "2030W01-1"
+    },
+    {
+      "id": "week-mixed-extended",
+      "day": "2030-W011"
+    }
+  ],
+  "kept_ids": [
+    "missing",
+    "invalid",
+    "year-zero",
+    "week-mixed-compact",
+    "week-mixed-extended"
+  ],
+  "removed": [
+    {
+      "rank": 1,
+      "id": "old",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 2,
+      "id": "compact",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 3,
+      "id": "week-sunday",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 4,
+      "id": "week-no-day",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 5,
+      "id": "same",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 6,
+      "id": "future",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 10,
+      "id": "week-compact-day",
+      "reason": "after_time_anchor"
+    },
+    {
+      "rank": 11,
+      "id": "week-compact-no-day",
+      "reason": "after_time_anchor"
+    }
+  ]
+}

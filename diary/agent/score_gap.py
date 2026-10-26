@@ -10,11 +10,18 @@ It is skipped when the message names an entity (or is a follow-up carrying one):
 is about the asked entity, and an entry about it, or about a name the question mistyped, is never dropped for its
 score. The best candidate is always kept, order is never changed, and candidates without a
 score are kept.
+
+DIARY_SCORE_GAP_IMPL=python is the default. Explicit rust uses the fixed installed
+scores-only CLI through score_gap_native; image pairing is required before
+activation. Native failure retains every post-focus candidate, still computes
+best, and reports unavailable through the context trace with applied=false.
+No Python filtering is used as a fallback after a requested Rust failure.
 """
 from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -60,13 +67,25 @@ def _score(row: dict) -> Optional[float]:
     return score if math.isfinite(score) else None
 
 
-def cut(ranked: List[Tuple[int, dict]], gap: Optional[float]):
+def cut(ranked: List[Tuple[int, dict]], gap: Optional[float], *, diagnostics=None):
     """(kept, removed, best) for ``ranked`` [(vector rank, row)] in score order.
 
     ``removed`` lists the (vector rank, row) pairs that score more than ``gap`` below ``best``, the best score
     in ``ranked``. With ``gap`` None nothing is cut."""
-    scores = [s for s in (_score(row) for _, row in ranked) if s is not None]
+    normalized = [_score(row) for _, row in ranked]
+    scores = [s for s in normalized if s is not None]
     best = max(scores) if scores else None
+    # Off until a paired image supplies the reviewed CLI; never fall back to
+    # Python filtering after an explicitly requested native failure.
+    if os.environ.get("DIARY_SCORE_GAP_IMPL", "python").strip().lower() == "rust":
+        from . import score_gap_native
+        native = score_gap_native.partition(normalized, gap, best)
+        if diagnostics is not None:
+            diagnostics.update(implementation="rust", status="ok" if native is not None else "unavailable")
+        if native is None:
+            return list(ranked), [], best
+        kept, removed, native_best = native
+        return [ranked[i] for i in kept], [ranked[i] for i in removed], native_best
     if gap is None or best is None:
         return list(ranked), [], best
     kept, removed = [], []
