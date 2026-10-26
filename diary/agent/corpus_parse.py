@@ -9,9 +9,9 @@ import json
 import logging
 import os
 import re
+import selectors
 import struct
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -165,83 +165,89 @@ def _native(text):
     binary = DEFAULT_BIN
     if not (os.path.isabs(binary) and os.path.isfile(binary) and os.access(binary, os.X_OK)):
         raise _failure('missing_binary')
-    try:
-        proc = subprocess.Popen([binary, 'parse-v1'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, close_fds=True,
-                                env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
-    except OSError:
-        raise _failure('spawn') from None
-
     output = bytearray()
     errors = bytearray()
-    fault = threading.Event()
-    fed = threading.Event()
-    def feed():
-        try:
-            for part in (MAGIC_IN, struct.pack('>Q', len(body)), body, END):
-                view = memoryview(part)
-                while view:
-                    size = proc.stdin.write(view)
-                    if not size:
-                        raise OSError('short write')
-                    view = view[size:]
-            proc.stdin.close()
-            fed.set()
-        except (OSError, ValueError):
-            fault.set()
-            try:
-                proc.stdin.close()
-            except (OSError, ValueError):
-                pass
-
-    def drain(pipe, target, cap):
-        try:
-            while True:
-                chunk = pipe.read1(min(65536, cap + 1 - len(target)))
-                if not chunk:
-                    return
-                target.extend(chunk)
-                if len(target) > cap:
-                    fault.set()
-                    return
-        except (OSError, ValueError):
-            fault.set()
-
-    workers = [threading.Thread(target=feed, daemon=True),
-               threading.Thread(target=drain, args=(proc.stdout, output, MAX_OUTPUT), daemon=True),
-               threading.Thread(target=drain, args=(proc.stderr, errors, 256), daemon=True)]
-    for worker in workers:
-        worker.start()
     deadline = time.monotonic() + TIMEOUT_S
-    code = None
-    while True:
-        if fault.is_set():
-            break
+    parts = iter((MAGIC_IN, struct.pack('>Q', len(body)), body, END))
+    pending = memoryview(b'')
+    fed = False
+    proc = None
+    try:
+        try:
+            proc = subprocess.Popen([binary, 'parse-v1'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, close_fds=True,
+                                    env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
+        except OSError:
+            raise _failure('spawn') from None
+        # One owner performs all pipe IO. Cleanup cannot contend with a blocked
+        # buffered-reader thread after startup failure, cancellation or timeout.
+        with selectors.DefaultSelector() as selector:
+            for pipe, event in ((proc.stdin, selectors.EVENT_WRITE),
+                                (proc.stdout, selectors.EVENT_READ),
+                                (proc.stderr, selectors.EVENT_READ)):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, event)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _failure('transport')
+                for key, _ in selector.select(min(remaining, 0.05)):
+                    pipe = key.fileobj
+                    if pipe is proc.stdin:
+                        if not pending:
+                            try:
+                                pending = memoryview(next(parts))
+                            except StopIteration:
+                                selector.unregister(pipe)
+                                pipe.close()
+                                fed = True
+                                continue
+                        if pending:
+                            try:
+                                count = os.write(pipe.fileno(), pending[:65536])
+                            except BlockingIOError:
+                                continue
+                            if not count:
+                                raise _failure('transport')
+                            pending = pending[count:]
+                    else:
+                        target, cap = ((output, MAX_OUTPUT) if pipe is proc.stdout
+                                       else (errors, 256))
+                        try:
+                            block = os.read(pipe.fileno(), min(65536, cap + 1 - len(target)))
+                        except BlockingIOError:
+                            continue
+                        if not block:
+                            selector.unregister(pipe)
+                            pipe.close()
+                            continue
+                        target.extend(block)
+                        if len(target) > cap:
+                            raise _failure('transport', capacity=pipe is proc.stdout)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            break
-        try:
-            code = proc.wait(timeout=min(0.05, remaining))
-            break
-        except subprocess.TimeoutExpired:
-            pass
-    if code is None:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        proc.wait()
-    for worker in workers:
-        worker.join(timeout=max(0, deadline - time.monotonic()))
-    for pipe in (proc.stdout, proc.stderr):
-        try:
-            pipe.close()
-        except OSError:
-            pass
-    if fault.is_set() or code is None or any(worker.is_alive() for worker in workers) or time.monotonic() >= deadline:
-        raise _failure('transport', capacity=len(output) > MAX_OUTPUT)
-    if code != 0 or not fed.is_set():
-        raise _failure('child_exit', capacity=code == 3 and errors == b'capacity\n')
-    if errors:
-        raise _failure('stderr')
-    return _frame(output)
+            raise _failure('transport')
+        code = proc.wait(timeout=remaining)
+        if code != 0 or not fed:
+            raise _failure('child_exit', capacity=code == 3 and errors == b'capacity\n')
+        if errors:
+            raise _failure('stderr')
+        return _frame(output)
+    except ParseUnavailable:
+        raise
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        raise _failure('transport') from None
+    finally:
+        # Also runs for caller BaseException and selector setup failures.
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                proc.wait()
+            finally:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()

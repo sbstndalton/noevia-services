@@ -63,6 +63,38 @@ def use(monkeypatch, path):
     monkeypatch.setattr(cp, 'DEFAULT_BIN', str(path))
 
 
+@pytest.mark.parametrize('interruption', ['setup', 'cancel'])
+def test_transport_cleanup_on_setup_failure_and_caller_cancellation(tmp_path, monkeypatch, interruption):
+    use(monkeypatch, fake(tmp_path, 'import time\ntime.sleep(30)\n'))
+    processes = []
+    popen = cp.subprocess.Popen
+
+    def tracked(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    selector_type = cp.selectors.DefaultSelector
+
+    class InterruptedSelector(selector_type):
+        def register(self, *args, **kwargs):
+            if interruption == 'setup':
+                raise RuntimeError('synthetic selector startup failure')
+            return super().register(*args, **kwargs)
+
+        def select(self, *args, **kwargs):
+            raise KeyboardInterrupt('synthetic caller cancellation')
+
+    monkeypatch.setattr(cp.subprocess, 'Popen', tracked)
+    monkeypatch.setattr(cp.selectors, 'DefaultSelector', InterruptedSelector)
+    with pytest.raises(cp.ParseUnavailable if interruption == 'setup' else KeyboardInterrupt):
+        cp.parse(SAMPLE)
+    assert len(processes) == 1
+    process = processes[0]
+    assert process.returncode is not None
+    assert all(pipe.closed for pipe in (process.stdin, process.stdout, process.stderr))
+
+
 @pytest.mark.skipif(not BIN, reason='paired Rust CLI path required')
 def test_actual_cli_days_chunks_and_both_callers(tmp_path, monkeypatch):
     use(monkeypatch, BIN)
@@ -101,7 +133,26 @@ def test_actual_cli_455_synthetic_python_differential(monkeypatch):
 
 
 @pytest.mark.parametrize('damage', ['truncated', 'magic', 'length', 'version', 'schema', 'hash', 'extra', 'nonzero', 'overflow', 'timeout'])
-def test_fault_never_creates_plan_or_deletes_index(tmp_path, monkeypatch, damage):
+@pytest.mark.parametrize('vector_mode', [False, True])
+def test_fault_never_creates_plan_or_deletes_index(tmp_path, monkeypatch, damage, vector_mode):
+    from agent import retrieval
+
+    if vector_mode:
+        # Enable only the bundled extension on this test's temporary connection;
+        # production connection policy and graceful degradation stay unchanged.
+        sqlite_vec = pytest.importorskip('sqlite_vec')
+
+        def load_test_vectors(connection):
+            connection.enable_load_extension(True)
+            try:
+                sqlite_vec.load(connection)
+            finally:
+                connection.enable_load_extension(False)
+            return True
+
+        monkeypatch.setattr(retrieval, '_load_vec_extension', load_test_vectors)
+    else:
+        monkeypatch.setattr(retrieval, '_load_vec_extension', lambda connection: False)
     retriever = Retriever(tmp_path / 'idx.db', StubLLM())
     retriever.reindex_file('2026-08.md', SAMPLE)
     with retriever._conn:
@@ -111,6 +162,9 @@ def test_fault_never_creates_plan_or_deletes_index(tmp_path, monkeypatch, damage
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_%'")]
         vectors = {name: retriever._conn.execute(f'SELECT * FROM "{name}"').fetchall()
                    for name in vector_tables}
+    if vector_mode:
+        assert retriever.vec_available
+        assert any(name != 'vec_meta' and rows for name, rows in vectors.items())
     good = parsed_frame()
     if damage in ('version', 'schema', 'hash'):
         obj = json.loads(good[12:-4])
