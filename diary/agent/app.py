@@ -1462,6 +1462,7 @@ async def api_workspace_import(request: Request):
     st = await run_in_threadpool(_tenant_state, request, recover=False)
     def perform():
         from .workspace_import import prepare, apply, drain_index_outbox
+        from .workspace_import_native import ImportUnavailable, ImportUncertain
         with st.store._write_lock, st.managed.migration_lock():
             if not isinstance(st.backend, ManagedCorpusBackend):
                 raise HTTPException(409, 'ZIP import requires app-managed Diary storage. Use isolated operator restore for legacy storage.')
@@ -1481,8 +1482,22 @@ async def api_workspace_import(request: Request):
                     st.recovered = False
                     result['indexPending'] = True
                 return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+            except ImportUncertain as exc:
+                # A committed receipt/outbox may exist despite a lost child reply.
+                # Normal later recovery must inspect it; do not drain on failure.
+                st.recovered = False
+                raise HTTPException(503, str(exc))
+            except ImportUnavailable as exc:
+                raise HTTPException(503, str(exc))
             except ValueError as exc:
                 raise HTTPException(409 if action == 'apply' else 400, str(exc))
+            except BaseException:
+                # Cancellation or an unexpected failure may follow COMMIT. The
+                # native adapter reaps before unwinding these locks; leave any
+                # receipt/outbox for ordinary recovery, without draining here.
+                if action == 'apply':
+                    st.recovered = False
+                raise
     return await run_in_threadpool(perform)
 
 

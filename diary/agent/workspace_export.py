@@ -23,6 +23,12 @@ def archive(backend, prefix, settings):
             directories = [r[0] for r in db.execute('SELECT path FROM directories ORDER BY path LIMIT 5002')]
             if len(directories) > 5000:
                 raise ValueError('Export contains too many directories')
+            from . import workspace_export_native
+            if workspace_export_native.selected():
+                metadata = [{'path': r[0], 'bytes': r[1]} for r in
+                            db.execute('SELECT path,length(data) FROM files ORDER BY path')]
+                bodies = (bytes(r[0]) for r in db.execute('SELECT data FROM files ORDER BY path'))
+                return workspace_export_native.archive(settings, directories, metadata, bodies)
             files = {r[0]: bytes(r[1]) for r in db.execute('SELECT path,data FROM files ORDER BY path')}
     else:
         files, report = snapshot(backend, prefix, allow_empty=True)

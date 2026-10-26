@@ -1,8 +1,26 @@
 """Verified new-folder imports. Source, receipt and index outbox commit together."""
 import hashlib
+import logging
+import os
 import time
 from .managed_storage import ManagedCorpusBackend, digest, safe_key
 from .workspace_restore import verify
+
+
+_log = logging.getLogger(__name__)
+_warned_invalid_impl = False
+
+
+def impl_choice():
+    """Python is the default; the explicit Rust path never falls back."""
+    global _warned_invalid_impl
+    value = (os.environ.get('WORKSPACE_IMPORT_APPLY_IMPL') or 'python').strip().lower() or 'python'
+    if value not in ('python', 'rust'):
+        if not _warned_invalid_impl:
+            _log.warning('Invalid WORKSPACE_IMPORT_APPLY_IMPL; using python')
+            _warned_invalid_impl = True
+        return 'python'
+    return value
 
 
 def destination_path(name):
@@ -50,6 +68,11 @@ def apply(backend, body, name, reviewed):
     files, directories, report = prepare(backend, body, name)
     if reviewed != report['fingerprint']:
         raise ValueError('Archive or destination changed. Review a fresh preview.')
+    # prepare() returned after its db() context closed. close() is a no-op and
+    # must never stand in for ending that SQL read transaction.
+    if impl_choice() == 'rust':
+        from .workspace_import_native import apply_native
+        return apply_native(backend, body, report)
     destination = report['destination']
     with backend.db() as db:
         db.execute('BEGIN IMMEDIATE')

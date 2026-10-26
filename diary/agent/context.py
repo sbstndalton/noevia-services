@@ -245,9 +245,13 @@ class ContextAssembler:
         # its score.
         gap = score_gap.parse_gap(self.cfg.get("retrieval.score_gap", score_gap.SCORE_GAP))
         gap_applies = gap is not None and not (focus is not None and focus.entities)
-        ranked, gap_removed, gap_best = score_gap.cut(ranked, gap if gap_applies else None)
+        gap_diagnostics = {}
+        ranked, gap_removed, gap_best = score_gap.cut(
+            ranked, gap if gap_applies else None, diagnostics=gap_diagnostics)
+        if gap_diagnostics.get("status") == "unavailable":
+            gap_applies = False
         if trace is not None:
-            trace.set_score_gap(gap, gap_applies, gap_best, gap_removed)
+            trace.set_score_gap(gap, gap_applies, gap_best, gap_removed, diagnostics=gap_diagnostics)
         notes = entity_focus.context_notes(focus) if focus is not None else []
         # Fit budget: keep highest-scored, cap each excerpt, drop overflow lowest-first. The notes and
         # labels are charged to the same budget as the excerpts they describe.
