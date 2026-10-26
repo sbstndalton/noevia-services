@@ -331,10 +331,17 @@ installed binary using synthetic source bytes, settings, an empty folder and an
 invalid archive. The smoke disables the Python parser and selects Rust only in its
 own process. The service selector default remains Python.
 
-The existing CI gate requires Diary and OCR source pins/checksums to match. This
-Diary pairing depends on the coordinated source-pin update for the other images
-and release lock; the gate is expected to reject a standalone mismatched pairing
-until that dependency is integrated. Do not bypass that check.
+All five service Dockerfiles carry the same reviewed source ref/checksum in this
+change; metadata guards reject a mismatched standalone pin. The global release
+lock and runtime activation remain separate qualification steps.
+
+Decode IPC uses nonblocking selector-driven pipes with bounded input/output and a
+shared 120-second deadline. Setup, I/O failure and caller cancellation close the
+owned pipes and reap the direct child before returning. No daemon pipe workers
+remain blocked on inherited descriptors. Known child refusals retain their
+validation messages; partial frames, extra bytes, failed input or child exit fail
+closed without Python ZIP fallback. Stderr remains discarded, preserving the
+existing private protocol and keeping child diagnostics out of responses/logs.
 
 ### Opt-in native managed ZIP import transaction
 

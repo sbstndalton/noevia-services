@@ -231,3 +231,109 @@ def test_legacy_verify_only_binary_fails_closed(bundle, tmp_path, monkeypatch):
     monkeypatch.setattr(wr, '_verify', lambda _: pytest.fail('Python ZIP fallback called'))
     with pytest.raises(wd.DecodeUnavailable):
         wr.verify(bundle)
+
+
+def test_cancellation_after_spawn_reaps_child(bundle, tmp_path, monkeypatch):
+    use(monkeypatch, fake(tmp_path, 'import sys, time\nsys.stdin.buffer.read()\ntime.sleep(30)\n'))
+    real_spawn = wd.subprocess.Popen
+    real_clock = time.monotonic
+    children = []
+    interrupted = False
+
+    def spawn(*args, **kwargs):
+        child = real_spawn(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def clock():
+        nonlocal interrupted
+        if children and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt('synthetic caller cancellation')
+        return real_clock()
+
+    monkeypatch.setattr(wd.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(wd.time, 'monotonic', clock)
+    try:
+        with pytest.raises(KeyboardInterrupt, match='synthetic caller cancellation'):
+            wr.verify(bundle)
+        assert len(children) == 1
+        assert children[0].poll() is not None, 'decode returned while its direct child was live'
+    finally:
+        monkeypatch.setattr(wd.time, 'monotonic', real_clock)
+        for child in children:
+            if child.poll() is None:
+                child.kill()  # Only this test-created process, including old-code negative controls.
+            child.wait()
+            for stream in (child.stdin, child.stdout, child.stderr):
+                if stream is not None:
+                    stream.close()
+
+
+@pytest.mark.parametrize('stage', ['selector', 'nonblocking', 'register', 'read', 'write'])
+def test_setup_and_io_faults_reap_child_and_close_pipes(bundle, tmp_path, monkeypatch, stage):
+    use(monkeypatch, fake(tmp_path, 'import sys, time\nsys.stdout.write("x"); sys.stdout.flush()\nsys.stdin.buffer.read()\ntime.sleep(30)\n'))
+    real_spawn = wd.subprocess.Popen
+    children = []
+
+    def spawn(*args, **kwargs):
+        child = real_spawn(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def refuse(*_args, **_kwargs):
+        raise OSError('synthetic IPC fault')
+
+    monkeypatch.setattr(wd.subprocess, 'Popen', spawn)
+    if stage == 'selector':
+        monkeypatch.setattr(wd.selectors, 'DefaultSelector', refuse)
+    elif stage == 'nonblocking':
+        monkeypatch.setattr(wd.os, 'set_blocking', refuse)
+    elif stage == 'register':
+        selector = wd.selectors.DefaultSelector()
+        monkeypatch.setattr(wd.selectors, 'DefaultSelector', lambda: selector)
+        monkeypatch.setattr(selector, 'register', refuse)
+    else:
+        original = getattr(wd.os, stage)
+
+        def fail_pipe(fd, *args):
+            if children:
+                stream = children[0].stdout if stage == 'read' else children[0].stdin
+                if not stream.closed and fd == stream.fileno():
+                    raise OSError('synthetic pipe fault')
+            return original(fd, *args)
+
+        monkeypatch.setattr(wd.os, stage, fail_pipe)
+        monkeypatch.setattr(wd, 'TIMEOUT_S', 0.2)
+    try:
+        with pytest.raises(wd.DecodeUnavailable):
+            wr.verify(bundle)
+        assert len(children) == (0 if stage == 'selector' else 1)
+        for child in children:
+            assert child.poll() is not None
+            assert child.stdin.closed and child.stdout.closed
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+            for stream in (child.stdin, child.stdout):
+                stream.close()
+
+
+def test_inherited_output_pipe_is_bounded_without_daemon_workers(bundle, tmp_path, monkeypatch):
+    # The synthetic descendant exits itself and holds only the test output pipe.
+    script = ('import subprocess, sys\n'
+              'sys.stdin.buffer.read()\n'
+              'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"], '
+              'stdin=subprocess.DEVNULL, close_fds=True)\n')
+    use(monkeypatch, fake(tmp_path, script))
+    monkeypatch.setattr(wd, 'TIMEOUT_S', 0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(wd.DecodeUnavailable):
+            wr.verify(bundle)
+        assert time.monotonic() - started < 1.5, 'pipe close waited for the descendant'
+    finally:
+        # Let the test descendant exit before deleting its fixture. No group kill.
+        time.sleep(max(0, 2.3 - (time.monotonic() - started)))

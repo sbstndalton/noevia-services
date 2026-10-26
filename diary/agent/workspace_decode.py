@@ -10,7 +10,7 @@ import os
 import re
 import struct
 import subprocess
-import threading
+import selectors
 import time
 
 from .managed_storage import safe_key
@@ -141,77 +141,107 @@ def decode(body, messages):
     binary = DEFAULT_BIN
     if not (os.path.isabs(binary) and os.path.isfile(binary) and os.access(binary, os.X_OK)):
         raise _unavailable('missing_binary')
-    try:
-        proc = subprocess.Popen([binary, 'decode-v1'], stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                close_fds=True, env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
-    except OSError:
-        raise _unavailable('spawn') from None
     output = bytearray()
-    overflow = threading.Event()
-    fed = threading.Event()
-    feed_error = threading.Event()
-    drain_error = threading.Event()
-
-    def feed():
-        try:
-            if proc.stdin.write(body) != len(body):
-                feed_error.set()
-            proc.stdin.close()  # Flush and EOF must complete before a zero exit is trusted.
-            if not feed_error.is_set():
-                fed.set()
-        except (OSError, ValueError):
-            feed_error.set()
-            try:
-                proc.stdin.close()
-            except (OSError, ValueError):
-                pass
-
-    def drain():
-        try:
-            while True:
-                chunk = proc.stdout.read1(min(65536, MAX_FRAME + 1 - len(output)))
-                if not chunk:
-                    return
-                output.extend(chunk)
-                if len(output) > MAX_FRAME:
-                    overflow.set()
-                    return
-        except (OSError, ValueError):
-            drain_error.set()
-
-    workers = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain, daemon=True)]
-    for worker in workers:
-        worker.start()
-    deadline = time.monotonic() + TIMEOUT_S
+    offset = 0
+    fed = False
+    feed_error = False
     fault = None
-    while True:
-        if overflow.is_set() or drain_error.is_set():
-            fault = 'output'
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            fault = 'timeout'
-            break
+    deadline = time.monotonic() + TIMEOUT_S
+    selector = None
+    proc = None
+    code = None
+
+    def close(stream):
         try:
-            code = proc.wait(timeout=min(0.05, remaining))
-            break
-        except subprocess.TimeoutExpired:
-            continue
-    if fault:
-        try:
-            proc.kill()  # Only this exact owned child; no process-group action.
-        except ProcessLookupError:
-            pass  # It exited between the fault flag and kill; still reap it.
-        proc.wait()
-    for worker in workers:
-        worker.join(timeout=max(0, deadline - time.monotonic()))
+            selector.unregister(stream)
+        except (KeyError, ValueError):
+            pass
+        stream.close()
+
     try:
-        proc.stdout.close()
-    except OSError:
-        pass
-    if fault or overflow.is_set() or drain_error.is_set() or any(worker.is_alive() for worker in workers) or time.monotonic() >= deadline:
-        raise _unavailable(fault or 'worker')
+        selector = selectors.DefaultSelector()
+        proc = subprocess.Popen([binary, 'decode-v1'], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+                                close_fds=True, env={'PATH': '/usr/local/bin:/usr/bin:/bin'})
+        for stream, kind, event in ((proc.stdin, 'input', selectors.EVENT_WRITE),
+                                    (proc.stdout, 'output', selectors.EVENT_READ)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, event, kind)
+        while selector.get_map() or proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fault = 'timeout'
+                break
+            for key, _ in selector.select(timeout=min(.05, remaining)):
+                stream, kind = key.fileobj, key.data
+                try:
+                    if kind == 'input':
+                        if offset == len(body):
+                            close(stream)
+                            fed = True
+                            continue
+                        written = os.write(stream.fileno(), memoryview(body)[offset:offset + 65536])
+                        if written == 0:
+                            raise OSError('short write')
+                        offset += written
+                    else:
+                        cap = MAX_FRAME
+                        used = len(output)
+                        chunk = os.read(stream.fileno(), min(65536, cap + 1 - used))
+                        if not chunk:
+                            close(stream)
+                            continue
+                        output.extend(chunk)
+                        if used + len(chunk) > cap:
+                            fault = kind + '_overflow'
+                            break
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    if kind == 'input':
+                        feed_error = True
+                        close(stream)
+                    else:
+                        fault = 'stream'
+                        break
+            if fault:
+                break
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        fault = 'io'
+    finally:
+        # Cover selector construction, spawn and setup, as well as caller
+        # cancellation during IO. Success requires reap; no daemon pipe worker
+        # can remain blocked on an inherited descriptor.
+        try:
+            if proc is not None:
+                try:
+                    if proc.poll() is None:
+                        try:
+                            proc.kill()  # Only this owned direct child.
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    code = proc.wait()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            fault = fault or 'cleanup'
+        finally:
+            try:
+                if proc is not None:
+                    for stream in (proc.stdin, proc.stdout):
+                        try:
+                            stream.close()
+                        except (OSError, ValueError, RuntimeError):
+                            fault = fault or 'cleanup'
+            finally:
+                if selector is not None:
+                    try:
+                        selector.close()
+                    except (OSError, ValueError, RuntimeError):
+                        fault = fault or 'cleanup'
+    if time.monotonic() >= deadline:
+        fault = fault or 'timeout'
+    if fault:
+        raise _unavailable(fault)
     out = output
     if code == 1:
         match = REJECT.fullmatch(out)
@@ -219,6 +249,6 @@ def decode(body, messages):
             reason = match.group(1).decode('ascii')
             if reason in messages:
                 raise ValueError(messages[reason])
-    if code != 0 or not fed.is_set() or feed_error.is_set():
+    if code != 0 or not fed or feed_error:
         raise _unavailable('child_exit_or_input')
     return _parse_frame(out, body)
