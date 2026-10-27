@@ -284,6 +284,7 @@ def world(tmp_path, monkeypatch):
             return "reply-" + hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()[:12]
 
         states[tenant] = SimpleNamespace(
+            store=SimpleNamespace(require_write_transform=lambda: None),
             assembler=asm,
             llm_main=SimpleNamespace(chat=chat, chat_stream=lambda messages, gate, temperature=0.7, alive=None, max_tokens=None: chat(messages)),
             pipeline=SimpleNamespace(log_exchange=lambda **kw: SimpleNamespace(decision="logged", xid="x1", reason="")),
