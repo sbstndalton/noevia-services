@@ -358,6 +358,9 @@ def test_status_contract_pre_save_texts_and_saving_began_before_any_store_write(
     timeline = []  # ("status", text) | ("store", method) | ("model", kind), in order
 
     class RecordingStore:
+        def require_write_transform(self):
+            pass  # This test double represents an available Python transform.
+
         def get_standing_sections_text(self, max_chars=0):
             timeline.append(("store", "get_standing_sections_text"))
             return ""

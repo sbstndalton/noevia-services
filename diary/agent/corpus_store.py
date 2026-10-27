@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from . import corpus as fmt
+from . import corpus_write_native as native_write
 from .config import Config
 from .journal import Journal, JournalEntry
 from .storage import CorpusBackend
@@ -136,6 +137,7 @@ def is_transient_failure(exc: Optional[BaseException]) -> bool:
 class CorpusStore:
     def __init__(self, cfg: Config, backend: CorpusBackend, journal: Journal):
         self._write_lock = threading.RLock()
+        self._corpus_write_impl = native_write.implementation()
         self.closed = False
         self.cfg = cfg
         self.backend = backend
@@ -162,6 +164,12 @@ class CorpusStore:
         # INDEX.md standing sections can be disabled entirely (corpora that manage
         # their own index / don't use one). Default: enabled (original behavior).
         self.index_enabled = bool(cfg.get("corpus.index_enabled", True))
+
+    def require_write_transform(self) -> None:
+        """Refuse known native outages before companion inference starts."""
+        if self._corpus_write_impl == "rust":
+            native_write.transform("prepare_append", time_token="00:00", topic="", me="",
+                                   assistant="", xid="00000000-0000-4000-8000-000000000000")
 
     # ---------------- paths ----------------
 
@@ -421,14 +429,21 @@ class CorpusStore:
             existing, _ = self.backend.get_text(self.document_path(day))
             if existing is not None and fmt.has_marker(existing, xid):
                 return xid
-        body = fmt.render_exchange(me_text, claude_text, xid)
-        rendered_header = fmt.render_subsection_header(now=now, topic=sub_header)
-        # store the header TEXT (no '### ' prefix) — the appender adds the prefix
-        header_text = rendered_header[4:] if rendered_header.startswith("### ") else rendered_header
+        if self._corpus_write_impl == "rust":
+            prepared = native_write.transform(
+                "prepare_append", time_token=(now or datetime.now()).strftime("%H:%M"),
+                topic=sub_header, me=me_text, assistant=claude_text, xid=xid,
+            )
+            body, header_text = prepared["body"], prepared["sub_header"]
+        else:
+            body = fmt.render_exchange(me_text, claude_text, xid)
+            rendered_header = fmt.render_subsection_header(now=now, topic=sub_header)
+            # store the header TEXT (no '### ' prefix) — the appender adds the prefix
+            header_text = rendered_header[4:] if rendered_header.startswith("### ") else rendered_header
         # Existing journals/corpora are not migrated. Persist the decision with
         # the exchange so partial scaffold writes are retried after a crash.
         scaffold = not self.journal.has_exchange() and not self.list_months()
-        self.journal.enqueue(
+        exchange_jid = self.journal.enqueue(
             "exchange",
             {
                 "scaffold": scaffold,
@@ -449,6 +464,10 @@ class CorpusStore:
                 {"month": self.month_filename(day), "label": self.month_label(day)},
             )
         self.apply_pending()
+        if self._corpus_write_impl == "rust" and not self.journal.is_applied(exchange_jid):
+            raise native_write.NativeWriteUnavailable(
+                "Diary exchange is pending; the save outcome is uncertain until journal replay"
+            )
         return xid
 
     @serialized
@@ -501,13 +520,23 @@ class CorpusStore:
         if found is None:
             raise CorpusError(f"no corpus document contains exchange {xid}")
         original, _ = self.backend.get_text(found[0])
-        edited = None if original is None else fmt.replace_exchange_text(original, xid, new_me, new_claude)
+        if self._corpus_write_impl == "rust":
+            inspected = native_write.transform("inspect_edit", current=original, xid=xid,
+                                               new_me=new_me, new_assistant=new_claude)
+            edited = inspected["edited_text"] if inspected["found"] else None
+            current_hash = inspected["current_hash"]
+            current_text = inspected["current_text"]
+            edited_hash = inspected["edited_hash"]
+        else:
+            edited = None if original is None else fmt.replace_exchange_text(original, xid, new_me, new_claude)
+            current_hash = fmt.exchange_hash(original, xid) if edited is not None else None
+            current_text = fmt.exchange_text(original, xid) if edited is not None else None
+            edited_hash = fmt.exchange_hash(edited, xid) if edited is not None else None
         if edited is None:
             raise CorpusError("The entry cannot be edited safely: malformed or missing block")
         if base_hash is not None:
-            current_hash = fmt.exchange_hash(original, xid)
             if current_hash != base_hash.strip().lower():
-                raise EditConflict(current_hash, fmt.exchange_text(original, xid))
+                raise EditConflict(current_hash, current_text)
             queued = self.journal.unapplied_exchange_edit(xid)
             if queued is not None:
                 # The caller's base matches current storage, but an earlier edit
@@ -518,12 +547,17 @@ class CorpusStore:
                 # re-deriving it here, so treat it as a conflict outright.
                 queued_new_me = queued.payload.get("new_me")
                 queued_new_claude = queued.payload.get("new_claude")
-                queued_result = fmt.replace_exchange_text(original, xid, queued_new_me, queued_new_claude)
-                queued_hash = fmt.exchange_hash(queued_result, xid) if queued_result else None
+                if self._corpus_write_impl == "rust":
+                    queued_inspected = native_write.transform("inspect_edit", current=original, xid=xid,
+                                                              new_me=queued_new_me, new_assistant=queued_new_claude)
+                    queued_hash = queued_inspected["edited_hash"] if queued_inspected["found"] else None
+                else:
+                    queued_result = fmt.replace_exchange_text(original, xid, queued_new_me, queued_new_claude)
+                    queued_hash = fmt.exchange_hash(queued_result, xid) if queued_result else None
                 if queued_hash is None or queued_hash != base_hash.strip().lower():
                     raise EditConflict(
                         current_hash,
-                        fmt.exchange_text(original, xid),
+                        current_text,
                         message="An edit for this exchange is still queued; reload and retry",
                     )
         payload = {"xid": xid, "new_me": new_me, "new_claude": new_claude}
@@ -534,7 +568,7 @@ class CorpusStore:
         if not self.journal.is_applied(jid):
             raise CorpusError("Correction is queued but could not be saved yet. It will retry when storage is available.")
         path, day = found
-        return path, day.isoformat(), fmt.exchange_hash(edited, xid)
+        return path, day.isoformat(), edited_hash
 
     def _documents_for_month(
         self, month_id: str, errors: Optional[list] = None
@@ -610,6 +644,12 @@ class CorpusStore:
         def mutate(current: Optional[str]) -> Tuple[Optional[str], bool]:
             if current is None:
                 raise PermanentApplyError("The entry no longer exists")
+            if self._corpus_write_impl == "rust":
+                result = native_write.transform("apply_edit", current=current, xid=xid,
+                                                new_me=p["new_me"], new_assistant=p["new_claude"])
+                if not result["found"]:
+                    raise PermanentApplyError("The entry cannot be edited safely: malformed or missing block")
+                return result["text"], result["changed"]
             new_text = fmt.replace_exchange_text(current, xid, p["new_me"], p["new_claude"])
             if new_text is None:
                 raise PermanentApplyError("The entry cannot be edited safely: malformed or missing block")
@@ -751,6 +791,12 @@ class CorpusStore:
         path = self.document_path(day)
 
         def mutate(current: Optional[str]) -> Tuple[Optional[str], bool]:
+            if self._corpus_write_impl == "rust":
+                result = native_write.transform(
+                    "apply_append", current=current, day_header=fmt.canonical_day_header(day),
+                    sub_header=sub_header, body=body, xid=xid,
+                )
+                return result["text"], result["changed"]
             if current is not None and fmt.has_marker(current, xid):
                 return current, False  # already applied — replay safe
             return fmt.append_to_month_text(current, day, sub_header, body), True

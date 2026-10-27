@@ -70,7 +70,8 @@ def test_v1_stream_keeps_tenant_and_one_exchange(monkeypatch):
     from fastapi.testclient import TestClient
     from types import SimpleNamespace
     tenant='11111111-1111-4111-8111-111111111111'
-    st=SimpleNamespace()
+    preflights=[]
+    st=SimpleNamespace(store=SimpleNamespace(require_write_transform=lambda:preflights.append(True)))
     calls=[]
     monkeypatch.setattr(appmod,'check_auth',lambda r:True)
     def state(request, recover=True):
@@ -90,6 +91,7 @@ def test_v1_stream_keeps_tenant_and_one_exchange(monkeypatch):
     assert r.status_code==200
     assert 'text/event-stream' in r.headers['content-type']
     assert calls==['Synthetic message']
+    assert preflights==[True,True]
     events=[json.loads(line[6:]) for line in r.text.splitlines() if line.startswith('data: ')]
     assert [e['type'] for e in events]==['status','status','answer','diary','done']  # #1505: the reasoning event is dropped
     appmod.SESSIONS.pop(f'{tenant}:stream-test',None)

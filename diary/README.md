@@ -380,3 +380,27 @@ is test-only and never changes production executable selection. The tests cover
 transaction closure, locks through reap, tenant/deleted/replaced databases,
 rollback, lost replies/idempotent retry, bounded child failures, HTTP status and
 exactly-once later outbox transfer. No real Diary data is required.
+
+
+### Corpus-write transform integration (source only)
+
+`DIARY_CORPUS_WRITE_IMPL` defaults to `python`. The explicit `rust` selection
+requires the fixed `/usr/local/bin/diary-corpus-write-cli` binary; this integration
+does not install it or activate the selector in an image. The private
+`transform-v1` process transforms text only. Python retains consent, locale/time
+header data, exchange identifiers, journal ordering, ETags, storage writes,
+indexing and history. There is no fallback after native selection.
+
+The adapter requires a complete input frame, bounded UTF-8 JSON output, exact
+schemas and EOF, zero exit and empty stderr. Setup/transport/cancellation cleanup
+reaps the owned child. Before enqueue, a native fault refuses the operation;
+after enqueue, the primary exchange remains pending and the API reports an
+uncertain save rather than success. Native outages do not quarantine intent or
+permit an untransformed PUT. Streaming responses emit an error without diary or
+done success events when the journaled write cannot finish.
+
+For paired source tests, set `DIARY_CORPUS_WRITE_TEST_BIN` to the separately built
+reviewed CLI. CI builds a checksum-verified test-only Rust source revision for
+these cases. This test dependency does not change Docker or release source pins.
+Packaging, activation, full isolated Diary qualification and retirement of
+Python journal/storage authority remain separate work.

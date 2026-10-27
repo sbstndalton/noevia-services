@@ -1,5 +1,6 @@
 """Synthetic bounded native temporal transport and context fail-closed checks."""
 from datetime import date
+from types import SimpleNamespace
 import json
 import os
 from pathlib import Path
@@ -268,6 +269,7 @@ def test_native_failure_stops_context_before_search_or_model(monkeypatch):
     assert retriever.calls == [8]
     calls = []
     class FakeState:
+        store = SimpleNamespace(require_write_transform=lambda: None)
         assembler = type('FailingAssembler', (), {'build': lambda *a, **k: (_ for _ in ()).throw(native.TemporalUnavailable('unavailable'))})()
         llm_main = type('Model', (), {'chat': lambda *a, **k: calls.append('model')})()
     monkeypatch.setattr(app, '_reindex_dirty', lambda _: None)
@@ -280,7 +282,7 @@ def test_native_context_failure_http_and_stream_are_unsaved(monkeypatch):
     from fastapi.testclient import TestClient
     import agent.app as app
     monkeypatch.setattr(app, 'check_auth', lambda _: True)
-    monkeypatch.setattr(app, '_tenant_state', lambda *a, **k: object())
+    monkeypatch.setattr(app, '_tenant_state', lambda *a, **k: SimpleNamespace(store=SimpleNamespace(require_write_transform=lambda: None)))
     monkeypatch.setattr(app, '_run_exchange',
                         lambda *a, **k: (_ for _ in ()).throw(native.TemporalUnavailable('private detail')))
     client = TestClient(app.app)

@@ -125,6 +125,9 @@ def fast(monkeypatch):
 
 
 class _Store:
+    def require_write_transform(self):
+        pass  # This test double represents an available Python transform.
+
     index_enabled = False
 
     def __init__(self):
@@ -273,7 +276,7 @@ def _v1(monkeypatch, run):
     import agent.app as appmod
     from fastapi.testclient import TestClient
     monkeypatch.setattr(appmod, "check_auth", lambda r: True)
-    monkeypatch.setattr(appmod, "_tenant_state", lambda r, **k: SimpleNamespace())
+    monkeypatch.setattr(appmod, "_tenant_state", lambda r, **k: SimpleNamespace(store=SimpleNamespace(require_write_transform=lambda: None)))
     monkeypatch.setattr(appmod, "_run_exchange", run)
     return TestClient(appmod.app).post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Synthetic?"}]})
 

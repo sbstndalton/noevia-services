@@ -14,6 +14,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from . import deadline as _deadline
+from . import corpus_write_native as native_write
 from .corpus_store import CorpusStore
 from .deadline import ExchangeBudget
 from .llm import LLMClient
@@ -173,6 +174,10 @@ class LoggingPipeline:
                 claude_text=summary,
                 now=now,
             )
+        except native_write.NativeWriteUnavailable:
+            # A selected native write may already hold a durable pending intent.
+            # The app must return 503 and must not record the turn as saved history.
+            raise
         except Exception as exc:  # noqa: BLE001
             log.exception("durable logging failed")
             return LogOutcome(decision="error", xid=None, reason=str(exc))
