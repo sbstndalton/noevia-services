@@ -109,6 +109,9 @@ def test_an_exhausted_budget_refuses_to_start_another_call():
 
 
 class _Store:
+    def require_write_transform(self):
+        pass  # This test double represents an available Python transform.
+
     def __init__(self, index_enabled=False):
         self.index_enabled = index_enabled
         self.saved = []

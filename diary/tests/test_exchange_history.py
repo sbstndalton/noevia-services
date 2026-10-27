@@ -83,7 +83,7 @@ def test_v1_seeds_a_new_session_only_with_completed_exchanges(monkeypatch, strea
     tenant = "11111111-1111-4111-8111-111111111111"
     seen = {}
     monkeypatch.setattr(appmod, "check_auth", lambda r: True)
-    monkeypatch.setattr(appmod, "_tenant_state", lambda request, recover=True: SimpleNamespace())
+    monkeypatch.setattr(appmod, "_tenant_state", lambda request, recover=True: SimpleNamespace(store=SimpleNamespace(require_write_transform=lambda: None)))
 
     def exchange(st, message, sid, owner, now, day, background, extra, emit=None):
         seen["message"] = message
@@ -114,7 +114,7 @@ def test_v1_new_message_is_the_last_user_turn_even_when_the_thread_ends_with_an_
     tenant = "11111111-1111-4111-8111-111111111111"
     seen = {}
     monkeypatch.setattr(appmod, "check_auth", lambda r: True)
-    monkeypatch.setattr(appmod, "_tenant_state", lambda request, recover=True: SimpleNamespace())
+    monkeypatch.setattr(appmod, "_tenant_state", lambda request, recover=True: SimpleNamespace(store=SimpleNamespace(require_write_transform=lambda: None)))
 
     def exchange(st, message, sid, owner, now, day, background, extra, emit=None):
         seen["message"] = message
@@ -163,6 +163,9 @@ def test_an_exchange_whose_save_failed_is_not_remembered_as_history(monkeypatch)
     import agent.app as appmod
 
     class FailingStore:
+        def require_write_transform(self):
+            pass  # This test double represents an available Python transform.
+
         def get_standing_sections_text(self, max_chars=0):
             return ""
 
@@ -182,6 +185,9 @@ def test_a_saved_exchange_is_remembered_as_a_completed_pair(monkeypatch):
     import agent.app as appmod
 
     class SavingStore:
+        def require_write_transform(self):
+            pass  # This test double represents an available Python transform.
+
         def get_standing_sections_text(self, max_chars=0):
             return ""
 

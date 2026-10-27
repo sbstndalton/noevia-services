@@ -19,8 +19,10 @@ DAY = date(2026, 10, 23)
 
 @pytest.fixture
 def rust(monkeypatch):
-    if not BIN or not Path(BIN).is_file():
+    if not BIN:
         pytest.skip("set DIARY_CORPUS_WRITE_TEST_BIN to the isolated source CLI for integration cases")
+    if not Path(BIN).is_file():
+        pytest.fail("DIARY_CORPUS_WRITE_TEST_BIN must name the paired test binary")
     monkeypatch.setenv(native.SELECTOR, "rust")
     monkeypatch.setattr(native, "BINARY", BIN)
 
@@ -211,4 +213,47 @@ def test_unavailable_native_refuses_before_model_and_history(client, monkeypatch
         {"role": "user", "content": "synthetic now"},
     ], "session_id": "native-fault"})
     assert response.status_code == 503
+    assert not appmod.SESSIONS
+
+
+def test_stream_native_fault_after_enqueue_has_error_without_success(client, rust, monkeypatch):
+    import json
+    from agent import app as appmod
+    from tests.test_diary_edit import _StubMain
+    def chat_stream(self, messages, emit, **kwargs):
+        return self.chat(messages, **kwargs)
+    monkeypatch.setattr(_StubMain, 'chat_stream', chat_stream, raising=False)
+    original = native.transform
+    def fail_apply(op, **fields):
+        if op == 'apply_append':
+            raise native.NativeWriteUnavailable('synthetic child failure')
+        return original(op, **fields)
+    monkeypatch.setattr(native, 'transform', fail_apply)
+    response = client.post('/v1/chat/completions', json={
+        'messages': [{'role': 'user', 'content': 'synthetic streaming question'}],
+        'session_id': 'native-stream-pending', 'stream': True, 'diary_events': True,
+    })
+    assert response.status_code == 200  # SSE transport starts before the journaled work.
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+    assert any(e['type'] == 'error' for e in events)
+    assert not any(e['type'] in ('diary', 'done') for e in events)
+    st = next(iter(appmod._tenant_states.values()))
+    assert st.journal.pending_count() >= 1
+    assert st.journal.quarantined_count() == 0
+    assert all(not item['turns'] for item in appmod.SESSIONS.values())
+
+
+def test_local_exchange_native_outage_returns_503_before_model(client, monkeypatch):
+    from agent import app as appmod
+    from tests.test_diary_edit import _StubMain
+    monkeypatch.setenv(native.SELECTOR, 'rust')
+    monkeypatch.setattr(native, 'BINARY', '/absent/diary-corpus-write-cli')
+    def no_model(*args, **kwargs):
+        pytest.fail('model called with unavailable native transform')
+    monkeypatch.setattr(_StubMain, 'chat', no_model)
+    response = client.post('/api/local-exchange', headers={
+        'X-Cowork-User-ID': '22222222-2222-4222-8222-222222222222',
+    }, json={'message': 'synthetic local question', 'files': {}})
+    assert response.status_code == 503
+    assert response.json()['code'] == 'writeUnavailable'
     assert not appmod.SESSIONS

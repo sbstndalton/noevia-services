@@ -124,6 +124,9 @@ def upstreams():
 
 
 class _Store:
+    def require_write_transform(self):
+        pass  # This test double represents an available Python transform.
+
     index_enabled = False
 
     def __init__(self):

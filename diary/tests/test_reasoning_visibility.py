@@ -90,6 +90,9 @@ def test_saved_entry_and_stream_carry_no_reasoning_from_a_real_exchange(monkeypa
     saved = []
 
     class Store:
+        def require_write_transform(self):
+            pass  # This test double represents an available Python transform.
+
         index_enabled = False
 
         def get_standing_sections_text(self, max_chars=0):

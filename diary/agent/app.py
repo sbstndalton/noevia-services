@@ -1877,6 +1877,8 @@ def local_exchange(body: dict, request: Request):
         return exchange_stream(work)
     try:
         return work()
+    except NativeWriteUnavailable:
+        return JSONResponse({"error": "diary write transform unavailable", "code": "writeUnavailable"}, status_code=503)
     except TemporalUnavailable:
         return JSONResponse({"error": TEMPORAL_UNAVAILABLE_TEXT, "detail": TEMPORAL_UNAVAILABLE_TEXT,
                              "code": "contextUnavailable", "saved": False}, status_code=503)

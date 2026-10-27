@@ -108,10 +108,24 @@ jobs:
           python scripts/smoke_workspace_decode.py
       - name: Tenant-assertion fixtures match noevia-rs
         run: cmp tests/fixtures/tenant-assertion.v1.json "$RUNNER_TEMP/noevia-rs/crates/tenant-assertion/tests/fixtures/tenant-assertion.v1.json"
+      # Source-only dependency for paired transform tests. Docker/release pins stay separate.
+      - name: Build the reviewed corpus-write CLI for paired tests
+        working-directory: .
+        env:
+          CORPUS_WRITE_RS_REF: 8580fe5c77ebc65d34efab097ba62d250788142c
+          CORPUS_WRITE_RS_SHA256: 47f3711142a8fbb5df1c67e09655279ca7823c69d81cfcd5d842d002971517cb
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/corpus-write-rs.tar.gz" "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$CORPUS_WRITE_RS_REF"
+          echo "$CORPUS_WRITE_RS_SHA256  $RUNNER_TEMP/corpus-write-rs.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/corpus-write-rs"
+          tar -xzf "$RUNNER_TEMP/corpus-write-rs.tar.gz" -C "$RUNNER_TEMP/corpus-write-rs" --strip-components=1
+          cargo build --release --locked --manifest-path "$RUNNER_TEMP/corpus-write-rs/Cargo.toml" -p diary-corpus-write-cli
       - name: Diary test suite (with the tenant-assertion binary)
         env:
           TENANT_ASSERTION_BIN: ${{ runner.temp }}/noevia-rs/target/release/tenant-assertion
           TENANT_ASSERTION_REQUIRED: "1"
+          DIARY_CORPUS_WRITE_TEST_BIN: ${{ runner.temp }}/corpus-write-rs/target/release/diary-corpus-write-cli
         run: python -m pytest -q -rs
       # workspace-restore-verify (WORKSPACE_RESTORE_VERIFY_IMPL=rust, noevia#982): same contract: the
       # fixture table is byte-identical to noevia-rs' copy, and the binary agrees with the live Python

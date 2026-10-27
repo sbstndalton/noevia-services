@@ -108,7 +108,7 @@ def test_chat_resolves_the_tenant_off_the_event_loop(app_client, monkeypatch, st
             seen.append("event loop")
         except RuntimeError:
             seen.append("worker thread")
-        return SimpleNamespace()
+        return SimpleNamespace(store=SimpleNamespace(require_write_transform=lambda: None))
 
     monkeypatch.setattr(appmod, "_tenant_state", state)
     monkeypatch.setattr(appmod, "_run_exchange", lambda *a, **k: {"reply": "Synthetic", "decision": "skipped", "xid": None})
