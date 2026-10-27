@@ -101,6 +101,11 @@ jobs:
       - name: Build tenant-assertion and workspace-restore-verify
         working-directory: ${{ runner.temp }}/noevia-rs
         run: cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli
+      - name: Install and smoke the pinned decode-v1 binary
+        run: |
+          set -euo pipefail
+          sudo install -m 0755 "$RUNNER_TEMP/noevia-rs/target/release/workspace-restore-verify" /usr/local/bin/workspace-restore-verify
+          python scripts/smoke_workspace_decode.py
       - name: Tenant-assertion fixtures match noevia-rs
         run: cmp tests/fixtures/tenant-assertion.v1.json "$RUNNER_TEMP/noevia-rs/crates/tenant-assertion/tests/fixtures/tenant-assertion.v1.json"
       - name: Diary test suite (with the tenant-assertion binary)

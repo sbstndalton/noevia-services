@@ -218,6 +218,10 @@ note says the list may be incomplete.
 A short note opens the retrieved block. Messages without a name or anchor are unaffected, and
 `retrieval.entity_focus: false` turns the check off.
 
+`DIARY_TEMPORAL_FOCUS_IMPL=rust` opts the date-anchor and candidate cutoff within that check into the pinned `diary-temporal-cli` binary at `/usr/local/bin/diary-temporal-cli`. The default remains Python. The service passes the one validated native anchor to both pool selection and post-search cutoff; content/name matching remains in Python. Native capacity, protocol, process, or missing-binary failures make the exchange context unavailable before model delivery or saving, with no Python fallback. The Rust binary must be supplied and pinned separately before the selector is enabled. This adapter does not change images, pins, or runtime selection.
+
+
+
 ## Score gap (services#114)
 
 A fixed `top_k` loads eight entries even when one or two are relevant. When the message names no entity (and is
@@ -312,3 +316,67 @@ storage headers, over-long fields (the tenant ids web signs are UUIDs). A `secre
 mismatch (400), a non-ASCII one no longer an error. The key and headers reach the child on stdin only, with a
 `PATH`-only environment. With `DIARY_TENANT_KEY` set and no usable binary the service logs an error at start and
 refuses every tenant request. `TENANT_ASSERTION_BIN` overrides the binary path (tests).
+
+### Workspace archive decoder source pairing
+
+The standalone Diary image pins noevia-rs `4d18712c75be72f209af47ea420bfeb25da3dca3`
+(noevia-rs#301) with verified codeload SHA-256
+`0eedcd57b1852e4ed91c4db5d7cb5360a7656cc1849c3095b0760953d1015831`.
+This supplies the `decode-v1` command required by the explicit Rust restore/import
+path. Its versioned frame, successful exit and exact EOF are mandatory; an older
+verify-only binary fails closed without Python ZIP fallback.
+
+Both image construction and CI run `scripts/smoke_workspace_decode.py` against the
+installed binary using synthetic source bytes, settings, an empty folder and an
+invalid archive. The smoke disables the Python parser and selects Rust only in its
+own process. The service selector default remains Python.
+
+All five service Dockerfiles carry the same reviewed source ref/checksum in this
+change; metadata guards reject a mismatched standalone pin. The global release
+lock and runtime activation remain separate qualification steps.
+
+Decode IPC uses nonblocking selector-driven pipes with bounded input/output and a
+shared 120-second deadline. Setup, I/O failure and caller cancellation close the
+owned pipes and reap the direct child before returning. No daemon pipe workers
+remain blocked on inherited descriptors. Known child refusals retain their
+validation messages; partial frames, extra bytes, failed input or child exit fail
+closed without Python ZIP fallback. Stderr remains discarded, preserving the
+existing private protocol and keeping child diagnostics out of responses/logs.
+
+### Opt-in native managed ZIP import transaction
+
+The default import APPLY implementation remains Python. Explicit
+`WORKSPACE_IMPORT_APPLY_IMPL=rust` selects the fixed installed
+`/usr/local/bin/diary-workspace-import-apply apply-v1` transaction CLI from
+noevia-rs#311; this source-only adapter does not build/install that binary, change
+an image pin or activate the selector. Missing/incompatible native binaries fail
+closed. There is no environment-selected executable or Python mutation fallback.
+
+Python preview and review validation finish their SQLite contexts before spawning
+Rust. `ManagedCorpusBackend.close()` is a no-op and is not used for this purpose.
+The application keeps its existing store write/migration/journal exclusions until
+the child exits and is reaped. Rust receives the original ZIP, reviewed fingerprint,
+normalized destination and the backend-derived database path/tenant/debounce;
+verified source application belongs to its single SQLite transaction.
+
+The versioned IPC caps metadata at 1 MiB, original ZIP at the existing 272 MiB
+limit, and stdout/stderr at 4096 bytes each. Browser uploads retain their 32 MiB
+limit. Nonblocking pipes concurrently feed input and drain output under a
+120-second monotonic deadline; faults kill/reap only the owned child. Responses
+require exact fields, version, destination/count, EOF and successful exit.
+Child output and private paths/bytes are never logged.
+
+Preview validation remains HTTP 400; APPLY validation/conflicts remain 409.
+Native unavailability and uncertain outcomes return 503 without draining the
+index outbox or claiming success. An uncertain outcome clears the recovery flag
+because a receipt/outbox may already have committed. Retry the same archive,
+destination and reviewed fingerprint: the durable receipt makes that retry
+idempotent. Normal later recovery transfers/indexes pending outbox entries; the
+import itself never invokes a model.
+
+Synthetic tests in `tests/test_workspace_import_native.py` use the reviewed Rust
+binary when `WORKSPACE_IMPORT_APPLY_TEST_BIN` is supplied to pytest. That variable
+is test-only and never changes production executable selection. The tests cover
+transaction closure, locks through reap, tenant/deleted/replaced databases,
+rollback, lost replies/idempotent retry, bounded child failures, HTTP status and
+exactly-once later outbox transfer. No real Diary data is required.

@@ -18,7 +18,7 @@ import logging
 import re
 from typing import List, Optional
 
-from . import entity_focus, follow_up, score_gap
+from . import entity_focus, follow_up, score_gap, temporal_native
 from .corpus_store import CorpusStore
 from .retrieval import Retriever
 from .retrieval_trace import RetrievalTrace, SafeTrace
@@ -195,7 +195,15 @@ class ContextAssembler:
         # Earlier user messages of this conversation: a name-less follow-up carries their entities.
         earlier = [t["content"] for t in (session_turns or []) if t.get("role") == "user"][-3:]
         enabled = _enabled(self.cfg.get("retrieval.entity_focus", True))
-        focused = enabled and entity_focus.analyse(user_message, earlier).active
+        native_temporal = enabled and temporal_native.choice() == "rust"
+        analysis = None
+        if enabled:
+            if native_temporal:
+                analysis = entity_focus.analyse(user_message, earlier,
+                                                anchor=temporal_native.anchor(user_message))
+            else:
+                analysis = entity_focus.analyse(user_message, earlier)
+        focused = bool(analysis and analysis.active)
         pool = top_k * 4 if focused else candidate_k
         if trace is not None:
             trace.set_params(top_k=top_k, candidate_k=pool, min_score=min_score)
@@ -224,8 +232,9 @@ class ContextAssembler:
         focus = None
         if focused:
             margin = entity_focus.parse_margin(self.cfg.get("retrieval.entity_focus_margin", entity_focus.MARGIN))
+            partition = temporal_native.cutoff(analysis.anchor, results) if native_temporal else None
             focus = entity_focus.focus_candidates(user_message, results, limit=candidate_k, earlier=earlier,
-                                                  margin=margin)
+                                                  margin=margin, analysed=analysis, temporal_partition=partition)
             ranked = focus.kept
             if trace is not None:
                 trace.set_focus(focus, len(results))
@@ -236,9 +245,13 @@ class ContextAssembler:
         # its score.
         gap = score_gap.parse_gap(self.cfg.get("retrieval.score_gap", score_gap.SCORE_GAP))
         gap_applies = gap is not None and not (focus is not None and focus.entities)
-        ranked, gap_removed, gap_best = score_gap.cut(ranked, gap if gap_applies else None)
+        gap_diagnostics = {}
+        ranked, gap_removed, gap_best = score_gap.cut(
+            ranked, gap if gap_applies else None, diagnostics=gap_diagnostics)
+        if gap_diagnostics.get("status") == "unavailable":
+            gap_applies = False
         if trace is not None:
-            trace.set_score_gap(gap, gap_applies, gap_best, gap_removed)
+            trace.set_score_gap(gap, gap_applies, gap_best, gap_removed, diagnostics=gap_diagnostics)
         notes = entity_focus.context_notes(focus) if focus is not None else []
         # Fit budget: keep highest-scored, cap each excerpt, drop overflow lowest-first. The notes and
         # labels are charged to the same budget as the excerpts they describe.

@@ -864,10 +864,12 @@ class CorpusStore:
         except Exception as exc:  # noqa: BLE001
             log.warning("day-text read failed (degrading to empty): %s", exc)
             return ""
+        from .corpus_parse import parse
+        parsed = parse(month_text)
         if not month_text:
             return ""
         header = fmt.canonical_day_header(day)
-        for d in fmt.parse_diary(month_text):
+        for d in parsed.days:
             if d.header == header:
                 parts = [d.header, ""]
                 for sub in d.subsections:

@@ -46,11 +46,12 @@ def test_python_reference_still_decides_as_recorded(case, monkeypatch):
 
 @pytest.mark.skipif(not os.environ.get('WORKSPACE_RESTORE_VERIFY_BIN'), reason='WORKSPACE_RESTORE_VERIFY_BIN not set (CI builds it)')
 def test_rust_through_the_switch_matches_and_never_accepts_more(monkeypatch):
+    from agent import workspace_decode as wd
     monkeypatch.setenv('WORKSPACE_RESTORE_VERIFY_IMPL', 'rust')
+    monkeypatch.setattr(wd, 'DEFAULT_BIN', os.environ['WORKSPACE_RESTORE_VERIFY_BIN'])
     for c in FIXTURES:
         got = decision(base64.b64decode(c['archive_b64']))
-        # Through the switch Rust runs first: its refusal (with Python's message) wins, and an
-        # archive is accepted only when both accept with the same listing.
+        # Native decode-v1 alone decides acceptance; the reference stays test-only.
         assert got == c['rust'], c['name']
         if got.startswith('accept'):
             assert got == c['python'], c['name']
