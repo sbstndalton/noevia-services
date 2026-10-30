@@ -99,10 +99,10 @@ refuse before importing the model engine. Rust owns validation, admission,
 deadlines and worker supervision. The Python worker owns only framed IPC,
 model loading, context-budget checks, inference and keep-warm behavior.
 
-The Dockerfile must pin the exact merged Rust commit containing the native-only
-launcher, with an independently verified source-archive checksum. Until that
-paired pin and image qualification change lands, this source branch is not an
-image or deployment change. RUNTIME_IMAGE remains a global build argument and
+The Dockerfile pins the exact merged Rust commit containing the native-only
+launcher, with a verified source-archive checksum, and CI qualifies the synthetic
+images. Images already running keep the launcher they were built with; a rebuilt
+production image needs its own qualification with real models. RUNTIME_IMAGE remains a global build argument and
 REUSE_CPU_RUNTIME remains available in the final production stage. The
 production engine installation instructions and pinned package versions stay
 byte-identical to services commit 4f3cf816225d4ed12db33fd8e4a7e2d7ae946a4b.
