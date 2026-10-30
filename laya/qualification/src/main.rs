@@ -15,9 +15,10 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const CAP: usize = 16_384;
 const OUTPUT_CAP: u64 = 65_536;
 const REFUSAL_TMPFS: &str = "/tmp:rw,exec,size=16777216,mode=1777";
-// Hash of the Python source shipped in the synthetic and production images. Its
-// HTTP path no longer runs: noevia-laya starts only its --engine-worker mode.
-const SERVER_HASH: &str = "858f39094eb66e99d582a47e62fd4ff380408e0278db592e40e0cd828f30c76d";
+// Hash the engine-only Python source shipped in the synthetic and production
+// images. The legacy Python HTTP oracle remains frozen in noevia-rs at services
+// commit 920d57d82d8f4c817760255cff602e15ccc64448.
+const SERVER_HASH: &str = "c3bb14541ba232735218dfbc5a962f08b72e24ebe391dab46db523eb16f2e2e1";
 const ENGINE_DOCKER_HASH: &str = "3e63e74b0265b9a524d601a1ad1222335122a4988671c1a22924574d7d20d964";
 // Fixed ML collaborators exercise the actual retained engine and framed IPC.
 // HTTP cases, clients and assertions remain in Rust.

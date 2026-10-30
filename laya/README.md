@@ -57,7 +57,8 @@ record and can omit relevant evidence. Root Laya is English-only; its suitabilit
 for this checkpoint policy is unqualified. Model probabilities are not established
 correctness probabilities. No quality or speed claims follow from the smoke test.
 
-Verification: Python validation tests use no model imports; Node tests use mocked
+Verification: Python engine and framed-transport tests use synthetic model modules;
+Rust owns HTTP validation and its differential fixtures. Node tests use mocked
 HTTP responses and answering providers. The one authorized real synthetic smoke test
 on DaServer returned `continue` with scores 0.465 / 0.2975 / 0.2374. No benchmark,
 training, paid endpoint call, or real Diary/personal source test was performed.
@@ -68,7 +69,7 @@ option-logit endpoint remains a compatibility fallback when no shared endpoint i
 
 ## Concurrency (`LAYA_MAX_CONCURRENCY`, issue #780)
 
-The HTTP server is threaded (daemon threads); `/health` never waits on inference.
+The Rust HTTP front serves `/health` independently of inference admission.
 `LAYA_MAX_CONCURRENCY` (integer 1 to 4, default 1, garbage refused with a log line)
 sets the number of inference slots. Each slot is its own worker process with its own
 model copy and pipe, so a request holds one slot exclusively and nothing mutable is
@@ -87,33 +88,37 @@ Cost: every extra slot loads another model copy (RSS not yet measured; the conta
 limit is 6 GiB and 2 CPUs, which also caps real speedup). Raising the bound, and
 `NOEVIA_ROUTER_CHUNKS`, needs a measured, owner-approved run.
 
-## Native image source (issue #1326)
+## Native HTTP and retained engine (issues #1326 and #1071)
 
-The image entrypoint is `noevia-laya`. With `NOEVIA_LAYA_IMPL` absent or set to `rust`
-it runs the compiled Rust HTTP, validation, admission and process supervisor; the fixed
-Python Laya/PyTorch worker (`server.py --engine-worker`) remains the ML engine through
-bounded framed IPC. Any other selector, including the retired `python`, refuses startup.
-A build without `native-laya` refuses startup before spawning a child or binding a
-listener, with no fallback. Images already running keep the launcher they were built with.
+The noevia-laya binary owns HTTP when NOEVIA_LAYA_IMPL is absent or rust.
+The retired python selector, unknown values and non-UTF-8 values fail closed.
+A binary without the native-laya feature refuses before a worker or listener
+starts. The only remaining Python service entrypoint is
+python /service/server.py --engine-worker; plain or unknown Python commands
+refuse before importing the model engine. Rust owns validation, admission,
+deadlines and worker supervision. The Python worker owns only framed IPC,
+model loading, context-budget checks, inference and keep-warm behavior.
 
-The Dockerfile fetches a checksum-verified merged Rust source archive and builds
-the native and featureless binaries separately. `RUNTIME_IMAGE` remains a global
-build argument, and `REUSE_CPU_RUNTIME` remains available in the final production
-stage. The engine installation instructions and pinned package versions are
-byte-identical to services commit `4f3cf816225d4ed12db33fd8e4a7e2d7ae946a4b`.
-The Rust source guard checks that original instruction hash; this does not prove
-identity of an existing image's dependency layers or transitive package contents.
+The Dockerfile must pin the exact merged Rust commit containing the native-only
+launcher, with an independently verified source-archive checksum. Until that
+paired pin and image qualification change lands, this source branch is not an
+image or deployment change. RUNTIME_IMAGE remains a global build argument and
+REUSE_CPU_RUNTIME remains available in the final production stage. The
+production engine installation instructions and pinned package versions stay
+byte-identical to services commit 4f3cf816225d4ed12db33fd8e4a7e2d7ae946a4b.
+The Rust source guard checks that instruction hash; it does not prove identity
+of existing dependency layers or transitive packages.
 
-The additive CI job builds only `--target synthetic` and
-`--target synthetic-featureless`. These targets use Python 3.12 without installing
-torch, Laya, tokenizer packages or models. A Rust qualification runner mounts its
-own fixed fake engine modules and a synthetic model marker read-only and exercises
-the actual retained `server.py`. Containers use UID 1000, a read-only root,
-`--network none`, no published ports, no capabilities, no new privileges, bounded
-memory/CPU/PIDs and a bounded `/tmp` tmpfs. Rust probes inside the network namespace
-check default/explicit Python, native HTTP and deadlines, busy `Retry-After: 1`,
-late reply discard, disconnect/recovery, selector and feature refusal, and
-startup/ready SIGTERM. Owned random labels restrict cleanup to these containers.
+CI builds only synthetic and synthetic-featureless image targets. They use
+Python 3.12 without installing torch, Laya, tokenizer packages or models.
+The Rust qualification runner mounts fixed fake engine modules and a synthetic
+model marker read-only. Containers use UID 1000, a read-only root, no network or
+published ports, no capabilities, no new privileges, bounded memory/CPU/PIDs
+and a bounded /tmp tmpfs. The image probe must show default and explicit Rust
+HTTP with native PID 1, retired-selector and feature-omission refusal, typed
+HTTP and deadlines, busy Retry-After, late reply discard, disconnect/recovery,
+and startup/ready SIGTERM cleanup. Owned random labels restrict cleanup to
+these synthetic containers.
 
 Local source checks:
 
@@ -128,5 +133,5 @@ target build or real model startup to qualify this source change. The existing
 private network, read-only model mount, offline serving and provisioning runbook
 continue to apply. This source does not activate an owner or recreate a live Laya
 service. Synthetic evidence establishes no model quality, real-tokenizer parity,
-memory or inference-performance claim; issue #1326 remains open for production
-deployment qualification.
+memory or inference-performance claim. Issue #1071 still requires coordinated
+release pinning and production qualification before any live switch.
