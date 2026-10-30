@@ -89,12 +89,12 @@ limit is 6 GiB and 2 CPUs, which also caps real speedup). Raising the bound, and
 
 ## Native image source (issue #1326)
 
-The image entrypoint is now `noevia-laya`. With `NOEVIA_LAYA_IMPL` absent or set to
-`python`, it execs the existing `python /service/server.py` command. Explicit `rust`
-selects the compiled Rust HTTP, validation, admission and process supervisor; the
-fixed Python Laya/PyTorch worker remains the ML engine through bounded framed IPC.
-An unknown or non-UTF-8 selector refuses startup. A build without `native-laya`
-refuses `rust` before spawning a child or binding a listener, with no fallback.
+The image entrypoint is `noevia-laya`. With `NOEVIA_LAYA_IMPL` absent or set to `rust`
+it runs the compiled Rust HTTP, validation, admission and process supervisor; the fixed
+Python Laya/PyTorch worker (`server.py --engine-worker`) remains the ML engine through
+bounded framed IPC. Any other selector, including the retired `python`, refuses startup.
+A build without `native-laya` refuses startup before spawning a child or binding a
+listener, with no fallback. Images already running keep the launcher they were built with.
 
 The Dockerfile fetches a checksum-verified merged Rust source archive and builds
 the native and featureless binaries separately. `RUNTIME_IMAGE` remains a global

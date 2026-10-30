@@ -15,12 +15,12 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const CAP: usize = 16_384;
 const OUTPUT_CAP: u64 = 65_536;
 const REFUSAL_TMPFS: &str = "/tmp:rw,exec,size=16777216,mode=1777";
-// Re-pinned for sbstndalton/noevia#1074 (late-answer guards in Runtime.decide); the
-// previous pin was services commit 4f3cf816225d4ed12db33fd8e4a7e2d7ae946a4b.
+// Hash of the Python source shipped in the synthetic and production images. Its
+// HTTP path no longer runs: noevia-laya starts only its --engine-worker mode.
 const SERVER_HASH: &str = "858f39094eb66e99d582a47e62fd4ff380408e0278db592e40e0cd828f30c76d";
 const ENGINE_DOCKER_HASH: &str = "3e63e74b0265b9a524d601a1ad1222335122a4988671c1a22924574d7d20d964";
-// Fixed ML collaborators: the actual retained server remains the policy/IPC
-// oracle. No case generation, HTTP client or test assertions run in Python.
+// Fixed ML collaborators exercise the actual retained engine and framed IPC.
+// HTTP cases, clients and assertions remain in Rust.
 const TORCH: &str = "def set_num_threads(n):pass\ndef set_num_interop_threads(n):pass\n";
 const ENGINE: &str = r#"import os,time,json,subprocess
 ROOT='/tmp/laya-synthetic'
@@ -437,7 +437,9 @@ fn refusal(featureless: bool) -> Result<()> {
     // before any absence-of-marker assertion can count as selector refusal.
     interpreter_control(&python, &marker)?;
     for selector in [
+        std::ffi::OsString::from("python"),
         std::ffi::OsString::from("unknown"),
+        std::ffi::OsString::new(),
         std::ffi::OsString::from_vec(vec![0xff]),
     ] {
         let (success, output) = command(
@@ -448,24 +450,14 @@ fn refusal(featureless: bool) -> Result<()> {
         )?;
         require(
             !success && output.contains("NOEVIA_LAYA_IMPL must be"),
-            "invalid selector silently fell back",
-        )?;
-        require(!marker.exists(), "invalid selector spawned interpreter")?;
-    }
-    if featureless {
-        let (success, output) = command(
-            Command::new("/usr/local/bin/noevia-laya")
-                .env("NOEVIA_LAYA_IMPL", "rust")
-                .env("PATH", directory.path()),
-            Duration::from_secs(2),
+            "retired or invalid selector did not fail closed",
         )?;
         require(
-            !success && output.contains("native-laya feature required"),
-            "feature omission did not refuse before startup",
+            !marker.exists(),
+            "retired or invalid selector spawned interpreter",
         )?;
-        require(!marker.exists(), "featureless native spawned interpreter")?;
     }
-    for selector in [None, Some("python")] {
+    for selector in [None, Some("rust")] {
         let mut owner = Command::new("/usr/local/bin/noevia-laya");
         owner
             .env_remove("NOEVIA_LAYA_IMPL")
@@ -474,19 +466,23 @@ fn refusal(featureless: bool) -> Result<()> {
             owner.env("NOEVIA_LAYA_IMPL", selector);
         }
         let (success, output) = command(&mut owner, Duration::from_secs(2))?;
-        let phase = if selector.is_some() {
-            "explicit-python"
+        require(!success, "synthetic failing worker made launcher succeed")?;
+        if featureless {
+            require(
+                output.contains("native-laya feature required"),
+                "feature omission did not refuse before startup",
+            )?;
+            require(!marker.exists(), "featureless native spawned interpreter")?;
         } else {
-            "default-python"
-        };
-        let actual = fs::read_to_string(&marker).map_err(|error| {
-            format!("refusal {phase}: interpreter marker missing at {}: {error}; owner output: {output}", marker.display())
-        })?;
-        require(
-            !success && actual == "/service/server.py",
-            "legacy argv changed",
-        )?;
-        fs::remove_file(&marker)?;
+            let actual = fs::read_to_string(&marker).map_err(|error| {
+                format!("native launcher interpreter marker missing at {}: {error}; owner output: {output}", marker.display())
+            })?;
+            require(
+                actual == "/service/server.py --engine-worker",
+                "native launcher invoked Python HTTP instead of the retained worker",
+            )?;
+            fs::remove_file(&marker)?;
+        }
     }
     require(
         exchange("GET", &[]).is_err(),
@@ -496,7 +492,7 @@ fn refusal(featureless: bool) -> Result<()> {
 }
 fn interpreter_control(python: &Path, marker: &Path) -> Result<()> {
     let (success, output) = command(
-        Command::new(python).arg("/service/server.py"),
+        Command::new(python).args(["/service/server.py", "--engine-worker"]),
         Duration::from_secs(2),
     )
     .map_err(|error| {
@@ -512,7 +508,7 @@ fn interpreter_control(python: &Path, marker: &Path) -> Result<()> {
         )
     })?;
     require(
-        !success && actual == "/service/server.py",
+        !success && actual == "/service/server.py --engine-worker",
         "refusal interpreter preflight argv/status mismatch",
     )?;
     fs::remove_file(marker)?;
@@ -744,26 +740,17 @@ fn run_images(image: &str, featureless: &str, source: &Path) -> Result<()> {
     guard(source)?;
     let directory = tempfile::tempdir()?;
     prepare(directory.path())?;
-    for (suffix, selector) in [
-        ("default", None),
-        ("python", Some("python")),
-        ("native", Some("rust")),
-    ] {
+    for (suffix, selector) in [("default", None), ("native", Some("rust"))] {
         let owner = Container::start(image, directory.path(), suffix, selector, "")?;
         owner.ready()?;
         // Namespace-local Rust probe: no exposed port or host-network access.
         docker(&["exec", &owner.name, "laya-image-probe", "contract"])?;
         let argv = docker(&["exec", &owner.name, "laya-image-probe", "owner"])?;
-        let expected = if selector == Some("rust") {
-            "noevia-laya"
-        } else {
-            "python /service/server.py"
-        };
         require(
-            argv.trim() == expected,
-            "default/native PID1 owner mismatch",
+            argv.trim() == "noevia-laya",
+            "default/native PID1 must be the Rust front",
         )?;
-        owner.stop(selector == Some("rust"))?;
+        owner.stop(true)?;
     }
     for (suffix, selected_image, mode) in [
         ("selector", image, "native"),
@@ -826,7 +813,7 @@ fn run_images(image: &str, featureless: &str, source: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(20));
     }
     startup.stop(true)?;
-    println!("synthetic image qualification PASS: default/explicit-python/native, typed HTTP, bounds, late/cancel/recovery, refusal/omission, startup/ready SIGTERM; no actual ML");
+    println!("synthetic image qualification PASS: default/native Rust, typed HTTP, bounds, late/cancel/recovery, retired-selector/feature refusal, startup/ready SIGTERM; no actual ML");
     Ok(())
 }
 fn main() -> Result<()> {
