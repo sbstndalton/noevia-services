@@ -126,7 +126,7 @@ def _build_converter(figures=False):
     # Tesseract, not Docling's EasyOCR default: EasyOCR measures ~13 s/page on
     # CPU and would dominate everything else. Tesseract is already in this
     # image and is what the previous OCR worker used, so output stays
-    # comparable. Languages match services/ocr/server.py.
+    # comparable. Languages match noevia-ocr (noevia-rs bins/noevia-ocr).
     options.ocr_options = TesseractCliOcrOptions(lang=["eng", "deu"])
     if figures:
         options.generate_picture_images = True
