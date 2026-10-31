@@ -319,9 +319,9 @@ refuses every tenant request. `TENANT_ASSERTION_BIN` overrides the binary path (
 
 ### Workspace archive decoder source pairing
 
-The standalone Diary image pins noevia-rs `f113499643d8a74a51aa7e5e2c2518acf14d529e`
+The standalone Diary image pins noevia-rs `843cf34027e59a0a2ee93e552c743b1b48e05ada`
 (noevia-rs#301) with verified codeload SHA-256
-`2f12c79a95feabbe7b488713570b526bcf49eace058792e350a3ee918095f2be`.
+`02a9d7702a9e62c507de9fa0417953b4f007ba5be981cc553d39329f0eff71a7`.
 This supplies the `decode-v1` command required by the explicit Rust restore/import
 path. Its versioned frame, successful exit and exact EOF are mandatory; an older
 verify-only binary fails closed without Python ZIP fallback.
