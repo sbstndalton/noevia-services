@@ -1,7 +1,7 @@
 # Native Docling HTTP/worker supervision (#1322). Engine layers below remain unchanged.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS native-docling
-ARG NOEVIA_RS_REF=3a34a0ed85791e7950a130e96357b9252871d377
-ARG NOEVIA_RS_SHA256=b34a692a30f4bff6f199992235e51a032e8e30c2dda1dfd0fae5d47947f782dd
+ARG NOEVIA_RS_REF=f113499643d8a74a51aa7e5e2c2518acf14d529e
+ARG NOEVIA_RS_SHA256=2f12c79a95feabbe7b488713570b526bcf49eace058792e350a3ee918095f2be
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
