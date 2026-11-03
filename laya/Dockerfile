@@ -2,8 +2,8 @@
 # This global argument remains visible to the final production FROM.
 ARG RUNTIME_IMAGE=python:3.12-slim
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS native-builder
-ARG NOEVIA_RS_REF=ae595013b05555f8a9232d688f392e482e314d5a
-ARG NOEVIA_RS_SHA256=9dd273ea8c11cfab02bf294be46420116bb747e5156cd363e5cbfdd374198723
+ARG NOEVIA_RS_REF=abd9c4c3a2b48c697fdbc70daa17a711c384820f
+ARG NOEVIA_RS_SHA256=b889b5398a49a098f432854c7f492c5e4a0daa0a6103f9be92f17c88673da0dd
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
