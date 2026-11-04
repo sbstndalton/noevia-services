@@ -35,14 +35,19 @@ from typing import Callable, Optional
 
 import httpx
 
-from . import tenant_assertion
+from . import tenant_assertion, workspace_export_native
+from .diary_migration import SETTING_KEYS
 
 log = logging.getLogger("diary.rust")
 
 PORT = 8011
 DEFAULT_BIN = "/usr/local/bin/noevia-diary"
 # The routes the Rust process implements (D4). Anything else named in DIARY_RUST_ROUTES is ignored.
-SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET"}
+# D4b adds the read side of the file API, storage status and workspace export; `PUT /api/file`
+# and every other write stay here (single writer until D5).
+SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
+             "/api/files": "GET", "/api/file": "POST", "/api/storage-status": "GET",
+             "/api/workspace-export": "GET"}
 DECLINE_HEADER = b"x-noevia-diary-decline"
 CONTROL_HEADER = "x-noevia-diary-control"
 READY_TIMEOUT_S = 10.0
@@ -102,6 +107,13 @@ def server_config(base_cfg, state, port: int, control_token: str) -> dict:
             "aux": client(state.llm_aux, "llm.aux.api_key"),
             "aux_prefers_main": getattr(state.llm_aux, "_prefer_from", None) is state.llm_main,
             "configured": base_cfg.get("llm.chat_model"),
+        },
+        # GET /api/workspace-export is reproducible only with the native exporter (the Python
+        # exporter stamps the current local time into the ZIP); the Rust side declines otherwise.
+        "workspace_export": {
+            "impl": os.environ.get("WORKSPACE_EXPORT_IMPL", "python"),
+            "binary": workspace_export_native.BINARY,
+            "settings": {key: base_cfg.get("corpus." + key) for key in SETTING_KEYS},
         },
     }
 
@@ -317,9 +329,9 @@ class ForwardMiddleware:
         if any(k.lower() == DECLINE_HEADER for k, _ in raw):
             return None
         kept = [(k.lower(), v) for k, v in raw if k.lower() not in _DROP_REPLY]
-        # Starlette's order: content-length, then content-type, then the rest.
-        order = {b"content-length": 0, b"content-type": 1}
-        kept.sort(key=lambda kv: order.get(kv[0], 2))
+        # Starlette's order: the response's own headers, then content-length, then content-type.
+        order = {b"content-length": 1, b"content-type": 2}
+        kept.sort(key=lambda kv: order.get(kv[0], 0))
         return resp.status_code, kept, content
 
 
