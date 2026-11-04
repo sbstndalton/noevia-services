@@ -28,6 +28,10 @@ def test_the_image_builds_and_bundles_every_leaf_and_smokes_them_all():
     copied = re.search(r'&& cp ([a-z \\\n-]+) /out/', text)
     assert copied, 'the Rust stage copies its binaries into /out/'
     assert set(copied.group(1).replace('\\', ' ').split()) == set(smoke.LEAVES) | SELF_TESTED
+    # The build tree and cargo registry do not stay in the builder layer (review P3-2).
+    rust_stage = text.split('\nFROM python:')[0]
+    assert rust_stage.rstrip().endswith('&& rm -rf /src/target /usr/local/cargo/registry')
+    assert rust_stage.index('/out/ \\') < rust_stage.index('rm -rf /src/target')
     final = text.split('\nFROM ')[-1]
     assert 'COPY --from=tenant-assertion /out/ /usr/local/bin/' in final
     assert 'COPY --from=tenant-assertion /src/' not in final

@@ -28,7 +28,9 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && mkdir /out \
  && cd target/release \
  && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
-      diary-temporal-cli diary-workspace-export diary-workspace-import-apply /out/
+      diary-temporal-cli diary-workspace-export diary-workspace-import-apply /out/ \
+ && cd /src \
+ && rm -rf /src/target /usr/local/cargo/registry
 
 FROM python:3.12-slim
 
