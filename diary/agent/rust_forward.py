@@ -54,7 +54,7 @@ DEFAULT_BIN = "/usr/local/bin/noevia-diary"
 # D4b adds the read side of the file API, storage status and workspace export; `PUT /api/file`
 # and every other write stay here (single writer until D5).
 SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
-             "/api/files": "GET", "/api/file": "POST", "/api/storage-status": "GET",
+             "/api/files": "GET", "/api/storage-status": "GET",
              "/api/workspace-export": "GET"}
 DECLINE_HEADER = b"x-noevia-diary-decline"
 CONTROL_HEADER = "x-noevia-diary-control"
