@@ -730,9 +730,10 @@ async def lifespan(_app: FastAPI):
     # once the seeded embeddings addresses have been checked to be on this network (which can take a
     # while when the resolver is not up yet, so not on the startup path).
     threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
-    # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route (default: none).
+    # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
+    # DIARY_RUST_WRITES a tenant (default: none).
     rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
-                       _RUST_ROUTES)
+                       _RUST_ROUTES, _RUST_WRITERS)
     yield
     rust_forward.stop()
     if _embedding_migration is not None:
@@ -757,13 +758,24 @@ def _rust_recovered(user_id: str) -> bool:
         return True
 
 
+def _rust_write_uncertain(user_id: str) -> None:
+    """D5: a forwarded write got no reply after it may have reached the Rust process. Like an
+    uncertain workspace import, the tenant's state recovers again before it is served here."""
+    key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
+    with _tenant_lock:
+        state = _tenant_states.get(key)
+        if state is not None:
+            state.recovered = False
+
+
 _RUST_ROUTES = rust_forward.configured_routes()
+_RUST_WRITERS = rust_forward.configured_writers()
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 # D4: the forwarder sits INSIDE the assertion middleware (added first = innermost), so the one
 # verifier and nonce cache here check every request before anything is forwarded.
-if _RUST_ROUTES:
+if _RUST_ROUTES or _RUST_WRITERS:
     app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
-                       is_recovered=_rust_recovered)
+                       is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
 app.add_middleware(TenantAssertionMiddleware)
 
 
@@ -895,6 +907,9 @@ def delete_tenant(request: Request) -> JSONResponse:
     # instead of recreating files under the deleted root.
     for state in doomed:
         _close_state(state)
+    # D5: the Rust process (when it writes for tenants) finishes its write in flight and refuses
+    # the tenant from here on, before the root disappears.
+    rust_forward.fence_tenant(user_id)
     shutil.rmtree(root, ignore_errors=True)
     return JSONResponse({"ok": True})
 

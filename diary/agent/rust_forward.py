@@ -28,6 +28,20 @@ at once and killing/reaping the child happens on a background thread, never on t
 
 If the process fails to start, dies or stops answering, Python serves every route, logs the fallback, and restarts it at most MAX_RESTARTS times with a
 growing delay, so a broken binary never becomes a crash loop.
+
+D5, WRITES. The write routes (WRITE_ROUTES) are never chosen per route: DIARY_RUST_WRITES names the
+TENANTS (UUIDs, or ``*``) whose writes go to the Rust process, all of them together. For such a
+tenant every write request takes ONE per-tenant lock here, held until the request is answered by
+whichever process answers it (a native reply, or Python after a decline or a dead child), so at most
+one write of the tenant runs at any moment across both processes. A write body is forwarded only
+when it is complete, JSON (or untyped), at most MAX_WRITE_BODY (Python's own bound) and read within
+the forward's deadline; otherwise nothing was sent and Python serves it with the bytes it was given.
+A decline means the Rust side wrote nothing. A forward that fails after its request may have reached
+the child is NOT served again here (that could apply a write twice): it answers 503 UNCERTAIN, the
+tenant's state is marked unrecovered, and the next write waits until the old child is reaped.
+
+The switch is inert while PYTHON_ONLY_WRITES is non-empty: those writes have no Rust executor yet, so
+a tenant's writer cannot move without being split across two processes (see the D5 design note).
 """
 from __future__ import annotations
 
@@ -35,6 +49,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -56,6 +71,29 @@ DEFAULT_BIN = "/usr/local/bin/noevia-diary"
 SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/files": "GET", "/api/storage-status": "GET",
              "/api/workspace-export": "GET"}
+# D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
+WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
+                "/api/entries/edit": "POST"}
+# The writes that only this process performs today. While any is listed, DIARY_RUST_WRITES selects
+# no tenant: moving a tenant's writer would split it across two processes.
+PYTHON_ONLY_WRITES = (
+    "/v1/chat/completions logging (log_exchange)",
+    "retrieval index maintenance (_reindex_dirty, _reindex_today, embedding re-index)",
+    "journal replay and index-outbox drain when a tenant state recovers",
+    "/api/workspace-ops and /api/workspace-trash (workspace transaction receipt schema undecided)",
+    "/api/workspace-import",
+    "/api/storage-import",
+    "/api/storage-backup",
+    "/api/external-sources/import",
+)
+WRITER_HEADER = b"x-noevia-diary-writer"
+# app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
+MAX_WRITE_BODY = 64 * 1024 * 1024
+UNCERTAIN = b'{"detail":"The Diary did not confirm this save. Reload before trying again."}'
+TOO_LARGE = b'{"detail":"request body too large"}'
+RESTARTING = b'{"detail":"Diary saving is restarting. Try again in a moment."}'
+REAP_WAIT_S = 10.0
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 DECLINE_HEADER = b"x-noevia-diary-decline"
 CONTROL_HEADER = "x-noevia-diary-control"
 FORWARD_HEADER = b"x-noevia-diary-forward"
@@ -86,6 +124,35 @@ def configured_routes(raw: Optional[str] = None) -> dict:
         else:
             log.warning("DIARY_RUST_ROUTES: %r is not served by the Rust Diary process; ignoring it", name[:64])
     return routes
+
+
+ALL_TENANTS = "*"
+_gate_logged = False
+
+
+def configured_writers(raw: Optional[str] = None):
+    """The tenants whose writes go to the Rust process: frozenset of UUIDs, ALL_TENANTS, or empty.
+    Empty (the default) while any write in PYTHON_ONLY_WRITES remains."""
+    global _gate_logged
+    raw = os.environ.get("DIARY_RUST_WRITES", "") if raw is None else raw
+    names = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not names:
+        return frozenset()
+    if PYTHON_ONLY_WRITES:
+        if not _gate_logged:
+            _gate_logged = True
+            log.error("DIARY_RUST_WRITES is set but ignored: these writes have no Rust executor yet, so a "
+                      "tenant's writer would be split across two processes: %s", "; ".join(PYTHON_ONLY_WRITES))
+        return frozenset()
+    if ALL_TENANTS in names:
+        return ALL_TENANTS
+    tenants = set()
+    for name in names:
+        if _UUID_RE.fullmatch(name):
+            tenants.add(name)
+        else:
+            log.warning("DIARY_RUST_WRITES: %r is not a tenant UUID; ignoring it", name[:64])
+    return frozenset(tenants)
 
 
 def _binary() -> Optional[str]:
@@ -125,6 +192,8 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
         },
         # GET /api/workspace-export is reproducible only with the native exporter (the Python
         # exporter stamps the current local time into the ZIP); the Rust side declines otherwise.
+        # D5: entries are written natively only with the transforms Python itself uses.
+        "corpus_write_impl": (os.environ.get("DIARY_CORPUS_WRITE_IMPL") or "python").strip().lower(),
         "workspace_export": {
             "impl": os.environ.get("WORKSPACE_EXPORT_IMPL", "python"),
             "binary": workspace_export_native.BINARY,
@@ -151,6 +220,8 @@ class RustServer:
         self._thread: Optional[threading.Thread] = None
         self.ready = False
         self.restarts = 0
+        # Lost children still being killed/reaped: a tenant's next write waits for zero.
+        self.reaping = 0
         self.base_url = f"http://127.0.0.1:{port}"
 
     # ---- lifecycle ----
@@ -236,19 +307,37 @@ class RustServer:
             log.warning("Rust Diary server lost; Python serves every route")
         if current is None:
             return
+        with self._lock:
+            self.reaping += 1
         if background:
             threading.Thread(target=self._reap, args=(current,), name="rust-diary-reap", daemon=True).start()
         else:
             self._reap(current)
 
-    @staticmethod
-    def _reap(proc: subprocess.Popen) -> None:
+    def _reap(self, proc: subprocess.Popen) -> None:
         try:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            with self._lock:
+                self.reaping -= 1
+
+    def fence(self, user_id: str, timeout: float = FORWARD_DEADLINE_S) -> bool:
+        """DELETE /api/internal/tenant: make the Rust side refuse the tenant's later writes and wait
+        for its write in flight. False when the process is not running or did not confirm."""
+        with self._lock:
+            token, ready = self._token, self.ready
+        if not ready or not token:
+            return False
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=False) as client:
+                resp = client.post("/internal/fence", params={"tenant": user_id}, headers={CONTROL_HEADER: token})
+            return resp.status_code == 200
+        except httpx.HTTPError:
+            return False
 
     def lost(self) -> None:
         """Called from the request path when a forward fails: take every route back now; the child
@@ -264,14 +353,19 @@ class ForwardMiddleware:
 
     def __init__(self, app, server: Optional[RustServer] = None, routes: Optional[dict] = None,
                  is_deleted: Optional[Callable[[str], bool]] = None,
-                 is_recovered: Optional[Callable[[str], bool]] = None):
+                 is_recovered: Optional[Callable[[str], bool]] = None,
+                 writers=frozenset(), on_uncertain: Optional[Callable[[str], None]] = None):
         self.app = app
         self.server = server
         self.routes = routes or {}
+        self.writers = writers
         self.is_deleted = is_deleted or (lambda _uid: False)
         self.is_recovered = is_recovered or (lambda _uid: False)
+        self.on_uncertain = on_uncertain or (lambda _uid: None)
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop = None
+        # D5: one write at a time per writer tenant, across both processes. {uid: [lock, users]}
+        self._write_locks: dict = {}
 
     @staticmethod
     def _user(scope) -> str:
@@ -299,9 +393,25 @@ class ForwardMiddleware:
                 return True
         return False
 
+    def _writer_tenant(self, scope) -> str:
+        """The tenant (lower-case UUID) when this request is a write of a tenant whose writer is the
+        Rust process, else ""."""
+        if scope.get("type") != "http" or not self.writers:
+            return ""
+        if WRITE_ROUTES.get(scope.get("path", "")) != scope.get("method"):
+            return ""
+        user = self._user(scope).lower()
+        if not _UUID_RE.fullmatch(user) or self.is_deleted(user):
+            return ""
+        return user if self.writers == ALL_TENANTS or user in self.writers else ""
+
     async def __call__(self, scope, receive, send):
         server = self.server or current()
-        # A request with a body is never forwarded or read here: the app handles it as today.
+        writer = self._writer_tenant(scope)
+        if writer:
+            await self._write(writer, server, scope, receive, send)
+            return
+        # A read with a body is never forwarded or read here: the app handles it as today.
         if not self._wants(scope, server) or self._declares_body(scope):
             await self.app(scope, receive, send)
             return
@@ -314,9 +424,117 @@ class ForwardMiddleware:
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
-    async def _forward(self, server, scope, deadline: float):
+    # ---- D5 writes ----
+
+    async def _write(self, user, server, scope, receive, send):
+        entry = self._write_locks.setdefault(user, [asyncio.Lock(), 0])
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                await self._write_locked(user, server, scope, receive, send)
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0:
+                self._write_locks.pop(user, None)
+
+    @staticmethod
+    async def _reply(send, status, body, headers=None):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-length", str(len(body)).encode()),
+                                (b"content-type", b"application/json"), *(headers or [])]})
+        await send({"type": "http.response.body", "body": body})
+
+    @staticmethod
+    def _json_media(scope) -> bool:
+        for name, value in scope.get("headers") or []:
+            if name.lower() == b"content-type":
+                media = value.split(b";", 1)[0].strip().lower()
+                return media == b"application/json"
+        return True
+
+    @staticmethod
+    def _declared_length(scope) -> Optional[int]:
+        for name, value in scope.get("headers") or []:
+            if name.lower() == b"content-length":
+                try:
+                    return int(value.strip())
+                except ValueError:
+                    return None
+        return None
+
+    async def _write_locked(self, user, server, scope, receive, send):
+        # A child lost mid-write may still be running: never let a second process write meanwhile.
+        if server is not None and server.reaping:
+            waited = time.monotonic() + REAP_WAIT_S
+            while server.reaping and time.monotonic() < waited:
+                await asyncio.sleep(0.05)
+            if server.reaping:
+                await self._reply(send, 503, RESTARTING)
+                return
+        declared = self._declared_length(scope)
+        if declared is not None and declared > MAX_WRITE_BODY:
+            # Never read; Python's own bound for a buffered body (writes of this tenant never run
+            # on Python with an unbounded body).
+            await self._reply(send, 413, TOO_LARGE)
+            return
+        if server is None or not server.ready or not self._json_media(scope):
+            # The Rust process is not running (nothing of it can still write: see reaping above),
+            # or the body is not JSON (the app answers 422 without writing).
+            await self.app(scope, receive, send)
+            return
+        deadline = time.monotonic() + FORWARD_DEADLINE_S
+        chunks, size, complete, disconnected = [], 0, False, None
+        try:
+            while not complete:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                message = await asyncio.wait_for(receive(), remaining)
+                if message.get("type") != "http.request":
+                    disconnected = message
+                    break
+                chunk = message.get("body", b"")
+                size += len(chunk)
+                chunks.append(chunk)
+                if size > MAX_WRITE_BODY:
+                    await self._reply(send, 413, TOO_LARGE)
+                    return
+                complete = not message.get("more_body", False)
+        except asyncio.TimeoutError:
+            pass
+        body = b"".join(chunks)
+
+        async def replay():
+            # Exactly the bytes received so far, then whatever the client still sends.
+            nonlocal body, disconnected
+            if body is not None:
+                prefix, body = body, None
+                return {"type": "http.request", "body": prefix, "more_body": not complete}
+            if disconnected is not None:
+                message, disconnected = disconnected, None
+                return message
+            return await receive()
+
+        if not complete:
+            # Nothing was sent to the Rust side: Python serves what it was given.
+            await self.app(scope, replay, send)
+            return
+        outcome = await self._forward(server, scope, deadline, body=body, writer=True)
+        if outcome == "uncertain":
+            self.on_uncertain(user)
+            await self._reply(send, 503, UNCERTAIN)
+            return
+        if outcome is None:
+            await self.app(scope, replay, send)
+            return
+        status, headers, content = outcome
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": content})
+
+    async def _forward(self, server, scope, deadline: float, body: bytes = b"", writer: bool = False):
         """(status, headers, body) from the Rust side, or None to serve the request here. Everything
-        runs within `deadline` (time.monotonic)."""
+        runs within `deadline` (time.monotonic). A write (`writer`) that may have reached the child
+        and got no reply returns "uncertain" instead of None: it must not run again here."""
         raw_path = scope.get("raw_path") or scope.get("path", "").encode()
         raw_path = raw_path.split(b"?", 1)[0]
         query = scope.get("query_string", b"")
@@ -338,6 +556,8 @@ class ForwardMiddleware:
                    if k.lower() not in _HOP and not k.lower().startswith(INTERNAL_PREFIX)]
         headers += [(FORWARD_HEADER, secret.encode()), (ASSERTED_HEADER, b"1" if asserted else b"0"),
                     (RECOVERED_HEADER, b"1" if recovered else b"0")]
+        if writer:
+            headers.append((WRITER_HEADER, b"1"))
         loop = asyncio.get_running_loop()
         if self._client is None or self._client_loop is not loop:
             # One pooled client per event loop (uvicorn runs one; a client is bound to its loop).
@@ -345,7 +565,7 @@ class ForwardMiddleware:
 
         async def exchange():
             resp = await self._client.send(self._client.build_request(scope["method"], url, headers=headers,
-                                                                       content=b""))
+                                                                       content=body))
             return resp, await resp.aread()
 
         try:
@@ -356,6 +576,9 @@ class ForwardMiddleware:
         except Exception as exc:  # noqa: BLE001 - lost or stuck process: Python serves from here on
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
             server.lost()
+            if writer and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+                # The request may have reached the child, which may have committed it.
+                return "uncertain"
             return None
         raw = resp.headers.raw
         if any(k.lower() == DECLINE_HEADER for k, _ in raw):
@@ -370,10 +593,10 @@ class ForwardMiddleware:
 _server: Optional[RustServer] = None
 
 
-def start(config_factory: Callable[[int, str, str], dict], routes: dict) -> Optional[RustServer]:
-    """Lifespan hook: start the Rust process when any route is configured."""
+def start(config_factory: Callable[[int, str, str], dict], routes: dict, writers=frozenset()) -> Optional[RustServer]:
+    """Lifespan hook: start the Rust process when any route or writer tenant is configured."""
     global _server
-    if not routes:
+    if not routes and not writers:
         return None
     _server = RustServer(config_factory)
     _server.start()
@@ -389,3 +612,11 @@ def stop() -> None:
 
 def current() -> Optional[RustServer]:
     return _server
+
+
+def fence_tenant(user_id: str) -> None:
+    """DELETE /api/internal/tenant, after Python's tombstone: the Rust side stops writing the tenant
+    (and finishes the write in flight) before its root is removed."""
+    server = current()
+    if server is not None and not server.fence(user_id):
+        log.warning("Rust Diary server did not confirm the tenant fence; removing the tenant anyway")
