@@ -31,17 +31,16 @@ growing delay, so a broken binary never becomes a crash loop.
 
 D5, WRITES. The write routes (WRITE_ROUTES) are never chosen per route: DIARY_RUST_WRITES names the
 TENANTS (UUIDs, or ``*``) whose writes go to the Rust process, all of them together. For such a
-tenant every write request takes ONE per-tenant lock here, held until the request is answered by
-whichever process answers it (a native reply, or Python after a decline or a dead child), so at most
-one write of the tenant runs at any moment across both processes. A write body is forwarded only
+tenant every write request takes the tenant's writer lock (tenant_writer) here, held until the request
+is answered by whichever process answers it (a native reply, or Python after a decline or a dead
+child). Every write Python makes on its own for such a tenant (chat logging, re-index, recovery,
+workspace ops, imports, backup bookkeeping, deletion) takes the same lock, so at most one write of
+the tenant runs at any moment across both processes. A write body is forwarded only
 when it is complete, JSON (or untyped), at most MAX_WRITE_BODY (Python's own bound) and read within
 the forward's deadline; otherwise nothing was sent and Python serves it with the bytes it was given.
 A decline means the Rust side wrote nothing. A forward that fails after its request may have reached
 the child is NOT served again here (that could apply a write twice): it answers 503 UNCERTAIN, the
 tenant's state is marked unrecovered, and the next write waits until the old child is reaped.
-
-The switch is inert while PYTHON_ONLY_WRITES is non-empty: those writes have no Rust executor yet, so
-a tenant's writer cannot move without being split across two processes (see the D5 design note).
 """
 from __future__ import annotations
 
@@ -58,7 +57,7 @@ from typing import Callable, Optional
 
 import httpx
 
-from . import tenant_assertion, workspace_export_native
+from . import tenant_assertion, tenant_writer, workspace_export_native
 from .diary_migration import SETTING_KEYS
 
 log = logging.getLogger("diary.rust")
@@ -74,24 +73,13 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
                 "/api/entries/edit": "POST"}
-# The writes that only this process performs today. While any is listed, DIARY_RUST_WRITES selects
-# no tenant: moving a tenant's writer would split it across two processes.
-PYTHON_ONLY_WRITES = (
-    "/v1/chat/completions logging (log_exchange)",
-    "retrieval index maintenance (_reindex_dirty, _reindex_today, embedding re-index)",
-    "journal replay and index-outbox drain when a tenant state recovers",
-    "/api/workspace-ops and /api/workspace-trash (workspace transaction receipt schema undecided)",
-    "/api/workspace-import",
-    "/api/storage-import",
-    "/api/storage-backup",
-    "/api/external-sources/import",
-)
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024
 UNCERTAIN = b'{"detail":"The Diary did not confirm this save. Reload before trying again."}'
 TOO_LARGE = b'{"detail":"request body too large"}'
 RESTARTING = b'{"detail":"Diary saving is restarting. Try again in a moment."}'
+BUSY = b'{"detail":"Diary is saving another change. Try again in a moment."}'
 REAP_WAIT_S = 10.0
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 DECLINE_HEADER = b"x-noevia-diary-decline"
@@ -126,23 +114,15 @@ def configured_routes(raw: Optional[str] = None) -> dict:
     return routes
 
 
-ALL_TENANTS = "*"
-_gate_logged = False
+ALL_TENANTS = tenant_writer.ALL
 
 
 def configured_writers(raw: Optional[str] = None):
-    """The tenants whose writes go to the Rust process: frozenset of UUIDs, ALL_TENANTS, or empty.
-    Empty (the default) while any write in PYTHON_ONLY_WRITES remains."""
-    global _gate_logged
+    """The tenants whose writes go to the Rust process: frozenset of UUIDs, ALL_TENANTS, or empty
+    (the default)."""
     raw = os.environ.get("DIARY_RUST_WRITES", "") if raw is None else raw
     names = [part.strip().lower() for part in raw.split(",") if part.strip()]
     if not names:
-        return frozenset()
-    if PYTHON_ONLY_WRITES:
-        if not _gate_logged:
-            _gate_logged = True
-            log.error("DIARY_RUST_WRITES is set but ignored: these writes have no Rust executor yet, so a "
-                      "tenant's writer would be split across two processes: %s", "; ".join(PYTHON_ONLY_WRITES))
         return frozenset()
     if ALL_TENANTS in names:
         return ALL_TENANTS
@@ -364,8 +344,9 @@ class ForwardMiddleware:
         self.on_uncertain = on_uncertain or (lambda _uid: None)
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop = None
-        # D5: one write at a time per writer tenant, across both processes. {uid: [lock, users]}
-        self._write_locks: dict = {}
+        # D5: the writer tenants' lock is tenant_writer's, shared with every Python write path.
+        if writers:
+            tenant_writer.configure(writers)
 
     @staticmethod
     def _user(scope) -> str:
@@ -427,15 +408,19 @@ class ForwardMiddleware:
     # ---- D5 writes ----
 
     async def _write(self, user, server, scope, receive, send):
-        entry = self._write_locks.setdefault(user, [asyncio.Lock(), 0])
-        entry[1] += 1
+        # One deadline for the wait: a write never queues longer than a forward may take.
         try:
-            async with entry[0]:
-                await self._write_locked(user, server, scope, receive, send)
-        finally:
-            entry[1] -= 1
-            if entry[1] == 0:
-                self._write_locks.pop(user, None)
+            lock = tenant_writer.hold_async(user, until=time.monotonic() + tenant_writer.DEADLINE_S)
+            await lock.__aenter__()
+        except tenant_writer.WriterBusy:
+            await self._reply(send, 503, BUSY, [(b"retry-after", b"1")])
+            return
+        try:
+            await self._write_locked(user, server, scope, receive, send)
+        except BaseException as exc:
+            await lock.__aexit__(type(exc), exc, exc.__traceback__)
+            raise
+        await lock.__aexit__(None, None, None)
 
     @staticmethod
     async def _reply(send, status, body, headers=None):

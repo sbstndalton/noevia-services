@@ -2,8 +2,8 @@
 POST /api/entries/append, POST /api/entries/edit) behind DIARY_RUST_WRITES.
 
 Three groups:
-- the switch and the forwarder's write path with a scripted fake child (always run): the gate that
-  keeps DIARY_RUST_WRITES inert while Python-only writes remain, bounded bodies, a decline or a
+- the switch and the forwarder's write path with a scripted fake child (always run): tenant parsing,
+  bounded bodies, a decline or a
   refused connection served by Python with the exact bytes, an uncertain forward never re-run, the
   per-tenant serialization across both processes and the wait for a lost child to be reaped;
 - differential cases against the real binary: each write runs on the same synthetic state twice
@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware import Middleware
 
 import agent.app as appmod
-from agent import corpus_write_native, rust_forward
+from agent import corpus_write_native, rust_forward, tenant_writer
 from agent.managed_storage import ManagedCorpusBackend
 from tests.tenant_binary import needs_binary
 from tests.test_rust_forward import DAILY, MONTHLY, TOKEN, Modes, free_port, needs_server, seed, start_server, world  # noqa: F401
@@ -41,23 +41,27 @@ needs_cw = pytest.mark.skipif(not (CW_BIN and os.path.isfile(CW_BIN)) and os.env
 
 # ------------------------------------------------------------------ the switch
 
-def test_writes_switch_is_inert_while_python_only_writes_remain(monkeypatch, caplog):
-    monkeypatch.setattr(rust_forward, '_gate_logged', False)
-    assert rust_forward.PYTHON_ONLY_WRITES, 'D5 leaves writes on Python; the gate must hold'
-    assert rust_forward.configured_writers('') == frozenset()
-    assert rust_forward.configured_writers(f'*,{DAILY}') == frozenset()
-    assert 'ignored' in caplog.text and 'split across two processes' in caplog.text
+@pytest.fixture(autouse=True)
+def _writer_registry(monkeypatch):
+    """tenant_writer's writer set is process-wide; every test starts and ends with none."""
+    monkeypatch.setattr(tenant_writer, '_writers', frozenset())
+    monkeypatch.setattr(tenant_writer, 'max_concurrent', {})
+    monkeypatch.setattr(tenant_writer, 'denials', [])
+    yield
+
+
+def test_writes_switch_names_tenants_and_is_empty_by_default(monkeypatch):
     monkeypatch.delenv('DIARY_RUST_WRITES', raising=False)
     assert rust_forward.configured_writers() == frozenset()
+    assert rust_forward.configured_writers('') == frozenset()
     assert rust_forward.start(lambda p, t, f: {}, {}, frozenset()) is None
-    # Writes are never chosen per route.
-    assert rust_forward.configured_routes('/api/file,/api/entries/append,/api/months') == {'/api/months': 'GET'}
-
-
-def test_writes_switch_parses_tenants_once_the_gate_is_lifted(monkeypatch):
-    monkeypatch.setattr(rust_forward, 'PYTHON_ONLY_WRITES', ())
     assert rust_forward.configured_writers(f' {DAILY.upper()} , not-a-uuid,{MONTHLY}') == frozenset({DAILY, MONTHLY})
     assert rust_forward.configured_writers(f'{DAILY},*') == rust_forward.ALL_TENANTS
+    assert not hasattr(rust_forward, 'PYTHON_ONLY_WRITES'), 'the D5 no-op gate is gone'
+    # Writes are never chosen per route.
+    assert rust_forward.configured_routes('/api/file,/api/entries/append,/api/months') == {'/api/months': 'GET'}
+    # The app's process default selects no tenant: every tenant_writer call is a no-op.
+    assert appmod._RUST_WRITERS == frozenset() and not tenant_writer.is_writer(DAILY)
 
 
 # ------------------------------------------------------------------ scripted child
@@ -68,6 +72,7 @@ class FakeChild:
 
     def __init__(self, mode='native'):
         self.mode, self.requests, self.active, self.max_active = mode, [], 0, 0
+        self.delay = 0.3
         self.lock = threading.Lock()
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
@@ -105,7 +110,7 @@ class FakeChild:
                 self.stop.wait(30)
                 return
             if self.mode == 'slow':
-                time.sleep(0.3)
+                time.sleep(self.delay)
             if self.mode == 'decline':
                 conn.sendall(b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n')
             else:
@@ -269,6 +274,7 @@ def test_writes_of_one_tenant_are_serialized_across_both_processes(monkeypatch):
             one = await asyncio.gather(*(asgi(mw, headers, [body]) for _ in range(4)))
             serial = child.max_active
             child.max_active = 0
+            child.delay = 1.0  # long enough that two tenants' writes always meet on the child
             other = put(user=MONTHLY)
             both = await asyncio.gather(asgi(mw, headers, [body]), asgi(mw, other[0], [other[1]]))
             return one, serial, both
@@ -278,7 +284,8 @@ def test_writes_of_one_tenant_are_serialized_across_both_processes(monkeypatch):
         assert serial == 1, 'two writes of one tenant overlapped'
         assert child.max_active == 2, 'different tenants are not serialized against each other'
         assert all(s == 200 for s, _ in both)
-        assert mw._write_locks == {}
+        assert tenant_writer._slots == {}, 'a writer lock was left behind'
+        assert tenant_writer.max_concurrent == {DAILY: 1, MONTHLY: 1}
     finally:
         child.close()
 
@@ -346,12 +353,17 @@ def writers(world, monkeypatch):
     if CW_BIN:
         monkeypatch.setattr(corpus_write_native, 'BINARY', CW_BIN)
     monkeypatch.setenv('DIARY_CORPUS_WRITE_IMPL', 'rust')
-    monkeypatch.setattr(rust_forward, 'PYTHON_ONLY_WRITES', ())
     saved = install(frozenset({DAILY, MONTHLY}))
     client = TestClient(appmod.app)
     modes = Modes(monkeypatch, None)
     modes.python()
+    # Seeding writes the tenants directly, as Python's earlier releases left them: the writer set
+    # takes effect afterwards (the forwarder configures it when the middleware stack is built).
+    real_configure = tenant_writer.configure
+    monkeypatch.setattr(tenant_writer, 'configure', lambda _w: None)
     seed(world, client)
+    monkeypatch.setattr(tenant_writer, 'configure', real_configure)
+    tenant_writer.configure(frozenset({DAILY, MONTHLY}))
     for uid in (DAILY, MONTHLY):
         assert client.get('/api/months', headers=sign(uid, 'GET', '/api/months')).status_code == 200
     # Python's appends need fresh AppStates that read DIARY_CORPUS_WRITE_IMPL=rust.
@@ -556,12 +568,14 @@ def test_a_child_killed_mid_write_leaves_no_torn_state(writers):
     ids = [str(uuid.uuid4()) for _ in range(30)]
     results = {}
     Recorder.served = []
+    # Armed once the child has served a write natively, so the kill always lands mid-run.
     killer = threading.Timer(0.15, lambda: server._proc and server._proc.kill())
-    killer.start()
     for rid in ids:
         r = request(client, DAILY, 'POST', '/api/entries/append', {'text': f'Synthetic {rid}', 'requestId': rid,
                                                                     'entryTime': now_iso()})
         results[rid] = r.status_code
+        if True in Recorder.served and not killer.is_alive() and not killer.finished.is_set():
+            killer.start()
     killer.cancel()
     assert set(results.values()) <= {200, 503}, results
     assert True in Recorder.served and not server.ready, 'the child served some writes and was then lost'

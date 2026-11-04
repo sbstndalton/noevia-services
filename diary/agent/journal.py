@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from . import tenant_writer
+
 log = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -73,6 +75,8 @@ class Journal:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # D5: a writer tenant's writes need its writer lock (agent/tenant_writer.py).
+        tenant_writer.guard(self._conn, self.db_path)
 
     # ---------------- write-ahead ----------------
 

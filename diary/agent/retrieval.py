@@ -35,6 +35,7 @@ from . import corpus as fmt
 from . import vector_slots as slots
 from .embedding import EmbeddingView, Target
 from .llm import LLMClient
+from . import tenant_writer
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +113,13 @@ class Retriever:
         self._conn.commit()
         self.vec_available = _load_vec_extension(self._conn)
         self._dim: Optional[int] = None
+        # D5: a writer tenant's index writes need its writer lock. The state is built under the
+        # tenant registry lock, where it may not be taken, so a legacy slot is not adopted here
+        # (_active_slot): the next re-index adopts it under the lock.
+        self.tenant_id = tenant_writer.tenant_of(self.db_path)
+        self._guarded = True
         self._ensure_vec_table()
+        tenant_writer.guard(self._conn, self.db_path)
 
     # ---------------- schema ----------------
 
@@ -126,8 +133,14 @@ class Retriever:
         target = self.embedding.active()
         if not self.vec_available:
             return target, None
+        tid = getattr(self, "tenant_id", None)
+        # D5: adoption is a write. Without the tenant's writer lock (a search) it is left to the
+        # next re-index, which adopts under the lock (apply_reindex); reads never take the lock.
+        adopt = not (getattr(self, "_guarded", False) and tenant_writer.is_writer(tid) and not tenant_writer.held(tid))
         with self._lock:
-            if self._conn.in_transaction:
+            if not adopt:
+                pass
+            elif self._conn.in_transaction:
                 slots.adopt_legacy(self._conn, target)
             else:
                 with self._conn:

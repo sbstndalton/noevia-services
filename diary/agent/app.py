@@ -76,6 +76,7 @@ from .managed_storage import ManagedCorpusBackend
 from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
 from . import tenant_assertion
 from . import rust_forward
+from . import tenant_writer
 
 log = logging.getLogger("diary")
 
@@ -170,7 +171,8 @@ class AppState:
 
 _state: Optional[AppState] = None
 _tenant_states: "OrderedDict[str, AppState]" = OrderedDict()
-_tenant_lock = threading.Lock()
+# An OrderedLock so tenant_writer can refuse to take a tenant's writer lock under it (lock order).
+_tenant_lock = tenant_writer.OrderedLock("app._tenant_lock")
 # Bound how large the (client-influenced) X-Cowork-Storage header can be
 # before we bother decoding/parsing it. The cache key derived from it is
 # already a sha256 digest, but decoding an unbounded header is needless
@@ -508,10 +510,17 @@ def _recover_state(state: "AppState") -> None:
     """
     if getattr(state, "recovered", True):
         return
+    # D5: recovery writes (journal replay, outbox drain, reindex), so a writer tenant runs it under
+    # its writer lock, taken before recover_lock (tenant_writer lock order).
     # setdefault is atomic: tests and legacy code may build AppState without __init__.
-    with state.__dict__.setdefault("recover_lock", threading.Lock()):
+    with tenant_writer.hold(getattr(state, "tenant_id", None)), \
+            state.__dict__.setdefault("recover_lock", threading.Lock()):
         if state.recovered:
             return
+        # Every Markdown file of a managed tenant is reindexed once per state (moved here from
+        # the build, which runs under _tenant_lock where the writer lock may not be taken).
+        for document in getattr(state, "dirty_on_recover", ()):
+            state.journal.mark_dirty(document)
         state.store.apply_pending()
         _reindex_dirty(state)
         state.recovered = True
@@ -570,7 +579,9 @@ def _build_tenant_state_locked(request, user_id, state_key, storage_header, mana
     local_root = Path(cfg.get("corpus.local.root") or str(tenant_root / "corpus"))
     fresh = fresh and not (local_root.exists() and any(local_root.iterdir()))
     if fresh and not is_managed:
-        with managed.migration_lock():
+        # D5: activation runs under _tenant_lock, where the writer lock may not be taken. It cannot
+        # meet a Rust write: the Rust process declines every write of a tenant that is not active.
+        with tenant_writer.exempt(user_id, "fresh activation"), managed.migration_lock(writer=False):
             if not managed.active():
                 managed.activate({}, corpus_settings(cfg))
         is_managed = True
@@ -585,10 +596,12 @@ def _build_tenant_state_locked(request, user_id, state_key, storage_header, mana
     backend = managed if is_managed else LegacyWriteGuard(create_backend(cfg), managed)
     state = AppState(cfg, backend=backend)
     state.managed = managed
+    state.tenant_id = user_id
+    state.store._write_lock.tenant = user_id
+    state.dirty_on_recover = ()
     if is_managed:
         with managed.db() as db:
-            for row in db.execute("SELECT path FROM files WHERE lower(path) LIKE '%.md'"):
-                state.journal.mark_dirty(row[0])
+            state.dirty_on_recover = [row[0] for row in db.execute("SELECT path FROM files WHERE lower(path) LIKE '%.md'")]
     state.recovered = False
     state.last_used = time.monotonic()
     _tenant_states[state_key] = state
@@ -604,9 +617,11 @@ def _close_state(state: AppState) -> None:
 
     Closing takes the store write lock, so an in-flight guarded write finishes
     first; afterwards store.closed makes every later write raise StoreClosed
-    instead of touching (or recreating) the tenant's files."""
+    instead of touching (or recreating) the tenant's files. Only the store's own lock is taken
+    (TenantWriteLock.local): a Python store write holds it, and eviction may run in another
+    tenant's request, which must not take this tenant's writer lock."""
     try:
-        with state.store._write_lock:
+        with state.store._write_lock.local():
             state.store.closed = True
     except Exception:  # noqa: BLE001
         log.exception("failed to mark tenant store closed")
@@ -770,6 +785,7 @@ def _rust_write_uncertain(user_id: str) -> None:
 
 _RUST_ROUTES = rust_forward.configured_routes()
 _RUST_WRITERS = rust_forward.configured_writers()
+tenant_writer.configure(_RUST_WRITERS)
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 # D4: the forwarder sits INSIDE the assertion middleware (added first = innermost), so the one
 # verifier and nonce cache here check every request before anything is forwarded.
@@ -777,6 +793,13 @@ if _RUST_ROUTES or _RUST_WRITERS:
     app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
                        is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
 app.add_middleware(TenantAssertionMiddleware)
+
+
+@app.exception_handler(tenant_writer.WriterBusy)
+async def writer_busy(_request: Request, _exc: tenant_writer.WriterBusy):
+    # D5: another write of the tenant (either process) held its writer lock for the whole deadline.
+    return JSONResponse({"detail": "Diary is saving another change. Try again in a moment."}, status_code=503,
+                        headers={"Retry-After": "1"})
 
 
 @app.exception_handler(StorageUnavailable)
@@ -880,6 +903,12 @@ def delete_tenant(request: Request) -> JSONResponse:
     if tenant_assertion.tenant_key() and not getattr(request.state, "tenant_asserted", False):
         return JSONResponse({"error": "tenant assertion required"}, status_code=401)
     user_id = user_id.lower()
+    # D5: deletion writes the tenant (rmtree), so a writer tenant deletes under its writer lock.
+    with tenant_writer.hold(user_id):
+        return _delete_tenant(user_id)
+
+
+def _delete_tenant(user_id: str) -> JSONResponse:
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     # Under _tenant_lock only bookkeeping (#804): tombstone first, so every new
     # request for this tenant is refused (410) from here on, then unregister its
@@ -1353,7 +1382,7 @@ def api_storage_status(request: Request):
 # tenant. Kept separate from _tenant_states (which is heavier and tied to
 # the full AppState/LLM/retrieval stack backup requests must not build).
 _backup_backends: "OrderedDict[str, ManagedCorpusBackend]" = OrderedDict()
-_backup_backends_lock = threading.Lock()
+_backup_backends_lock = tenant_writer.OrderedLock("app._backup_backends_lock")
 _BACKUP_BACKEND_CAP = 128
 
 
@@ -1363,15 +1392,26 @@ def _get_backup_backend(user_id: str, root: Path) -> ManagedCorpusBackend:
         if cached is not None:
             _backup_backends.move_to_end(user_id)
             return cached
-        backend = ManagedCorpusBackend(root, user_id)
-        _backup_backends[user_id] = backend
-        while len(_backup_backends) > _BACKUP_BACKEND_CAP:
-            _, evicted = _backup_backends.popitem(last=False)
-            try:
-                evicted.close()
-            except Exception:  # noqa: BLE001
-                pass
-        return backend
+    # D5: constructed outside the cache lock: construction takes the tenant's writer lock, which is
+    # never taken under another lock (delete_tenant holds it and then takes this one).
+    backend = ManagedCorpusBackend(root, user_id)
+    evicted = []
+    with _backup_backends_lock:
+        cached = _backup_backends.get(user_id)
+        if cached is not None:
+            evicted.append(backend)  # another request built one meanwhile: keep that one
+            backend = cached
+            _backup_backends.move_to_end(user_id)
+        else:
+            _backup_backends[user_id] = backend
+            while len(_backup_backends) > _BACKUP_BACKEND_CAP:
+                evicted.append(_backup_backends.popitem(last=False)[1])
+    for old in evicted:
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return backend
 
 
 def _drop_backup_backend(user_id: str, backend: ManagedCorpusBackend) -> None:
@@ -1938,3 +1978,54 @@ def local_exchange(body: dict, request: Request):
         log.error("local exchange returned no answer text")
         return JSONResponse({"error": EMPTY_ANSWER_TEXT, "detail": EMPTY_ANSWER_TEXT, "code": "modelFailed",
                              "reason": "empty_answer", "saved": False}, status_code=503)
+
+
+# ---------------- D5: tenant writer lock coverage ----------------
+# Every route and every background job, with how a writer tenant's writes in it take the tenant
+# writer lock (tenant_writer). tests/test_tenant_writer_d5.py fails when a route or a thread target
+# is added without being listed here, and exercises them with the SQLite guard on (an unlocked write
+# to a writer tenant's managed databases is refused there and recorded).
+#   store     CorpusStore._write_lock (a TenantWriteLock): the writer lock, then the store's RLock
+#   migration ManagedCorpusBackend.migration_lock(): the writer lock, then its RLock and flock
+#   hold      tenant_writer.hold() around the write itself
+#   forwarded ForwardMiddleware takes the lock before forwarding and holds it until the reply
+WRITE_ENTRY_POINTS = {
+    ("PUT", "/api/file"): "forwarded; store (file_write, _reindex_dirty)",
+    ("POST", "/api/directory"): "forwarded; store (directory_create)",
+    ("POST", "/api/entries/append"): "forwarded; store (log_exchange), _reindex_today thread",
+    ("POST", "/api/entries/edit"): "forwarded; store (edit_exchange, _reindex_dirty)",
+    ("POST", "/v1/chat/completions"): "store (log_exchange, maintain_index), _reindex_today thread",
+    ("POST", "/api/workspace-ops"): "store + migration",
+    ("POST", "/api/workspace-trash"): "store + migration",
+    ("POST", "/api/workspace-import"): "store + migration; outbox drain under store",
+    ("POST", "/api/storage-import"): "store + migration (activation of the import)",
+    ("POST", "/api/storage-backup"): "hold (backups rows); native backup off for writer tenants",
+    ("POST", "/api/external-sources/import"): "store (log_exchange), _reindex_today thread",
+    ("DELETE", "/api/internal/tenant"): "hold (close, fence, rmtree)",
+    ("POST", "/api/internal/embedding"): "hold per index file (EmbeddingMigration)",
+}
+# Write nothing of a tenant's own, beyond what every tenant request may do: build its state (the
+# #2378 construction write, hold; a fresh activation, exempt) and recover it (hold).
+READ_ENTRY_POINTS = {
+    ("GET", "/api/health"), ("GET", "/api/day"), ("GET", "/api/months"), ("GET", "/api/files"),
+    ("POST", "/api/file"), ("GET", "/api/storage-status"), ("GET", "/api/workspace-trash"),
+    ("GET", "/api/workspace-export"), ("GET", "/api/external-sources"), ("GET", "/api/internal/embedding"),
+    ("POST", "/api/local-exchange"),  # an in-memory corpus and index only
+    ("GET", "/openapi.json"), ("HEAD", "/openapi.json"),
+}
+# "module:target" of every threading.Thread / threading.Timer in agent/*.py.
+BACKGROUND_ENTRY_POINTS = {
+    "app:_reindex_today": "store",
+    "app:_model_startup_check": "no tenant writes (model listing)",
+    "app:_start_embedding": "starts EmbeddingMigration: hold per index file",
+    "embedding_migration:self._run": "hold per index file (_fill, _drop_everywhere)",
+    "embedding_migration:self._retry": "kicks self._run",
+    "embedding_migration:self._recheck": "kicks self._run",
+    "embedding:fn": "no tenant writes (embeddings address re-check)",
+    "deadline:target": "the model call; its caller writes under store",
+    "streaming:run": "the exchange; store (log_exchange)",
+    "score_gap_native:write": "subprocess pipe", "score_gap_native:read": "subprocess pipe",
+    "tenant_assertion:feed": "subprocess pipe", "tenant_assertion:drain": "subprocess pipe",
+    "rust_forward:self._supervise": "child process supervision",
+    "rust_forward:self._reap": "child process supervision",
+}
