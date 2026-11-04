@@ -75,6 +75,7 @@ from .dedicated_storage import StorageUnavailable, tenant_volume
 from .managed_storage import ManagedCorpusBackend
 from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
 from . import tenant_assertion
+from . import rust_forward
 
 log = logging.getLogger("diary")
 
@@ -729,7 +730,10 @@ async def lifespan(_app: FastAPI):
     # once the seeded embeddings addresses have been checked to be on this network (which can take a
     # while when the resolver is not up yet, so not on the startup path).
     threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
+    # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route (default: none).
+    rust_forward.start(lambda port, token: rust_forward.server_config(_base_cfg, st, port, token), _RUST_ROUTES)
     yield
+    rust_forward.stop()
     if _embedding_migration is not None:
         _embedding_migration.stop()
     st.backend.close()
@@ -739,8 +743,12 @@ async def lifespan(_app: FastAPI):
     st.journal.close()
 
 
+_RUST_ROUTES = rust_forward.configured_routes()
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 app.add_middleware(TenantAssertionMiddleware)
+# Outermost (added last): forwarded requests never reach the assertion middleware here.
+if _RUST_ROUTES:
+    app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted)
 
 
 @app.exception_handler(StorageUnavailable)
