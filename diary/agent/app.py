@@ -731,7 +731,8 @@ async def lifespan(_app: FastAPI):
     # while when the resolver is not up yet, so not on the startup path).
     threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
     # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route (default: none).
-    rust_forward.start(lambda port, token: rust_forward.server_config(_base_cfg, st, port, token), _RUST_ROUTES)
+    rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
+                       _RUST_ROUTES)
     yield
     rust_forward.stop()
     if _embedding_migration is not None:
@@ -743,12 +744,27 @@ async def lifespan(_app: FastAPI):
     st.journal.close()
 
 
+def _rust_recovered(user_id: str) -> bool:
+    """D4: does this process hold a recovered managed state for the tenant? Then a native read skips
+    nothing _tenant_state would do; the state is touched like a request served here would touch it."""
+    key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
+    with _tenant_lock:
+        state = _tenant_states.get(key)
+        if state is None or getattr(state, "recovered", True) is not True:
+            return False
+        _tenant_states.move_to_end(key)
+        state.last_used = time.monotonic()
+        return True
+
+
 _RUST_ROUTES = rust_forward.configured_routes()
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
-app.add_middleware(TenantAssertionMiddleware)
-# Outermost (added last): forwarded requests never reach the assertion middleware here.
+# D4: the forwarder sits INSIDE the assertion middleware (added first = innermost), so the one
+# verifier and nonce cache here check every request before anything is forwarded.
 if _RUST_ROUTES:
-    app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted)
+    app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
+                       is_recovered=_rust_recovered)
+app.add_middleware(TenantAssertionMiddleware)
 
 
 @app.exception_handler(StorageUnavailable)
