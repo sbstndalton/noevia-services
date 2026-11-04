@@ -105,7 +105,8 @@ jobs:
         run: |
           cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
             -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
-            -p diary-workspace-export -p diary-workspace-import-apply
+            -p diary-workspace-export -p diary-workspace-import-apply \
+            -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run
       - name: Install and smoke the pinned decode-v1 binary
         run: |
           set -euo pipefail
@@ -120,6 +121,7 @@ jobs:
           TENANT_ASSERTION_BIN: ${{ runner.temp }}/noevia-rs/target/release/tenant-assertion
           TENANT_ASSERTION_REQUIRED: "1"
           DIARY_RUST_LEAVES_REQUIRED: "1"
+          DIARY_D2_TEST_BIN_DIR: ${{ runner.temp }}/noevia-rs/target/release
           DIARY_CORPUS_WRITE_TEST_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-corpus-write-cli
           DIARY_CORPUS_PARSE_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-corpus-parse
           SCORE_GAP_TEST_BINARY: ${{ runner.temp }}/noevia-rs/target/release/diary-score-gap
@@ -130,6 +132,16 @@ jobs:
           WORKSPACE_IMPORT_APPLY_TEST_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-workspace-import-apply
           WORKSPACE_RESTORE_VERIFY_BIN: ${{ runner.temp }}/noevia-rs/target/release/workspace-restore-verify
         run: python -m pytest -q -rs
+      - name: D2 rules and D3 backup through real native leaves
+        env:
+          DIARY_D2_TEST_BIN_DIR: ${{ runner.temp }}/noevia-rs/target/release
+          DIARY_RUST_LEAVES_REQUIRED: "1"
+          DIARY_BACKUP_IMPL: rust
+          DIARY_STORAGE_BACKOFF_IMPL: rust
+          WORKSPACE_RULES_IMPL: rust
+        # The default suite above retains the Python-specific SQL-spy regression.
+        # Native parity here exercises saves, conflicts, mid-run edits/deletes, backoff and login refusal.
+        run: python -m pytest -q tests/test_managed_storage.py tests/test_storage_backoff.py tests/test_workspace_ops.py tests/test_workspace_trash.py -k 'not backup_streams_file_data_one_row_at_a_time'
       # workspace-restore-verify (WORKSPACE_RESTORE_VERIFY_IMPL=rust, noevia#982): same contract: the
       # fixture table is byte-identical to noevia-rs' copy, and the binary agrees with the live Python
       # module through the switch; the restore and import suites also pass with the switch on.

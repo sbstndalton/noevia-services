@@ -35,6 +35,14 @@ class OpError(Exception):
 def rel_path(path, allow_root=False):
     if not isinstance(path, str) or len(path) > 500 or '\\' in path or '\x00' in path:
         raise OpError(400, 'Invalid path')
+    from . import workspace_rules_native as native
+    if native.enabled():
+        result = native.invoke(op='rel_path', path=path, allow_root=allow_root)
+        if 'error' in result:
+            if not path.strip('/'):
+                raise OpError(403, 'The workspace root cannot be changed')
+            raise OpError(403, 'Choose a path inside the diary folder')
+        return result['path']
     path = path.strip('/')
     if not path:
         if allow_root:
@@ -47,6 +55,13 @@ def rel_path(path, allow_root=False):
 
 def protected(store, full):
     """True when ``full`` (a backend key) is a path clients may never delete, move or replace."""
+    from . import workspace_rules_native as native
+    if native.enabled():
+        import calendar
+        return native.invoke(op='protected', path=full, config={
+            'remote_root': store._join(''), 'entries_prefix': store.entries_prefix,
+            'monthly_prefix': store.monthly_prefix, 'month_file_template': store.month_file_template,
+            'index_file': store.index_file, 'month_names': list(calendar.month_name)[1:]})
     entries = store._join(store.entries_prefix).rstrip('/')
     memory = store._join(MEMORY_FOLDER).rstrip('/')
     # Field-specific substitutions (digits for year/month, {month_name} built from the actual

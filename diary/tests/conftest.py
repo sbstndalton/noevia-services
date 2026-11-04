@@ -25,7 +25,7 @@ def _fresh_storage_gates():
 RUST_LEAF_MODULES = frozenset({
     'test_corpus_write_native', 'test_corpus_parse_native', 'test_score_gap_native', 'test_temporal_native',
     'test_workspace_export_native', 'test_workspace_import_native', 'test_workspace_restore_differential',
-    'test_workspace_restore_switch',
+    'test_workspace_restore_switch', 'test_d2_native',
 })
 
 
@@ -41,3 +41,14 @@ def pytest_runtest_makereport(item, call):
         reason = report.longrepr[-1] if isinstance(report.longrepr, tuple) else str(report.longrepr)
         report.outcome = 'failed'
         report.longrepr = f'DIARY_RUST_LEAVES_REQUIRED=1: a real-binary leaf case skipped ({reason})'
+
+
+@pytest.fixture(autouse=True)
+def _d2_test_binaries(monkeypatch, request):
+    if request.node.name == 'test_each_leaf_is_its_adapters_fixed_installed_path':
+        return
+    folder = os.environ.get('DIARY_D2_TEST_BIN_DIR')
+    if folder:
+        from agent import entity_focus_native, index_transform_native, storage_backoff_native, workspace_rules_native, backup_format_native, backup_native
+        for module in (entity_focus_native, index_transform_native, storage_backoff_native, workspace_rules_native, backup_format_native, backup_native):
+            monkeypatch.setattr(module, 'DEFAULT_BIN', str(Path(folder) / Path(module.DEFAULT_BIN).name))

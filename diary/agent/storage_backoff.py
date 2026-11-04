@@ -71,6 +71,17 @@ UPSTREAM_MESSAGE = "The storage server returned an error or could not be reached
 
 def parse_retry_after(value: Optional[str], default: float = DEFAULT_RETRY_AFTER_S) -> float:
     """Retry-After as seconds (delta or HTTP-date), clamped to 1..MAX; default when absent or garbage."""
+    from . import storage_backoff_native as native
+    if native.enabled():
+        local_timestamp = None
+        if value:
+            try:
+                parsed = parsedate_to_datetime(value.strip())
+                if parsed.tzinfo is None:
+                    local_timestamp = parsed.timestamp()
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+        return native.invoke(op="parse", header=value, default=default, wall=time.time(), local_timestamp=local_timestamp)
     if value:
         text = value.strip()
         try:

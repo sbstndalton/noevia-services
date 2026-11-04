@@ -154,7 +154,103 @@ def workspace_import_apply(temp):
 
 
 # Leaf name (the installed binary's name) -> adapter attribute holding its fixed path, and the check.
+def entity_focus_leaf(_temp):
+    for impl in ('python', 'rust'):
+        from agent import entity_focus_native as native
+        with selected(native.SELECTOR, impl):
+            entities = entity_focus.asked_entities('What did Alder Brannock say?')
+            result = (entities, entity_focus.classify('Alder Brannock called.', entities[0]),
+                      entity_focus.identified_people('Dr Alder Brannock called.', entities))
+        if impl == 'python':
+            expected = result
+        else:
+            check(result == expected, 'entity helpers differ')
+
+
+def index_transform_leaf(_temp):
+    from agent import index_transform_native as native
+    for impl in ('python', 'rust'):
+        with selected(native.SELECTOR, impl):
+            idx = fmt.parse_index('# Synthetic\n## Open Questions\n- [ ] Where?\n')
+            changed = fmt.register_month(idx, 'January 2030', '2030-01.md')
+            edited = fmt.apply_index_edits(idx, [{'action':'resolve', 'text':'Where?'}],
+                                         [{'action':'add', 'text':'Arrived'}], '2030-01-01')
+            result = (changed, edited, idx.render())
+        if impl == 'python':
+            expected = result
+        else:
+            check(result == expected, 'INDEX transforms differ')
+
+
+def storage_backoff_leaf(_temp):
+    from agent import storage_backoff, storage_backoff_native as native
+    for header in (None, 'garbage', '12', '1_200', '-1', 'Infinity', 'NaN'):
+        with selected(native.SELECTOR, 'python'):
+            expected = storage_backoff.parse_retry_after(header)
+        with selected(native.SELECTOR, 'rust'):
+            actual = storage_backoff.parse_retry_after(header)
+        check(actual == expected, 'Retry-After differs')
+
+
+def workspace_rules_leaf(_temp):
+    from types import SimpleNamespace
+    from agent import workspace_ops, workspace_rules_native as native
+    from agent.corpus_store import CorpusStore
+    cfg = SimpleNamespace(get=lambda key, default=None: default)
+    store = CorpusStore(cfg, None, None)
+    for impl in ('python', 'rust'):
+        with selected(native.SELECTOR, impl):
+            result = ([workspace_ops.rel_path(p) for p in ('notes/a.md', '/notes/b.md/')],
+                      [workspace_ops.protected(store, p) for p in ('INDEX.md','AI Memory/a.md', 'notes/a.md', '2030-01.md')])
+        if impl == 'python':
+            expected = result
+        else:
+            check(result == expected, 'workspace rules differ')
+
+
+def backup_format_leaf(_temp):
+    import json
+    from agent import backup_format_native as native
+    manifest = {'format':'noevia-diary-backup-v1', 'savedAt':1.0, 'generation':7,
+                'settings':{'accent':'é', 'negative':-0.0}, 'files':[], 'directories':[], 'tenant':TENANT}
+    body = json.dumps(manifest, sort_keys=True, ensure_ascii=False)
+    check(native.invoke(body=body)['body'] == body, 'backup manifest JSON bytes differ')
+
+
+def backup_run_leaf(temp):
+    from agent import backup_native
+    from agent.local_storage import LocalCorpusBackend
+    from agent.backup_restore import restore
+    storage = {'kind':'webdav','baseUrl':'https://synthetic.invalid','username':'fixture','corpusRoot':'Diary'}
+    objects = {}
+    for impl in ('python','rust'):
+        backend = _backend(temp / ('backup-' + impl))
+        with backend.db() as db:
+            backend.set_meta(db, 'snapshot_time', '1234567890.25')
+            backend.set_meta(db, 'due', '0')
+        remote_root = temp / ('remote-' + impl)
+        remote = LocalCorpusBackend(str(remote_root))
+        with selected(backup_native.SELECTOR, impl):
+            status = backend.backup(remote, storage, now=1234567900)
+        check(status['backup'] == 'complete' and status.get('storageContacted'), 'backup did not verify storage')
+        objects[impl] = {str(p.relative_to(remote_root)):p.read_bytes() for p in remote_root.rglob('*') if p.is_file()}
+        manifest = next(remote_root.rglob('manifests/*.json'))
+        restored = temp / ('restored-' + impl)
+        check(restore(remote_root,manifest,restored)['files'] == 2, 'legacy restore differs')
+        check((restored/'assets/bin.dat').read_bytes() == b'\x00\xff', 'binary restore differs')
+    check(objects['rust'] == objects['python'], 'backup remote object or manifest bytes differ')
+
+
+from agent import entity_focus_native, index_transform_native, storage_backoff_native, workspace_rules_native, backup_format_native, backup_native
+
 LEAVES = {
+    'diary-backup-run': (backup_native, 'DEFAULT_BIN', backup_run_leaf),
+    'diary-entity-focus': (entity_focus_native, 'DEFAULT_BIN', entity_focus_leaf),
+    'diary-index-transform': (index_transform_native, 'DEFAULT_BIN', index_transform_leaf),
+    'diary-storage-backoff': (storage_backoff_native, 'DEFAULT_BIN', storage_backoff_leaf),
+    'diary-workspace-rules': (workspace_rules_native, 'DEFAULT_BIN', workspace_rules_leaf),
+    'diary-backup-format': (backup_format_native, 'DEFAULT_BIN', backup_format_leaf),
+
     'diary-corpus-write-cli': (corpus_write_native, 'BINARY', corpus_write),
     'diary-corpus-parse': (corpus_parse, 'DEFAULT_BIN', corpus_parse_leaf),
     'diary-score-gap': (score_gap_native, 'BINARY', score_gap_leaf),

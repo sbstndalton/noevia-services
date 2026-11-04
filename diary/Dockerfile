@@ -23,12 +23,14 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
       -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
       -p diary-workspace-export -p diary-workspace-import-apply \
+      -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run \
  && ./target/release/tenant-assertion self-test | grep -qx ok \
  && ./target/release/workspace-restore-verify self-test | grep -qx ok \
  && mkdir /out \
  && cd target/release \
  && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
-      diary-temporal-cli diary-workspace-export diary-workspace-import-apply /out/ \
+      diary-temporal-cli diary-workspace-export diary-workspace-import-apply \
+      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run /out/ \
  && cd /src \
  && rm -rf /src/target /usr/local/cargo/registry
 
