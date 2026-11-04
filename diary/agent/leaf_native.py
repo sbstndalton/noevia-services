@@ -5,8 +5,8 @@ import selectors
 import subprocess
 import time
 
-class LeafUnavailable(ValueError):
-    pass
+class LeafUnavailable(OSError):
+    """Retryable native apply outage; durable journal intent must never quarantine."""
 
 def selected(name):
     return (os.environ.get(name) or 'python').strip().lower() == 'rust'

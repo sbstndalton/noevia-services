@@ -34,7 +34,7 @@ def run(backend, remote, storage, now=None):
         except BlockingIOError:
             return backend.status(storage)
         try:
-            return _worker(backend, remote, storage, destination, now)
+            return _worker(backend, remote, storage, destination, now, handle.fileno())
         except LeafUnavailable:
             # The child is already reaped. Keep an acknowledged committed generation;
             # a lost response never authorizes a Python rerun or a remote-contact claim.
@@ -51,16 +51,16 @@ def run(backend, remote, storage, now=None):
             return backend.status(storage)
 
 
-def _worker(backend, remote, storage, destination, now):
+def _worker(backend, remote, storage, destination, now, lock_fd):
     request = {'db':str(backend.db_path), 'tenant':backend.tenant, 'destination':destination,
-               'now':now, 'corpusRoot':storage.get('corpusRoot', '')}
+               'lockFd':lock_fd, 'now':now, 'corpusRoot':storage.get('corpusRoot', '')}
     proc = None
     deadline = time.monotonic() + TIMEOUT_S
     result = None
     verified_count = 0
     try:
         proc = subprocess.Popen([DEFAULT_BIN, 'run-v1'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, close_fds=True,
+                                stderr=subprocess.PIPE, close_fds=True, pass_fds=(lock_fd,),
                                 env={'PATH':'/usr/local/bin:/usr/bin:/bin'})
         pending = memoryview(json.dumps(request).encode() + b'\n')
         output, errors = bytearray(), bytearray()

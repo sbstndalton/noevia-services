@@ -136,12 +136,14 @@ jobs:
         env:
           DIARY_D2_TEST_BIN_DIR: ${{ runner.temp }}/noevia-rs/target/release
           DIARY_RUST_LEAVES_REQUIRED: "1"
+          DIARY_INDEX_TRANSFORM_IMPL: rust
+          DIARY_ENTITY_FOCUS_IMPL: rust
           DIARY_BACKUP_IMPL: rust
           DIARY_STORAGE_BACKOFF_IMPL: rust
           WORKSPACE_RULES_IMPL: rust
         # The default suite above retains the Python-specific SQL-spy regression.
         # Native parity here exercises saves, conflicts, mid-run edits/deletes, backoff and login refusal.
-        run: python -m pytest -q tests/test_managed_storage.py tests/test_storage_backoff.py tests/test_workspace_ops.py tests/test_workspace_trash.py -k 'not backup_streams_file_data_one_row_at_a_time'
+        run: python -m pytest -q tests/test_managed_storage.py tests/test_storage_backoff.py tests/test_workspace_ops.py tests/test_workspace_trash.py tests/test_corpus.py tests/test_entity_focus.py tests/test_d2_regressions.py -k 'not backup_streams_file_data_one_row_at_a_time'
       # workspace-restore-verify (WORKSPACE_RESTORE_VERIFY_IMPL=rust, noevia#982): same contract: the
       # fixture table is byte-identical to noevia-rs' copy, and the binary agrees with the live Python
       # module through the switch; the restore and import suites also pass with the switch on.

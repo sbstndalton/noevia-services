@@ -10,7 +10,8 @@ still runs in Python using those helpers. Storage gate state, credential caching
 in Python; the native parser receives the caller's wall clock and local-date resolution.
 Workspace rules cover relative path normalization and configured protected paths. Mutating SQL
 operations remain Python-owned. Backup format covers canonical Python JSON encoding only;
-the backup scheduler, locks, network operations and retry state remain Python-owned.
+the backup scheduler and remote transport remain Python-owned. The optional backup
+worker below owns backup snapshot and retry-state transitions.
 
 These leaves require a paired Rust revision with their json-v1 executables. Changing the image
 pin, enabling selectors, adopting the transaction engine and enabling backup orchestration are
@@ -18,7 +19,12 @@ separate integration actions. No receipt schema or operation namespace is provis
 
 `DIARY_BACKUP_IMPL` defaults to `python`. Its Rust worker reads the unchanged managed database,
 uses the format crate for manifest bytes, and updates the existing backups row. Python retains
-flock and brokers immutable create-and-verify through the existing credential-gated backend;
+flock through reap and passes the same locked descriptor to the child, which retains it
+until exit even if the broker dies. Python brokers immutable create-and-verify through
+the existing credential-gated backend;
 no secret enters Rust. A total 300-second child deadline kills/reaps on protocol failure. The
 caller never runs the Python worker after failure. Cadence and account concurrency remain
 owned by the unchanged caller. No workspace receipt schema is used.
+
+Native leaf unavailability is an OSError: journal replay applies its transient cooldown
+and retains intent past the usual quarantine-attempt threshold. No Python fallback occurs.
