@@ -20,8 +20,13 @@ INDEX.md, tenant detail in /api/health ...). A declined request, like one the ch
 is served here without verifying it again, so each nonce is consumed exactly once whichever process
 answers, across declines, restarts and a dead child.
 
-If the process fails to start, dies or stops answering (each forward has an absolute deadline),
-Python serves every route, logs the fallback, and restarts it at most MAX_RESTARTS times with a
+Only requests that declare no body are forwarded (the native routes are GETs that ignore one); a
+request with a body is never read here and goes to the app untouched, so its timing is exactly
+Python's. A forward has ONE absolute deadline from the moment it is chosen, covering preparation,
+the call and reading the reply; when it passes, or the child fails, the request falls back to Python
+at once and killing/reaping the child happens on a background thread, never on the request path.
+
+If the process fails to start, dies or stops answering, Python serves every route, logs the fallback, and restarts it at most MAX_RESTARTS times with a
 growing delay, so a broken binary never becomes a crash loop.
 """
 from __future__ import annotations
@@ -59,7 +64,6 @@ FORWARD_TIMEOUT_S = 20.0
 FORWARD_DEADLINE_S = 30.0
 MAX_RESTARTS = 3
 RESTART_DELAYS_S = (5.0, 30.0, 120.0)
-MAX_FORWARD_BODY = 64 * 1024 * 1024
 _HOP = {b"connection", b"keep-alive", b"transfer-encoding", b"te", b"upgrade", b"content-length",
         b"proxy-connection", b"trailer"}
 _DROP_REPLY = {b"date", b"server", b"connection", b"keep-alive", b"transfer-encoding"}
@@ -208,27 +212,36 @@ class RustServer:
             self.restarts = attempt
             self._stopping.wait(delay)
 
-    def _mark_lost(self, proc: Optional[subprocess.Popen], quiet: bool = False) -> None:
-        """Python takes every route back (nothing to hand over: the nonce cache is already here)."""
+    def _mark_lost(self, proc: Optional[subprocess.Popen], quiet: bool = False, background: bool = False) -> None:
+        """Python takes every route back (nothing to hand over: the nonce cache is already here).
+        `background`: kill and reap the child on its own thread (the request path never waits)."""
         with self._lock:
             was_ready, self.ready = self.ready, False
             current = self._proc if proc is None else proc
             if proc is None or self._proc is proc:
                 self._proc = None
-        if current is not None and current.poll() is None:
-            try:
-                current.kill()
-                current.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
         if was_ready and not quiet:
-            code = current.returncode if current is not None else None
-            log.warning("Rust Diary server lost (exit %s); Python serves every route", code)
+            log.warning("Rust Diary server lost; Python serves every route")
+        if current is None:
+            return
+        if background:
+            threading.Thread(target=self._reap, args=(current,), name="rust-diary-reap", daemon=True).start()
+        else:
+            self._reap(current)
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def lost(self) -> None:
-        """Called from the request path when a forward fails: kill the process (the supervisor
-        restarts it) and take every route back."""
-        self._mark_lost(None)
+        """Called from the request path when a forward fails: take every route back now; the child
+        is killed and reaped in the background (the supervisor then restarts it)."""
+        self._mark_lost(None, background=True)
 
 
 class ForwardMiddleware:
@@ -264,42 +277,34 @@ class ForwardMiddleware:
         # A tenant deleted in this process (24 h tombstone) is answered here (410).
         return not (user and self.is_deleted(user.lower()))
 
+    @staticmethod
+    def _declares_body(scope) -> bool:
+        for name, value in scope.get("headers") or []:
+            name = name.lower()
+            if name == b"transfer-encoding":
+                return True
+            if name == b"content-length" and value.strip() not in (b"", b"0"):
+                return True
+        return False
+
     async def __call__(self, scope, receive, send):
         server = self.server or current()
-        if not self._wants(scope, server):
+        # A request with a body is never forwarded or read here: the app handles it as today.
+        if not self._wants(scope, server) or self._declares_body(scope):
             await self.app(scope, receive, send)
             return
-        chunks, size, more, overflow = [], 0, True, False
-        while more:
-            message = await receive()
-            if message.get("type") != "http.request":
-                break
-            chunk = message.get("body", b"")
-            size += len(chunk)
-            chunks.append(chunk)
-            more = message.get("more_body", False)
-            if size > MAX_FORWARD_BODY:
-                overflow = True
-                break
-        replayed = False
-
-        async def replay():
-            nonlocal replayed
-            if not replayed:
-                replayed = True
-                return {"type": "http.request", "body": b"".join(chunks), "more_body": overflow and more}
-            return await receive()
-
-        reply = None if overflow else await self._forward(server, scope, b"".join(chunks))
+        deadline = time.monotonic() + FORWARD_DEADLINE_S
+        reply = await self._forward(server, scope, deadline)
         if reply is None:
-            await self.app(scope, replay, send)
+            await self.app(scope, receive, send)
             return
         status, headers, body = reply
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
-    async def _forward(self, server, scope, body: bytes):
-        """(status, headers, body) from the Rust side, or None to serve the request here."""
+    async def _forward(self, server, scope, deadline: float):
+        """(status, headers, body) from the Rust side, or None to serve the request here. Everything
+        runs within `deadline` (time.monotonic)."""
         raw_path = scope.get("raw_path") or scope.get("path", "").encode()
         raw_path = raw_path.split(b"?", 1)[0]
         query = scope.get("query_string", b"")
@@ -328,11 +333,14 @@ class ForwardMiddleware:
 
         async def exchange():
             resp = await self._client.send(self._client.build_request(scope["method"], url, headers=headers,
-                                                                       content=body))
+                                                                       content=b""))
             return resp, await resp.aread()
 
         try:
-            resp, content = await asyncio.wait_for(exchange(), FORWARD_DEADLINE_S)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("forward deadline passed before the call")
+            resp, content = await asyncio.wait_for(exchange(), remaining)
         except Exception as exc:  # noqa: BLE001 - lost or stuck process: Python serves from here on
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
             server.lost()

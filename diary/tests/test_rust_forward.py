@@ -444,37 +444,137 @@ def test_a_binary_that_cannot_start_leaves_python_serving_without_a_crash_loop(w
     assert not missing.ready
 
 
-def test_a_stuck_child_is_bounded_by_the_absolute_deadline(world, monkeypatch):
-    """A child that accepts and then trickles forever: the forward gives up after the deadline,
-    Python answers, and the child is dropped."""
-    import socket as _socket
-    import threading
-    listener = _socket.socket()
-    listener.bind(('127.0.0.1', 0))
-    listener.listen()
-    port = listener.getsockname()[1]
-    stop = threading.Event()
+class _HungChild:
+    """Accepts one forward, then trickles reply bytes forever (never completes)."""
 
-    def trickle():
-        conn, _ = listener.accept()
+    def __init__(self):
+        import threading
+        self.listener = socket.socket()
+        self.listener.bind(('127.0.0.1', 0))
+        self.listener.listen()
+        self.port = self.listener.getsockname()[1]
+        self.stop = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return
         conn.recv(65536)
-        conn.sendall(b'HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n')
-        while not stop.is_set():
+        conn.sendall(b'HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n')
+        while not self.stop.is_set():
             try:
                 conn.sendall(b'x')
             except OSError:
                 return
-            time.sleep(0.05)
+            time.sleep(0.02)
 
-    threading.Thread(target=trickle, daemon=True).start()
-    monkeypatch.setattr(rust_forward, 'FORWARD_DEADLINE_S', 0.5)
+    def close(self):
+        self.stop.set()
+        self.listener.close()
+
+
+class _SlowReapProc:
+    """A child whose kill/reap takes seconds (the pre-fix code waited for it on the request path)."""
+
+    def __init__(self, reap_s):
+        import threading
+        self.reap_s, self.killed, self.reaped = reap_s, threading.Event(), threading.Event()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed.set()
+
+    def wait(self, timeout=None):
+        time.sleep(min(self.reap_s, timeout or self.reap_s))
+        self.returncode = -9
+        self.reaped.set()
+        return self.returncode
+
+
+def _hung_forwarder(port, deadline_s, monkeypatch):
+    monkeypatch.setattr(rust_forward, 'FORWARD_DEADLINE_S', deadline_s)
     server = rust_forward.RustServer(lambda p, t, f: {}, port=port, restart_delays=())
     server.ready, server.forward_secret = True, 'synthetic'
-    client = TestClient(rust_forward.ForwardMiddleware(appmod.app, server=server, routes={'/api/months': 'GET'}))
-    started = time.monotonic()
-    resp = client.get('/api/months', headers={'Authorization': f'Bearer {TOKEN}'})
-    stop.set()
-    listener.close()
-    assert time.monotonic() - started < 5
-    assert (resp.status_code, resp.json()) == (400, {'detail': 'missing or invalid X-Cowork-User-ID'})
-    assert not server.ready
+    return server, rust_forward.ForwardMiddleware(appmod.app, server=server, routes={'/api/months': 'GET'})
+
+
+def test_a_hung_child_with_slow_reaping_does_not_delay_the_fallback(world, monkeypatch):
+    child = _HungChild()
+    try:
+        server, app = _hung_forwarder(child.port, 0.5, monkeypatch)
+        proc = _SlowReapProc(reap_s=4.0)
+        server._proc = proc
+        client = TestClient(app)
+        started = time.monotonic()
+        resp = client.get('/api/months', headers={'Authorization': f'Bearer {TOKEN}'})
+        elapsed = time.monotonic() - started
+        # Python's own answer, within the deadline plus a small margin, while reaping is still pending.
+        assert (resp.status_code, resp.json()) == (400, {'detail': 'missing or invalid X-Cowork-User-ID'})
+        assert elapsed < 0.5 + 0.5, elapsed
+        assert not server.ready
+        assert proc.killed.wait(1) and not proc.reaped.is_set()
+        assert proc.reaped.wait(6)
+    finally:
+        child.close()
+
+
+def test_total_forward_time_is_the_deadline_plus_a_small_margin(world, monkeypatch):
+    for deadline in (0.3, 1.0):
+        child = _HungChild()
+        try:
+            server, app = _hung_forwarder(child.port, deadline, monkeypatch)
+            started = time.monotonic()
+            resp = TestClient(app).get('/api/months', headers={'Authorization': f'Bearer {TOKEN}'})
+            elapsed = time.monotonic() - started
+            assert resp.status_code == 400
+            assert deadline <= elapsed < deadline + 0.4, (deadline, elapsed)
+        finally:
+            child.close()
+
+
+def test_a_slow_request_body_is_never_read_or_forwarded_and_times_like_python(world, monkeypatch):
+    """A request that declares a body is handed to the app untouched: the forwarder never waits for
+    it, and the answer and its timing are the Python-only ones."""
+    import asyncio
+    forwarded = []
+
+    class Spy(rust_forward.ForwardMiddleware):
+        async def _forward(self, server, scope, deadline):
+            forwarded.append(scope['path'])
+            return None
+
+    server = rust_forward.RustServer(lambda p, t, f: {}, port=free_port(), restart_delays=())
+    server.ready, server.forward_secret = True, 'synthetic'
+    spy = Spy(appmod.app, server=server, routes={'/api/months': 'GET'})
+
+    async def call(app, headers):
+        sent, reads = [], []
+
+        async def receive():
+            reads.append(time.monotonic())
+            await asyncio.sleep(3600)  # the body never arrives
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1', 'method': 'GET',
+                 'scheme': 'http', 'path': '/api/months', 'raw_path': b'/api/months', 'query_string': b'',
+                 'root_path': '', 'headers': headers, 'client': ('127.0.0.1', 1), 'server': ('127.0.0.1', 8010)}
+        started = time.monotonic()
+        await asyncio.wait_for(app(scope, receive, send), 5)
+        return time.monotonic() - started, sent[0]['status'], b''.join(m.get('body', b'') for m in sent[1:]), reads
+
+    base = [(b'authorization', f'Bearer {TOKEN}'.encode()), (b'content-type', b'text/plain')]
+    for extra in ([(b'content-length', b'10')], [(b'transfer-encoding', b'chunked')]):
+        py_time, py_status, py_body, _ = asyncio.run(call(appmod.app, base + extra))
+        fw_time, fw_status, fw_body, reads = asyncio.run(call(spy, base + extra))
+        assert (fw_status, fw_body) == (py_status, py_body) == (400, b'{"detail":"missing or invalid X-Cowork-User-ID"}')
+        assert forwarded == [] and fw_time < 1 and py_time < 1
+    # Without a body the same request is forwarded.
+    asyncio.run(call(spy, base))
+    assert forwarded == ['/api/months']
