@@ -188,6 +188,14 @@ def _remember_nonce(nonce: str, ts: int, now: float) -> Optional[str]:
         return None
 
 
+def raise_floor(second: int) -> None:
+    """Refuse every assertion signed at or before `second` from now on. Called when routes move to
+    this process from the Rust Diary server (agent/rust_forward.py), which may have accepted them."""
+    global _floor
+    with _seen_lock:
+        _floor = max(_floor, int(second))
+
+
 def _nonce_count() -> int:
     with _seen_lock:
         return _count
