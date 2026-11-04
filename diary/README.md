@@ -392,7 +392,19 @@ behaviour: `DIARY_CORPUS_WRITE_IMPL`, `DIARY_CORPUS_PARSE_IMPL`, `DIARY_SCORE_GA
 `DIARY_TEMPORAL_FOCUS_IMPL`, `WORKSPACE_EXPORT_IMPL`, `WORKSPACE_IMPORT_APPLY_IMPL` and
 `WORKSPACE_RESTORE_VERIFY_IMPL` all stay `python` until a release flips one.
 
-The six leaves without a `self-test` command are proven by `scripts/smoke_diary_leaves.py`:
+The Rust Diary server `noevia-diary` (D4–D5) ships in the same bundle at `/usr/local/bin/noevia-diary`.
+Python starts it on `127.0.0.1:8011` only when `DIARY_RUST_ROUTES` names a route or (D5)
+`DIARY_RUST_WRITES` a tenant. The image sets neither (both empty), so the process is never
+started and behaviour is unchanged until the owner sets them. The image's `ENV` states the three
+binary paths the code already defaults to: `DIARY_RUST_SERVER_BIN=/usr/local/bin/noevia-diary`,
+`TENANT_ASSERTION_BIN=/usr/local/bin/tenant-assertion` and
+`DIARY_WORKSPACE_EXPORT_BIN=/usr/local/bin/diary-workspace-export` (the last is read only by the
+D4b tests; the service uses `workspace_export_native.BINARY`). The build fails if any of them is not
+executable, and `scripts/smoke_diary_leaves.py noevia-diary` starts the server on a free loopback
+port with a synthetic start-up line and checks its control probe, its refusal of a wrong control
+token or a missing forward secret, and its decline of a route it does not serve.
+
+The leaves without a `self-test` command (and `noevia-diary`) are proven by `scripts/smoke_diary_leaves.py`:
 each runs once through its real adapter, selected only inside that process, on synthetic
 data, and must agree with Python. The image build runs it with `--all`; the noevia Diary
 overlay runs it in the candidate for the leaves it built. CI builds the same leaves, runs

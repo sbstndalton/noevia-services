@@ -5,6 +5,9 @@
 # diary-corpus-write-cli (DIARY_CORPUS_WRITE_IMPL), diary-corpus-parse (DIARY_CORPUS_PARSE_IMPL),
 # diary-score-gap (DIARY_SCORE_GAP_IMPL), diary-temporal-cli (DIARY_TEMPORAL_FOCUS_IMPL),
 # diary-workspace-export (WORKSPACE_EXPORT_IMPL) and diary-workspace-import-apply (WORKSPACE_IMPORT_APPLY_IMPL).
+# noevia-diary (D4-D5) is the Rust Diary server process that Python starts on 127.0.0.1:8011 only when
+# DIARY_RUST_ROUTES names a route or DIARY_RUST_WRITES a tenant. Both are empty in this image, so the process
+# is never started and behaviour is unchanged until the owner sets them.
 # Pinned to release/versions.lock's NOEVIA_RS_REF like the OCR and model-manager
 # images, fetched as an anonymous tarball whose sha256 is checked before anything is built. Built on
 # bookworm (glibc 2.36); the runtime base is the same or newer Debian. The release's Diary overlay
@@ -24,13 +27,14 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
       -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
       -p diary-workspace-export -p diary-workspace-import-apply \
       -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run \
+      -p noevia-diary \
  && ./target/release/tenant-assertion self-test | grep -qx ok \
  && ./target/release/workspace-restore-verify self-test | grep -qx ok \
  && mkdir /out \
  && cd target/release \
  && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
       diary-temporal-cli diary-workspace-export diary-workspace-import-apply \
-      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run /out/ \
+      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run noevia-diary /out/ \
  && cd /src \
  && rm -rf /src/target /usr/local/cargo/registry
 
@@ -46,6 +50,15 @@ RUN pip install --no-cache-dir --upgrade "pip>=26.2" && pip install --no-cache-d
 
 COPY --from=tenant-assertion /out/ /usr/local/bin/
 RUN tenant-assertion self-test | grep -qx ok && workspace-restore-verify self-test | grep -qx ok
+# The native Diary binaries at the fixed paths the Python code already defaults to (agent/rust_forward.py
+# DEFAULT_BIN, agent/tenant_assertion.py DEFAULT_BIN, agent/workspace_export_native.py BINARY). These three are
+# the same values, stated once so an operator can see them; the service falls back to the same paths if they are
+# unset. DIARY_WORKSPACE_EXPORT_BIN is read by the D4b tests only. DIARY_RUST_ROUTES and DIARY_RUST_WRITES are
+# deliberately NOT set here: empty means the Rust server is never started (see agent/rust_forward.py).
+ENV DIARY_RUST_SERVER_BIN=/usr/local/bin/noevia-diary \
+    DIARY_WORKSPACE_EXPORT_BIN=/usr/local/bin/diary-workspace-export \
+    TENANT_ASSERTION_BIN=/usr/local/bin/tenant-assertion
+RUN test -x "$DIARY_RUST_SERVER_BIN" && test -x "$DIARY_WORKSPACE_EXPORT_BIN" && test -x "$TENANT_ASSERTION_BIN"
 COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
