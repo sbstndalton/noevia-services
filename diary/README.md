@@ -382,11 +382,30 @@ rollback, lost replies/idempotent retry, bounded child failures, HTTP status and
 exactly-once later outbox transfer. No real Diary data is required.
 
 
-### Corpus-write transform integration (source only)
+### Rust leaf bundle
+
+The image's Rust stage builds every Diary leaf at the pinned noevia-rs ref into one `/out/`
+bundle, copied to `/usr/local/bin/`: `tenant-assertion`, `workspace-restore-verify`,
+`diary-corpus-write-cli`, `diary-corpus-parse`, `diary-score-gap`, `diary-temporal-cli`,
+`diary-workspace-export` and `diary-workspace-import-apply`. Shipping a binary changes no
+behaviour: `DIARY_CORPUS_WRITE_IMPL`, `DIARY_CORPUS_PARSE_IMPL`, `DIARY_SCORE_GAP_IMPL`,
+`DIARY_TEMPORAL_FOCUS_IMPL`, `WORKSPACE_EXPORT_IMPL`, `WORKSPACE_IMPORT_APPLY_IMPL` and
+`WORKSPACE_RESTORE_VERIFY_IMPL` all stay `python` until a release flips one.
+
+The six leaves without a `self-test` command are proven by `scripts/smoke_diary_leaves.py`:
+each runs once through its real adapter, selected only inside that process, on synthetic
+data, and must agree with Python. The image build runs it with `--all`; the noevia Diary
+overlay runs it in the candidate for the leaves it built. CI builds the same leaves, runs
+the smoke, and runs the suite with every binary variable set and
+`DIARY_RUST_LEAVES_REQUIRED=1`, which turns any skipped real-binary case in the leaf
+modules into a failure.
+
+
+### Corpus-write transform integration
 
 `DIARY_CORPUS_WRITE_IMPL` defaults to `python`. The explicit `rust` selection
-requires the fixed `/usr/local/bin/diary-corpus-write-cli` binary; this integration
-does not install it or activate the selector in an image. The private
+requires the fixed `/usr/local/bin/diary-corpus-write-cli` binary. The image ships it
+(see "Rust leaf bundle" below) but never activates the selector. The private
 `transform-v1` process transforms text only. Python retains consent, locale/time
 header data, exchange identifiers, journal ordering, ETags, storage writes,
 indexing and history. There is no fallback after native selection.

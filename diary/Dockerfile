@@ -1,11 +1,15 @@
-# tenant-assertion and workspace-restore-verify: the bounded Rust leaves from sbstndalton/noevia-rs.
+# The Diary Rust leaves from sbstndalton/noevia-rs, built into one /out/ bundle (noevia#1071):
 # tenant-assertion is the only tenant signature check (TENANT_ASSERTION_IMPL is retired, noevia#1071);
-# workspace-restore-verify is behind WORKSPACE_RESTORE_VERIFY_IMPL (default python). Pinned to
-# release/versions.lock's NOEVIA_RS_REF like the OCR and model-manager
+# workspace-restore-verify is behind WORKSPACE_RESTORE_VERIFY_IMPL. The six leaves below it ship for the
+# Python adapters that already call them, each behind its own selector, all defaulting to python:
+# diary-corpus-write-cli (DIARY_CORPUS_WRITE_IMPL), diary-corpus-parse (DIARY_CORPUS_PARSE_IMPL),
+# diary-score-gap (DIARY_SCORE_GAP_IMPL), diary-temporal-cli (DIARY_TEMPORAL_FOCUS_IMPL),
+# diary-workspace-export (WORKSPACE_EXPORT_IMPL) and diary-workspace-import-apply (WORKSPACE_IMPORT_APPLY_IMPL).
+# Pinned to release/versions.lock's NOEVIA_RS_REF like the OCR and model-manager
 # images, fetched as an anonymous tarball whose sha256 is checked before anything is built. Built on
 # bookworm (glibc 2.36); the runtime base is the same or newer Debian. The release's Diary overlay
-# (noevia deploy/examples/diary-overlay.sh) builds this same stage from these ARG defaults, so an
-# overlaid image carries the binaries at the same paths without a pip install.
+# (noevia deploy/examples/diary-overlay.sh) builds the same list from these ARG defaults into the same
+# /out/ bundle, so an overlaid image carries the binaries at the same paths without a pip install.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS tenant-assertion
 # Merged decode-v1 Rust runtime dependency (noevia-rs#301); checksum verified below.
 ARG NOEVIA_RS_REF=73441129af1d36f4b5f8e1da7673eb2aacc9d615
@@ -17,8 +21,14 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/noevia-rs.tar.gz --strip-components=1 \
  && rm /tmp/noevia-rs.tar.gz \
  && cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
+      -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
+      -p diary-workspace-export -p diary-workspace-import-apply \
  && ./target/release/tenant-assertion self-test | grep -qx ok \
- && ./target/release/workspace-restore-verify self-test | grep -qx ok
+ && ./target/release/workspace-restore-verify self-test | grep -qx ok \
+ && mkdir /out \
+ && cd target/release \
+ && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
+      diary-temporal-cli diary-workspace-export diary-workspace-import-apply /out/
 
 FROM python:3.12-slim
 
@@ -30,14 +40,16 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade "pip>=26.2" && pip install --no-cache-dir -r requirements.txt
 
-COPY --from=tenant-assertion /src/target/release/tenant-assertion /usr/local/bin/tenant-assertion
-COPY --from=tenant-assertion /src/target/release/workspace-restore-verify /usr/local/bin/workspace-restore-verify
+COPY --from=tenant-assertion /out/ /usr/local/bin/
 RUN tenant-assertion self-test | grep -qx ok && workspace-restore-verify self-test | grep -qx ok
 COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
 # Prove the installed binary speaks decode-v1, including payload/version/EOF checks.
 RUN python scripts/smoke_workspace_decode.py
+# Every other leaf answers through its real adapter and agrees with Python on synthetic data. The selectors
+# are set only inside this smoke; the service keeps every one at python. The overlay runs the same script.
+RUN python scripts/smoke_diary_leaves.py --all
 
 # Bind-mounted state must be writable by the image's runtime user.
 
