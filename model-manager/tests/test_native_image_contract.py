@@ -79,7 +79,9 @@ def test_native_image_build_copy_capability_and_default_entrypoint():
     assert re.search(r"^FROM python:3\.12(?:\.\d+)?-slim AS legacy-runtime$", legacy, re.M)
     assert "ENV MODEL_MANAGER_SECTIONS_IMPL=python MODEL_MANAGER_SETTINGS_IMPL=python" in legacy
     assert "COPY requirements.txt ." in legacy
-    assert "COPY app ./app" in legacy
+    assert "COPY app ./app" not in source
+    assert "qualification/restore_python_oracle.py" in legacy
+    assert "ADD --checksum=sha256:" in legacy
     for helper in ("gguf-meta", "model-files", "model-autoconfig"):
         assert f"COPY --from=legacy-builder /src/target/release/{helper} /usr/local/bin/{helper}" in legacy
     assert 'HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c ' in legacy
