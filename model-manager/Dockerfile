@@ -82,7 +82,11 @@ COPY --from=legacy-builder /src/target/release/model-files /usr/local/bin/model-
 COPY --from=legacy-builder /src/target/release/model-autoconfig /usr/local/bin/model-autoconfig
 COPY --from=legacy-builder /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager
 COPY LICENSE ./
-COPY app ./app
+# Historical source is fetched only in this test-only stage, never kept as application code.
+ADD --checksum=sha256:f3c62670d50380937377a4a1cb06bf8b2bed2cbe0acd14d169a7998a0355f225 https://codeload.github.com/sbstndalton/noevia-services/tar.gz/ce1af82e055397df715ae837fa7cd393f02281c7 /tmp/python-oracle.tar.gz
+COPY qualification/restore_python_oracle.py qualification/python-oracle.json ./qualification/
+RUN python qualification/restore_python_oracle.py /tmp/python-oracle.tar.gz /srv \
+ && rm /tmp/python-oracle.tar.gz
 EXPOSE 8090
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8090/api/v1/health',timeout=4)"
 CMD ["noevia-model-manager"]
