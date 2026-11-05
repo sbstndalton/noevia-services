@@ -73,11 +73,12 @@ class FakeChild:
     def __init__(self, mode='native'):
         self.mode, self.requests, self.active, self.max_active = mode, [], 0, 0
         self.delay = 0.3
-        # 'slow' with meet=N: each request waits (at most 10 s) until N are inside the child at once,
-        # so concurrency is observed deterministically whatever the machine's load.
+        # meet=N: each request waits (at most 10 s) until N requests have ARRIVED, a latched count
+        # that never goes down, so concurrency is observed deterministically whatever the load.
         self.meet = 0
+        self.arrived = 0
+        self.all_arrived = threading.Event()
         self.lock = threading.Lock()
-        self.met = threading.Condition(self.lock)
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.listener.listen(16)
@@ -109,9 +110,12 @@ class FakeChild:
             self.requests.append((headers, body))
             self.active += 1
             self.max_active = max(self.max_active, self.active)
-            self.met.notify_all()
-            if self.meet:
-                self.met.wait_for(lambda: self.active >= self.meet, timeout=10)
+            self.arrived += 1
+            if self.meet and self.arrived >= self.meet:
+                self.all_arrived.set()
+        if self.meet:
+            # Latched: once set it stays set, so no arrival can miss it however the others run.
+            self.all_arrived.wait(timeout=10)
         try:
             if self.mode == 'hang':
                 self.stop.wait(30)
@@ -283,7 +287,9 @@ def test_writes_of_one_tenant_are_serialized_across_both_processes(monkeypatch):
             one = await asyncio.gather(*(asgi(mw, headers, [body]) for _ in range(4)))
             serial = child.max_active
             child.max_active = 0
-            child.meet = 2  # two tenants' writes must be inside the child at once (10 s cap)
+            with child.lock:
+                child.arrived = 0
+                child.meet = 2  # two tenants' writes must be inside the child at once (10 s cap)
             other = put(user=MONTHLY)
             both = await asyncio.gather(asgi(mw, headers, [body]), asgi(mw, other[0], [other[1]]))
             return one, serial, both
@@ -488,6 +494,52 @@ def test_write_routes_are_wire_and_storage_identical(writers):
             headers['Authorization'] = 'Bearer wrong'
             replies.append(wire(client.request(method, path, headers=headers, content=raw)))
         assert replies[0] == replies[1] and replies[0][0] == 401
+
+
+@needs_binary
+@needs_server
+@needs_cw
+def test_a_body_fastapi_refuses_gets_its_422_before_auth_on_every_write_route(writers):
+    """FastAPI validates the body parameter (422) before the handler's check_auth (401): with a
+    wrong or missing token, Python and Rust must give the same 422 for every invalid-body kind,
+    and the same 401 for a valid shape."""
+    client, start, state = writers
+    modes = start()
+    shape = [b'{"path":', b'[1]', b'"text"', b'']
+    edit_model = [b'{"me":"x"}', b'{"xid":5,"me":"x"}', b'{"xid":"0123abcd","me":"x","month":3}',
+                  b'{"xid":"0123abcd","me":"x","assistant":null}']
+    routes = [('PUT', '/api/file', b'{"path":"a.md","content":"x","version":null}'),
+              ('POST', '/api/directory', b'{"path":"Projects"}'),
+              ('POST', '/api/entries/append', b'{"text":"x"}'),
+              ('POST', '/api/entries/edit', b'{"xid":"zz","me":"x"}')]
+    rows = []
+    for token in ('wrong', None):
+        for method, path, valid in routes:
+            bodies = shape + (edit_model if path.endswith('/edit') else [])
+            # NaN: Python's json reads it (a dict, so auth answers 401); Rust cannot read it alike and
+            # declines. The valid shape is the only one Rust answers itself. (A NaN body the edit model
+            # refuses makes FastAPI's own 422 fail to encode: pre-existing, Python-only.)
+            nan = valid[:-1] + b',"n":NaN}'  # a model-valid body Rust cannot read alike
+            for raw, want, native in [(b, 422, False) for b in bodies] + [(nan, 401, False), (valid, 401, True)]:
+                snap = snapshot(state, DAILY)
+                replies = []
+                for mode in (modes.python, modes.rust):
+                    mode()
+                    Recorder.served = []
+                    headers = sign(DAILY, method, path, raw, None, b'', 'application/json')
+                    if token is None:
+                        headers.pop('Authorization', None)
+                    else:
+                        headers['Authorization'] = f'Bearer {token}'
+                    replies.append((wire(client.request(method, path, headers=headers, content=raw)), Recorder.served))
+                    restore(state, DAILY, snap)
+                (p, _), (r, served) = replies
+                rows.append(f'{token!s:6} {method} {path:22} {raw[:40]!r:44} python={p[0]} rust={r[0]} native={served}')
+                assert p == r, (token, path, raw, p[2][:200], r[2][:200])
+                assert p[0] == want, (token, path, raw, p[0])
+                # A non-JSON body never reaches Rust; a JSON one Rust must decline, not answer.
+                assert served == [True] if native else served in ([], [False]), (token, path, raw, served)
+    print('\n'.join(rows))
 
 
 def hashlib_sha(data):
