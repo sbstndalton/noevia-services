@@ -72,7 +72,7 @@ RUN python scripts/smoke_diary_leaves.py --all
 
 EXPOSE 8010
 # Authed probe: /api/health returns 401 once DIARY_AUTH_TOKEN is set (same fix as
-# the compose healthcheck and the cowork sidecar's override). Exec form — Docker
+# the compose healthcheck and the cowork sidecar's override). Exec form - Docker
 # runs the JSON array directly, no shell, so the python -c string needs only one
 # quoting level; an uncaught 401 HTTPError exits non-zero (no `|| exit 1` needed).
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
