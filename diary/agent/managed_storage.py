@@ -58,7 +58,7 @@ class ManagedCorpusBackend:
         if not self.db_path.exists():
             # Only construction may create a database; operational reads/writes
             # below use mode=rw and never replace a disappeared database.
-            sqlite3.connect(self.db_path).close()
+            tenant_writer.connect(self.db_path).close()
         # D5: the schema and identity write below runs on every construction (#2378, open). For a
         # writer tenant it is a write like any other, under the tenant's writer lock (constructions
         # run outside every other ordered lock: app._get_backup_backend, _tenant_state). So that a
@@ -88,7 +88,7 @@ class ManagedCorpusBackend:
     _TABLES = frozenset({'files', 'directories', 'workspace_imports', 'workspace_index_outbox', 'meta', 'backups'})
 
     def _read_meta(self, key):
-        db = sqlite3.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
+        db = tenant_writer.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
         try:
             row = db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
             return row[0] if row else None
@@ -98,7 +98,7 @@ class ManagedCorpusBackend:
     def _initialized(self):
         """Read-only: every table exists and meta.tenant already names this tenant (D5)."""
         try:
-            db = sqlite3.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
+            db = tenant_writer.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
             try:
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not self._TABLES <= tables:
@@ -114,10 +114,9 @@ class ManagedCorpusBackend:
 
     @contextmanager
     def db(self):
-        db = sqlite3.connect(self.db_path.as_uri() + '?mode=rw', uri=True, timeout=30)
+        db = tenant_writer.connect(self.db_path.as_uri() + '?mode=rw', uri=True, timeout=30)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA synchronous=FULL')
-        tenant_writer.guard(db, self.db_path)
         try:
             with db:
                 yield db

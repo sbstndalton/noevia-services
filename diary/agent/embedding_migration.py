@@ -125,7 +125,7 @@ class EmbeddingMigration:
     def _open(self, path: Path) -> Optional[sqlite3.Connection]:
         try:
             # mode=rw: a tenant deleted meanwhile must not be recreated by this pass.
-            conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=30, check_same_thread=False)
+            conn = tenant_writer.connect(f"file:{path}?mode=rw", uri=True, timeout=30, check_same_thread=False)
         except sqlite3.Error:
             return None
         try:
@@ -141,7 +141,7 @@ class EmbeddingMigration:
         except sqlite3.Error:
             conn.close()
             return None
-        return tenant_writer.guard(conn, path)
+        return conn
 
     def _coverage(self, target: Optional[Target]) -> Optional[Dict[str, int]]:
         if target is None:

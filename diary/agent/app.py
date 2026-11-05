@@ -23,6 +23,7 @@ Run:  uvicorn agent.app:app --host 0.0.0.0 --port 8010
 from __future__ import annotations
 
 import logging
+import contextlib
 import copy
 import base64
 import hashlib
@@ -63,10 +64,12 @@ from .external_sources import (
     scan_source,
 )
 from .journal import Journal
+from . import journal as journal_mod
 from .llm import (DEFAULT_MAX_ANSWER_TOKENS, DEFAULT_MAX_REASONING_TOKENS, EMPTY_ANSWER_TEXT, LENGTH_CAP_TEXT, EmptyAnswerError, EngineUnreachable, LengthCapError, LLMClient, LLMError, ModelNotServed, one_listing_per_check,
                   strip_reasoning, with_shortened_note)
 from .pipeline import LoggingPipeline
 from .retrieval import Retriever
+from . import retrieval as retrieval_mod
 from .retrieval_trace import RetrievalTrace, attach as attach_trace, trace_requested
 from . import embedding as embedding_mod
 from .embedding_migration import EmbeddingMigration
@@ -257,14 +260,14 @@ def _snapshot_sqlite(source: Path, target: Path) -> None:
     API takes a consistent, restartable copy instead; an integrity check on
     the result guarantees the tenant migration starts from a valid database.
     """
-    src = sqlite3.connect(str(source))
+    src = tenant_writer.connect(str(source))
     try:
-        dst = sqlite3.connect(str(target))
+        dst = tenant_writer.connect(str(target))
         try:
             src.backup(dst)
         finally:
             dst.close()
-        check = sqlite3.connect(str(target))
+        check = tenant_writer.connect(str(target))
         try:
             result = check.execute("PRAGMA integrity_check").fetchone()[0]
         finally:
@@ -444,6 +447,13 @@ def _tenant_state(request: Request, *, recover=True) -> AppState:
     try:
         managed = ManagedCorpusBackend(managed_root, user_id)
         is_managed = managed.active()
+        if is_managed and tenant_writer.is_writer(user_id):
+            # D5: the state build runs under _tenant_lock, where the writer lock may not be taken,
+            # so a writer tenant's index schema is completed here first (under its lock, and only
+            # when an object is missing); the build then finds it in place and writes nothing.
+            index_db = managed_root / "managed-index.db"
+            journal_mod.ensure_schema_file(index_db)
+            retrieval_mod.ensure_schema_file(index_db)
     except Exception:  # noqa: BLE001
         # A concurrent DELETE /api/internal/tenant can rmtree the tenant root
         # while we're mid-construction (e.g. sqlite file vanishes under us).
@@ -517,10 +527,20 @@ def _recover_state(state: "AppState") -> None:
             state.__dict__.setdefault("recover_lock", threading.Lock()):
         if state.recovered:
             return
-        # Every Markdown file of a managed tenant is reindexed once per state (moved here from
-        # the build, which runs under _tenant_lock where the writer lock may not be taken).
-        for document in getattr(state, "dirty_on_recover", ()):
-            state.journal.mark_dirty(document)
+        # Every Markdown file of a managed tenant is reindexed once per state (moved here from the
+        # build, which runs under _tenant_lock where the writer lock may not be taken), and again
+        # after a lost Rust write (_rust_write_uncertain), whose document Python cannot know. The
+        # files are read NOW, not when the state was built, so documents created since are covered.
+        managed = getattr(state, "managed", None)
+        if getattr(state, "dirty_on_recover", False) and managed is not None:
+            with managed.db() as db:
+                # Paths still in the import outbox are marked by its drain (_reindex_dirty).
+                documents = [row[0] for row in db.execute(
+                    "SELECT path FROM files WHERE lower(path) LIKE '%.md' "
+                    "AND path NOT IN (SELECT path FROM workspace_index_outbox)")]
+            for document in documents:
+                state.journal.mark_dirty(document)
+            state.dirty_on_recover = False
         state.store.apply_pending()
         _reindex_dirty(state)
         state.recovered = True
@@ -594,14 +614,21 @@ def _build_tenant_state_locked(request, user_id, state_key, storage_header, mana
         for key, value in managed.settings().items():
             _set_cfg(cfg, "corpus." + key, value)
     backend = managed if is_managed else LegacyWriteGuard(create_backend(cfg), managed)
-    state = AppState(cfg, backend=backend)
+    index_db = tenant_root / "managed-index.db"
+    if is_managed and not index_db.exists():
+        # D5: this build creates the tenant's index database (a fresh account, or the first build
+        # after an import). No Rust write can meet it: the Rust process never creates a database
+        # (it opens them read-write) and declines every write of a tenant with no recovered state,
+        # which this tenant has none of until the build is registered and recovered.
+        building = tenant_writer.exempt(user_id, "a database file this build creates")
+    else:
+        building = contextlib.nullcontext()
+    with building:
+        state = AppState(cfg, backend=backend)
     state.managed = managed
     state.tenant_id = user_id
     state.store._write_lock.tenant = user_id
-    state.dirty_on_recover = ()
-    if is_managed:
-        with managed.db() as db:
-            state.dirty_on_recover = [row[0] for row in db.execute("SELECT path FROM files WHERE lower(path) LIKE '%.md'")]
+    state.dirty_on_recover = bool(is_managed)
     state.recovered = False
     state.last_used = time.monotonic()
     _tenant_states[state_key] = state
@@ -780,6 +807,7 @@ def _rust_write_uncertain(user_id: str) -> None:
     with _tenant_lock:
         state = _tenant_states.get(key)
         if state is not None:
+            state.dirty_on_recover = True  # the lost write's document is unknown: invalidate all
             state.recovered = False
 
 
@@ -796,10 +824,11 @@ app.add_middleware(TenantAssertionMiddleware)
 
 
 @app.exception_handler(tenant_writer.WriterBusy)
-async def writer_busy(_request: Request, _exc: tenant_writer.WriterBusy):
-    # D5: another write of the tenant (either process) held its writer lock for the whole deadline.
-    return JSONResponse({"detail": "Diary is saving another change. Try again in a moment."}, status_code=503,
-                        headers={"Retry-After": "1"})
+async def writer_busy(_request: Request, exc: tenant_writer.WriterBusy):
+    # D5: another write of the tenant (either process) held its writer lock for the whole deadline,
+    # or a lost Rust child was not yet confirmed exited (the admission barrier).
+    detail = (rust_forward.RESTARTING if exc.reason == "restarting" else rust_forward.BUSY).decode()
+    return JSONResponse(json.loads(detail), status_code=503, headers={"Retry-After": "1"})
 
 
 @app.exception_handler(StorageUnavailable)

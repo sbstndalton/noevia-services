@@ -73,7 +73,11 @@ class FakeChild:
     def __init__(self, mode='native'):
         self.mode, self.requests, self.active, self.max_active = mode, [], 0, 0
         self.delay = 0.3
+        # 'slow' with meet=N: each request waits (at most 10 s) until N are inside the child at once,
+        # so concurrency is observed deterministically whatever the machine's load.
+        self.meet = 0
         self.lock = threading.Lock()
+        self.met = threading.Condition(self.lock)
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.listener.listen(16)
@@ -105,6 +109,9 @@ class FakeChild:
             self.requests.append((headers, body))
             self.active += 1
             self.max_active = max(self.max_active, self.active)
+            self.met.notify_all()
+            if self.meet:
+                self.met.wait_for(lambda: self.active >= self.meet, timeout=10)
         try:
             if self.mode == 'hang':
                 self.stop.wait(30)
@@ -227,8 +234,9 @@ def test_an_uncertain_write_is_never_run_again_and_the_next_waits_for_the_reap(m
         assert (status, reply) == (503, rust_forward.UNCERTAIN)
         assert time.monotonic() - started < 1.5
         assert spy.calls == [] and uncertain == [DAILY] and not server.ready
-        # A lost child still being reaped: the next write of the tenant waits, then refuses.
-        monkeypatch.setattr(rust_forward, 'REAP_WAIT_S', 0.2)
+        # A lost child still being reaped: the next write of the tenant waits (the admission
+        # barrier, at most the lock deadline), then refuses.
+        monkeypatch.setattr(tenant_writer, 'DEADLINE_S', 0.2)
         server.reaping = 1
         assert asyncio.run(asgi(mw, headers, [body])) == (503, rust_forward.RESTARTING)
         server.reaping = 0
@@ -251,15 +259,16 @@ def test_write_bodies_are_bounded_and_a_slow_body_is_never_forwarded(monkeypatch
         chunked = [h for h in put(body=big)[0] if h[0] != b'content-length'] + [(b'transfer-encoding', b'chunked')]
         assert asyncio.run(asgi(mw, chunked, [big[:40], big[40:]])) == (413, rust_forward.TOO_LARGE)
         assert spy.calls == [] and child.requests == []
-        # A body still arriving at the deadline: nothing sent; Python gets every byte.
+        # A body still arriving at the deadline: nothing sent, and never handed to Python
+        # unfinished (a stalled sender would hold the tenant's lock): 408.
         headers, body = put()
         status, reply = asyncio.run(asgi(mw, headers, [body[:5], body[5:]], gap=0.25))
-        assert (status, reply) == (200, b'{"python":true}')
-        assert spy.calls == [('/api/file', body)] and child.requests == []
-        # Not JSON: FastAPI's 422 path, on Python, unread.
+        assert (status, reply) == (408, rust_forward.BODY_TIMEOUT)
+        assert spy.calls == [] and child.requests == []
+        # Not JSON: FastAPI's 422 path, on Python, with the bounded body.
         text = [(k, b'text/plain' if k == b'content-type' else v) for k, v in headers]
         assert asyncio.run(asgi(mw, text, [body]))[1] == b'{"python":true}'
-        assert child.requests == []
+        assert spy.calls == [('/api/file', body)] and child.requests == []
     finally:
         child.close()
 
@@ -274,7 +283,7 @@ def test_writes_of_one_tenant_are_serialized_across_both_processes(monkeypatch):
             one = await asyncio.gather(*(asgi(mw, headers, [body]) for _ in range(4)))
             serial = child.max_active
             child.max_active = 0
-            child.delay = 1.0  # long enough that two tenants' writes always meet on the child
+            child.meet = 2  # two tenants' writes must be inside the child at once (10 s cap)
             other = put(user=MONTHLY)
             both = await asyncio.gather(asgi(mw, headers, [body]), asgi(mw, other[0], [other[1]]))
             return one, serial, both

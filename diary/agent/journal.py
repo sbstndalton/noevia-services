@@ -60,6 +60,17 @@ class JournalEntry:
     last_error: Optional[str]
 
 
+def ensure_schema_file(db_path) -> None:
+    """Create a journal database's missing schema objects (under the tenant's writer lock)."""
+    db_path = Path(db_path)
+    existed = db_path.exists()
+    conn = tenant_writer.connect(str(db_path), timeout=30)
+    try:
+        tenant_writer.ensure_schema(conn, db_path, _SCHEMA, existed)
+    finally:
+        conn.close()
+
+
 class Journal:
     def __init__(self, db_path: Path):
         self._lock = threading.RLock()
@@ -71,12 +82,12 @@ class Journal:
         # sqlite's 5 s default. The rollback journal mode is kept on purpose:
         # WAL would rewrite existing index.db headers and keep recent commits
         # in index.db-wal until a checkpoint, breaking "one file to back up".
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
+        # D5: tenant_writer.connect guards a writer tenant's database from the start (writes need
+        # its writer lock); the schema is written only when an object is missing.
+        existed = self.db_path.exists()
+        self._conn = tenant_writer.connect(str(self.db_path), check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        # D5: a writer tenant's writes need its writer lock (agent/tenant_writer.py).
-        tenant_writer.guard(self._conn, self.db_path)
+        tenant_writer.ensure_schema(self._conn, self.db_path, _SCHEMA, existed)
 
     # ---------------- write-ahead ----------------
 

@@ -35,7 +35,7 @@ from agent.workspace_export import archive
 from agent.workspace_files import file_write
 from tests.test_dedicated_storage import A, B, request as plain_request, volume  # noqa: F401
 from tests.tenant_binary import needs_binary
-from tests.test_rust_forward import DAILY, needs_server, world  # noqa: F401
+from tests.test_rust_forward import DAILY, MONTHLY, needs_server, world  # noqa: F401
 from tests.test_rust_forward_d5 import CW_BIN, FakeChild, Recorder, asgi, forwarder, put, writers  # noqa: F401
 from tests.test_rust_forward_d5 import request as signed
 
@@ -542,3 +542,313 @@ def test_a_tenant_that_is_not_recovered_still_declines_to_rust(monkeypatch):
         assert spy.calls == [('/api/file', body)]
     finally:
         child.close()
+
+
+# ------------------------------------------------------------------ review ba3a712: P1, P2
+
+class StubChild:
+    """Stands in for the Rust child process: does not exit until `exit()`; wait() times out until
+    then (a child whose exit is not yet confirmed)."""
+
+    def __init__(self):
+        self.exited, self.kills = threading.Event(), 0
+
+    def poll(self):
+        return 0 if self.exited.is_set() else None
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, timeout=None):
+        import subprocess
+        if not self.exited.wait(timeout):
+            raise subprocess.TimeoutExpired('noevia-diary', timeout)
+        return 0
+
+    def exit(self):
+        self.exited.set()
+
+
+def blocked_writer(uid, deadline=0.3):
+    """From a plain thread (a Python-only writer): None when the lock was taken, else the reason."""
+    out = []
+
+    def run():
+        try:
+            with tenant_writer.hold(uid, deadline_s=deadline):
+                out.append(None)
+        except tenant_writer.WriterBusy as exc:
+            out.append(exc.reason or 'busy')
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(10)
+    return out[0]
+
+
+def test_a_cancelled_forward_is_uncertain_and_keeps_writers_out_until_the_child_exits(monkeypatch):
+    """P1: a request cancelled after it may have reached the child must not free the tenant's
+    lock while the child can still write."""
+    monkeypatch.setattr(rust_forward, 'REAP_WAIT_S', 0.05)
+    child, uncertain = FakeChild('hang'), []
+    stub = StubChild()
+    try:
+        server, spy, mw = forwarder(child.port, monkeypatch, deadline=10, uncertain=uncertain,
+                                    writers=frozenset({DAILY, MONTHLY}))
+        server._proc = stub
+        user = DAILY
+
+        async def run():
+            headers, body = put()
+            task = asyncio.ensure_future(asgi(mw, headers, [body]))
+            for _ in range(500):
+                if child.requests:
+                    break
+                await asyncio.sleep(0.01)
+            assert child.requests, 'the write reached the child'
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        asyncio.run(run())
+        assert uncertain == [user], 'the tenant is marked recovery-pending'
+        assert not server.ready and server.reaping == 1
+        assert tenant_writer._slots == {}, 'the request itself released its reference'
+        # Every writer, of this tenant or any other, waits for the child's confirmed exit.
+        assert blocked_writer(user) == 'restarting'
+        assert blocked_writer(MONTHLY) == 'restarting'
+        assert spy.calls == []
+        stub.exit()
+        deadline = time.monotonic() + 5
+        while server.reaping and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server.reaping == 0 and stub.kills >= 1
+        assert blocked_writer(user) is None
+    finally:
+        stub.exit()
+        child.close()
+
+
+def test_python_only_writers_wait_for_a_lost_child_until_its_exit_is_confirmed(monkeypatch):
+    """P1: the reaping barrier is in the common admission path, not only the forwarded routes, and
+    it is lowered only once the child has exited (not when kill/wait fail)."""
+    monkeypatch.setattr(rust_forward, 'REAP_WAIT_S', 0.05)
+    child, uncertain = FakeChild('hang'), []
+    stub = StubChild()
+    try:
+        server, spy, mw = forwarder(child.port, monkeypatch, deadline=0.3, uncertain=uncertain,
+                                    writers=frozenset({DAILY, MONTHLY}))
+        server._proc = stub
+        user = DAILY
+        headers, body = put()
+        assert asyncio.run(asgi(mw, headers, [body])) == (503, rust_forward.UNCERTAIN)
+        assert uncertain == [user]
+        # The reaper's wait has timed out several times by now: the barrier is still up.
+        time.sleep(0.3)
+        assert server.reaping == 1
+        assert blocked_writer(user) == 'restarting'      # a Python-only write of the tenant
+        assert blocked_writer(MONTHLY) == 'restarting'   # and of any other writer tenant
+        monkeypatch.setattr(tenant_writer, 'DEADLINE_S', 0.2)
+        with pytest.raises(tenant_writer.WriterBusy):    # a store write (CorpusStore._write_lock)
+            with tenant_writer.TenantWriteLock(user):
+                pass
+        with tenant_writer.hold(C):                      # a non-writer tenant is never held up
+            pass
+        stub.exit()
+        deadline = time.monotonic() + 5
+        while server.reaping and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server.reaping == 0
+        assert blocked_writer(user) is None and blocked_writer(MONTHLY) is None
+    finally:
+        stub.exit()
+        child.close()
+
+
+def test_a_tenant_deletion_waits_for_the_barrier_too(guarded, monkeypatch):
+    client, _ = guarded
+    hb = {'X-Cowork-User-ID': B}
+    assert client.get('/api/storage-status', headers=hb).status_code == 200
+    server = rust_forward.RustServer(lambda p, t, f: {}, port=free_port_local(), restart_delays=())
+    monkeypatch.setattr(tenant_writer, 'DEADLINE_S', 0.3)
+    server.reaping = 1
+    try:
+        resp = client.request('DELETE', '/api/internal/tenant', headers=hb)
+        assert resp.status_code == 503 and resp.json() == json.loads(rust_forward.RESTARTING)
+    finally:
+        server.reaping = 0
+    assert client.request('DELETE', '/api/internal/tenant', headers=hb).status_code == 200
+
+
+def free_port_local():
+    import socket
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def test_a_cached_statement_is_authorized_again_at_every_execution(tmp_path):
+    """P2: the guard holds for prepared/cached statements: a statement first run under the lock is
+    refused when run again without it."""
+    import sqlite3
+    from agent.journal import Journal
+    tenant_writer.configure(frozenset({B}))
+    path = tmp_path / 'users' / B / 'managed-index.db'
+    journal = Journal(path)  # a new file: its schema is created exempt
+    with tenant_writer.hold(B):
+        journal.mark_dirty('a.md')
+    errors = []
+
+    def unlocked():
+        try:
+            journal.mark_dirty('b.md')  # the same statement text, on the same connection
+        except sqlite3.DatabaseError as exc:
+            errors.append(str(exc))
+    t = threading.Thread(target=unlocked)
+    t.start()
+    t.join(10)
+    assert errors and 'not authorized' in errors[0]
+    assert journal.dirty_documents() == ['a.md']
+    assert tenant_writer.denials
+
+
+def test_attach_is_refused_so_no_connection_reaches_a_writer_database_under_another_name(tmp_path):
+    import sqlite3
+    tenant_writer.configure(frozenset({B}))
+    target = tmp_path / 'users' / B / 'managed-diary.db'
+    ManagedCorpusBackend(target.parent, B)
+    other = tmp_path / 'users' / C / 'managed-diary.db'
+    ManagedCorpusBackend(other.parent, C)
+    for conn in (tenant_writer.connect(':memory:'), tenant_writer.connect(str(other))):
+        with tenant_writer.hold(C):  # even holding another tenant's lock
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute('ATTACH DATABASE ? AS b', (str(target),))
+        conn.close()
+
+
+def test_agent_code_opens_sqlite_only_through_tenant_writer_connect():
+    offenders = []
+    for path in sorted(AGENT.glob('*.py')):
+        if path.name == 'tenant_writer.py':
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in ('sqlite3.connect', 'connect'):
+                offenders.append(f'{path.name}:{node.lineno}')
+    assert not offenders, f'use tenant_writer.connect: {offenders}'
+
+
+def test_opening_a_writer_tenants_index_writes_its_schema_only_under_the_lock(tmp_path, monkeypatch):
+    """P2: schema initialization is covered: an existing database whose schema is in place is
+    opened without any write; a missing object is created only under the tenant's lock."""
+    import sqlite3
+    from agent.journal import Journal
+    from agent.retrieval import Retriever
+    tenant_writer.configure(frozenset({B}))
+    path = tmp_path / 'users' / B / 'managed-index.db'
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as db:  # an older file: the journal table only
+        db.execute('CREATE TABLE journal (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL, '
+                   'payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0, applied_at TEXT, '
+                   'attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)')
+    monkeypatch.setattr(tenant_writer, 'DEADLINE_S', 0.3)
+    release, taken = threading.Event(), threading.Event()
+
+    def holder():
+        with tenant_writer.hold(B):
+            taken.set()
+            release.wait(10)
+    t = threading.Thread(target=holder)
+    t.start()
+    assert taken.wait(5)
+    try:
+        with pytest.raises(tenant_writer.WriterBusy):
+            Journal(path)  # needs to create dirty_documents: waits for the lock
+    finally:
+        release.set()
+        t.join(5)
+    Journal(path)  # lock free: created under it
+    Retriever(path, llm=None)
+    with sqlite3.connect(path) as db:
+        names = {r[0] for r in db.execute('SELECT name FROM sqlite_master')}
+    assert {'dirty_documents', 'journal', 'chunks', 'vec_meta'} <= names
+    # Schema in place: opening again from a plain thread writes nothing (no lock, no denial).
+    tenant_writer.denials.clear()
+    errors = []
+
+    def reopen():
+        try:
+            Journal(path)
+            Retriever(path, llm=None)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    w = threading.Thread(target=reopen)
+    w.start()
+    w.join(10)
+    assert not errors and tenant_writer.denials == []
+
+
+def test_recovery_after_a_lost_write_invalidates_documents_created_since_the_build(guarded, monkeypatch):
+    """P2: a document a lost Rust write created after the state was built (no dirty row survived)
+    is reindexed by the surviving state's recovery."""
+    client, _ = guarded
+    hb = {'X-Cowork-User-ID': B}
+    assert client.get('/api/storage-status', headers=hb).status_code == 200
+    st = appmod._tenant_state(plain_request(B))
+    assert st.recovered
+    new = 'Entries/2030/January/January 7, 2030.md'
+    with tenant_writer.hold(B):  # what the lost child left: the corpus saved, no dirty row
+        assert st.managed.put(new, b'## Monday, January 7, 2030\n')[0]
+    assert new not in st.journal.dirty_documents()
+    seen = []
+
+    def record(state):
+        seen.extend(state.journal.dirty_documents())
+    monkeypatch.setattr(appmod, '_reindex_dirty', record)
+    appmod._rust_write_uncertain(B)  # what the forwarder's on_uncertain does
+    assert not st.recovered
+    assert client.get('/api/files', headers=hb).status_code == 200
+    assert st.recovered and new in seen
+
+
+def test_every_fallback_path_bounds_the_body_and_its_deadline(monkeypatch):
+    """P2: with the Rust process unavailable, a writer tenant's write still never runs on Python
+    with a body over the bound or unfinished at the deadline."""
+    child = FakeChild('native')
+    try:
+        monkeypatch.setattr(rust_forward, 'MAX_WRITE_BODY', 64)
+        server, spy, mw = forwarder(child.port, monkeypatch, deadline=0.3)
+        server.ready = False  # Rust unavailable: Python serves
+        big = b'{"path":"a.md","content":"' + b'x' * 80 + b'","version":null}'
+        chunked = [h for h in put(body=big)[0] if h[0] != b'content-length'] + [(b'transfer-encoding', b'chunked')]
+        assert asyncio.run(asgi(mw, chunked, [big[:40], big[40:]])) == (413, rust_forward.TOO_LARGE)
+        headers, body = put()
+        assert asyncio.run(asgi(mw, headers, [body[:5], body[5:]], gap=0.25)) == (408, rust_forward.BODY_TIMEOUT)
+        assert spy.calls == []
+        # A complete, bounded body is served by Python with exactly its bytes.
+        assert asyncio.run(asgi(mw, headers, [body[:5], body[5:]])) == (200, b'{"python":true}')
+        assert spy.calls == [('/api/file', body)] and child.requests == []
+    finally:
+        child.close()
+
+
+def test_a_handler_thread_keeps_the_lock_after_its_request_is_cancelled():
+    """The middleware's reference and the handler thread's joined reference: the lock is freed by
+    the last one, so a sync handler still writing after a cancellation is never overlapped."""
+    tenant_writer.configure(frozenset({B}))
+    inside, release, done = threading.Event(), threading.Event(), threading.Event()
+
+    async def request():
+        h = await tenant_writer.acquire_async(B, time.monotonic() + 1)
+        ctx = __import__('contextvars').copy_context()
+
+        def handler():  # what Starlette's threadpool runs, in the request's context
+            with tenant_writer.hold(B):
+                inside.set()
+                release.wait(10)
+            done.set()
+        threading.Thread(target=lambda: ctx.run(handler)).start()
+        inside.wait(5)
+        h.release()  # the request is cancelled: the middleware lets go
+    asyncio.run(request())
+    assert blocked_writer(B, deadline=0.2) == 'busy', 'the handler thread still holds the lock'
+    release.set()
+    assert done.wait(5)
+    assert blocked_writer(B) is None

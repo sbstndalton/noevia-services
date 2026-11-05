@@ -53,6 +53,7 @@ import secrets
 import subprocess
 import threading
 import time
+import weakref
 from typing import Callable, Optional
 
 import httpx
@@ -80,6 +81,7 @@ UNCERTAIN = b'{"detail":"The Diary did not confirm this save. Reload before tryi
 TOO_LARGE = b'{"detail":"request body too large"}'
 RESTARTING = b'{"detail":"Diary saving is restarting. Try again in a moment."}'
 BUSY = b'{"detail":"Diary is saving another change. Try again in a moment."}'
+BODY_TIMEOUT = b'{"detail":"The request body did not arrive in time."}'
 REAP_WAIT_S = 10.0
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 DECLINE_HEADER = b"x-noevia-diary-decline"
@@ -200,9 +202,11 @@ class RustServer:
         self._thread: Optional[threading.Thread] = None
         self.ready = False
         self.restarts = 0
-        # Lost children still being killed/reaped: a tenant's next write waits for zero.
+        # Lost children not yet confirmed exited. While non-zero no writer tenant's lock can be newly
+        # acquired, by either process's writers (tenant_writer admission barrier).
         self.reaping = 0
         self.base_url = f"http://127.0.0.1:{port}"
+        _servers.add(self)
 
     # ---- lifecycle ----
     def start(self) -> None:
@@ -283,27 +287,39 @@ class RustServer:
             current = self._proc if proc is None else proc
             if proc is None or self._proc is proc:
                 self._proc = None
+            if current is not None:
+                # In the same critical section that forgets the child: a caller that finds no
+                # child here always finds the barrier up until the child is confirmed exited.
+                self.reaping += 1
         if was_ready and not quiet:
             log.warning("Rust Diary server lost; Python serves every route")
         if current is None:
             return
-        with self._lock:
-            self.reaping += 1
         if background:
             threading.Thread(target=self._reap, args=(current,), name="rust-diary-reap", daemon=True).start()
         else:
             self._reap(current)
 
     def _reap(self, proc: subprocess.Popen) -> None:
-        try:
-            if proc.poll() is None:
+        """Kill the child and lower the barrier only once its exit is confirmed. Until then (kill
+        or wait failing, a child that does not exit) the barrier stays up and writes fail closed."""
+        attempt = 0
+        while True:
+            try:
+                if proc.poll() is not None:
+                    break
                 proc.kill()
-                proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            with self._lock:
-                self.reaping -= 1
+                proc.wait(timeout=REAP_WAIT_S)
+                break
+            except Exception as exc:  # noqa: BLE001 - keep trying; never lower the barrier unproven
+                attempt += 1
+                if attempt in (1, 10) or attempt % 100 == 0:
+                    log.error("Rust Diary server did not confirm its exit (%s); Diary writes stay paused",
+                              type(exc).__name__)
+                time.sleep(0.2)
+        with self._lock:
+            self.reaping -= 1
+        tenant_writer.notify()
 
     def fence(self, user_id: str, timeout: float = FORWARD_DEADLINE_S) -> bool:
         """DELETE /api/internal/tenant: make the Rust side refuse the tenant's later writes and wait
@@ -323,6 +339,16 @@ class RustServer:
         """Called from the request path when a forward fails: take every route back now; the child
         is killed and reaped in the background (the supervisor then restarts it)."""
         self._mark_lost(None, background=True)
+
+
+_servers: "weakref.WeakSet[RustServer]" = weakref.WeakSet()
+
+
+def _reaping_barrier() -> Optional[str]:
+    return "restarting" if any(server.reaping for server in list(_servers)) else None
+
+
+tenant_writer.add_barrier(_reaping_barrier)
 
 
 class ForwardMiddleware:
@@ -408,19 +434,19 @@ class ForwardMiddleware:
     # ---- D5 writes ----
 
     async def _write(self, user, server, scope, receive, send):
-        # One deadline for the wait: a write never queues longer than a forward may take.
+        # One deadline for the wait: a write never queues longer than a forward may take. The wait
+        # also covers the admission barrier: a lost child not yet confirmed exited (RESTARTING).
         try:
-            lock = tenant_writer.hold_async(user, until=time.monotonic() + tenant_writer.DEADLINE_S)
-            await lock.__aenter__()
-        except tenant_writer.WriterBusy:
-            await self._reply(send, 503, BUSY, [(b"retry-after", b"1")])
+            lock = await tenant_writer.acquire_async(user, until=time.monotonic() + tenant_writer.DEADLINE_S)
+        except tenant_writer.WriterBusy as exc:
+            await self._reply(send, 503, RESTARTING if exc.reason == "restarting" else BUSY, [(b"retry-after", b"1")])
             return
         try:
             await self._write_locked(user, server, scope, receive, send)
-        except BaseException as exc:
-            await lock.__aexit__(type(exc), exc, exc.__traceback__)
-            raise
-        await lock.__aexit__(None, None, None)
+        finally:
+            # Synchronous: runs to completion even when the request task is cancelled. Anything
+            # that could leave the child writing has raised the admission barrier before this.
+            lock.release()
 
     @staticmethod
     async def _reply(send, status, body, headers=None):
@@ -447,64 +473,73 @@ class ForwardMiddleware:
                     return None
         return None
 
+    async def _collect(self, receive, deadline):
+        """The whole request body, bounded: (body, None), or (None, reason) with reason one of
+        "too_large", "timeout" or "disconnected". Every path of a writer tenant's write uses it, so
+        no write of the tenant runs on either process with an unbounded or unfinished body."""
+        chunks, size = [], 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "timeout"
+            try:
+                message = await asyncio.wait_for(receive(), remaining)
+            except asyncio.TimeoutError:
+                return None, "timeout"
+            if message.get("type") != "http.request":
+                return None, "disconnected"
+            chunk = message.get("body", b"")
+            size += len(chunk)
+            if size > MAX_WRITE_BODY:
+                return None, "too_large"
+            chunks.append(chunk)
+            if not message.get("more_body", False):
+                return b"".join(chunks), None
+
     async def _write_locked(self, user, server, scope, receive, send):
-        # A child lost mid-write may still be running: never let a second process write meanwhile.
-        if server is not None and server.reaping:
-            waited = time.monotonic() + REAP_WAIT_S
-            while server.reaping and time.monotonic() < waited:
-                await asyncio.sleep(0.05)
-            if server.reaping:
-                await self._reply(send, 503, RESTARTING)
-                return
         declared = self._declared_length(scope)
         if declared is not None and declared > MAX_WRITE_BODY:
             # Never read; Python's own bound for a buffered body (writes of this tenant never run
             # on Python with an unbounded body).
             await self._reply(send, 413, TOO_LARGE)
             return
-        if server is None or not server.ready or not self._json_media(scope):
-            # The Rust process is not running (nothing of it can still write: see reaping above),
-            # or the body is not JSON (the app answers 422 without writing).
-            await self.app(scope, receive, send)
-            return
+        # One deadline from the lock: the body, then the forward.
         deadline = time.monotonic() + FORWARD_DEADLINE_S
-        chunks, size, complete, disconnected = [], 0, False, None
-        try:
-            while not complete:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                message = await asyncio.wait_for(receive(), remaining)
-                if message.get("type") != "http.request":
-                    disconnected = message
-                    break
-                chunk = message.get("body", b"")
-                size += len(chunk)
-                chunks.append(chunk)
-                if size > MAX_WRITE_BODY:
-                    await self._reply(send, 413, TOO_LARGE)
-                    return
-                complete = not message.get("more_body", False)
-        except asyncio.TimeoutError:
-            pass
-        body = b"".join(chunks)
+        body, failure = await self._collect(receive, deadline)
+        if failure == "too_large":
+            await self._reply(send, 413, TOO_LARGE)
+            return
+        if failure == "timeout":
+            # Never handed on unfinished: a stalled sender would hold the tenant's lock.
+            await self._reply(send, 408, BODY_TIMEOUT)
+            return
+        if failure == "disconnected":
+            return  # nobody to answer; nothing was written
+
+        sent = False
 
         async def replay():
-            # Exactly the bytes received so far, then whatever the client still sends.
-            nonlocal body, disconnected
-            if body is not None:
-                prefix, body = body, None
-                return {"type": "http.request", "body": prefix, "more_body": not complete}
-            if disconnected is not None:
-                message, disconnected = disconnected, None
-                return message
+            # The whole body once; after it the client can only disconnect.
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
-        if not complete:
-            # Nothing was sent to the Rust side: Python serves what it was given.
+        if server is None or not server.ready or not self._json_media(scope):
+            # The Rust process is not running (nothing of it can still write: the admission
+            # barrier held this lock closed until any lost child was confirmed exited), or the
+            # body is not JSON (the app answers 422 without writing).
             await self.app(scope, replay, send)
             return
-        outcome = await self._forward(server, scope, deadline, body=body, writer=True)
+        try:
+            outcome = await self._forward(server, scope, deadline, body=body, writer=True)
+        except asyncio.CancelledError:
+            # The request may have reached the child, which may still be writing: the same as a
+            # lost reply. The child is killed (the barrier is up before this lock is released) and
+            # the tenant recovers before its next write.
+            self._uncertain(server, user)
+            raise
         if outcome == "uncertain":
             self.on_uncertain(user)
             await self._reply(send, 503, UNCERTAIN)
@@ -515,6 +550,12 @@ class ForwardMiddleware:
         status, headers, content = outcome
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
+
+    def _uncertain(self, server, user) -> None:
+        try:
+            server.lost()
+        finally:
+            self.on_uncertain(user)
 
     async def _forward(self, server, scope, deadline: float, body: bytes = b"", writer: bool = False):
         """(status, headers, body) from the Rust side, or None to serve the request here. Everything
