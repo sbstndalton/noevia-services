@@ -12,8 +12,8 @@
 # /out/ bundle, so an overlaid image carries the binaries at the same paths without a pip install.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS tenant-assertion
 # Merged decode-v1 Rust runtime dependency (noevia-rs#301); checksum verified below.
-ARG NOEVIA_RS_REF=c649b804423f23fcf0ba83f1ef0abdce7475ef7a
-ARG NOEVIA_RS_SHA256=39fa6e28a58d6a21f4b162112d5f6c0abe1c13f0a98fca81c02288c25fbf9d2d
+ARG NOEVIA_RS_REF=14899676cd6f654eff57680b6e8a2c637b0ee650
+ARG NOEVIA_RS_SHA256=08c59c1581c7a4ed841707b8bf0e3808c164003127db807d7830d532090b539b
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
@@ -23,12 +23,14 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
       -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
       -p diary-workspace-export -p diary-workspace-import-apply \
+      -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run \
  && ./target/release/tenant-assertion self-test | grep -qx ok \
  && ./target/release/workspace-restore-verify self-test | grep -qx ok \
  && mkdir /out \
  && cd target/release \
  && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
-      diary-temporal-cli diary-workspace-export diary-workspace-import-apply /out/ \
+      diary-temporal-cli diary-workspace-export diary-workspace-import-apply \
+      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run /out/ \
  && cd /src \
  && rm -rf /src/target /usr/local/cargo/registry
 

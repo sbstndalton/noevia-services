@@ -283,6 +283,9 @@ class Entity:
 
 
 def asked_entities(message: str) -> List[Entity]:
+    from . import entity_focus_native as native
+    if native.enabled():
+        return [Entity(e["name"], tuple(e["keys"])) for e in native.invoke(op="asked", text=message)]
     """Capitalised name phrases in ``message``, in order, unique by comparison form."""
     text = _norm(message)
     out, seen = [], set()
@@ -485,6 +488,9 @@ def _names_in_full(window: Sequence[str], entity_keys: Sequence[str]) -> bool:
 
 
 def classify(text: str, entity: Entity) -> Tuple[Optional[str], Optional[str]]:
+    from . import entity_focus_native as native
+    if native.enabled():
+        return tuple(native.invoke(op="classify", text=text, entity={"name": entity.name, "keys": entity.keys}))
     """(kind, the name as written) of the strongest mention of ``entity`` in ``text``; kind is one of match,
     extended, partial, near, variant, shared or None (see the module docstring)."""
     e, n = entity.keys, len(entity.keys)
@@ -702,6 +708,9 @@ _LABEL_AFTER = re.compile(r"[*_]*\s*:")  # "**Bryony Castellow:** went": a speak
 
 
 def identified_people(text: str, asked: Optional[Sequence[Entity]] = None) -> List[Tuple[str, ...]]:
+    from . import entity_focus_native as native
+    if native.enabled():
+        return [tuple(keys) for keys in native.invoke(op="people", text=text, asked=None if asked is None else [{"name":e.name,"keys":e.keys} for e in asked])]
     """The people ``text`` confidently names (see _person_keys), as comparison words.
 
     A run that opens a sentence (after list markers, quotes, dashes and brackets; leading function and time

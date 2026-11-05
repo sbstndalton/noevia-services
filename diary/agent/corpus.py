@@ -401,6 +401,9 @@ class IndexFile:
     preamble: List[str] = field(default_factory=list)
 
     def render(self) -> str:
+        from . import index_transform_native as native
+        if native.enabled():
+            return native.invoke(op="render", state=_native_index_state(self))
         out: List[str] = []
         out.extend(self.preamble)
         out.append("## Months")
@@ -419,6 +422,9 @@ class IndexFile:
 
 
 def parse_index(text: Optional[str]) -> IndexFile:
+    from . import index_transform_native as native
+    if native.enabled():
+        return _native_index(native.invoke(op="parse", text=text))
     idx = IndexFile(
         sections={"Open Questions": [], "Timeline of Key Events": []},
     )
@@ -455,6 +461,11 @@ def parse_index(text: Optional[str]) -> IndexFile:
 
 def register_month(idx: IndexFile, label: str, filename: str) -> bool:
     """Add a month link if missing. Returns True if changed."""
+    from . import index_transform_native as native
+    if native.enabled():
+        result = native.invoke(op="register", state=_native_index_state(idx), label=label, filename=filename)
+        _update_native_index(idx, result["state"])
+        return result["changed"]
     link = f"- [{label}]({filename})"
     if any(link in existing for existing in idx.month_links):
         return False
@@ -499,6 +510,12 @@ def apply_index_edits(
     today: Optional[str] = None,
 ) -> bool:
     """Apply JSON edit ops from the index_edit prompt. Returns True if anything changed."""
+    from . import index_transform_native as native
+    if native.enabled():
+        result = native.invoke(op="apply", state=_native_index_state(idx), questions=open_question_ops or [],
+                               timeline=timeline_ops or [], today=today or date.today().isoformat())
+        _update_native_index(idx, result['state'])
+        return result['changed']
     changed = False
     for op in open_question_ops or []:
         action = op.get("action")
@@ -556,3 +573,14 @@ def apply_index_edits(
                 changed = True
             idx.sections["Timeline of Key Events"] = new_bullets
     return changed
+
+
+def _native_index_state(idx):
+    return {'preamble': idx.preamble, 'month_links': idx.month_links, 'sections': list(idx.sections.items())}
+
+def _native_index(value):
+    return IndexFile(preamble=value['preamble'], month_links=value['month_links'], sections=dict(value['sections']))
+
+def _update_native_index(idx, value):
+    out = _native_index(value)
+    idx.preamble, idx.month_links, idx.sections = out.preamble, out.month_links, out.sections

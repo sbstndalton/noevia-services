@@ -46,7 +46,9 @@ def test_every_named_package_is_built():
     packages = set(re.findall(r'-p ([a-z-]+)', build))
     assert packages == {'tenant-assertion-cli', 'workspace-restore-verify-cli', 'diary-corpus-write-cli',
                         'diary-corpus-parse', 'diary-score-gap', 'diary-temporal-focus',
-                        'diary-workspace-export', 'diary-workspace-import-apply'}
+                        'diary-workspace-export', 'diary-workspace-import-apply',
+                        'diary-entity-focus', 'diary-index-transform', 'diary-storage-backoff',
+                        'diary-workspace-rules', 'diary-backup-format', 'diary-backup-run'}
 
 
 @pytest.mark.parametrize('name', sorted(smoke.LEAVES))
@@ -56,7 +58,7 @@ def test_a_missing_or_failing_leaf_fails_the_smoke(name, tmp_path, monkeypatch, 
     assert smoke.main([name, '--bin-dir', str(tmp_path)]) == 1
     assert f'{name}: FAILED' in capsys.readouterr().err
     broken = tmp_path / name
-    broken.write_text('#!/bin/sh\ncat >/dev/null\nexit 3\n')
+    broken.write_text('#!/bin/sh\nexit 3\n')
     broken.chmod(0o755)
     assert smoke.main([name, '--bin-dir', str(tmp_path)]) == 1
 

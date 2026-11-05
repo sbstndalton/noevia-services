@@ -254,6 +254,9 @@ class ManagedCorpusBackend:
 
     def backup(self, remote, storage, now=None):
         """Idempotent full manifest; immutable content objects are deduplicated."""
+        from . import backup_native
+        if backup_native.enabled():
+            return backup_native.run(self, remote, storage, now)
         now = time.time() if now is None else now
         started = time.monotonic()
         destination = self.destination(storage)
@@ -315,7 +318,10 @@ class ManagedCorpusBackend:
                         raise ValueError('Stored file does not match its checksum')
                     self._create_verified(remote, object_path, data)
                     manifest['files'].append({'path': path, 'sha256': version, 'object': object_path})
+                from . import backup_format_native as native
                 body = json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode()
+                if native.enabled():
+                    body = native.invoke(body=body.decode('utf-8'))['body'].encode('utf-8')
                 self._create_verified(remote, base + '/manifests/' + digest(body) + '.json', body)
                 with self.db() as db:
                     db.execute('INSERT OR REPLACE INTO backups VALUES (?,?,?,0,0,NULL)', (destination, generation, time.time()))
