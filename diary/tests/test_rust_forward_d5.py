@@ -66,6 +66,10 @@ def test_writes_switch_names_tenants_and_is_empty_by_default(monkeypatch):
 
 # ------------------------------------------------------------------ scripted child
 
+MEET_CAP_S = 8.0  # the two-tenant rendezvous must give up before the forwarder's deadline
+FORWARD_DEADLINE_S = 20.0
+
+
 class FakeChild:
     """A loopback HTTP/1.1 server standing in for noevia-diary: records each request (headers and
     body) and answers per `mode`: 'native', 'decline', 'hang' or 'slow' (native after 0.3 s)."""
@@ -73,8 +77,12 @@ class FakeChild:
     def __init__(self, mode='native'):
         self.mode, self.requests, self.active, self.max_active = mode, [], 0, 0
         self.delay = 0.3
-        # meet=N: each request waits (at most 10 s) until N requests have ARRIVED, a latched count
-        # that never goes down, so concurrency is observed deterministically whatever the load.
+        # Time the serving thread is slow to run after the reply was published (scheduling lag).
+        # It must not matter: a write is over when its reply is published, never later.
+        self.cleanup_lag = 0.0
+        # meet=N: each request waits (at most MEET_CAP_S, below the forwarder's deadline) until N
+        # requests have ARRIVED, a latched count that never goes down, so concurrency is observed
+        # deterministically whatever the load.
         self.meet = 0
         self.arrived = 0
         self.all_arrived = threading.Event()
@@ -115,7 +123,18 @@ class FakeChild:
                 self.all_arrived.set()
         if self.meet:
             # Latched: once set it stays set, so no arrival can miss it however the others run.
-            self.all_arrived.wait(timeout=10)
+            self.all_arrived.wait(timeout=MEET_CAP_S)
+        finished = False
+
+        def finish():
+            # The simulated write is over HERE, before its reply exists: the client cannot see a
+            # reply (and send the next request) while this write is still counted as active.
+            nonlocal finished
+            if not finished:
+                finished = True
+                with self.lock:
+                    self.active -= 1
+
         try:
             if self.mode == 'hang':
                 self.stop.wait(30)
@@ -123,15 +142,26 @@ class FakeChild:
             if self.mode == 'slow':
                 time.sleep(self.delay)
             if self.mode == 'decline':
-                conn.sendall(b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n')
+                reply = b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n'
             else:
-                reply = b'{"native":true}'
-                conn.sendall(b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n' % len(reply)
-                             + reply)
-        finally:
-            with self.lock:
-                self.active -= 1
+                body = b'{"native":true}'
+                reply = (b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n' % len(body)
+                         + body)
+            finish()
+            conn.sendall(reply)
             conn.close()
+            time.sleep(self.cleanup_lag)
+        finally:
+            finish()
+            conn.close()
+
+    def phase(self, meet=0):
+        """Start a measurement phase: forget earlier maxima and arrivals, atomically. No request is
+        in flight between phases (each reply is published after its write is recorded as over)."""
+        with self.lock:
+            assert self.active == 0, 'a write is still counted as running between phases'
+            self.max_active, self.arrived, self.meet = 0, 0, meet
+            self.all_arrived = threading.Event()
 
     def close(self):
         self.stop.set()
@@ -280,16 +310,16 @@ def test_write_bodies_are_bounded_and_a_slow_body_is_never_forwarded(monkeypatch
 def test_writes_of_one_tenant_are_serialized_across_both_processes(monkeypatch):
     child = FakeChild('slow')
     try:
-        _, spy, mw = forwarder(child.port, monkeypatch, writers=frozenset({DAILY, MONTHLY}))
+        assert MEET_CAP_S < FORWARD_DEADLINE_S
+        _, spy, mw = forwarder(child.port, monkeypatch, writers=frozenset({DAILY, MONTHLY}),
+                               deadline=FORWARD_DEADLINE_S)
 
         async def run():
             headers, body = put()
+            child.cleanup_lag = 0.2  # the serving thread lags after each reply: must not count
             one = await asyncio.gather(*(asgi(mw, headers, [body]) for _ in range(4)))
             serial = child.max_active
-            child.max_active = 0
-            with child.lock:
-                child.arrived = 0
-                child.meet = 2  # two tenants' writes must be inside the child at once (10 s cap)
+            child.phase(meet=2)  # two tenants' writes must be inside the child at once
             other = put(user=MONTHLY)
             both = await asyncio.gather(asgi(mw, headers, [body]), asgi(mw, other[0], [other[1]]))
             return one, serial, both
@@ -301,6 +331,26 @@ def test_writes_of_one_tenant_are_serialized_across_both_processes(monkeypatch):
         assert all(s == 200 for s, _ in both)
         assert tenant_writer._slots == {}, 'a writer lock was left behind'
         assert tenant_writer.max_concurrent == {DAILY: 1, MONTHLY: 1}
+    finally:
+        child.close()
+
+
+def test_the_fake_childs_measurement_does_not_count_its_own_cleanup(monkeypatch):
+    """Regression (review P3-1): two consecutive writes of one tenant, with the serving thread slow
+    to run after each reply, are never counted as overlapping, and a phase starts from zero."""
+    child = FakeChild('slow')
+    try:
+        child.delay, child.cleanup_lag = 0.02, 0.4
+        _, _, mw = forwarder(child.port, monkeypatch, deadline=FORWARD_DEADLINE_S)
+        headers, body = put()
+
+        async def two():
+            return [await asgi(mw, headers, [body]) for _ in range(3)]
+
+        assert [s for s, _ in asyncio.run(two())] == [200] * 3
+        assert child.max_active == 1, 'the previous write was still counted after its reply'
+        child.phase(meet=0)
+        assert (child.max_active, child.arrived, child.active) == (0, 0, 0)
     finally:
         child.close()
 
