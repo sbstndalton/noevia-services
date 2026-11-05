@@ -283,6 +283,15 @@ def norm(value, xid):
     return repr(value).replace(xid, 'XID') if xid else repr(value)
 
 
+def norm_storage(stored, xid):
+    """storage() with the random xid masked, also inside each file's content hash."""
+    files, *rest = stored
+    if xid:
+        files = [(p, d.replace(xid.encode(), b'XID'), hashlib.sha256(d.replace(xid.encode(), b'XID')).hexdigest())
+                 for p, d, _ in files]
+    return norm((files, *rest), xid)
+
+
 def import_differential(client, modes, state, root, cases):
     rows = []
     for name, user, body, status, native in cases:
@@ -291,14 +300,14 @@ def import_differential(client, modes, state, root, cases):
         p = request(client, user, 'POST', IMPORT, body)
         pj = p.json() if p.status_code == 200 else {}
         p_xid = pj.get('xid', '')
-        after_python = norm(storage(state, user), p_xid)
+        after_python = norm_storage(storage(state, user), p_xid)
         restore(state, user, snap)
         modes.rust()
         Recorder.served = []
         r = request(client, user, 'POST', IMPORT, body)
         rj = r.json() if r.status_code == 200 else {}
         r_xid = rj.get('xid', '')
-        after_rust = norm(storage(state, user), r_xid)
+        after_rust = norm_storage(storage(state, user), r_xid)
         rows.append(f'{name:44} python={p.status_code} rust={r.status_code} native={Recorder.served}')
         assert (p.status_code, p.headers.get('content-type')) == (r.status_code, r.headers.get('content-type')), name
         assert norm(p.json(), p_xid) == norm(r.json(), r_xid), (name, p.content[:300], r.content[:300])
