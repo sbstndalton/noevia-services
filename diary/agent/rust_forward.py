@@ -60,6 +60,7 @@ import httpx
 
 from . import tenant_assertion, tenant_writer, workspace_export_native
 from .diary_migration import SETTING_KEYS
+from .external_sources import external_source_paths
 
 log = logging.getLogger("diary.rust")
 
@@ -68,9 +69,12 @@ DEFAULT_BIN = "/usr/local/bin/noevia-diary"
 # The routes the Rust process implements (D4). Anything else named in DIARY_RUST_ROUTES is ignored.
 # D4b adds the read side of the file API, storage status and workspace export; `PUT /api/file`
 # and every other write stay here (single writer until D5).
+# D6 adds the external-sources listing (a read-only scan of DIARY_EXTERNAL_SOURCES) and the workspace
+# trash list.
 SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/files": "GET", "/api/storage-status": "GET",
-             "/api/workspace-export": "GET"}
+             "/api/workspace-export": "GET", "/api/external-sources": "GET",
+             "/api/workspace-trash": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
                 "/api/entries/edit": "POST"}
@@ -176,6 +180,9 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
         # exporter stamps the current local time into the ZIP); the Rust side declines otherwise.
         # D5: entries are written natively only with the transforms Python itself uses.
         "corpus_write_impl": (os.environ.get("DIARY_CORPUS_WRITE_IMPL") or "python").strip().lower(),
+        # D6: GET /api/external-sources lists exactly the folders Python resolves (its path
+        # normalisation, `~` expansion and de-duplication).
+        "external_sources": external_source_paths(),
         "workspace_export": {
             "impl": os.environ.get("WORKSPACE_EXPORT_IMPL", "python"),
             "binary": workspace_export_native.BINARY,
