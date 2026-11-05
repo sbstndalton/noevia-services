@@ -98,9 +98,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ${{ runner.temp }}/noevia-rs
-      - name: Build tenant-assertion and workspace-restore-verify
+      # P0 (noevia#1071): every Diary Rust leaf the image ships, at the Dockerfile's pin. The suite below runs with
+      # all of them and DIARY_RUST_LEAVES_REQUIRED=1, so a real-binary differential case that skips fails instead.
+      - name: Build the Diary Rust leaves
         working-directory: ${{ runner.temp }}/noevia-rs
-        run: cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli
+        run: |
+          cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
+            -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
+            -p diary-workspace-export -p diary-workspace-import-apply
       - name: Install and smoke the pinned decode-v1 binary
         run: |
           set -euo pipefail
@@ -108,24 +113,22 @@ jobs:
           python scripts/smoke_workspace_decode.py
       - name: Tenant-assertion fixtures match noevia-rs
         run: cmp tests/fixtures/tenant-assertion.v1.json "$RUNNER_TEMP/noevia-rs/crates/tenant-assertion/tests/fixtures/tenant-assertion.v1.json"
-      # Source-only dependency for paired transform tests. Docker/release pins stay separate.
-      - name: Build the reviewed corpus-write CLI for paired tests
-        working-directory: .
-        env:
-          CORPUS_WRITE_RS_REF: 8580fe5c77ebc65d34efab097ba62d250788142c
-          CORPUS_WRITE_RS_SHA256: 47f3711142a8fbb5df1c67e09655279ca7823c69d81cfcd5d842d002971517cb
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/corpus-write-rs.tar.gz" "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$CORPUS_WRITE_RS_REF"
-          echo "$CORPUS_WRITE_RS_SHA256  $RUNNER_TEMP/corpus-write-rs.tar.gz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/corpus-write-rs"
-          tar -xzf "$RUNNER_TEMP/corpus-write-rs.tar.gz" -C "$RUNNER_TEMP/corpus-write-rs" --strip-components=1
-          cargo build --release --locked --manifest-path "$RUNNER_TEMP/corpus-write-rs/Cargo.toml" -p diary-corpus-write-cli
-      - name: Diary test suite (with the tenant-assertion binary)
+      - name: Every leaf answers through its adapter and agrees with Python (the image and overlay smoke)
+        run: python scripts/smoke_diary_leaves.py --all --bin-dir "$RUNNER_TEMP/noevia-rs/target/release"
+      - name: Diary test suite (with every Rust leaf binary)
         env:
           TENANT_ASSERTION_BIN: ${{ runner.temp }}/noevia-rs/target/release/tenant-assertion
           TENANT_ASSERTION_REQUIRED: "1"
-          DIARY_CORPUS_WRITE_TEST_BIN: ${{ runner.temp }}/corpus-write-rs/target/release/diary-corpus-write-cli
+          DIARY_RUST_LEAVES_REQUIRED: "1"
+          DIARY_CORPUS_WRITE_TEST_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-corpus-write-cli
+          DIARY_CORPUS_PARSE_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-corpus-parse
+          SCORE_GAP_TEST_BINARY: ${{ runner.temp }}/noevia-rs/target/release/diary-score-gap
+          SCORE_GAP_TEST_VECTORS: ${{ runner.temp }}/noevia-rs/crates/diary-score-gap/tests/python-cut.tsv
+          DIARY_TEMPORAL_TEST_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-temporal-cli
+          WORKSPACE_EXPORT_TEST_BINARY: ${{ runner.temp }}/noevia-rs/target/release/diary-workspace-export
+          WORKSPACE_EXPORT_TEST_VERIFIER: ${{ runner.temp }}/noevia-rs/target/release/workspace-restore-verify
+          WORKSPACE_IMPORT_APPLY_TEST_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-workspace-import-apply
+          WORKSPACE_RESTORE_VERIFY_BIN: ${{ runner.temp }}/noevia-rs/target/release/workspace-restore-verify
         run: python -m pytest -q -rs
       # workspace-restore-verify (WORKSPACE_RESTORE_VERIFY_IMPL=rust, noevia#982): same contract: the
       # fixture table is byte-identical to noevia-rs' copy, and the binary agrees with the live Python
