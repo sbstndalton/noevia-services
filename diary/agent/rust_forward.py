@@ -77,7 +77,7 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/workspace-trash": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
-                "/api/entries/edit": "POST"}
+                "/api/entries/edit": "POST", "/api/external-sources/import": "POST"}
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024

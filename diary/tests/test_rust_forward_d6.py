@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 
 from agent import rust_forward
@@ -19,6 +20,8 @@ import agent.app as appmod
 from tests.tenant_binary import needs_binary
 from tests.test_rust_forward import DAILY, MONTHLY, needs_server, world  # noqa: F401
 from tests.test_rust_forward_d4b import LONG, check, db, get, pair, quiesce, sign  # noqa: F401
+from tests.test_rust_forward_d5 import (Recorder, needs_cw, request, restore, snapshot, storage,  # noqa: F401
+                                        wire, writers)
 
 DAY = 24 * 3600
 
@@ -251,3 +254,108 @@ def test_workspace_trash_pages(pair):
         ('first page', get(MONTHLY, TRASH), 200, True),
         ('second page', get(MONTHLY, TRASH, b'after=' + op(100).encode()), 200, True),
     ])
+
+
+# ---------------------------------------------------------------- POST /api/external-sources/import
+
+IMPORT = '/api/external-sources/import'
+HEX = r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+
+
+def import_tree(root):
+    touch(root / 'sub' / '2026-09-06 trip.md', 'Walked by the river, “quoted” ünïcode.\n\n# A heading\n\nMore.\n', days_ago=1)
+    touch(root / 'notes_20260907.txt', 'Line one\n\n## Not an entry header\n', days_ago=2)
+    touch(root / 'undated.markdown', 'No date in the name.', days_ago=40)
+    touch(root / 'markers.md', 'Verbatim <!-- xid:00000000-0000-4000-8000-000000000001 --> text', days_ago=3)
+    touch(root / '2030-01-06 future.md', 'Synthetic January note.', days_ago=3)
+    touch(root / '1850-01-01 old.md', 'Too old for the Rust range.', days_ago=3)
+    touch(root / 'blank.txt', ' \n\t ', days_ago=3)
+    touch(root / 'big.md', 'x' * (2 * 1024 * 1024 + 1), days_ago=3)
+    touch(root / 'exact.md', 'y' * (2 * 1024 * 1024), days_ago=3)
+    (root / 'bad.txt').write_bytes(b'ok \xff\xfe not utf-8')
+    touch(root / 'image.png', 'png', days_ago=3)
+    touch(root.parent / 'outside.md', 'outside the source', days_ago=3)
+    os.symlink(root.parent / 'outside.md', root / 'escape.md')
+    os.symlink(root / 'sub' / '2026-09-06 trip.md', root / 'inside-link.md')
+
+
+def norm(value, xid):
+    return repr(value).replace(xid, 'XID') if xid else repr(value)
+
+
+def import_differential(client, modes, state, root, cases):
+    rows = []
+    for name, user, body, status, native in cases:
+        snap = snapshot(state, user)
+        modes.python()
+        p = request(client, user, 'POST', IMPORT, body)
+        pj = p.json() if p.status_code == 200 else {}
+        p_xid = pj.get('xid', '')
+        after_python = norm(storage(state, user), p_xid)
+        restore(state, user, snap)
+        modes.rust()
+        Recorder.served = []
+        r = request(client, user, 'POST', IMPORT, body)
+        rj = r.json() if r.status_code == 200 else {}
+        r_xid = rj.get('xid', '')
+        after_rust = norm(storage(state, user), r_xid)
+        rows.append(f'{name:44} python={p.status_code} rust={r.status_code} native={Recorder.served}')
+        assert (p.status_code, p.headers.get('content-type')) == (r.status_code, r.headers.get('content-type')), name
+        assert norm(p.json(), p_xid) == norm(r.json(), r_xid), (name, p.content[:300], r.content[:300])
+        if p_xid:
+            assert re.fullmatch(HEX, p_xid) and re.fullmatch(HEX, r_xid) and p_xid != r_xid, name
+        assert p.status_code == status, (name, p.status_code, p.content[:300])
+        assert after_python == after_rust, name
+        assert Recorder.served == [native], (name, Recorder.served)
+        restore(state, user, snap)
+    print('\n'.join(rows))
+
+
+@needs_binary
+@needs_server
+@needs_cw
+def test_external_import_is_wire_and_storage_identical(writers, monkeypatch, tmp_path):
+    client, start, state = writers
+    root = tmp_path / 'ext'
+    import_tree(root)
+    monkeypatch.setenv('DIARY_EXTERNAL_SOURCES', f'{root},{tmp_path / "other"}')
+    modes = start()
+    src = str(root)
+
+    def body(rel, source=src):
+        return {'source_path': source, 'rel_path': rel}
+
+    cases = [
+        ('filename date, subfolder, headings', DAILY, body('sub/2026-09-06 trip.md'), 200, True),
+        ('compact filename date', DAILY, body('notes_20260907.txt'), 200, True),
+        ('mtime date', DAILY, body('undated.markdown'), 200, True),
+        ('verbatim marker text', DAILY, body('markers.md'), 200, True),
+        ('monthly tenant', MONTHLY, body('2030-01-06 future.md'), 200, True),
+        ('exactly 2 MiB', DAILY, body('exact.md'), 200, True),
+        ('symlink inside the source', DAILY, body('inside-link.md'), 200, True),
+        ('rel_path with ./ and //', DAILY, body('./sub//2026-09-06 trip.md'), 200, True),
+        ('year outside 1900-2100 (Python decides)', DAILY, body('1850-01-01 old.md'), 200, False),
+        ('source not configured', DAILY, body('blank.txt', str(tmp_path)), 400, True),
+        ('configured but absent source', DAILY, body('blank.txt', str(tmp_path / 'other')), 404, True),
+        ('missing file', DAILY, body('missing.md'), 404, True),
+        ('parent traversal', DAILY, body('../outside.md'), 404, True),
+        ('absolute rel_path', DAILY, body('/etc/hostname'), 404, True),
+        ('symlink out of the source', DAILY, body('escape.md'), 404, True),
+        ('not a listed type', DAILY, body('image.png'), 404, True),
+        ('a directory', DAILY, body('sub'), 404, True),
+        ('empty rel_path', DAILY, body(''), 404, True),
+        ('blank file', DAILY, body('blank.txt'), 400, True),
+        ('not UTF-8', DAILY, body('bad.txt'), 400, True),
+        ('over 2 MiB', DAILY, body('big.md'), 413, True),
+        ('missing field (422)', DAILY, {'source_path': src}, 422, False),
+        ('non-string field (422)', DAILY, {'source_path': src, 'rel_path': 5}, 422, False),
+        ('extra fields are ignored', DAILY, {**body('notes_20260907.txt'), 'x': 1}, 200, True),
+    ]
+    import_differential(client, modes, state, root, cases)
+    for mode in (modes.python, modes.rust):
+        mode()
+        raw = json.dumps(body('blank.txt')).encode()
+        headers = sign(DAILY, 'POST', IMPORT, raw, None, b'', 'application/json')
+        headers['Authorization'] = 'Bearer wrong'
+        resp = client.post(IMPORT, headers=headers, content=raw)
+        assert (resp.status_code, resp.json()) == (401, {'error': 'unauthorized'})

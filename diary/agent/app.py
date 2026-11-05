@@ -2029,7 +2029,7 @@ WRITE_ENTRY_POINTS = {
     ("POST", "/api/workspace-import"): "store + migration; outbox drain under store",
     ("POST", "/api/storage-import"): "store + migration (activation of the import)",
     ("POST", "/api/storage-backup"): "hold (backups rows); native backup off for writer tenants",
-    ("POST", "/api/external-sources/import"): "store (log_exchange), _reindex_today thread",
+    ("POST", "/api/external-sources/import"): "forwarded; store (log_exchange), _reindex_today thread",
     ("DELETE", "/api/internal/tenant"): "hold (close, fence, rmtree)",
     ("POST", "/api/internal/embedding"): "hold per index file (EmbeddingMigration)",
 }
