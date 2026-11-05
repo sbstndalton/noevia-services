@@ -35,6 +35,7 @@ from . import corpus as fmt
 from . import vector_slots as slots
 from .embedding import EmbeddingView, Target
 from .llm import LLMClient
+from . import tenant_writer
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +97,17 @@ class _LLMOnly:
         return self._view.embed(target, texts, kind, titles)
 
 
+def ensure_schema_file(db_path) -> None:
+    """Create an index database's missing retrieval schema objects (under the tenant's writer lock)."""
+    db_path = Path(db_path)
+    existed = db_path.exists()
+    conn = tenant_writer.connect(str(db_path), timeout=30)
+    try:
+        tenant_writer.ensure_schema(conn, db_path, _SCHEMA, existed)
+    finally:
+        conn.close()
+
+
 class Retriever:
     def __init__(self, db_path: Path, llm: LLMClient, embedding=None):
         self._lock = threading.RLock()
@@ -106,12 +118,19 @@ class Retriever:
         # #1636: active target + embed(target, texts, kind) (embedding.EmbeddingView).
         self.embedding = embedding if embedding is not None else _LLMOnly(llm)
         # Shares index.db with the journal; wait for its short writes.
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
+        # D5: tenant_writer.connect guards a writer tenant's database from the start; the schema
+        # is written only when an object is missing.
+        existed = self.db_path.exists()
+        self._conn = tenant_writer.connect(str(self.db_path), check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        tenant_writer.ensure_schema(self._conn, self.db_path, _SCHEMA, existed)
         self.vec_available = _load_vec_extension(self._conn)
         self._dim: Optional[int] = None
+        # D5: a writer tenant's index writes need its writer lock. The state is built under the
+        # tenant registry lock, where it may not be taken, so a legacy slot is not adopted here
+        # (_active_slot): the next re-index adopts it under the lock.
+        self.tenant_id = tenant_writer.tenant_of(self.db_path)
+        self._guarded = True
         self._ensure_vec_table()
 
     # ---------------- schema ----------------
@@ -126,8 +145,14 @@ class Retriever:
         target = self.embedding.active()
         if not self.vec_available:
             return target, None
+        tid = getattr(self, "tenant_id", None)
+        # D5: adoption is a write. Without the tenant's writer lock (a search) it is left to the
+        # next re-index, which adopts under the lock (apply_reindex); reads never take the lock.
+        adopt = not (getattr(self, "_guarded", False) and tenant_writer.is_writer(tid) and not tenant_writer.held(tid))
         with self._lock:
-            if self._conn.in_transaction:
+            if not adopt:
+                pass
+            elif self._conn.in_transaction:
                 slots.adopt_legacy(self._conn, target)
             else:
                 with self._conn:
