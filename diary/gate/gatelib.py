@@ -33,7 +33,6 @@ TENANT_NS = uuid.UUID("0c7b4f8e-2a55-4d3f-a1e6-9d0b6c2f4e83")
 # The diary's tenant assertion (agent/tenant_assertion.py, apps/web/server/diary-tenant-assertion.cjs).
 ASSERTION_HEADER = "X-Cowork-Tenant-Assertion"
 ASSERTION_LABEL = "cowork-diary-tenant-v2"
-SECRET_KEYS = ("DIARY_AUTH_TOKEN", "DIARY_TENANT_KEY", "LLM_API_KEY", "LLM_AUX_API_KEY")
 # base64url {"kind":"local"}: lets /api/health report tenant detail (journal, retrieval) for an app-managed tenant.
 LOCAL_STORAGE = "eyJraW5kIjoibG9jYWwifQ"
 DISABLED_INFERENCE = "http://gate-inference-disabled.invalid:9/v1"
