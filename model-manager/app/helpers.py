@@ -122,11 +122,6 @@ def _why_no_estimate(reason: str, **detail: object) -> None:
                  "".join(f" {k}={v}" for k, v in detail.items()))
 
 
-def _preset_estimates(summary: dict, size_bytes: int, mmproj_gb: float = 0.0) -> list[dict]:
-    """_preset_estimates_with_reason's estimates alone."""
-    return _preset_estimates_with_reason(summary, size_bytes, mmproj_gb)[0]
-
-
 _REASON_MAX = 600
 
 

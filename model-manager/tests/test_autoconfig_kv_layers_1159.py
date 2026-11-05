@@ -145,7 +145,7 @@ def test_estimates_carry_the_refusal_reason(monkeypatch):
                                              {"_array": True, "count": 30, "sample": LFM2_HEADS[:8]})}
     est, reason = helpers._preset_estimates_with_reason(summary, 1_600_000_000)
     assert est == [] and "hybrid model" in reason and len(reason) <= helpers._REASON_MAX
-    assert helpers._preset_estimates(summary, 1_600_000_000) == []
+    assert helpers._preset_estimates_with_reason(summary, 1_600_000_000)[0] == []
     ok, why = helpers._preset_estimates_with_reason({"arch": "lfm2", "model": dict(BASE, attention_head_count_kv=LFM2_HEADS)},
                                                     1_600_000_000)
     assert ok and why == ""
