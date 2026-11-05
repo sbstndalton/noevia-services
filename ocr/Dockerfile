@@ -5,8 +5,8 @@
 # Python server is the test oracle at services bbed9b8, never part of this image.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS native
 # Merged Rust runtime dependency; checksum verified below.
-ARG NOEVIA_RS_REF=d589e8fc5156855078be9090f5dba26de52a88c3
-ARG NOEVIA_RS_SHA256=215f77000faae0802c0009a1ab5b0d345de597029d545ae08dccae5b259033db
+ARG NOEVIA_RS_REF=7718fcb3050cec3951ac741d0c832bda468b6c70
+ARG NOEVIA_RS_SHA256=3b1708a206718dd7fe2044d45e9a86df9ccfbd53ddc004e6813938f2d72a958b
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never

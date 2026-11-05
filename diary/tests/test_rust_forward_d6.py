@@ -35,6 +35,20 @@ def touch(path, text='x', days_ago=None):
         os.utime(path, (stamp, stamp))
 
 
+def local_midnight(year=2025, month=11, day=6):
+    return int(time.mktime((year, month, day, 0, 0, 0, 0, 0, -1)))
+
+
+def touch_before_midnight(path, nanos_before):
+    """An undated file whose mtime is `nanos_before` ns before local midnight (2025-11-06): Python's
+    datetime.fromtimestamp rounds the float mtime to the microsecond, so 200 ns before is already the NEXT
+    day for it and 600 ns before is not."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('x', encoding='utf-8')
+    stamp = local_midnight() * 10**9 - nanos_before
+    os.utime(path, ns=(stamp, stamp))
+
+
 def build_tree(root):
     touch(root / '2026-09-06 trip.md', days_ago=1)
     touch(root / 'notes_20260907.txt', 'abc', days_ago=2)
@@ -53,6 +67,8 @@ def build_tree(root):
     touch(root / 'sub' / '20261301 14.md', days_ago=12)
     touch(root / 'tab\there.md', days_ago=13)  # a control character in the name
     touch(root / 'quote"back\\slash.md', days_ago=13)
+    touch_before_midnight(root / 'mtime-rounds-up.md', 200)  # Python: 2025-11-06 (floor would say 11-05)
+    touch_before_midnight(root / 'mtime-stays.md', 600)  # Python: 2025-11-05
     os.symlink(root / 'sub', root / 'link-to-dir')  # not listed, not entered
     os.symlink(root / 'UPPER.MD', root / 'link-to-file.md')  # listed (stat follows it)
     os.symlink(root / 'does-not-exist.md', root / 'broken.md')  # skipped
@@ -74,6 +90,9 @@ def test_external_sources_parity(pair, monkeypatch, tmp_path):
     modes = start()
     quiesce(state, DAILY, MONTHLY)
     ext = '/api/external-sources'
+    python_listing = client.get(ext, headers=sign(DAILY, 'GET', ext))
+    files = {f['name']: f for f in python_listing.json()['sources'][0]['files']}
+    assert (files['mtime-rounds-up.md']['date'], files['mtime-stays.md']['date']) == ('2025-11-06', '2025-11-05')
     check(client, modes, [
         ('one tree', get(DAILY, ext), 200, True),
         ('one tree monthly tenant', get(MONTHLY, ext), 200, True),
@@ -195,7 +214,6 @@ def test_workspace_trash_list_parity(pair):
     good = [(PREFIX + op(n) + '.json', capsule(op(n), path=f'Notes/n{n}.md', data=b'x' * n)) for n in range(1, 6)]
     put(state, DAILY, good + [
         (PREFIX + op(6) + '.json', capsule(op(6), state='restored', restoredAt=1730000001.25)),
-        (PREFIX + op(7) + '.json', b'{not json'),
         (PREFIX + op(8) + '.json', capsule(op(8), version='0' * 64)),
         (PREFIX + op(9) + '.json', capsule(op(9), format='other')),
         (PREFIX + op(10) + '.json', capsule(op(10), id=op(99))),
@@ -241,6 +259,44 @@ def test_workspace_trash_list_parity(pair):
     drop(state, DAILY, PREFIX + 'no-extension')
 
 
+def with_unused(record_bytes, raw_json_member):
+    """A capsule with one more member appended verbatim (raw JSON text, e.g. a lone surrogate escape)."""
+    assert record_bytes.endswith(b'}')
+    return record_bytes[:-1] + b',' + raw_json_member + b'}'
+
+
+@needs_binary
+@needs_server
+def test_a_capsule_the_rust_parser_rejects_is_never_answered_natively(pair):
+    """Review P2: Python's json.loads reads a lone surrogate escape in a member decode() never uses, so
+    that capsule is a valid record to it; serde_json refuses it. Every parse failure must decline."""
+    client, start, state = pair
+    modes = start()
+    quiesce(state, DAILY, MONTHLY)
+    ok = [(PREFIX + op(n) + '.json', capsule(op(n), path=f'Notes/n{n}.md')) for n in (1, 3)]
+    unparsable = {
+        'lone surrogate in an unused member': with_unused(capsule(op(2)), b'"unused":"\\ud800"'),
+        'lone low surrogate in an unused member': with_unused(capsule(op(2)), b'"unused":"\\udc00"'),
+        'NaN in an unused member': with_unused(capsule(op(2)), b'"unused":NaN'),
+        'not json': b'{not json',
+        'truncated': capsule(op(2))[:30],
+        'empty': b'',
+        'invalid UTF-8': b'{"a":"\xff\xfe"}',
+        'UTF-8 BOM': b'\xef\xbb\xbf' + capsule(op(2)),
+        'trailing comma': with_unused(capsule(op(2)), b'')[:-1] + b'}',
+    }
+    for name, data in unparsable.items():
+        put(state, DAILY, ok + [(PREFIX + op(2) + '.json', data)])
+        python = client.get(TRASH, headers=sign(DAILY, 'GET', TRASH))
+        assert python.status_code == 200, (name, python.content[:200])
+        if name.startswith('lone') or name.startswith('NaN') or name.startswith('UTF-8 BOM'):
+            # Python reads these as a normal, valid record: hiding it would be the defect.
+            record = next(r for r in python.json()['records'] if r['id'] == op(2))
+            assert record['state'] == 'trashed' and record['path'] == 'Notes/a.md' and 'invalid' not in record, (name, record)
+        check(client, modes, [(name, get(DAILY, TRASH), 200, False)])
+    drop(state, DAILY, PREFIX + '%')
+
+
 @needs_binary
 @needs_server
 def test_workspace_trash_pages(pair):
@@ -269,6 +325,8 @@ def import_tree(root):
     touch(root / 'markers.md', 'Verbatim <!-- xid:00000000-0000-4000-8000-000000000001 --> text', days_ago=3)
     touch(root / '2030-01-06 future.md', 'Synthetic January note.', days_ago=3)
     touch(root / '1850-01-01 old.md', 'Too old for the Rust range.', days_ago=3)
+    touch_before_midnight(root / 'mtime-rounds-up.md', 200)  # imported into 2025-11-06 (a floor says 11-05)
+    touch_before_midnight(root / 'mtime-stays.md', 600)  # imported into 2025-11-05
     touch(root / 'blank.txt', ' \n\t ', days_ago=3)
     touch(root / 'big.md', 'x' * (2 * 1024 * 1024 + 1), days_ago=3)
     touch(root / 'exact.md', 'y' * (2 * 1024 * 1024), days_ago=3)
@@ -338,6 +396,8 @@ def test_external_import_is_wire_and_storage_identical(writers, monkeypatch, tmp
         ('filename date, subfolder, headings', DAILY, body('sub/2026-09-06 trip.md'), 200, True),
         ('compact filename date', DAILY, body('notes_20260907.txt'), 200, True),
         ('mtime date', DAILY, body('undated.markdown'), 200, True),
+        ('mtime within 0.5 us before local midnight rounds to the next day', DAILY, body('mtime-rounds-up.md'), 200, True),
+        ('mtime 0.6 us before local midnight stays on the day', DAILY, body('mtime-stays.md'), 200, True),
         ('verbatim marker text', DAILY, body('markers.md'), 200, True),
         ('monthly tenant', MONTHLY, body('2030-01-06 future.md'), 200, True),
         ('exactly 2 MiB', DAILY, body('exact.md'), 200, True),
@@ -361,6 +421,13 @@ def test_external_import_is_wire_and_storage_identical(writers, monkeypatch, tmp
         ('extra fields are ignored', DAILY, {**body('notes_20260907.txt'), 'x': 1}, 200, True),
     ]
     import_differential(client, modes, state, root, cases)
+    # The day each boundary file lands on, from Python alone (the differential above proves Rust stores the same).
+    modes.python()
+    for rel, day in (('mtime-rounds-up.md', '2025-11-06'), ('mtime-stays.md', '2025-11-05')):
+        snap = snapshot(state, DAILY)
+        reply = request(client, DAILY, 'POST', IMPORT, body(rel))
+        assert (reply.status_code, reply.json()['day'], reply.json()['date_source']) == (200, day, 'mtime'), rel
+        restore(state, DAILY, snap)
     for mode in (modes.python, modes.rust):
         mode()
         raw = json.dumps(body('blank.txt')).encode()
