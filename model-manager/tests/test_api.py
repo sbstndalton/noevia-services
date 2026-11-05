@@ -700,14 +700,14 @@ def test_preset_estimates_say_why_they_are_empty_once_per_reason(monkeypatch, ca
     monkeypatch.setattr(services, "_fit_backends", lambda: {})
     monkeypatch.setattr(services, "_cpu_backends", lambda: ["llama-cpu"])
     with caplog.at_level(logging.WARNING, logger="app.helpers"):
-        assert helpers._preset_estimates_with_reason(summary, 2 * 1024 ** 3)[0] == []
-        assert helpers._preset_estimates_with_reason(summary, 2 * 1024 ** 3)[0] == []
+        assert helpers._preset_estimates(summary, 2 * 1024 ** 3) == []
+        assert helpers._preset_estimates(summary, 2 * 1024 ** 3) == []
     lines = [r.getMessage() for r in caplog.records if "context estimate is empty" in r.getMessage()]
     assert len(lines) == 1 and "no llama backend reports GPU VRAM" in lines[0] and "cpu_backends=1" in lines[0]
     # No summary is not worth a line: that is a repo whose header could not be read, reported elsewhere.
     caplog.clear(); helpers._estimate_reasons_logged.clear()
     with caplog.at_level(logging.WARNING, logger="app.helpers"):
-        assert helpers._preset_estimates_with_reason({}, 1)[0] == []
+        assert helpers._preset_estimates({}, 1) == []
     assert not caplog.records
     # An autoconfig that raises still returns [] and names the exception type, not its text.
     monkeypatch.setattr(services, "_fit_backends", lambda: {"engine": 14.0})
@@ -718,7 +718,7 @@ def test_preset_estimates_say_why_they_are_empty_once_per_reason(monkeypatch, ca
     def boom(**kw): raise ValueError("secret detail")
     monkeypatch.setattr(autoconfig, "analyze", boom)
     with caplog.at_level(logging.WARNING, logger="app.helpers"):
-        assert helpers._preset_estimates_with_reason(summary, 1)[0] == []
+        assert helpers._preset_estimates(summary, 1) == []
     assert any("autoconfig raised" in r.getMessage() and "ValueError" in r.getMessage() and "secret detail" not in r.getMessage() for r in caplog.records)
 
 

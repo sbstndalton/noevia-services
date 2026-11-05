@@ -586,6 +586,11 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+      - name: Verify retired Python source and restore immutable test oracle
+        run: |
+          python qualification/check_python_retirement.py
+          curl -fsSL --max-time 120 -o "$RUNNER_TEMP/mm-python-oracle.tar.gz" https://codeload.github.com/sbstndalton/noevia-services/tar.gz/ce1af82e055397df715ae837fa7cd393f02281c7
+          python qualification/restore_python_oracle.py "$RUNNER_TEMP/mm-python-oracle.tar.gz" .
       - run: pip install -r requirements.txt pytest==9.1.1 pytest-asyncio==1.4.0
       # gguf-meta (sbstndalton/noevia-rs) at the Dockerfile's pinned ref, checksum-verified, then
       # compared with the Python parser (#909).
