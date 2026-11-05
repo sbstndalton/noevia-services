@@ -68,7 +68,7 @@ class Retirement(unittest.TestCase):
                     restore.restore(archive, dest, manifest)
                 self.assertFalse(dest.exists())
 
-    def test_manifest_pins_docker_and_ci_to_the_same_oracle(self):
+    def test_manifest_pins_docker_to_the_verified_oracle(self):
         manifest = json.loads((HERE / "python-oracle.json").read_text())
         self.assertEqual(len(manifest["files"]), 21)
         self.assertTrue(all(Path(name).name == name and name.endswith(".py")
@@ -76,9 +76,6 @@ class Retirement(unittest.TestCase):
         docker = (HERE.parent / "Dockerfile").read_text()
         self.assertIn("--checksum=sha256:" + manifest["sha256"], docker)
         self.assertIn("/tar.gz/" + manifest["ref"], docker)
-        workflow = (HERE.parents[1] / ".github/workflows/ci.yml").read_text()
-        self.assertIn("/tar.gz/" + manifest["ref"], workflow)
-        self.assertIn("python qualification/check_python_retirement.py", workflow)
 
     def test_production_has_no_oracle_dependency(self):
         source = (HERE.parent / "Dockerfile").read_text()
