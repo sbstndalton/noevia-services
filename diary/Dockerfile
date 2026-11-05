@@ -17,7 +17,7 @@ FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de
 # Merged decode-v1 Rust runtime dependency (noevia-rs#301); checksum verified below.
 ARG NOEVIA_RS_REF=4b44d27518de85ba4d55aa12b5ffd44d77dbc9d4
 ARG NOEVIA_RS_SHA256=0457911ea6a4fc93028add11beb8a181dad563585994775418dea9eb820fb480
-ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=2
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
