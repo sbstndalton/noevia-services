@@ -2026,7 +2026,7 @@ WRITE_ENTRY_POINTS = {
     ("POST", "/v1/chat/completions"): "store (log_exchange, maintain_index), _reindex_today thread",
     ("POST", "/api/workspace-ops"): "store + migration",
     ("POST", "/api/workspace-trash"): "store + migration",
-    ("POST", "/api/workspace-import"): "store + migration; outbox drain under store",
+    ("POST", "/api/workspace-import"): "forwarded; store + migration; outbox drain under store",
     ("POST", "/api/storage-import"): "store + migration (activation of the import)",
     ("POST", "/api/storage-backup"): "hold (backups rows); native backup off for writer tenants",
     ("POST", "/api/external-sources/import"): "store (log_exchange), _reindex_today thread",

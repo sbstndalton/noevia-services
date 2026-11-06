@@ -73,7 +73,7 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/workspace-export": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
-                "/api/entries/edit": "POST"}
+                "/api/entries/edit": "POST", "/api/workspace-import": "POST"}
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024
@@ -175,6 +175,7 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
         # GET /api/workspace-export is reproducible only with the native exporter (the Python
         # exporter stamps the current local time into the ZIP); the Rust side declines otherwise.
         # D5: entries are written natively only with the transforms Python itself uses.
+        "workspace_import_native_errors": (os.environ.get("WORKSPACE_IMPORT_APPLY_IMPL") or "python").strip().lower() == "rust",
         "corpus_write_impl": (os.environ.get("DIARY_CORPUS_WRITE_IMPL") or "python").strip().lower(),
         "workspace_export": {
             "impl": os.environ.get("WORKSPACE_EXPORT_IMPL", "python"),
@@ -473,7 +474,7 @@ class ForwardMiddleware:
                     return None
         return None
 
-    async def _collect(self, receive, deadline):
+    async def _collect(self, receive, deadline, import_upload=False):
         """The whole request body, bounded: (body, None), or (None, reason) with reason one of
         "too_large", "timeout" or "disconnected". Every path of a writer tenant's write uses it, so
         no write of the tenant runs on either process with an unbounded or unfinished body."""
@@ -490,6 +491,10 @@ class ForwardMiddleware:
                 return None, "disconnected"
             chunk = message.get("body", b"")
             size += len(chunk)
+            if import_upload and size > 32 * 1024 * 1024:
+                # A bounded sentinel still exceeds the route limit. The handler checks auth and
+                # query first, then returns its own 413; no archive can be applied from it.
+                return b"x" * (32 * 1024 * 1024 + 1), None
             if size > MAX_WRITE_BODY:
                 return None, "too_large"
             chunks.append(chunk)
@@ -497,15 +502,16 @@ class ForwardMiddleware:
                 return b"".join(chunks), None
 
     async def _write_locked(self, user, server, scope, receive, send):
+        import_upload = scope.get("path") == "/api/workspace-import"
         declared = self._declared_length(scope)
-        if declared is not None and declared > MAX_WRITE_BODY:
+        if not import_upload and declared is not None and declared > MAX_WRITE_BODY:
             # Never read; Python's own bound for a buffered body (writes of this tenant never run
             # on Python with an unbounded body).
             await self._reply(send, 413, TOO_LARGE)
             return
         # One deadline from the lock: the body, then the forward.
         deadline = time.monotonic() + FORWARD_DEADLINE_S
-        body, failure = await self._collect(receive, deadline)
+        body, failure = await self._collect(receive, deadline, import_upload=import_upload)
         if failure == "too_large":
             await self._reply(send, 413, TOO_LARGE)
             return
@@ -526,7 +532,7 @@ class ForwardMiddleware:
                 return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
-        if server is None or not server.ready or not self._json_media(scope):
+        if server is None or not server.ready or (scope.get("path") != "/api/workspace-import" and not self._json_media(scope)):
             # The Rust process is not running (nothing of it can still write: the admission
             # barrier held this lock closed until any lost child was confirmed exited), or the
             # body is not JSON (the app answers 422 without writing).
@@ -542,12 +548,14 @@ class ForwardMiddleware:
             raise
         if outcome == "uncertain":
             self.on_uncertain(user)
-            await self._reply(send, 503, UNCERTAIN)
+            await self._reply(send, 503, (b'{"detail":"Workspace import outcome is uncertain. Retry the same archive and destination with the same reviewed fingerprint."}' if scope.get("path") == "/api/workspace-import" else UNCERTAIN))
             return
         if outcome is None:
             await self.app(scope, replay, send)
             return
         status, headers, content = outcome
+        if scope.get("path") == "/api/workspace-import" and (status >= 500 or (status == 200 and b'"indexPending":true' in content)):
+            self.on_uncertain(user)
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
 
