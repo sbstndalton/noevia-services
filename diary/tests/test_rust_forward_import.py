@@ -260,3 +260,99 @@ def test_transaction_fault_classification_matches_configured_python(writers, mon
     assert not appmod._rust_recovered(DAILY)
     with sqlite3.connect(state / 'users' / DAILY / 'managed-diary.db') as db:
         assert db.execute('SELECT count(*) FROM workspace_imports').fetchone()[0] == 0
+
+# Each refusal class is measured through the real Python HTTP handler: invalid int syntax,
+# input conversion limit (ASCII/Unicode/underscores/leading zeroes), and output conversion limit.
+GENERATION_REFUSALS = [
+    pytest.param('bad', id='invalid-literal'),
+    pytest.param('', id='empty'),
+    pytest.param('+', id='sign-only'),
+    pytest.param('1__2', id='invalid-underscore'),
+    pytest.param("a'\"\\\n\x00", id='escaped-literal'),
+    pytest.param('\x1c1', id='non-integer-whitespace'),
+    pytest.param('²', id='non-decimal-digit'),
+    pytest.param('1' * 4301, id='input-limit'),
+    pytest.param('٠' * 4301, id='unicode-input-limit'),
+    pytest.param('1_' * 4300 + '1', id='underscored-input-limit'),
+    pytest.param('0' * 4301, id='leading-zero-input-limit'),
+    pytest.param('9' * 4300, id='output-limit'),
+]
+
+
+def import_tables(state):
+    """All source/receipt/outbox/meta and journal rows, including clocks: no changes allowed."""
+    result = {}
+    for database, tables in [('managed-diary.db', ('files', 'directories', 'meta', 'workspace_imports', 'workspace_index_outbox')),
+                              ('managed-index.db', ('journal', 'dirty_documents'))]:
+        with sqlite3.connect(state / 'users' / DAILY / database) as db:
+            for table in tables:
+                result[database, table] = db.execute(f'SELECT * FROM {table} ORDER BY 1').fetchall()
+    return result
+
+
+@needs_binary
+@needs_server
+@pytest.mark.parametrize('implementation', [None, 'python', 'rust'], ids=['unset', 'python', 'native-adapter'])
+@pytest.mark.parametrize('generation', GENERATION_REFUSALS)
+def test_generation_refusals_match_python_without_mutation(writers, monkeypatch, implementation, generation):
+    import os
+    import sys
+    from agent import workspace_import_native
+    assert sys.get_int_max_str_digits() == 4300, 'use the shipped runtime conversion limit'
+    client, start, state = writers
+    if implementation is None:
+        monkeypatch.delenv('WORKSPACE_IMPORT_APPLY_IMPL', raising=False)
+    else:
+        monkeypatch.setenv('WORKSPACE_IMPORT_APPLY_IMPL', implementation)
+    if implementation == 'rust':
+        monkeypatch.setattr(workspace_import_native, 'DEFAULT_BIN', os.environ['WORKSPACE_IMPORT_APPLY_TEST_BIN'])
+    modes = start()
+    with sqlite3.connect(state / 'users' / DAILY / 'managed-diary.db') as db:
+        db.execute("UPDATE meta SET value=? WHERE key='generation'", [generation])
+    body = archive()
+    before = import_tables(state)
+    modes.python()
+    p_preview = request(client, body)
+    assert p_preview.status_code == 200
+    p = request(client, body, 'apply', fingerprint=p_preview.json()['fingerprint'])
+    assert p.status_code == (503 if implementation == 'rust' else 409), p.text
+    assert import_tables(state) == before
+    modes.rust(); Recorder.served = []
+    r_preview = request(client, body)
+    r = request(client, body, 'apply', fingerprint=r_preview.json()['fingerprint'])
+    assert wire(p_preview) == wire(r_preview)
+    assert wire(p) == wire(r), (p.content, r.content)
+    assert import_tables(state) == before
+    # Default failures decline before entering the apply leaf. Explicit native-adapter
+    # selection retains its existing 503 behavior and never reruns an attempted apply.
+    assert Recorder.served == [True, implementation == 'rust']
+
+
+@needs_binary
+@needs_server
+@pytest.mark.parametrize('case', ['receipt', 'conflict', 'fingerprint'])
+def test_apply_precedence_with_invalid_generation(writers, case):
+    client, start, state = writers
+    modes = start(); body = archive()
+    preview = request(client, body).json()
+    reviewed = preview['fingerprint']
+    if case == 'receipt':
+        assert request(client, body, 'apply', fingerprint=reviewed).status_code == 200
+        modes.python()
+        # Clear ordinary recovery before comparing the idempotent request.
+        client.get('/api/months', headers=sign(DAILY, 'GET', '/api/months'))
+    with sqlite3.connect(state / 'users' / DAILY / 'managed-diary.db') as db:
+        db.execute("UPDATE meta SET value='bad' WHERE key='generation'")
+        if case == 'conflict':
+            db.execute("INSERT INTO directories VALUES ('Imports/Copy')")
+    if case == 'fingerprint': reviewed = '0' * 64
+    before = import_tables(state)
+    modes.python(); p = request(client, body, 'apply', fingerprint=reviewed)
+    # Python's receipt response invalidates its cached recovered bit despite no outstanding
+    # work. Restore that fixture bit so this comparison reaches the native receipt branch.
+    for st in appmod._tenant_states.values(): st.recovered = True
+    modes.rust(); Recorder.served = []; r = request(client, body, 'apply', fingerprint=reviewed)
+    assert wire(p) == wire(r), (p.content, r.content)
+    assert p.status_code == (200 if case == 'receipt' else 409)
+    assert import_tables(state) == before
+    assert Recorder.served == [True]
