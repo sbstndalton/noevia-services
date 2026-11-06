@@ -121,19 +121,20 @@ class Recording(rust_forward.ForwardMiddleware):
     """Records whether the Rust side served (True) or Python did (False) each forwarded request."""
     served = []
 
-    async def _forward(self, server, scope, body):
-        reply = await super()._forward(server, scope, body)
+    async def _forward(self, server, scope, deadline, **kwargs):
+        reply = await super()._forward(server, scope, deadline, **kwargs)
         Recording.served.append(reply is not None)
         return reply
 
 
 def install_forwarder():
     """The production order: the forwarder INSIDE TenantAssertionMiddleware (app.py adds it first)."""
-    routes = {path: 'GET' for path in rust_forward.SUPPORTED}
+    routes = dict(rust_forward.SUPPORTED)
     saved = list(appmod.app.user_middleware)
     position = next(i for i, m in enumerate(saved) if m.cls is appmod.TenantAssertionMiddleware)
     appmod.app.user_middleware.insert(position + 1, Middleware(Recording, routes=routes, is_deleted=appmod._tenant_deleted,
-                                                               is_recovered=appmod._rust_recovered))
+                                                               is_recovered=appmod._rust_recovered,
+                                                               retrieval_facts=appmod._rust_retrieval_facts))
     appmod.app.middleware_stack = None
     return saved
 
@@ -208,7 +209,7 @@ CASES = [
     ('client-supplied internal headers are dropped', DAILY, '/api/months', b'',
      {'X-Noevia-Diary-Forward': 'forged', 'X-Noevia-Diary-Asserted': '0'}, 200, True),
     ('health process part', None, '/api/health', b'', {}, 200, True),
-    ('health with tenant detail', DAILY, '/api/health', b'', {'X-Cowork-Storage': b64({'kind': 'local'})}, 200, False),
+    ('health with tenant detail', DAILY, '/api/health', b'', {'X-Cowork-Storage': b64({'kind': 'local'})}, 200, True),
 ]
 
 

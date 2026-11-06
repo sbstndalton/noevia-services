@@ -59,7 +59,7 @@ def test_writes_switch_names_tenants_and_is_empty_by_default(monkeypatch):
     assert rust_forward.configured_writers(f'{DAILY},*') == rust_forward.ALL_TENANTS
     assert not hasattr(rust_forward, 'PYTHON_ONLY_WRITES'), 'the D5 no-op gate is gone'
     # Writes are never chosen per route.
-    assert rust_forward.configured_routes('/api/file,/api/entries/append,/api/months') == {'/api/months': 'GET'}
+    assert rust_forward.configured_routes('/api/file,/api/entries/append,/api/months') == {'/api/file': 'POST', '/api/months': 'GET'}
     # The app's process default selects no tenant: every tenant_writer call is a no-op.
     assert appmod._RUST_WRITERS == frozenset() and not tenant_writer.is_writer(DAILY)
 
@@ -142,11 +142,13 @@ class FakeChild:
             if self.mode == 'slow':
                 time.sleep(self.delay)
             if self.mode == 'decline':
-                reply = b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n'
+                reply = b'HTTP/1.1 421 Misdirected Request\r\nconnection: close\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n'
             else:
                 body = b'{"native":true}'
-                reply = (b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n' % len(body)
+                reply = (b'HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n' % len(body)
                          + body)
+            # This fixture handles one request per socket. Advertise closure so the pooled
+            # client cannot race a second request against the imminent close.
             finish()
             conn.sendall(reply)
             conn.close()

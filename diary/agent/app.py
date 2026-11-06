@@ -800,6 +800,18 @@ def _rust_recovered(user_id: str) -> bool:
         return True
 
 
+def _rust_retrieval_facts(user_id: str):
+    """Only runtime facts; the native health handler reads persisted counts and slot metadata."""
+    key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
+    with _tenant_lock:
+        state = _tenant_states.get(key)
+        if state is None or getattr(state, "recovered", True) is not True:
+            return None
+        target = state.retrieval.embedding.active()
+        return {"model": target.model, "profile": target.profile,
+                "vec_available": state.retrieval.vec_available}
+
+
 def _rust_write_uncertain(user_id: str) -> None:
     """D5: a forwarded write got no reply after it may have reached the Rust process. Like an
     uncertain workspace import, the tenant's state recovers again before it is served here."""
@@ -819,7 +831,8 @@ app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_u
 # verifier and nonce cache here check every request before anything is forwarded.
 if _RUST_ROUTES or _RUST_WRITERS:
     app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
-                       is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
+                       is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain,
+                       retrieval_facts=_rust_retrieval_facts)
 app.add_middleware(TenantAssertionMiddleware)
 
 

@@ -16,13 +16,12 @@ tenant. The Rust side refuses anything without the secret with this app's own 40
 verifies an assertion itself, and either serves the request exactly as this app would or DECLINES it
 (421 + ``x-noevia-diary-decline: 1``) for anything it does not reproduce (non-managed storage, a
 tenant this process has not recovered yet, pending journal / dirty / outbox work, an enabled
-INDEX.md, tenant detail in /api/health ...). A declined request, like one the child never answered,
+INDEX.md, unavailable health runtime facts ...). A declined request, like one the child never answered,
 is served here without verifying it again, so each nonce is consumed exactly once whichever process
 answers, across declines, restarts and a dead child.
 
-Only requests that declare no body are forwarded (the native routes are GETs that ignore one); a
-request with a body is never read here and goes to the app untouched, so its timing is exactly
-Python's. A forward has ONE absolute deadline from the moment it is chosen, covering preparation,
+POST /api/file forwards its bounded body without writer admission, replaying all consumed
+ASGI messages on decline or failure. Other read routes forward only requests declaring no body. A forward has ONE absolute deadline from the moment it is chosen, covering preparation,
 the call and reading the reply; when it passes, or the child fails, the request falls back to Python
 at once and killing/reaping the child happens on a background thread, never on the request path.
 
@@ -72,7 +71,7 @@ DEFAULT_BIN = "/usr/local/bin/noevia-diary"
 # D6 adds the external-sources listing (a read-only scan of DIARY_EXTERNAL_SOURCES) and the workspace
 # trash list.
 SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
-             "/api/files": "GET", "/api/storage-status": "GET",
+             "/api/file": "POST", "/api/files": "GET", "/api/storage-status": "GET",
              "/api/workspace-export": "GET", "/api/external-sources": "GET",
              "/api/workspace-trash": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
@@ -367,10 +366,12 @@ class ForwardMiddleware:
     def __init__(self, app, server: Optional[RustServer] = None, routes: Optional[dict] = None,
                  is_deleted: Optional[Callable[[str], bool]] = None,
                  is_recovered: Optional[Callable[[str], bool]] = None,
-                 writers=frozenset(), on_uncertain: Optional[Callable[[str], None]] = None):
+                 writers=frozenset(), on_uncertain: Optional[Callable[[str], None]] = None,
+                 retrieval_facts=None):
         self.app = app
         self.server = server
         self.routes = routes or {}
+        self.retrieval_facts = retrieval_facts or (lambda _uid: None)
         self.writers = writers
         self.is_deleted = is_deleted or (lambda _uid: False)
         self.is_recovered = is_recovered or (lambda _uid: False)
@@ -425,6 +426,9 @@ class ForwardMiddleware:
         if writer:
             await self._write(writer, server, scope, receive, send)
             return
+        if (scope.get("path"), scope.get("method")) == ("/api/file", "POST") and self._wants(scope, server):
+            await self._read_file(server, scope, receive, send)
+            return
         # A read with a body is never forwarded or read here: the app handles it as today.
         if not self._wants(scope, server) or self._declares_body(scope):
             await self.app(scope, receive, send)
@@ -437,6 +441,26 @@ class ForwardMiddleware:
         status, headers, body = reply
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
+
+    async def _read_file(self, server, scope, receive, send):
+        # No writer admission: this POST only reads. Preserve every consumed ASGI message for
+        # fallback, including a partial/oversized/timed-out body; never discard bytes.
+        messages = []
+        async def recording_receive():
+            message = await receive()
+            messages.append(message)
+            return message
+        deadline = time.monotonic() + FORWARD_DEADLINE_S
+        body, failure = await self._collect(recording_receive, deadline)
+        async def replay():
+            return messages.pop(0) if messages else await receive()
+        reply = None if failure else await self._forward(server, scope, deadline, body=body)
+        if reply is None:
+            await self.app(scope, replay, send)
+            return
+        status, headers, content = reply
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": content})
 
     # ---- D5 writes ----
 
@@ -589,6 +613,10 @@ class ForwardMiddleware:
                    if k.lower() not in _HOP and not k.lower().startswith(INTERNAL_PREFIX)]
         headers += [(FORWARD_HEADER, secret.encode()), (ASSERTED_HEADER, b"1" if asserted else b"0"),
                     (RECOVERED_HEADER, b"1" if recovered else b"0")]
+        if recovered and scope.get("path") == "/api/health":
+            facts = self.retrieval_facts(user.lower())
+            if facts is not None:
+                headers.append((b"x-noevia-diary-retrieval", json.dumps(facts, ensure_ascii=True).encode()))
         if writer:
             headers.append((WRITER_HEADER, b"1"))
         loop = asyncio.get_running_loop()

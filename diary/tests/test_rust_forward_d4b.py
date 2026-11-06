@@ -5,7 +5,7 @@ Same method as test_rust_forward.py: every request runs twice on the same synthe
 with Python alone and once with the forwarder and the Rust process (each a freshly signed request,
 verified once by Python), and the replies are compared byte for byte (status, every header, body).
 Each case also says whether the Rust side must serve it natively or decline it to Python.
-POST /api/file has a body and is never forwarded (D4 part 1), so it stays on Python. Needs the real binaries (DIARY_RUST_SERVER_BIN,
+POST /api/file is forwarded as a read with a JSON body. Needs the real binaries (DIARY_RUST_SERVER_BIN,
 the tenant-assertion leaf, and DIARY_WORKSPACE_EXPORT_BIN for the export cases).
 """
 import hashlib
@@ -140,7 +140,7 @@ def webdav(**fields):
 
 @needs_binary
 @needs_server
-def test_files_parity_and_file_reads_stay_with_python(pair):
+def test_files_and_file_reads_parity(pair):
     client, start, state = pair
     modes = start()
     # Not settled yet: Python still owes this tenant a reindex, so Rust declines.
@@ -170,23 +170,23 @@ def test_files_parity_and_file_reads_stay_with_python(pair):
         ('files names differing only in case', get(DAILY, '/api/files', b'path=Tie'), 200, False),
         ('files non-uuid tenant', get('not-a-uuid', '/api/files'), 400, True),
         ('files storage header too large', get(DAILY, '/api/files', extra={'X-Cowork-Storage': LONG}), 413, True),
-        ('file read', post_file(DAILY, {'path': 'memory.md'}), 200, None),
-        ('file read nested unicode', post_file(DAILY, {'path': 'Notes/note.md'}), 200, None),
-        ('file read day file', post_file(DAILY, {'path': 'Entries/2030/January/January 6, 2030.md'}), 200, None),
-        ('file read missing', post_file(DAILY, {'path': 'missing.md'}), 200, None),
-        ('file read upper-case extension', post_file(DAILY, {'path': 'README.MD'}), 200, None),
-        ('file read invalid utf-8 (replaced)', post_file(DAILY, {'path': 'bad-utf8.md'}), 200, None),
-        ('file read charset parameter', post_file(DAILY, {'path': 'memory.md'}, 'application/json; charset=utf-8'), 200, None),
-        ('file read too large', post_file(DAILY, {'path': 'big.md'}), 413, None),
-        ('file read not markdown', post_file(DAILY, {'path': 'Notes/image.png'}), 400, None),
-        ('file read hidden', post_file(DAILY, {'path': '.hidden.md'}), 400, None),
-        ('file read parent', post_file(DAILY, {'path': '../x.md'}), 400, None),
-        ('file read backslash', post_file(DAILY, {'path': 'a\\b.md'}), 400, None),
-        ('file read non-string path', post_file(DAILY, {'path': 5}), 400, None),
-        ('file read no path', post_file(DAILY, {}), 400, None),
-        ('file read not an object (422)', post_file(DAILY, [1]), 422, None),
-        ('file read not JSON media (422)', post_file(DAILY, {'path': 'memory.md'}, 'text/plain'), 422, None),
-        ('file read NaN body', post_file(DAILY, b'{"path":"memory.md","x":NaN}'), 200, None),
+        ('file read', post_file(DAILY, {'path': 'memory.md'}), 200, True),
+        ('file read nested unicode', post_file(DAILY, {'path': 'Notes/note.md'}), 200, True),
+        ('file read day file', post_file(DAILY, {'path': 'Entries/2030/January/January 6, 2030.md'}), 200, True),
+        ('file read missing', post_file(DAILY, {'path': 'missing.md'}), 200, True),
+        ('file read upper-case extension', post_file(DAILY, {'path': 'README.MD'}), 200, True),
+        ('file read invalid utf-8 (replaced)', post_file(DAILY, {'path': 'bad-utf8.md'}), 200, True),
+        ('file read charset parameter', post_file(DAILY, {'path': 'memory.md'}, 'application/json; charset=utf-8'), 200, True),
+        ('file read too large', post_file(DAILY, {'path': 'big.md'}), 413, True),
+        ('file read not markdown', post_file(DAILY, {'path': 'Notes/image.png'}), 400, True),
+        ('file read hidden', post_file(DAILY, {'path': '.hidden.md'}), 400, True),
+        ('file read parent', post_file(DAILY, {'path': '../x.md'}), 400, True),
+        ('file read backslash', post_file(DAILY, {'path': 'a\\b.md'}), 400, True),
+        ('file read non-string path', post_file(DAILY, {'path': 5}), 400, True),
+        ('file read no path', post_file(DAILY, {}), 400, True),
+        ('file read not an object (422)', post_file(DAILY, [1]), 422, False),
+        ('file read not JSON media (422)', post_file(DAILY, {'path': 'memory.md'}, 'text/plain'), 422, False),
+        ('file read NaN body', post_file(DAILY, b'{"path":"memory.md","x":NaN}'), 200, False),
     ]
     check(client, modes, cases)
     for mode in (modes.python, modes.rust):
@@ -233,7 +233,7 @@ def test_storage_status_parity(pair):
         ('status storage header too large', get(DAILY, '/api/storage-status', extra={'X-Cowork-Storage': LONG}), 413, True),
         ('status non-uuid tenant', get('not-a-uuid', '/api/storage-status'), 400, True),
         ('health storage header too large (no detail)', get(DAILY, '/api/health', extra={'X-Cowork-Storage': LONG}), 200, True),
-        ('health with tenant detail', get(DAILY, '/api/health', extra={'X-Cowork-Storage': b64({'kind': 'local'})}), 200, False),
+        ('health with tenant detail', get(DAILY, '/api/health', extra={'X-Cowork-Storage': b64({'kind': 'local'})}), 200, True),
     ]
     check(client, modes, cases)
 
@@ -278,8 +278,8 @@ def test_d4b_routes_are_supported_but_off_by_default(monkeypatch):
     monkeypatch.delenv('DIARY_RUST_ROUTES', raising=False)
     assert rust_forward.configured_routes() == {}
     routes = rust_forward.configured_routes('/api/files,/api/file,/api/storage-status,/api/workspace-export')
-    # POST /api/file carries a body, which is never forwarded: not a Rust route (yet).
-    assert routes == {'/api/files': 'GET', '/api/storage-status': 'GET', '/api/workspace-export': 'GET'}
+    # POST /api/file is a read route; PUT remains tenant-writer selected.
+    assert routes == {'/api/file': 'POST', '/api/files': 'GET', '/api/storage-status': 'GET', '/api/workspace-export': 'GET'}
 
 
 def test_server_config_carries_the_export_selection(world, monkeypatch):
