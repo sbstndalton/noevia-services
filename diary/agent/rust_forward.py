@@ -54,6 +54,7 @@ import subprocess
 import threading
 import time
 import weakref
+from pathlib import Path
 from typing import Callable, Optional
 
 import httpx
@@ -73,7 +74,15 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/workspace-export": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
-                "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
+                "/api/entries/edit": "POST", "/api/storage-backup": "POST",
+                "/api/storage-import": "POST"}
+# Routes whose native task keeps its own writer and flock until its effects settle: a forward
+# timeout or cancellation must not kill the child under them (it could unlock mid-commit).
+SETTLING_ROUTES = frozenset({"/api/storage-backup", "/api/storage-import"})
+# POST /api/storage-import of a non-managed (legacy) tenant: Python holds a recovered legacy state
+# for this request's storage key, with no pending journal entry and no storage cool-down.
+IMPORT_ROUTE = "/api/storage-import"
+LEGACY_READY_HEADER = b"x-noevia-diary-legacy-ready"
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024
@@ -176,12 +185,66 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
         # exporter stamps the current local time into the ZIP); the Rust side declines otherwise.
         # D5: entries are written natively only with the transforms Python itself uses.
         "corpus_write_impl": (os.environ.get("DIARY_CORPUS_WRITE_IMPL") or "python").strip().lower(),
+        "legacy": legacy_config(base_cfg),
         "workspace_export": {
             "impl": os.environ.get("WORKSPACE_EXPORT_IMPL", "python"),
             "binary": workspace_export_native.BINARY,
             "settings": {key: base_cfg.get("corpus." + key) for key in SETTING_KEYS},
         },
     }
+
+
+def legacy_config(base_cfg) -> dict:
+    """The non-managed corpus settings the Rust side needs for POST /api/storage-import: the
+    operator volumes, CorpusStore.remote_root's fallbacks and the base backend (the header-less
+    legacy owner's). A value this side would read differently marks the base backend unsupported,
+    so the Rust side declines and Python serves. Credentials travel only in this stdin line."""
+    unsupported = False
+
+    def text(key, default=""):
+        nonlocal unsupported
+        value = base_cfg.get(key)
+        if value is None or value == "":
+            return default
+        if not isinstance(value, str):
+            unsupported = True
+            return ""
+        return value
+
+    def seconds(key):
+        nonlocal unsupported
+        try:
+            return float(base_cfg.get(key, 60))
+        except (TypeError, ValueError):
+            unsupported = True
+            return 60.0
+
+    kind = str(base_cfg.get("corpus.backend", "local")).strip().lower()
+    local_root = text("corpus.local.root") or "data/corpus"
+    try:
+        local_root = str(Path(local_root).expanduser().resolve())
+    except (OSError, RuntimeError):
+        unsupported = True
+    base = {
+        "local_root": local_root,
+        "volume_identity": text("corpus.local.volume_identity"),
+        "webdav_base_url": text("corpus.webdav.base_url"),
+        "webdav_username": text("corpus.webdav.username"),
+        "webdav_password": text("corpus.webdav.password"),
+        "webdav_timeout_s": seconds("corpus.webdav.timeout_s"),
+        "s3_endpoint_url": text("corpus.s3.endpoint_url"),
+        "s3_bucket": text("corpus.s3.bucket"),
+        "s3_access_key": text("corpus.s3.access_key"),
+        "s3_secret_key": text("corpus.s3.secret_key"),
+        "s3_session_token": text("corpus.s3.session_token"),
+        "s3_region": text("corpus.s3.region") or "us-east-1",
+        "s3_prefix": text("corpus.s3.prefix"),
+        "s3_timeout_s": seconds("corpus.s3.timeout_s"),
+    }
+    corpus_root, remote_root = text("corpus.root"), text("corpus.webdav.remote_root")
+    base["kind"] = "unsupported" if unsupported else kind
+    return {"local_volumes": os.environ.get("DIARY_LOCAL_VOLUMES") or "",
+            "corpus_root": corpus_root, "remote_root": remote_root, "base": base}
 
 
 class RustServer:
@@ -360,7 +423,8 @@ class ForwardMiddleware:
     def __init__(self, app, server: Optional[RustServer] = None, routes: Optional[dict] = None,
                  is_deleted: Optional[Callable[[str], bool]] = None,
                  is_recovered: Optional[Callable[[str], bool]] = None,
-                 writers=frozenset(), on_uncertain: Optional[Callable[[str], None]] = None):
+                 writers=frozenset(), on_uncertain: Optional[Callable[[str], None]] = None,
+                 legacy_ready: Optional[Callable[[str, Callable[[str], str]], bool]] = None):
         self.app = app
         self.server = server
         self.routes = routes or {}
@@ -368,6 +432,7 @@ class ForwardMiddleware:
         self.is_deleted = is_deleted or (lambda _uid: False)
         self.is_recovered = is_recovered or (lambda _uid: False)
         self.on_uncertain = on_uncertain or (lambda _uid: None)
+        self.legacy_ready = legacy_ready or (lambda _uid, _header: False)
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop = None
         # D5: the writer tenants' lock is tenant_writer's, shared with every Python write path.
@@ -408,6 +473,9 @@ class ForwardMiddleware:
         if WRITE_ROUTES.get(scope.get("path", "")) != scope.get("method"):
             return ""
         user = self._user(scope).lower()
+        if not user and scope.get("path") == IMPORT_ROUTE:
+            # The header-less legacy tenant (DIARY_LEGACY_USER_ID) imports through the same lock.
+            user = (os.environ.get("DIARY_LEGACY_USER_ID") or "").lower()
         if not _UUID_RE.fullmatch(user) or self.is_deleted(user):
             return ""
         return user if self.writers == ALL_TENANTS or user in self.writers else ""
@@ -538,7 +606,7 @@ class ForwardMiddleware:
             # The request may have reached the child, which may still be writing: the same as a
             # lost reply. The child is killed (the barrier is up before this lock is released) and
             # the tenant recovers before its next write.
-            if scope.get("path") != "/api/storage-backup":
+            if scope.get("path") not in SETTLING_ROUTES:
                 self._uncertain(server, user)
             # Backup retains its own flock and native writer until transport settles.
             # Killing the process here could unlock while a remote PUT still commits.
@@ -587,6 +655,19 @@ class ForwardMiddleware:
                     (RECOVERED_HEADER, b"1" if recovered else b"0")]
         if writer:
             headers.append((WRITER_HEADER, b"1"))
+            if scope.get("path") == IMPORT_ROUTE:
+                tenant = (user or os.environ.get("DIARY_LEGACY_USER_ID") or "").lower()
+                ready = False
+                if _UUID_RE.fullmatch(tenant):
+                    raw = {k.lower(): v for k, v in scope.get("headers") or []}
+
+                    def header(name: str) -> str:
+                        return raw.get(name.encode(), b"").decode("latin-1")
+                    try:
+                        ready = bool(self.legacy_ready(tenant, header))
+                    except Exception:  # noqa: BLE001 - unknown: Python serves the import
+                        ready = False
+                headers.append((LEGACY_READY_HEADER, b"1" if ready else b"0"))
         loop = asyncio.get_running_loop()
         if self._client is None or self._client_loop is not loop:
             # One pooled client per event loop (uvicorn runs one; a client is bound to its loop).
@@ -604,7 +685,7 @@ class ForwardMiddleware:
             resp, content = await asyncio.wait_for(exchange(), remaining)
         except Exception as exc:  # noqa: BLE001 - lost or stuck process: Python serves from here on
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
-            if scope.get("path") != "/api/storage-backup":
+            if scope.get("path") not in SETTLING_ROUTES:
                 server.lost()
             if writer and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
                 # The request may have reached the child, which may have committed it.

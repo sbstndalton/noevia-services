@@ -800,6 +800,48 @@ def _rust_recovered(user_id: str) -> bool:
         return True
 
 
+def _rust_legacy_ready(user_id: str, header) -> bool:
+    """POST /api/storage-import of a non-managed tenant may be served natively only when this
+    process holds a RECOVERED legacy state under the same key _tenant_state would use for this
+    request (same volume / credential / descriptor), with no pending journal entry, no storage
+    cool-down, and no activation yet. The state's build and recovery stay here. Called under the
+    tenant's writer lock (rust_forward), so no Python write of the tenant can interleave."""
+    try:
+        storage_header = header("x-cowork-storage")
+        if len(storage_header) > MAX_STORAGE_HEADER_LEN or header("x-cowork-storage-blocked") == "1":
+            return False
+        descriptor = _storage_descriptor(storage_header)
+        credential_key, credential_missing = _storage_credential(descriptor, user_id)
+        if credential_missing:
+            return False
+        root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+        if (root / "managed-diary.active").exists():
+            return False
+        volume = tenant_volume(user_id)
+    except Exception:  # noqa: BLE001 - Python answers whatever this would refuse
+        return False
+    storage_key = json.dumps(volume, sort_keys=True) if volume else credential_key or storage_header
+    key = f"{user_id}:{hashlib.sha256(storage_key.encode()).hexdigest()[:16]}"
+    with _tenant_lock:
+        if _tenant_recently_deleted_locked(user_id):
+            return False
+        state = _tenant_states.get(key)
+        if state is None or getattr(state, "recovered", True) is not True:
+            return False
+        backend = getattr(state, "backend", None)
+        if not isinstance(backend, LegacyWriteGuard):
+            return False
+        gate = getattr(backend.backend, "storage_gate", None)
+        if gate is not None and gate.state()[0]:
+            return False
+        _tenant_states.move_to_end(key)
+        state.last_used = time.monotonic()
+    try:
+        return state.journal.pending_count() == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _rust_write_uncertain(user_id: str) -> None:
     """D5: a forwarded write got no reply after it may have reached the Rust process. Like an
     uncertain workspace import, the tenant's state recovers again before it is served here."""
@@ -819,7 +861,8 @@ app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_u
 # verifier and nonce cache here check every request before anything is forwarded.
 if _RUST_ROUTES or _RUST_WRITERS:
     app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
-                       is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
+                       is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain,
+                       legacy_ready=_rust_legacy_ready)
 app.add_middleware(TenantAssertionMiddleware)
 
 
