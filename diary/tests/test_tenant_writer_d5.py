@@ -16,6 +16,7 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -369,7 +370,7 @@ def run_concurrently(jobs, workers=3):
     assert not errors, errors
 
 
-def test_python_only_and_forwarded_writes_of_one_tenant_never_overlap(volume, monkeypatch):
+def test_forwarded_workspace_and_file_writes_never_overlap_python_background(volume, monkeypatch):
     monkeypatch.setattr(appmod, '_reindex_dirty', lambda st: None)
     monkeypatch.setattr(appmod, '_deleted_tenants', {})
     monkeypatch.setattr(rust_forward, '_server', None)
@@ -390,7 +391,7 @@ def test_python_only_and_forwarded_writes_of_one_tenant_never_overlap(volume, mo
         def forwarded(i):
             return lambda: TestClient(appmod.app).put('/api/file', headers=hb, json={'path': f'r{i}.md', 'content': 'x', 'version': None}).raise_for_status()
 
-        def python_op(i):  # Python-only route
+        def workspace_op(i):  # Workspace ops now share the forwarded writer path.
             return lambda: TestClient(appmod.app).post('/api/workspace-ops', headers=hb, json={
                 'op': 'copy', 'path': f'n{i}.md', 'destination': f'c{i}.md'}).raise_for_status()
 
@@ -400,9 +401,9 @@ def test_python_only_and_forwarded_writes_of_one_tenant_never_overlap(volume, mo
         with python_write_spans(B) as spans:
             jobs = []
             for i in range(4):
-                jobs += [forwarded(i), python_op(i), background(i)]
+                jobs += [forwarded(i), workspace_op(i), background(i)]
             run_concurrently(jobs, workers=6)
-        assert len(TimedForward.spans) == 4 and len(spans) >= 8
+        assert len(TimedForward.spans) == 8 and len(spans) >= 4
         assert overlaps(spans, TimedForward.spans) == [], 'a Python write ran while a forwarded write was on the wire'
         assert overlaps(spans, spans) == [] and overlaps(TimedForward.spans, TimedForward.spans) == []
         assert tenant_writer.denials == []
@@ -447,10 +448,13 @@ def test_python_only_and_native_writes_never_overlap_on_the_real_binary(writers,
         for i in range(4):
             jobs += [native(i), python_op(i), background(i)]
         run_concurrently(jobs, workers=3)  # the assertion leaf allows 4 concurrent checks
-    # Python's workspace ops leave index work behind, after which the Rust side declines (Python then
-    # serves those under the same lock): at least the first writes are native.
+    # Workspace ops may now execute natively, or decline while recovery is pending.
+    # The four background effects always execute in Python; all twelve effects must land.
     assert True in Recorder.served and len(spans_fwd) >= 4, Recorder.served
-    assert len(spans) >= 8
+    assert len(spans) >= 4
+    with sqlite3.connect(state / 'users' / DAILY / 'managed-diary.db') as db:
+        paths = {row[0] for row in db.execute('SELECT path FROM files')}
+    assert {f'{prefix}{i}.md' for prefix in ('r', 'c', 'b') for i in range(4)} <= paths
     assert overlaps(spans, spans_fwd) == [], 'a Python write ran while a native write was in flight'
     assert tenant_writer.denials == []
     del modes

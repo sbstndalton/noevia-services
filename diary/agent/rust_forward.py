@@ -72,7 +72,7 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/files": "GET", "/api/storage-status": "GET",
              "/api/workspace-export": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
-WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
+WRITE_ROUTES = {"/api/workspace-ops": "POST", "/api/workspace-trash": "POST", "/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
                 "/api/entries/edit": "POST"}
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
@@ -548,6 +548,11 @@ class ForwardMiddleware:
             await self.app(scope, replay, send)
             return
         status, headers, content = outcome
+        if status == 200 and scope.get("path") in ("/api/workspace-ops", "/api/workspace-trash"):
+            # Python's handlers leave recovery pending after a workspace mutation. Reuse the
+            # existing invalidation callback, conservatively recovering all documents next time.
+            if scope.get("path") == "/api/workspace-trash" or json.loads(body).get("op") != "stat":
+                self.on_uncertain(user)
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
 
