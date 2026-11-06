@@ -176,3 +176,55 @@ def test_pending_journal_and_nonmanaged_tenant_decline_to_real_python(writers, i
         assert wire(p) == wire(r)
         assert r.status_code == (503 if inactive else 409)
         assert Recorder.served == [False]
+
+
+@needs_binary
+@needs_server
+@pytest.mark.parametrize('action,state_name', [('restore', 'trashed'), ('trash', 'trashed'), ('restore', 'restored')])
+@pytest.mark.parametrize('timestamp_json', [
+    '{"z":1,"a":2}',
+    '[{"z":1e-7,"a":1e20},-0.0,0.000001]',
+    '{"n":18446744073709551617,"minus":-18446744073709551617}',
+    '{"z":{"b":"\\u00e9\\n","a":[true,null,"x"]},"z":{"last":2,"first":1}}',
+])
+def test_legacy_capsule_summary_bytes_and_nested_values(writers, action, state_name, timestamp_json):
+    client, start, state = writers
+    modes = start()
+    warm(client, modes)
+    h = hashlib.sha256(b'hello').hexdigest()
+    raw = ('{"format":"noevia-trash-v1","id":"' + ID + '","path":"Notes/a.md",'
+           '"version":"' + h + '","data":"aGVsbG8=","state":"' + state_name + '",'
+           '"trashedAt":' + timestamp_json + ',"unused":{"z":18446744073709551617,"a":1e-7}}').encode()
+    db_path = state / 'users' / DAILY / 'managed-diary.db'
+    capsule_path = f'.noevia-trash/{ID}.json'
+    with sqlite3.connect(db_path) as db:
+        db.execute('INSERT INTO files VALUES (?,?,?,1.0)', (capsule_path, raw, hashlib.sha256(raw).hexdigest()))
+    snap = snapshot(state, DAILY)
+    replies, effects = [], []
+    for mode in (modes.python, modes.rust):
+        restore(state, DAILY, snap)
+        warm(client, modes)
+        mode()
+        Recorder.served = []
+        response = request(client, DAILY, 'POST', TRASH, {'action': action, 'id': ID, 'path': 'Notes/a.md', 'version': h})
+        assert response.status_code == 200, response.text
+        if mode == modes.rust:
+            assert Recorder.served == [True]
+        replies.append(wire(response))
+        with sqlite3.connect(db_path) as db:
+            data, version = db.execute('SELECT data,version FROM files WHERE path=?', (capsule_path,)).fetchone()
+            assert version == hashlib.sha256(data).hexdigest()
+            if action == 'restore' and state_name == 'trashed':
+                record = json.loads(data)
+                assert data == json.dumps(record, sort_keys=True, ensure_ascii=False).encode()
+                assert isinstance(record.pop('restoredAt'), float)
+                # Capsule encoding sorts recursively, while HTTP summary preserves insertion order.
+                normalized = json.dumps(record, sort_keys=True, ensure_ascii=False).encode()
+                assert b'"unused": {"a": 1e-07, "z": 18446744073709551617}' in normalized
+                effects.append(normalized)
+                assert db.execute('SELECT data FROM files WHERE path=?', ('Notes/a.md',)).fetchone()[0] == b'hello'
+            else:
+                assert data == raw, 'retry must leave the legacy capsule bytes unchanged'
+                effects.append(data)
+    assert replies[0] == replies[1]
+    assert effects[0] == effects[1]

@@ -856,3 +856,12 @@ def test_a_handler_thread_keeps_the_lock_after_its_request_is_cancelled():
     release.set()
     assert done.wait(5)
     assert blocked_writer(B) is None
+
+
+def test_workspace_write_entry_points_record_forwarding_and_recovery():
+    for path in ('/api/workspace-ops', '/api/workspace-trash'):
+        entry = appmod.WRITE_ENTRY_POINTS[('POST', path)]
+        assert rust_forward.WRITE_ROUTES[path] == 'POST'
+        for fact in ('forwarded', 'fallback', 'native success', 'recovery invalidation'):
+            assert fact in entry, (path, fact, entry)
+    assert 'except stat' in appmod.WRITE_ENTRY_POINTS[('POST', '/api/workspace-ops')]
