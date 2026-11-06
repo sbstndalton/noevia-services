@@ -14,7 +14,8 @@ FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de
 # Merged decode-v1 Rust runtime dependency (noevia-rs#301); checksum verified below.
 ARG NOEVIA_RS_REF=ea6d7c3e74c3e67b8e5da4de0253ec149bc776a3
 ARG NOEVIA_RS_SHA256=7dd51e5eaca63e077b8ed26e1bdbc7edb572f7e67945d0bbebca724f4f010d4e
-ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+ARG CARGO_BUILD_JOBS=3
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
@@ -52,7 +53,12 @@ COPY scripts/ ./scripts/
 COPY entrypoint.sh /usr/local/bin/diary-entrypoint
 RUN chmod 755 /usr/local/bin/diary-entrypoint \
  && diary-backup-restore --help | grep -q '^usage: backup_restore.py ' \
- && diary-config /nonexistent/diary-config-smoke.yaml | grep -qx '{}'
+ && diary-config /nonexistent/diary-config-smoke.yaml | grep -qx '{"configured":true}'
+# Prove real installed binaries and historical Python spellings offline, including
+# credential-canary checks. Build args bind this candidate to a verified Rust archive.
+RUN mkdir /operator-smoke-evidence \
+ && DIARY_OPERATOR_SMOKE_ROOT=/operator-smoke-evidence python scripts/smoke_operator_image.py \
+ && rm -rf /operator-smoke-evidence
 # Prove the installed binary speaks decode-v1, including payload/version/EOF checks.
 RUN python scripts/smoke_workspace_decode.py
 # Every other leaf answers through its real adapter and agrees with Python on synthetic data. The selectors

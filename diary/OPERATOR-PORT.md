@@ -14,6 +14,16 @@ Python command with a disposable executable outside the checkout. Shell dispatch
 is checked by intercepting only `exec`; the real compatibility module also executes
 an actual stub binary to prove argument and exit-code propagation.
 
+## Public diagnostic output
+
+`config` is a load-status check, not a configuration export. It emits only
+`{"configured":true}` on success and a fixed error on failure. It never prints values,
+field names, loader warnings or parser source excerpts. This includes malformed
+YAML and invalid Unicode arguments/environment values. Full library projections
+exist only in the Rust test example, which is not installed in the image.
+The installed image smoke uses synthetic credential canaries on both success and
+failure and exercises the real native and historical Python command spellings.
+
 ## Retained Python and importers
 
 `agent/config.py` stays because the live Python service still imports `load_config`
