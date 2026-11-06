@@ -5,20 +5,29 @@ serves, comma-separated, e.g. ``/api/months,/api/day``. Empty (the default) mean
 everything: no process is started and no middleware is installed, so behaviour is byte-identical to
 a release without this module.
 
-ONE verifier, ONE nonce cache. While both processes exist, the tenant assertion is checked only by
-this process, by TenantAssertionMiddleware exactly as before (same refusals, bytes and order).
-ForwardMiddleware sits INSIDE it, so it only ever sees requests that middleware let through. It
-forwards the configured routes with their raw wire path, raw query, headers and body plus three
-loopback-only headers: the per-process forward secret (sent to the child on stdin, never argv or
-environment; a client-supplied copy of any of these headers is dropped), whether this request's
-tenant was asserted, and whether this process already holds a recovered managed state for the
-tenant. The Rust side refuses anything without the secret with this app's own 401 bytes, never
-verifies an assertion itself, and either serves the request exactly as this app would or DECLINES it
-(421 + ``x-noevia-diary-decline: 1``) for anything it does not reproduce (non-managed storage, a
-tenant this process has not recovered yet, pending journal / dirty / outbox work, an enabled
-INDEX.md, tenant detail in /api/health ...). A declined request, like one the child never answered,
-is served here without verifying it again, so each nonce is consumed exactly once whichever process
-answers, across declines, restarts and a dead child.
+ONE verifier per request (D8 verifier move). A request this forwarder will send to a ready Rust
+process (`delegates`) is NOT verified here: TenantAssertionMiddleware lets it through unread and
+the Rust side (noevia-rs bins/noevia-diary assertion.rs) verifies it first, with the middleware's
+exact refusals (401 ``invalid tenant assertion``, 413 above MAX_SIGNED_BODY). Every other request is
+verified here exactly as before. ForwardMiddleware sits INSIDE the middleware. It forwards with the
+raw wire path, raw query, headers and body plus loopback-only headers: the per-process forward
+secret (sent to the child on stdin, never argv or environment; a client-supplied copy of any
+``x-noevia-diary-*`` header is dropped), ``x-noevia-diary-verify: 1`` for a delegated request (else
+``x-noevia-diary-asserted`` says whether this process verified it), and whether this process
+already holds a recovered managed state for the tenant. The Rust side refuses anything without the
+secret with this app's own 401 bytes, and either serves the request exactly as this app would or
+DECLINES it (421 + ``x-noevia-diary-decline: 1``) for anything it does not reproduce (non-managed
+storage, a tenant this process has not recovered yet, pending journal / dirty / outbox work, an
+enabled INDEX.md, tenant detail in /api/health ...).
+
+Every reply to a request the Rust side verified carries ``x-noevia-diary-verified: 1``: its nonce is
+then also recorded in this process's cache (tenant_assertion.record_verified), and a declined one is
+served here as asserted, without verifying it again. A delegated request the Rust side declined
+WITHOUT that header, or never answered, is verified HERE before it is served (fail closed: nothing
+is ever served unverified). A nonce this cache already holds is never delegated, so a nonce is
+accepted at most once across both caches: Rust refuses its own replays, this process refuses the
+ones it recorded, and a restarted child refuses anything signed before it started (the same
+restart guard as here).
 
 Only requests that declare no body are forwarded (the native routes are GETs that ignore one); a
 request with a body is never read here and goes to the app untouched, so its timing is exactly
@@ -85,6 +94,9 @@ BODY_TIMEOUT = b'{"detail":"The request body did not arrive in time."}'
 REAP_WAIT_S = 10.0
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 DECLINE_HEADER = b"x-noevia-diary-decline"
+VERIFY_HEADER = b"x-noevia-diary-verify"
+VERIFIED_HEADER = b"x-noevia-diary-verified"
+UNVERIFIED = b'{"detail":"invalid tenant assertion"}'
 CONTROL_HEADER = "x-noevia-diary-control"
 FORWARD_HEADER = b"x-noevia-diary-forward"
 ASSERTED_HEADER = b"x-noevia-diary-asserted"
@@ -374,6 +386,76 @@ class ForwardMiddleware:
         if writers:
             tenant_writer.configure(writers)
 
+    def delegates(self, scope) -> bool:
+        """True when this request will be forwarded to a ready Rust process now, so its assertion is
+        the Rust side's to verify (TenantAssertionMiddleware skips it). A request whose nonce this
+        process has already accepted is never delegated: it is verified (and refused) here."""
+        server = self.server or current()
+        if scope.get("type") != "http" or server is None or not server.ready or not server.forward_secret:
+            return False
+        if self._writer_tenant(scope):
+            declared = self._declared_length(scope)
+            if not self._json_media(scope) or (declared is not None and declared > MAX_WRITE_BODY):
+                return False
+        elif not self._wants(scope, server) or self._declares_body(scope):
+            return False
+        raw = ""
+        for name, value in scope.get("headers") or []:
+            if name == tenant_assertion.HEADER.lower().encode():
+                raw = value.decode("latin-1")
+                break
+        return not tenant_assertion.already_seen(raw)
+
+    @staticmethod
+    def _delegated(scope) -> bool:
+        return bool((scope.get("state") or {}).get("rust_verifies"))
+
+    async def _serve_here(self, scope, receive, send, body: bytes = b""):
+        """Serve a request in this process. A delegated request the Rust side did not verify is
+        verified here first, exactly as TenantAssertionMiddleware would have (fail closed)."""
+        state = scope.setdefault("state", {})
+        if self._delegated(scope) and not state.get("tenant_asserted"):
+            reason = await self._verify_here(scope, body)
+            if reason:
+                if reason != tenant_assertion.BUSY_REFUSAL:
+                    log.warning("tenant assertion rejected: %s", reason)
+                await self._reply(send, 401, UNVERIFIED)
+                return
+            state["tenant_asserted"] = True
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _verify_here(scope, body: bytes) -> Optional[str]:
+        from starlette.concurrency import run_in_threadpool
+        from starlette.datastructures import Headers
+        headers = Headers(scope=scope)
+        key = tenant_assertion.tenant_key()
+        if not key or not headers.get("x-cowork-user-id", ""):
+            return None
+        body_hash = (tenant_assertion.sha256_hex(body) if tenant_assertion.body_is_hashed(headers.get("content-type", ""))
+                     else tenant_assertion.STREAM)
+        return await run_in_threadpool(tenant_assertion.verify, key, headers, scope.get("method", "GET"),
+                                       tenant_assertion.wire_path(scope), query=scope.get("query_string", b""),
+                                       body_hash=body_hash)
+
+    async def _after_decline(self, scope, receive, send, body: bytes = b""):
+        """A forward that came back without a served reply (declined, or no answer)."""
+        state = scope.setdefault("state", {})
+        if state.pop("rust_verified", False):
+            # The Rust side verified and recorded this assertion; mark it consumed here too.
+            if tenant_assertion.record_verified(self._assertion(scope)):
+                await self._reply(send, 401, UNVERIFIED)
+                return
+            state["tenant_asserted"] = True
+        await self._serve_here(scope, receive, send, body)
+
+    @staticmethod
+    def _assertion(scope) -> str:
+        for name, value in scope.get("headers") or []:
+            if name == b"x-cowork-tenant-assertion":
+                return value.decode("latin-1")
+        return ""
+
     @staticmethod
     def _user(scope) -> str:
         for name, value in scope.get("headers") or []:
@@ -420,13 +502,14 @@ class ForwardMiddleware:
             return
         # A read with a body is never forwarded or read here: the app handles it as today.
         if not self._wants(scope, server) or self._declares_body(scope):
-            await self.app(scope, receive, send)
+            await self._serve_here(scope, receive, send)
             return
         deadline = time.monotonic() + FORWARD_DEADLINE_S
         reply = await self._forward(server, scope, deadline)
         if reply is None:
-            await self.app(scope, receive, send)
+            await self._after_decline(scope, receive, send)
             return
+        self._record_served(scope)
         status, headers, body = reply
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
@@ -530,7 +613,7 @@ class ForwardMiddleware:
             # The Rust process is not running (nothing of it can still write: the admission
             # barrier held this lock closed until any lost child was confirmed exited), or the
             # body is not JSON (the app answers 422 without writing).
-            await self.app(scope, replay, send)
+            await self._serve_here(scope, replay, send, body)
             return
         try:
             outcome = await self._forward(server, scope, deadline, body=body, writer=True)
@@ -545,11 +628,17 @@ class ForwardMiddleware:
             await self._reply(send, 503, UNCERTAIN)
             return
         if outcome is None:
-            await self.app(scope, replay, send)
+            await self._after_decline(scope, replay, send, body)
             return
+        self._record_served(scope)
         status, headers, content = outcome
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
+
+    def _record_served(self, scope) -> None:
+        """A reply the Rust side served: if it verified the assertion, its nonce is consumed here too."""
+        if (scope.get("state") or {}).pop("rust_verified", False):
+            tenant_assertion.record_verified(self._assertion(scope))
 
     def _uncertain(self, server, user) -> None:
         try:
@@ -575,13 +664,18 @@ class ForwardMiddleware:
         secret = server.forward_secret
         if not secret:
             return None
-        asserted = bool((scope.get("state") or {}).get("tenant_asserted"))
+        state = scope.setdefault("state", {})
+        state.pop("rust_verified", None)
+        delegated = self._delegated(scope) and not state.get("tenant_asserted")
+        asserted = bool(state.get("tenant_asserted"))
         user = self._user(scope)
         recovered = bool(user) and self.is_recovered(user.lower())
         headers = [(k, v) for k, v in scope.get("headers") or []
                    if k.lower() not in _HOP and not k.lower().startswith(INTERNAL_PREFIX)]
         headers += [(FORWARD_HEADER, secret.encode()), (ASSERTED_HEADER, b"1" if asserted else b"0"),
                     (RECOVERED_HEADER, b"1" if recovered else b"0")]
+        if delegated:
+            headers.append((VERIFY_HEADER, b"1"))
         if writer:
             headers.append((WRITER_HEADER, b"1"))
         loop = asyncio.get_running_loop()
@@ -607,9 +701,12 @@ class ForwardMiddleware:
                 return "uncertain"
             return None
         raw = resp.headers.raw
+        if delegated and any(k.lower() == VERIFIED_HEADER and v == b"1" for k, v in raw):
+            state["rust_verified"] = True
         if any(k.lower() == DECLINE_HEADER for k, _ in raw):
             return None
-        kept = [(k.lower(), v) for k, v in raw if k.lower() not in _DROP_REPLY]
+        kept = [(k.lower(), v) for k, v in raw
+                if k.lower() not in _DROP_REPLY and not k.lower().startswith(INTERNAL_PREFIX)]
         # Starlette's order: the response's own headers, then content-length, then content-type.
         order = {b"content-length": 1, b"content-type": 2}
         kept.sort(key=lambda kv: order.get(kv[0], 0))

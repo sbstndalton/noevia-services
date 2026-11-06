@@ -188,6 +188,27 @@ def _remember_nonce(nonce: str, ts: int, now: float) -> Optional[str]:
         return None
 
 
+def already_seen(raw: str, now: Optional[float] = None) -> bool:
+    """D8 forwarder: would this cache refuse the assertion `raw` as a replay right now? Read-only
+    (True also for a ts at or below the floor). A malformed header is not "seen"."""
+    match = _ASSERTION_RE.fullmatch(raw or "")
+    if not match:
+        return False
+    ts, nonce = int(match.group(1)), match.group(2)
+    with _seen_lock:
+        return ts <= _floor or ts in _lost or nonce in _seen.get(ts, ())
+
+
+def record_verified(raw: str, now: Optional[float] = None) -> Optional[str]:
+    """D8 forwarder: the Rust process verified and accepted `raw`; consume its nonce here too, so this
+    process refuses a replay of it even while the Rust process is down. None when recorded, else the
+    replay reason (another request with the same nonce got here first)."""
+    match = _ASSERTION_RE.fullmatch(raw or "")
+    if not match:
+        return "missing or malformed assertion"
+    return _remember_nonce(match.group(2), int(match.group(1)), time.time() if now is None else now)
+
+
 def _nonce_count() -> int:
     with _seen_lock:
         return _count
