@@ -50,7 +50,9 @@ COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
 COPY entrypoint.sh /usr/local/bin/diary-entrypoint
-RUN chmod 755 /usr/local/bin/diary-entrypoint
+RUN chmod 755 /usr/local/bin/diary-entrypoint \
+ && diary-backup-restore --help | grep -q '^usage: backup_restore.py ' \
+ && diary-config /nonexistent/diary-config-smoke.yaml | grep -qx '{}'
 # Prove the installed binary speaks decode-v1, including payload/version/EOF checks.
 RUN python scripts/smoke_workspace_decode.py
 # Every other leaf answers through its real adapter and agrees with Python on synthetic data. The selectors
