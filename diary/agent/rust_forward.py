@@ -73,7 +73,7 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/workspace-export": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
-                "/api/entries/edit": "POST"}
+                "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024
@@ -538,7 +538,10 @@ class ForwardMiddleware:
             # The request may have reached the child, which may still be writing: the same as a
             # lost reply. The child is killed (the barrier is up before this lock is released) and
             # the tenant recovers before its next write.
-            self._uncertain(server, user)
+            if scope.get("path") != "/api/storage-backup":
+                self._uncertain(server, user)
+            # Backup retains its own flock and native writer until transport settles.
+            # Killing the process here could unlock while a remote PUT still commits.
             raise
         if outcome == "uncertain":
             self.on_uncertain(user)
@@ -601,7 +604,8 @@ class ForwardMiddleware:
             resp, content = await asyncio.wait_for(exchange(), remaining)
         except Exception as exc:  # noqa: BLE001 - lost or stuck process: Python serves from here on
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
-            server.lost()
+            if scope.get("path") != "/api/storage-backup":
+                server.lost()
             if writer and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
                 # The request may have reached the child, which may have committed it.
                 return "uncertain"
