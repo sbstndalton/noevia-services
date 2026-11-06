@@ -23,14 +23,14 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
       -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
       -p diary-workspace-export -p diary-workspace-import-apply \
-      -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run \
+      -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run -p diary-operator \
  && ./target/release/tenant-assertion self-test | grep -qx ok \
  && ./target/release/workspace-restore-verify self-test | grep -qx ok \
  && mkdir /out \
  && cd target/release \
  && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
       diary-temporal-cli diary-workspace-export diary-workspace-import-apply \
-      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run /out/ \
+      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run diary-backup-restore diary-config /out/ \
  && cd /src \
  && rm -rf /src/target /usr/local/cargo/registry
 
@@ -49,6 +49,8 @@ RUN tenant-assertion self-test | grep -qx ok && workspace-restore-verify self-te
 COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY entrypoint.sh /usr/local/bin/diary-entrypoint
+RUN chmod 755 /usr/local/bin/diary-entrypoint
 # Prove the installed binary speaks decode-v1, including payload/version/EOF checks.
 RUN python scripts/smoke_workspace_decode.py
 # Every other leaf answers through its real adapter and agrees with Python on synthetic data. The selectors
@@ -65,4 +67,5 @@ EXPOSE 8010
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
   CMD ["python", "-c", "import os,urllib.request; h={'Authorization':'Bearer '+os.environ.get('DIARY_AUTH_TOKEN','')} if os.environ.get('DIARY_AUTH_TOKEN') else {}; print(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/api/health', headers=h), timeout=5).status)"]
 
+ENTRYPOINT ["diary-entrypoint"]
 CMD ["uvicorn", "agent.app:app", "--host", "0.0.0.0", "--port", "8010"]
