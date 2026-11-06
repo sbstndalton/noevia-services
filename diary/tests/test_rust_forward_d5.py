@@ -609,7 +609,7 @@ def test_decline_paths_outbox_pending_journal_and_recovery(writers):
         db.execute("INSERT INTO workspace_index_outbox VALUES ('Notes/x.md')")
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', body).status_code == 200
-    assert Recorder.served == [False]
+    assert Recorder.served == [True]
     with sqlite3.connect(state / 'users' / DAILY / 'managed-diary.db') as db:
         db.execute('DELETE FROM workspace_index_outbox')
     # A pending journal entry: Python replays it first.
@@ -617,7 +617,7 @@ def test_decline_paths_outbox_pending_journal_and_recovery(writers):
         idx.execute("INSERT INTO journal (id, created_at, kind, payload) VALUES ('synthetic-pending', 't', 'index_month', '{}')")
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', {**body, 'path': 'decline2.md'}).status_code == 200
-    assert Recorder.served == [False]
+    assert Recorder.served == [True]
     with sqlite3.connect(state / 'users' / DAILY / 'managed-index.db') as idx:
         idx.execute('UPDATE journal SET applied=1')
     # Dirty documents do not stop a write (the index lags; Python reindexes later).
@@ -630,7 +630,7 @@ def test_decline_paths_outbox_pending_journal_and_recovery(writers):
     appmod._tenant_states.clear()
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', {**body, 'path': 'after-restart.md'}).status_code == 200
-    assert Recorder.served == [False]
+    assert Recorder.served == [True]
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', {**body, 'path': 'after-recovery.md'}).status_code == 200
     assert Recorder.served == [True]

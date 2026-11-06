@@ -548,6 +548,9 @@ class ForwardMiddleware:
             await self.app(scope, replay, send)
             return
         status, headers, content = outcome
+        # Native replay and writes leave durable dirty marks for Python retrieval.
+        # Invalidate the cached recovery state before any later read can skip indexing.
+        self.on_uncertain(user)
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
 
