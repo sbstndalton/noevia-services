@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from . import tenant_writer
 from . import vector_slots as slots
 from .embedding import EmbeddingConfigError, SharedEmbedding, Target
 
@@ -124,7 +125,7 @@ class EmbeddingMigration:
     def _open(self, path: Path) -> Optional[sqlite3.Connection]:
         try:
             # mode=rw: a tenant deleted meanwhile must not be recreated by this pass.
-            conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=30, check_same_thread=False)
+            conn = tenant_writer.connect(f"file:{path}?mode=rw", uri=True, timeout=30, check_same_thread=False)
         except sqlite3.Error:
             return None
         try:
@@ -228,22 +229,25 @@ class EmbeddingMigration:
                     return {"embedded": embedded, "aborted": True}
                 n = 0
                 if done:
-                    conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        # The embedding took a while: check again, now that nothing else can write.
-                        if self._stop.is_set() or self.config.version != version:
+                    # D5: a writer tenant's index is written only under its writer lock (WriterBusy:
+                    # this file counts as failed and is retried by the next pass).
+                    with tenant_writer.hold(tenant_writer.tenant_of(path)):
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            # The embedding took a while: check again, now that nothing else can write.
+                            if self._stop.is_set() or self.config.version != version:
+                                conn.rollback()
+                                return {"embedded": embedded, "aborted": True}
+                            slots.adopt_legacy(conn, self.config.active())
+                            slot = slots.ensure_slot(conn, target, len(done[0][2]))
+                            # Only while the chunk still holds the text that was embedded.
+                            current = [(cid, h, v) for cid, h, v in done
+                                       if conn.execute("SELECT 1 FROM chunks WHERE id = ? AND content_hash = ?", (cid, h)).fetchone()]
+                            n = slots.write_vectors(conn, slot, current)
+                            conn.commit()
+                        except BaseException:
                             conn.rollback()
-                            return {"embedded": embedded, "aborted": True}
-                        slots.adopt_legacy(conn, self.config.active())
-                        slot = slots.ensure_slot(conn, target, len(done[0][2]))
-                        # Only while the chunk still holds the text that was embedded.
-                        current = [(cid, h, v) for cid, h, v in done
-                                   if conn.execute("SELECT 1 FROM chunks WHERE id = ? AND content_hash = ?", (cid, h)).fetchone()]
-                        n = slots.write_vectors(conn, slot, current)
-                        conn.commit()
-                    except BaseException:
-                        conn.rollback()
-                        raise
+                            raise
             finally:
                 conn.close()
             embedded += n
@@ -369,10 +373,11 @@ class EmbeddingMigration:
             if conn is None:
                 continue
             try:
-                conn.execute("BEGIN IMMEDIATE")
-                slots.drop_slot(conn, target)
-                conn.commit()
-            except sqlite3.Error as exc:
+                with tenant_writer.hold(tenant_writer.tenant_of(f)):
+                    conn.execute("BEGIN IMMEDIATE")
+                    slots.drop_slot(conn, target)
+                    conn.commit()
+            except (sqlite3.Error, tenant_writer.WriterBusy) as exc:
                 conn.rollback()
                 log.warning("could not drop %s from an index file (%s)", target.model, type(exc).__name__)
             finally:

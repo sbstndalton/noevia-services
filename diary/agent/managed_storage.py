@@ -20,6 +20,7 @@ import os
 
 import httpx
 from .dedicated_storage import StorageUnavailable
+from . import tenant_writer
 
 log = logging.getLogger(__name__)
 
@@ -57,8 +58,17 @@ class ManagedCorpusBackend:
         if not self.db_path.exists():
             # Only construction may create a database; operational reads/writes
             # below use mode=rw and never replace a disappeared database.
-            sqlite3.connect(self.db_path).close()
-        with self.db() as db:
+            tenant_writer.connect(self.db_path).close()
+        # D5: the schema and identity write below runs on every construction (#2378, open). For a
+        # writer tenant it is a write like any other, under the tenant's writer lock (constructions
+        # run outside every other ordered lock: app._get_backup_backend, _tenant_state). So that a
+        # read does not queue behind a long write, a writer tenant whose schema and identity are
+        # already in place skips it: it would change nothing.
+        if tenant_writer.is_writer(self.tenant) and self._initialized():
+            if self.marker.exists() and self._read_meta('active') != '1':
+                raise StorageUnavailable('App Diary activation is incomplete. Restore or review the staged database.')
+            return
+        with tenant_writer.hold(self.tenant), self.db() as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, data BLOB NOT NULL, version TEXT NOT NULL, updated REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS directories(path TEXT PRIMARY KEY);
@@ -75,9 +85,36 @@ class ManagedCorpusBackend:
             if self.marker.exists() and self.meta(db, 'active') != '1':
                 raise StorageUnavailable('App Diary activation is incomplete. Restore or review the staged database.')
 
+    _TABLES = frozenset({'files', 'directories', 'workspace_imports', 'workspace_index_outbox', 'meta', 'backups'})
+
+    def _read_meta(self, key):
+        db = tenant_writer.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
+        try:
+            row = db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+            return row[0] if row else None
+        finally:
+            db.close()
+
+    def _initialized(self):
+        """Read-only: every table exists and meta.tenant already names this tenant (D5)."""
+        try:
+            db = tenant_writer.connect(self.db_path.as_uri() + '?mode=ro', uri=True, timeout=30)
+            try:
+                tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not self._TABLES <= tables:
+                    return False
+                row = db.execute("SELECT value FROM meta WHERE key='tenant'").fetchone()
+            finally:
+                db.close()
+        except sqlite3.Error:
+            return False
+        if row is not None and row[0] != self.tenant:
+            raise StorageUnavailable('App Diary tenant identity mismatch.')
+        return row is not None
+
     @contextmanager
     def db(self):
-        db = sqlite3.connect(self.db_path.as_uri() + '?mode=rw', uri=True, timeout=30)
+        db = tenant_writer.connect(self.db_path.as_uri() + '?mode=rw', uri=True, timeout=30)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA synchronous=FULL')
         try:
@@ -87,7 +124,14 @@ class ManagedCorpusBackend:
             db.close()
 
     @contextmanager
-    def migration_lock(self):
+    def migration_lock(self, writer=True):
+        """The tenant's managed-storage lock (thread RLock + cross-process flock). With `writer` (the
+        default) the D5 tenant writer lock is taken first; writer=False only where the lock order
+        forbids it (activation under the tenant registry lock, see app._build_tenant_state_locked)."""
+        if writer:
+            with tenant_writer.hold(self.tenant), self.migration_lock(writer=False):
+                yield
+            return
         key = str(self.root)
         with _migration_guard:
             lock = _migration_locks.setdefault(key, threading.RLock())
@@ -255,7 +299,9 @@ class ManagedCorpusBackend:
     def backup(self, remote, storage, now=None):
         """Idempotent full manifest; immutable content objects are deduplicated."""
         from . import backup_native
-        if backup_native.enabled():
+        # D5: the native backup writes the managed db from its own process, outside the tenant
+        # writer lock, so a writer tenant always takes the Python path below.
+        if backup_native.enabled() and not tenant_writer.is_writer(self.tenant):
             return backup_native.run(self, remote, storage, now)
         now = time.time() if now is None else now
         started = time.monotonic()
@@ -323,7 +369,7 @@ class ManagedCorpusBackend:
                 if native.enabled():
                     body = native.invoke(body=body.decode('utf-8'))['body'].encode('utf-8')
                 self._create_verified(remote, base + '/manifests/' + digest(body) + '.json', body)
-                with self.db() as db:
+                with tenant_writer.hold(self.tenant), self.db() as db:
                     db.execute('INSERT OR REPLACE INTO backups VALUES (?,?,?,0,0,NULL)', (destination, generation, time.time()))
                 verified = True
             except _SnapshotChanged:
@@ -346,7 +392,7 @@ class ManagedCorpusBackend:
                 # answer counts: the sidecar's cool-down (StorageBackoff) and transport errors never set it.
                 refused = isinstance(exc, httpx.HTTPStatusError) and exc.response is not None and exc.response.status_code in (401, 403)
                 # Never persist server exceptions/URLs: these can contain credentials.
-                with self.db() as db:
+                with tenant_writer.hold(self.tenant), self.db() as db:
                     previous = db.execute('SELECT * FROM backups WHERE destination=?', (destination,)).fetchone()
                     failures = (previous['failures'] if previous else 0) + 1
                     db.execute('INSERT OR REPLACE INTO backups VALUES (?,?,?,?,?,?)',
