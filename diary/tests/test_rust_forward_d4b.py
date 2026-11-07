@@ -19,12 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import agent.app as appmod
-from agent import rust_forward, workspace_export_native
+from agent import rust_forward, tenant_writer, workspace_export_native
 from agent import tenant_assertion as ta
 from agent.managed_storage import ManagedCorpusBackend
 from tests.tenant_binary import needs_binary
 from tests.test_rust_forward import (BIN, DAILY, KEY, LONG, MONTHLY, TOKEN, Modes, Recording, b64,  # noqa: F401
-                                     install_forwarder, needs_server, seed, start_server, world)
+                                     _close_fixture_resources, install_forwarder, needs_server, seed, start_server, world)
 
 EXPORT_BIN = os.environ.get('DIARY_WORKSPACE_EXPORT_BIN', '')
 needs_exporter = pytest.mark.skipif(not (EXPORT_BIN and os.path.isfile(EXPORT_BIN))
@@ -57,44 +57,52 @@ def quiesce(state_dir, *uids):
 
 def seed_files(state_dir):
     managed = ManagedCorpusBackend(state_dir / 'users' / DAILY, DAILY)
-    for path, data in (('memory.md', b'# Synthetic memory\n\nPrefers tea.\n'), ('.hidden.md', b'hidden'),
-                       ('README.MD', b'upper'), ('Notes/note.md', 'Synthetic “note” ü\n'.encode()),
-                       ('big.md', b'x' * (512 * 1024 + 1)), ('bad-utf8.md', b'ok \xff\xfe \xed\xa0\x80 end'),
-                       ('Tie/a.md', b'a'), ('Tie/A.md', b'A'), ('Notes/.draft.md', b'd'), ('Notes/image.png', b'png')):
-        assert managed.put(path, data)[0], path
-    for i in range(501):
-        assert managed.put(f'Bulk/{i:03d}.md', b'b')[0]
-    managed.create_directory('Projects')
-    managed.close()
+    try:
+        with tenant_writer.hold(DAILY):
+            for path, data in (('memory.md', b'# Synthetic memory\n\nPrefers tea.\n'), ('.hidden.md', b'hidden'),
+                               ('README.MD', b'upper'), ('Notes/note.md', 'Synthetic “note” ü\n'.encode()),
+                               ('big.md', b'x' * (512 * 1024 + 1)), ('bad-utf8.md', b'ok \xff\xfe \xed\xa0\x80 end'),
+                               ('Tie/a.md', b'a'), ('Tie/A.md', b'A'), ('Notes/.draft.md', b'd'), ('Notes/image.png', b'png')):
+                assert managed.put(path, data)[0], path
+            for i in range(501):
+                assert managed.put(f'Bulk/{i:03d}.md', b'b')[0]
+            managed.create_directory('Projects')
+    finally:
+        _close_fixture_resources(managed.close)
 
 
 @pytest.fixture
 def pair(world, monkeypatch):
-    saved = install_forwarder()
-    client = TestClient(appmod.app)
-    modes = Modes(monkeypatch, None)
-    modes.python()
-    seed(world, client)
-    seed_files(world)
-    if EXPORT_BIN:
-        monkeypatch.setattr(workspace_export_native, 'BINARY', EXPORT_BIN)
-    monkeypatch.setenv('WORKSPACE_EXPORT_IMPL', 'rust')
-    # Python recovers each tenant's state on its first full read; only then may Rust serve it.
-    for uid in (DAILY, MONTHLY):
-        assert client.get('/api/months', headers=sign(uid, 'GET', '/api/months')).status_code == 200
-    started = []
-
-    def start():
-        started.append(start_server())
-        modes.rust(started[-1])
+    saved, stack = list(appmod.app.user_middleware), appmod.app.middleware_stack
+    client, started = None, []
+    try:
+        install_forwarder()
+        client = TestClient(appmod.app)
+        modes = Modes(monkeypatch, None)
         modes.python()
-        return modes
+        seed(world, client)
+        seed_files(world)
+        if EXPORT_BIN:
+            monkeypatch.setattr(workspace_export_native, 'BINARY', EXPORT_BIN)
+        monkeypatch.setenv('WORKSPACE_EXPORT_IMPL', 'rust')
+        # Python recovers each tenant's state on its first full read; only then may Rust serve it.
+        for uid in (DAILY, MONTHLY):
+            assert client.get('/api/months', headers=sign(uid, 'GET', '/api/months')).status_code == 200
 
-    yield client, start, world
-    for server in started:
-        server.stop()
-    appmod.app.user_middleware[:] = saved
-    appmod.app.middleware_stack = None
+        def start():
+            started.append(start_server())
+            modes.rust(started[-1])
+            modes.python()
+            return modes
+
+        yield client, start, world
+    finally:
+        try:
+            _close_fixture_resources(*(server.stop for server in started),
+                                     *([client.close] if client is not None else []))
+        finally:
+            appmod.app.user_middleware[:] = saved
+            appmod.app.middleware_stack = stack
 
 
 def call(client, case):

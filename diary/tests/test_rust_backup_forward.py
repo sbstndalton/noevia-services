@@ -9,6 +9,9 @@ from tests.test_rust_forward_d5 import FakeChild, forwarder, asgi, put
 def test_backup_does_not_kill_settling_child(monkeypatch, cancel):
     async def run():
         child = FakeChild('slow')
+        # Capture the incoming registry before forwarder configures DAILY. The later
+        # empty override must undo back to this value, not to forwarder's writer set.
+        monkeypatch.setattr(tenant_writer, '_writers', frozenset())
         server, spy, mw = forwarder(child.port, monkeypatch, deadline=.05 if not cancel else 2)
         lost = []
         monkeypatch.setattr(server, 'lost', lambda: lost.append(True))

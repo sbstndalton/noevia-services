@@ -14,6 +14,7 @@ import os
 import secrets
 import socket
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from fastapi.testclient import TestClient
 from starlette.middleware import Middleware
 
 import agent.app as appmod
-from agent import rust_forward
+from agent import rust_forward, tenant_writer
 from agent import tenant_assertion as ta
 from agent.config import Config
 from agent.managed_storage import ManagedCorpusBackend
@@ -70,19 +71,23 @@ def world(tmp_path, monkeypatch):
     })
     (tmp_path / 'state').mkdir()
     monkeypatch.setattr(appmod, '_base_cfg', cfg)
-    monkeypatch.setattr(appmod, '_state', appmod.AppState(cfg))
-    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
-    monkeypatch.delenv('DIARY_LEGACY_USER_ID', raising=False)
-    # A reindex that succeeds: what a completed Python recovery leaves (no dirty documents).
-    monkeypatch.setattr(appmod, '_reindex_dirty', clear_dirty)
-    monkeypatch.setattr(appmod, '_deleted_tenants', {})
-    ta._reset_for_tests()
-    appmod._tenant_states.clear()
-    yield tmp_path / 'state'
-    for state in appmod._tenant_states.values():
-        appmod._close_state(state)
-    appmod._tenant_states.clear()
-    ta._reset_for_tests()
+    owned_state = appmod.AppState(cfg)
+    owned_tenants = type(appmod._tenant_states)()
+    try:
+        monkeypatch.setattr(appmod, '_state', owned_state)
+        monkeypatch.setattr(appmod, '_tenant_states', owned_tenants)
+        monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+        monkeypatch.delenv('DIARY_LEGACY_USER_ID', raising=False)
+        # A reindex that succeeds: what a completed Python recovery leaves (no dirty documents).
+        monkeypatch.setattr(appmod, '_reindex_dirty', clear_dirty)
+        monkeypatch.setattr(appmod, '_deleted_tenants', {})
+        ta._reset_for_tests()
+        yield tmp_path / 'state'
+    finally:
+        states = {id(state): state for state in (owned_state, *owned_tenants.values())}
+        _close_fixture_resources(*(lambda state=state: appmod._close_state(state)
+                                   for state in states.values()),
+                                 owned_tenants.clear, ta._reset_for_tests())
 
 
 def clear_dirty(st):
@@ -107,13 +112,21 @@ def seed(state_dir, python):
     # A fresh account starts managed (Python activates it); a monthly one is activated directly.
     assert python.get('/api/storage-status', headers=signed(DAILY, 'GET', '/api/storage-status')).status_code == 200
     managed = ManagedCorpusBackend(state_dir / 'users' / DAILY, DAILY)
-    for day, text in ((today, 'Synthetic walk by the river, “quoted” ünïcode.'), (jan, 'Synthetic January note.')):
-        assert managed.put(daily_path(day), entry(day, text, '00000000-0000-4000-8000-%012d' % day.day).encode())[0]
-    managed.put('Entries/2030/February/notes.txt', b'not a day file')
+    try:
+        with tenant_writer.hold(DAILY):
+            for day, text in ((today, 'Synthetic walk by the river, “quoted” ünïcode.'), (jan, 'Synthetic January note.')):
+                assert managed.put(daily_path(day), entry(day, text, '00000000-0000-4000-8000-%012d' % day.day).encode())[0]
+            managed.put('Entries/2030/February/notes.txt', b'not a day file')
+    finally:
+        _close_fixture_resources(managed.close)
     monthly = ManagedCorpusBackend(state_dir / 'users' / MONTHLY, MONTHLY)
-    monthly.activate({'2030-01.md': entry(jan, 'Synthetic monthly note.', '00000000-0000-4000-8000-000000000099').encode(),
-                      '2029-12.md': b'## Monday, December 31, 2029\n', 'INDEX.md': b'# index'},
-                     {'entry_layout': 'monthly', 'month_file_template': '{year}-{month02}.md', 'index_enabled': False})
+    try:
+        with tenant_writer.hold(MONTHLY):
+            monthly.activate({'2030-01.md': entry(jan, 'Synthetic monthly note.', '00000000-0000-4000-8000-000000000099').encode(),
+                              '2029-12.md': b'## Monday, December 31, 2029\n', 'INDEX.md': b'# index'},
+                             {'entry_layout': 'monthly', 'month_file_template': '{year}-{month02}.md', 'index_enabled': False})
+    finally:
+        _close_fixture_resources(monthly.close)
     assert python.get('/api/storage-status', headers=signed(MONTHLY, 'GET', '/api/storage-status')).status_code == 200
 
 
@@ -142,17 +155,22 @@ def start_server():
     server = rust_forward.RustServer(
         lambda p, t, f: rust_forward.server_config(appmod._base_cfg, appmod.get_state(), p, t, f),
         port=free_port(), binary=BIN, restart_delays=())
-    server.start()
-    deadline = time.monotonic() + 15
-    while not server.ready and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert server.ready, 'noevia-diary did not become ready'
-    return server
+    try:
+        server.start()
+        deadline = time.monotonic() + 15
+        while not server.ready and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert server.ready, 'noevia-diary did not become ready'
+        return server
+    except BaseException:
+        _close_fixture_resources(server.stop)
+        raise
 
 
 class Modes:
     def __init__(self, monkeypatch, server):
         self.monkeypatch, self.server = monkeypatch, server
+        self.started = [] if server is None else [server]
 
     def python(self):
         self.monkeypatch.setattr(rust_forward, '_server', None)
@@ -160,22 +178,47 @@ class Modes:
     def rust(self, server=None):
         if server is not None:
             self.server = server
+            if not any(owned is server for owned in self.started):
+                self.started.append(server)
         self.monkeypatch.setattr(rust_forward, '_server', self.server)
+
+
+def _close_fixture_resources(*closers):
+    """Attempt every owned cleanup without hiding an active setup/body exception."""
+    active = sys.exc_info()[1]
+    failures = []
+    for close in closers:
+        try:
+            close()
+        except BaseException as error:
+            failures.append(error)
+    if failures:
+        if active is not None:
+            active.add_note('Synthetic fixture cleanup also failed; original exception preserved.')
+        else:
+            raise failures[0]
 
 
 @pytest.fixture
 def both(world, monkeypatch):
-    saved = install_forwarder()
-    client = TestClient(appmod.app)
+    saved, stack = list(appmod.app.user_middleware), appmod.app.middleware_stack
+    client = None
     modes = Modes(monkeypatch, None)
-    modes.python()
-    seed(world, client)
-    modes.rust(start_server())
-    Recording.served = []
-    yield client, modes
-    modes.server.stop()
-    appmod.app.user_middleware[:] = saved
-    appmod.app.middleware_stack = None
+    try:
+        install_forwarder()
+        client = TestClient(appmod.app)
+        modes.python()
+        seed(world, client)
+        modes.rust(start_server())
+        Recording.served = []
+        yield client, modes
+    finally:
+        try:
+            _close_fixture_resources(*(server.stop for server in modes.started),
+                                     *([client.close] if client is not None else []))
+        finally:
+            appmod.app.user_middleware[:] = saved
+            appmod.app.middleware_stack = stack
 
 
 def wire(resp):
