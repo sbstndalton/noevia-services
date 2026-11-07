@@ -479,3 +479,298 @@ def test_reservations_are_exclusive_owned_bounded_and_never_raise_the_floor(monk
     assert ta._pending_count() == 1
     assert ta._floor == floor and set(ta._lost) == lost
     ta._reset_for_tests()
+
+
+# Deterministic settlement schedules: exercise production forwarding/admission and D5 barriers;
+# the transport controls only where an exchange pauses or fails, never the claim decisions.
+def unit_scope(method='GET', path='/api/months', body=b''):
+    h = signed(DAILY, method, path)
+    if body:
+        from tests.test_rust_forward_d4b import sign
+        h = sign(DAILY, method, path, body, content_type='application/json')
+    scope = {'type': 'http', 'method': method, 'path': path, 'raw_path': path.encode(),
+             'query_string': b'', 'headers': [(k.lower().encode(), v.encode()) for k, v in h.items()],
+             'state': {'rust_verifies': True}}
+    claim = ta.reserve(h[ta.HEADER])
+    assert claim is not None
+    scope['state']['rust_claim'] = claim
+    return scope, claim
+
+
+def unit_forward():
+    from tests.test_diary_verifier_d8 import Spy
+    server = rust_forward.RustServer(lambda p, t, f: {}, restart_delays=())
+    server.ready, server.forward_secret = True, 'synthetic'
+    spy = Spy()
+    return server, spy, rust_forward.ForwardMiddleware(spy, server=server,
+                                                      routes={'/api/months': 'GET'})
+
+
+async def unit_call(mw, scope, body=b''):
+    sent = []
+
+    async def receive():
+        return {'type': 'http.request', 'body': body, 'more_body': False}
+
+    async def send(message):
+        sent.append(message)
+    await mw(scope, receive, send)
+    return sent
+
+
+def test_stale_entry_time_cannot_admit_after_another_reservation_prunes_pending(monkeypatch):
+    ta._reset_for_tests()
+    ts = int(time.time())
+    raw = ta.sign(KEY, DAILY, 'GET', '/', {}, ts, 'a' * 32)
+    claim = ta.reserve(raw, now=ts)
+    assert claim is not None
+    stale_now = ts + ta.SKEW_S - 0.1  # the leaf accepted at this entry time
+    late = ts + ta.SKEW_S + ta.RESTART_SKEW_S + 1
+    monkeypatch.setattr(ta.time, 'time', lambda: late)
+    other = ta.reserve(ta.sign(KEY, DAILY, 'GET', '/', {}, int(late), 'b' * 32))
+    assert other is not None and not ta.holds(claim), 'another admission pruned the unknown claim'
+    floor, lost = ta._floor, set(ta._lost)
+    assert ta._remember_nonce('a' * 32, ts, stale_now) is not None
+    assert 'a' * 32 not in ta._seen.get(ts, ())
+    assert ta._floor == floor and set(ta._lost) == lost, 'expiry refusal must not authenticate a floor'
+    assert ta.holds(other)
+    ta._reset_for_tests()
+
+
+def test_cancellation_during_read_exit_probe_marks_child_lost(monkeypatch):
+    ta._reset_for_tests()
+    server, _, mw = unit_forward()
+    scope, claim = unit_scope()
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def transport(request):
+            raise httpx.ReadError('synthetic lost reply', request=request)
+
+        async def probe(proc):
+            entered.set()
+            await asyncio.Event().wait()
+        monkeypatch.setattr(rust_forward, '_exited', probe)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            mw._client, mw._client_loop = client, asyncio.get_running_loop()
+            task = asyncio.create_task(mw._forward(server, scope, time.monotonic() + 10))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not server.ready, 'loss must be marked even when the exit probe is cancelled'
+            assert ta.holds(claim) and not consumed(dict(scope['headers'])[ta.HEADER.lower().encode()].decode())
+    try:
+        asyncio.run(run())
+    finally:
+        ta._reset_for_tests()
+
+
+def test_delegated_writer_unknown_outcome_does_not_probe_exit(monkeypatch):
+    ta._reset_for_tests()
+    server, _, mw = unit_forward()
+    scope, claim = unit_scope()
+
+    async def run():
+        async def transport(request):
+            raise httpx.ReadError('synthetic lost reply', request=request)
+
+        async def forbidden(proc):
+            pytest.fail('a writer must not await an unused exit probe')
+        monkeypatch.setattr(rust_forward, '_exited', forbidden)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            mw._client, mw._client_loop = client, asyncio.get_running_loop()
+            assert await mw._forward(server, scope, time.monotonic() + 10, writer=True) == 'uncertain'
+            assert not server.ready and ta.holds(claim)
+    try:
+        asyncio.run(run())
+    finally:
+        ta._reset_for_tests()
+
+
+@needs_binary
+def test_connect_error_releases_claim_and_falls_back_exactly_once(monkeypatch):
+    from tests.test_diary_verifier_d8 import stack, run
+    from tests.test_rust_forward import free_port
+    ta._reset_for_tests()
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    app, _, spy = stack(free_port())  # real refused loopback connection, not a transport mock
+    h = signed(DAILY, 'GET', '/api/months')
+    try:
+        assert run(app, h)[0] == 200
+        assert len(spy.calls) == 1 and consumed(h[ta.HEADER]) and pending() == 0
+        assert run(app, h)[0] == 401 and len(spy.calls) == 1
+    finally:
+        ta._reset_for_tests()
+
+
+@pytest.mark.parametrize('outcome', ['cancel', 'reply-loss'])
+def test_delegated_write_unknown_holds_nonce_and_d5_reaping_barrier(monkeypatch, outcome):
+    from agent import tenant_writer
+    from tests.test_tenant_writer_d5 import StubChild, blocked_writer
+    ta._reset_for_tests()
+    monkeypatch.setattr(tenant_writer, '_writers', frozenset({DAILY}))
+    monkeypatch.setattr(rust_forward, 'REAP_WAIT_S', 0.01)
+    server, spy, mw = unit_forward()
+    mw.writers = frozenset({DAILY})
+    uncertain = []
+    mw.on_uncertain = uncertain.append
+    proc = StubChild()
+    server._proc = proc
+    body = b'{"path":"synthetic.md","content":"synthetic","version":null}'
+    scope, claim = unit_scope('PUT', '/api/file', body)
+
+    async def run():
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def transport(request):
+            entered.set()
+            await finish.wait()
+            raise httpx.ReadError('synthetic lost reply', request=request)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            mw._client, mw._client_loop = client, asyncio.get_running_loop()
+            task = asyncio.create_task(unit_call(mw, scope, body))
+            await asyncio.wait_for(entered.wait(), 2)
+            if outcome == 'cancel':
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                finish.set()
+                sent = await task
+                assert sent[0]['status'] == 503 and sent[1]['body'] == rust_forward.UNCERTAIN
+            assert scope['state']['rust_dispatched'] and ta.holds(claim)
+            assert uncertain == [DAILY] and spy.calls == []
+            assert not server.ready and server.reaping == 1
+            assert await asyncio.to_thread(blocked_writer, DAILY, 0.02) == 'restarting'
+            finish.set()  # settle the detached failed exchange; its unknown claim stays held
+            for _ in range(100):
+                if not rust_forward._detached:
+                    break
+                await asyncio.sleep(0.01)
+            assert not rust_forward._detached and ta.holds(claim)
+            proc.exit()
+            for _ in range(200):
+                if not server.reaping:
+                    break
+                await asyncio.sleep(0.01)
+            assert server.reaping == 0 and proc.kills >= 1
+            assert await asyncio.to_thread(blocked_writer, DAILY, 0.02) is None
+    try:
+        asyncio.run(run())
+    finally:
+        proc.exit()
+        server.stop()
+        ta._reset_for_tests()
+
+
+def test_cancel_before_dispatch_releases_only_its_own_claim(monkeypatch):
+    from agent import tenant_writer
+    ta._reset_for_tests()
+    server, spy, mw = unit_forward()
+    mw.writers = frozenset({DAILY})
+    scope, claim = unit_scope('PUT', '/api/file', b'{}')
+    _, other = unit_scope()
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def acquire(*a, **kw):
+            entered.set()
+            await asyncio.Event().wait()
+        monkeypatch.setattr(tenant_writer, 'acquire_async', acquire)
+        task = asyncio.create_task(unit_call(mw, scope, b'{}'))
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not ta.holds(claim) and ta.holds(other)
+        assert not scope['state'].get('rust_dispatched') and spy.calls == [] and server.ready
+    try:
+        asyncio.run(run())
+    finally:
+        ta._reset_for_tests()
+
+
+def test_late_unmarked_reply_releases_only_the_detached_owner():
+    ta._reset_for_tests()
+    server, _, mw = unit_forward()
+    scope, claim = unit_scope()
+    _, other = unit_scope()
+
+    async def run():
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def transport(request):
+            entered.set()
+            await finish.wait()
+            return httpx.Response(401, content=UNVERIFIED)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            mw._client, mw._client_loop = client, asyncio.get_running_loop()
+            task = asyncio.create_task(mw._forward(server, scope, time.monotonic() + 10))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert ta.holds(claim) and ta.holds(other)
+            finish.set()
+            for _ in range(100):
+                if not ta.holds(claim):
+                    break
+                await asyncio.sleep(0.01)
+            assert not ta.holds(claim) and ta.holds(other) and not rust_forward._detached
+            # Even a late duplicate callback cannot clear a replacement owner's claim.
+            raw = dict(scope['headers'])[ta.HEADER.lower().encode()].decode()
+            replacement = ta.reserve(raw)
+            assert replacement is not None
+            rust_forward._settle(claim, [])
+            assert ta.holds(replacement) and ta.holds(other)
+    try:
+        asyncio.run(run())
+    finally:
+        ta._reset_for_tests()
+
+
+@needs_binary
+def test_sibling_loss_during_probe_allows_only_the_same_dead_child_fallback(monkeypatch):
+    from tests.test_diary_verifier_d8 import stack, run
+    from tests.test_tenant_writer_d5 import StubChild
+    ta._reset_for_tests()
+    monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
+    proc = StubChild()
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    app, forward, spy = stack(port)
+    forward.server._proc = proc
+
+    async def transport(request):
+        raise httpx.ReadError('synthetic lost reply', request=request)
+
+    async def sibling_loss(child):
+        assert child is proc and child.poll() is None
+        # A sibling's lost() raises the real shared barrier during B's probe.
+        forward.server.lost()
+        assert forward.server.reaping == 1
+        proc.exit()
+        return await original(child)
+    original = rust_forward._exited
+    monkeypatch.setattr(rust_forward, '_exited', sibling_loss)
+    h = signed(DAILY, 'GET', '/api/months')
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            forward._client, forward._client_loop = client, asyncio.get_running_loop()
+            scope = {'type': 'http', 'method': 'GET', 'path': '/api/months', 'raw_path': b'/api/months',
+                     'query_string': b'', 'headers': [(k.lower().encode(), v.encode()) for k, v in h.items()], 'state': {}}
+            return await unit_call(app, scope)
+    try:
+        sent = asyncio.run(go())
+        assert sent[0]['status'] == 200 and len(spy.calls) == 1
+        assert consumed(h[ta.HEADER]) and pending() == 0
+        assert run(app, h)[0] == 401 and len(spy.calls) == 1
+    finally:
+        proc.exit()
+        forward.server.stop()
+        ta._reset_for_tests()

@@ -166,6 +166,11 @@ def _remember_nonce(nonce: str, ts: int, now: float, owner: "Optional[Claim]" = 
     ("replayed") unless `owner` is that very reservation: the same logical request, served here
     after its forward ended without an answer (the accepted lost-child fallback)."""
     with _seen_lock:
+        # A leaf may have accepted at entry time, then stalled while another admission pruned
+        # an unknown native outcome. Recheck freshness at this lock's linearization point;
+        # an expired unverified reservation must neither admit a replay nor raise the floor.
+        if time.time() - ts > SKEW_S:
+            return "expired before admission"
         _prune_pending_locked(now)
         key = (ts, nonce)
         held = _pending.get(key)

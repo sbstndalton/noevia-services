@@ -28,7 +28,7 @@ import agent.app as appmod
 from agent import rust_forward
 from agent import tenant_assertion as ta
 from tests.tenant_binary import needs_binary
-from tests.test_rust_forward import (DAILY, KEY, OTHER, TOKEN, both, needs_server, signed, world)  # noqa: F401
+from tests.test_rust_forward import (DAILY, KEY, OTHER, TOKEN, Recording, both, needs_server, signed, world)  # noqa: F401
 from tests.test_rust_forward_d5 import _writer_registry, writers  # noqa: F401
 from tests.test_rust_forward_d4b import sign
 
@@ -180,13 +180,30 @@ def test_decline_without_verified_header_is_verified_here(keyed, leaf_calls):
 
 
 @needs_binary
-def test_no_answer_is_verified_here(keyed, leaf_calls):
+def test_out_of_window_no_answer_never_enters_the_exchange(keyed, leaf_calls):
     child = Child(None)  # closes without replying
     try:
         app, _, spy = stack(child.port)
         expired = signed(DAILY, 'GET', '/api/months', ts=int(time.time()) - 3600)
         assert run(app, expired)[0::2] == (401, UNVERIFIED)
         assert spy.calls == [] and len(leaf_calls) == 1
+        assert child.requests == []
+        assert ta._pending_count() == 0
+    finally:
+        child.close()
+
+
+@needs_binary
+def test_valid_no_answer_is_unconfirmed_without_a_second_serve(keyed, leaf_calls):
+    child = Child(None)
+    try:
+        app, _, spy = stack(child.port)
+        h = signed(DAILY, "GET", "/api/months")
+        status, headers, body = run(app, h)
+        assert (status, body) == (503, rust_forward.UNCONFIRMED)
+        assert headers[b"retry-after"] == b"1"
+        assert len(child.requests) == 1 and leaf_calls == [] and spy.calls == []
+        assert ta._pending_count() == 1 and not consumed(h[ta.HEADER])
     finally:
         child.close()
 
@@ -221,6 +238,14 @@ def test_not_delegated_when_no_forwarder_route_or_unready(keyed):
         assert not forward.delegates(scope(extra=[(b'content-length', b'3')])), \
             'a read with a body is served (and verified) by Python'
         assert not forward.delegates({**scope(), 'headers': []}), 'no assertion: verified (refused) here'
+        for raw in (signed(DAILY, 'GET', '/api/months', ts=int(time.time()) - 3600)[ta.HEADER],
+                    signed(DAILY, 'GET', '/api/months', ts=int(time.time()) + 65)[ta.HEADER],
+                    signed(DAILY, 'GET', '/api/months', ts=int(time.time()) - 65)[ta.HEADER],
+                    'v2.1.zz.x'):
+            refused = scope()
+            refused['headers'] = [(b'x-cowork-tenant-assertion', raw.encode())]
+            assert not forward.delegates(refused)
+            assert 'rust_claim' not in refused['state']
         forward.server.ready = False
         assert not forward.delegates(scope())
     finally:
@@ -235,7 +260,7 @@ def months(client, headers):
 
 @needs_binary
 @needs_server
-def test_differential_read_refusals_and_acceptance(both, leaf_calls):
+def test_differential_read_refusals_and_acceptance(both, leaf_calls, monkeypatch):
     client, modes = both
     now = int(time.time())
 
@@ -253,33 +278,53 @@ def test_differential_read_refusals_and_acceptance(both, leaf_calls):
         return signed(DAILY, 'GET', '/api/months', query=b'x=1')
 
     cases = [
-        ('valid', lambda: signed(DAILY, 'GET', '/api/months'), 200),
-        ('expired', lambda: signed(DAILY, 'GET', '/api/months', ts=now - 3600), 401),
-        ('wrong tenant', wrong_tenant, 401),
-        ('missing header', missing, 401),
-        ('malformed header', lambda: {**signed(DAILY, 'GET', '/api/months'), ta.HEADER: 'v2.1.zz.x'}, 401),
-        ('query not signed', tampered_query, 401),
-        ('future skew inside window', lambda: signed(DAILY, 'GET', '/api/months', ts=int(time.time()) + 55), 200),
-        ('future skew outside window', lambda: signed(DAILY, 'GET', '/api/months', ts=int(time.time()) + 65), 401),
-        ('past skew outside window', lambda: signed(DAILY, 'GET', '/api/months', ts=int(time.time()) - 65), 401),
+        ('valid', lambda: signed(DAILY, 'GET', '/api/months'), 200, True),
+        ('expired', lambda: signed(DAILY, 'GET', '/api/months', ts=now - 3600), 401, False),
+        ('wrong tenant', wrong_tenant, 401, True),
+        ('missing header', missing, 401, False),
+        ('malformed header', lambda: {**signed(DAILY, 'GET', '/api/months'), ta.HEADER: 'v2.1.zz.x'}, 401, False),
+        ('query not signed', tampered_query, 401, True),
+        ('future skew inside window', lambda: signed(DAILY, 'GET', '/api/months', ts=int(time.time()) + 55), 200, True),
+        ('future skew outside window', lambda: signed(DAILY, 'GET', '/api/months', ts=int(time.time()) + 65), 401, False),
+        ('past skew outside window', lambda: signed(DAILY, 'GET', '/api/months', ts=int(time.time()) - 65), 401, False),
     ]
     modes.python()
     months(client, signed(DAILY, 'GET', '/api/months'))  # Python recovers the tenant
     rows = []
-    for name, make, status in cases:
+    settled = []
+    real_settle = rust_forward._settle
+
+    def recording_settle(claim, raw):
+        marker = real_settle(claim, raw)
+        settled.append(marker)
+        return marker
+    monkeypatch.setattr(rust_forward, '_settle', recording_settle)
+    for name, make, status, delegated in cases:
         modes.python()
         leaf_calls.clear()
         p = months(client, make())
         python_checks = len(leaf_calls)
         modes.rust()
         leaf_calls.clear()
-        r = months(client, make())
+        Recording.served = []
+        settled.clear()
+        h = make()
+        r = months(client, h)
         rows.append((name, p.status_code, r.status_code, python_checks, len(leaf_calls)))
         assert wire(p) == wire(r), name
         assert p.status_code == status, name
         assert b'x-noevia-diary' not in b''.join(k for k, _ in r.headers.raw), name
-        # Rust verified it: Python never ran its signature check on the forwarded request.
-        assert len(leaf_calls) == 0, (name, rows[-1])
+        # Delegated rows: Rust verified, so the Python wrapper never invoked the native leaf.
+        # Non-delegated rows: exactly the Python-only path, with no native server exchange.
+        if delegated:
+            assert leaf_calls == [] and Recording.served == [True], (name, rows[-1])
+            assert settled == [status == 200], name
+            assert consumed(h[ta.HEADER]) == (status == 200), name
+        else:
+            assert len(leaf_calls) == python_checks, (name, rows[-1])
+            assert Recording.served == [] and settled == [], name
+            assert not ta._ASSERTION_RE.fullmatch(h.get(ta.HEADER, '')) or not consumed(h[ta.HEADER]), name
+        assert ta._pending_count() == 0, name
     print('\n'.join(f'{n:30} python={a} rust={b} python_checks={c}/{d}' for n, a, b, c, d in rows))
 
 

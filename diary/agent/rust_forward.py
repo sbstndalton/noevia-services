@@ -743,17 +743,22 @@ class ForwardMiddleware:
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
             not_sent = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
             exited = False
-            if delegated:
-                if not_sent:
-                    # Definitely never reached the child: nothing was accepted.
-                    tenant_assertion.release(claim)
+            try:
+                if delegated:
+                    if not_sent:
+                        # Definitely never reached the child: nothing was accepted.
+                        tenant_assertion.release(claim)
+                    else:
+                        # Unknown: keep the reservation; a late authoritative answer still settles it.
+                        _detach(task, claim)
+                        if not writer:
+                            exited = await _exited(proc)
                 else:
-                    # Unknown: keep the reservation; a late authoritative answer still settles it.
-                    _detach(task, claim)
-                    exited = await _exited(proc)
-            else:
-                task.cancel()
-            server.lost()
+                    task.cancel()
+            finally:
+                # Cancellation inside the read's exit probe still retires this child. Writes
+                # skip that probe and raise the D5 barrier without awaiting an unused verdict.
+                server.lost()
             if writer and not not_sent:
                 # The request may have reached the child, which may have committed it.
                 return "uncertain"
