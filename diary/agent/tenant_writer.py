@@ -486,7 +486,7 @@ def ensure_schema(conn: sqlite3.Connection, path, script: str, existed: bool) ->
             conn.commit()
         return
     if not existed and uid is not None:
-        with exempt(uid, "creating a database file this process just created"):
+        with exempt(uid, "creating a database file this process just created"), index_publication(path):
             conn.executescript(script)
             conn.commit()
         return

@@ -231,7 +231,7 @@ class EmbeddingMigration:
                 if done:
                     # D5: a writer tenant's index is written only under its writer lock (WriterBusy:
                     # this file counts as failed and is retried by the next pass).
-                    with tenant_writer.hold(tenant_writer.tenant_of(path)):
+                    with tenant_writer.hold(tenant_writer.tenant_of(path)), tenant_writer.index_publication(path):
                         conn.execute("BEGIN IMMEDIATE")
                         try:
                             # The embedding took a while: check again, now that nothing else can write.
@@ -373,12 +373,15 @@ class EmbeddingMigration:
             if conn is None:
                 continue
             try:
-                with tenant_writer.hold(tenant_writer.tenant_of(f)):
+                with tenant_writer.hold(tenant_writer.tenant_of(f)), tenant_writer.index_publication(f):
                     conn.execute("BEGIN IMMEDIATE")
-                    slots.drop_slot(conn, target)
-                    conn.commit()
+                    try:
+                        slots.drop_slot(conn, target)
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
             except (sqlite3.Error, tenant_writer.WriterBusy) as exc:
-                conn.rollback()
                 log.warning("could not drop %s from an index file (%s)", target.model, type(exc).__name__)
             finally:
                 conn.close()
