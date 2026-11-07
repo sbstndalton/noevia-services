@@ -363,6 +363,14 @@ class TenantAssertionMiddleware:
             headers = Headers(scope=scope)
             if headers.get("x-cowork-user-id", ""):
                 key = tenant_assertion.tenant_key()
+                forwarder = self.app if isinstance(self.app, rust_forward.ForwardMiddleware) else None
+                if key and forwarder is not None and forwarder.delegates(scope):
+                    # D8: the forwarder sends this request to the Rust process, which verifies it
+                    # (its only verifier); anything it does not verify is verified by the forwarder
+                    # before this process serves it (rust_forward module doc).
+                    scope.setdefault("state", {})["rust_verifies"] = True
+                    await self.app(scope, receive, send)
+                    return
                 if key:
                     if tenant_assertion.body_is_hashed(headers.get("content-type", "")):
                         chunks, size, more = [], 0, True
@@ -815,8 +823,9 @@ _RUST_ROUTES = rust_forward.configured_routes()
 _RUST_WRITERS = rust_forward.configured_writers()
 tenant_writer.configure(_RUST_WRITERS)
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
-# D4: the forwarder sits INSIDE the assertion middleware (added first = innermost), so the one
-# verifier and nonce cache here check every request before anything is forwarded.
+# D4: the forwarder sits INSIDE the assertion middleware (added first = innermost). D8: a request
+# it will forward to the ready Rust process is verified there instead (rust_forward.delegates); the
+# middleware verifies every other one, and the forwarder verifies any it ends up serving here.
 if _RUST_ROUTES or _RUST_WRITERS:
     app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
                        is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
