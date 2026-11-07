@@ -18,7 +18,8 @@ def pending(root):
         return False
     try:
         from . import tenant_writer
-        with tenant_writer.connect(path.as_uri() + '?mode=ro', uri=True, timeout=1) as db:
+        from contextlib import closing
+        with closing(tenant_writer.connect(path.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
             if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
                 return False  # construction has not exposed a managed tenant to the native path
             return bool(db.execute("SELECT 1 FROM meta WHERE key='backup_effect_pending'").fetchone())

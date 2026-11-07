@@ -79,10 +79,10 @@ def lab(tmp_path, monkeypatch):
                         assert state['release'].wait(25)
                         self.wfile.write(body[1:])
                     elif mode == 'trickle':
-                        for start in (0, 3, 6, 9):
+                        for start in (0, 4, 8, 12):
                             if start:
                                 time.sleep(6)
-                            self.wfile.write(body[start:start + 3])
+                            self.wfile.write(body[start:start + 4])
                             self.wfile.flush()
                         state['objects'][self.path] = body
                     else:
@@ -112,7 +112,7 @@ def lab(tmp_path, monkeypatch):
                 state['entered'].set()
                 assert state['release'].wait(25)
             state['objects'][self.path] = body
-            self.answer(201)
+            self.answer(state.get('put_status', 201))
 
     dav = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=dav.serve_forever, daemon=True)
@@ -156,6 +156,7 @@ def lab(tmp_path, monkeypatch):
             return exc.status_code, {'detail': exc.detail}
 
     state['proc'] = proc
+    state['cfg'] = cfg
     state['data_root'] = tmp_path
     yield backend, state, storage, call, base
     state['release'].set()
@@ -398,3 +399,42 @@ def test_read_timeout_is_inactivity_not_total_response_time(lab, phase):
         from agent.backup_effect import pending
         assert not pending(backend.root)  # no mutation was dispatched by a stalled GET
     state['release'].set()
+
+
+@pytest.mark.parametrize('reply', ['disconnect', 202, 500])
+def test_nonterminal_mutation_reply_never_retires_intent(lab, reply):
+    _, state, _, call, _ = lab
+    if reply == 'disconnect':
+        state['drop_reply'] = True
+        state['release'].set()
+    else:
+        state['put_status'] = reply
+    assert call(True)[0] == 503
+    assert_durable_fence(lab)
+    state['proc'].kill()
+    state['proc'].wait(timeout=5)
+    assert_durable_fence(lab)
+    restart_native(lab)
+
+
+
+def restart_native(lab):
+    _, state, _, call, base = lab
+    proc = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc.stdin.write(json.dumps(state['cfg']).encode() + b'\n')
+    proc.stdin.flush()
+    state['proc'] = proc
+    for _ in range(200):
+        try:
+            if httpx.get(base + '/internal/ready', headers={'x-noevia-diary-control': 'ctl'}, timeout=1).status_code == 200:
+                break
+        except httpx.TransportError:
+            pass
+        time.sleep(.02)
+    else:
+        raise AssertionError('restarted native server unavailable')
+    assert call(True)[0] == 503
+    reply = httpx.put(base + '/api/file', headers={'x-noevia-diary-forward': 'forward',
+                     'x-noevia-diary-writer': '1', 'x-cowork-user-id': UID}, json={'path': 'later.md', 'content': 'synthetic', 'version': None})
+    assert reply.status_code == 503
+    assert httpx.post(base + '/internal/fence?tenant=' + UID, headers={'x-noevia-diary-control': 'ctl'}).status_code == 503
