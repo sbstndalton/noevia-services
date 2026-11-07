@@ -157,56 +157,144 @@ def _drop_second(second: int, now: float) -> None:
         _floor = max(_floor, second)
 
 
-def _remember_nonce(nonce: str, ts: int, now: float) -> Optional[str]:
+def _remember_nonce(nonce: str, ts: int, now: float, owner: "Optional[Claim]" = None) -> Optional[str]:
     """None the first time (nonce, ts) is seen inside the window, else a reason. Never refuses
     a fresh request for capacity: when full it drops the bucket farthest from `now` (never the one
-    just written), so a future-dated flood evicts itself rather than live traffic."""
+    just written), so a future-dated flood evicts itself rather than live traffic.
+
+    D8: a nonce reserved for a request delegated to the Rust process (`reserve`) is refused here
+    ("replayed") unless `owner` is that very reservation: the same logical request, served here
+    after its forward ended without an answer (the accepted lost-child fallback)."""
+    with _seen_lock:
+        _prune_pending_locked(now)
+        key = (ts, nonce)
+        held = _pending.get(key)
+        if held is not None:
+            if held is not owner:
+                return "replayed"
+            del _pending[key]
+        return _insert_locked(nonce, ts, now)
+
+
+def _insert_locked(nonce: str, ts: int, now: float) -> Optional[str]:
     global _count
-    with _seen_lock:
-        # Seconds that can no longer pass |now - ts| <= SKEW_S are dead; dropping them raises the
-        # floor too, so a backwards clock step cannot revive their nonces.
-        while _seconds and _seconds[0] < now - SKEW_S:
-            _drop_second(_seconds[0], now)
-        for second in [x for x in _lost if x < now - SKEW_S]:
-            _lost.discard(second)
-        if ts <= _floor or ts in _lost:
-            return "replayed or older than the replay cache"
-        bucket = _seen.get(ts)
-        if bucket is None:
-            bucket = _seen[ts] = set()
-            bisect.insort(_seconds, ts)
-        elif nonce in bucket:
-            return "replayed"
-        bucket.add(nonce)
-        _count += 1
-        # The farthest second is always the oldest or the newest. The bucket just written is kept:
-        # the signed ts has one-second resolution, so dropping it would refuse the rest of that
-        # second's fresh requests. The cache is therefore bounded by _nonce_cap plus one second.
-        while _count > _nonce_cap and len(_seconds) > 1:
-            ends = [x for x in (_seconds[0], _seconds[-1]) if x != ts]
-            _drop_second(max(ends, key=lambda x: abs(x - now)), now)
+    # Seconds that can no longer pass |now - ts| <= SKEW_S are dead; dropping them raises the
+    # floor too, so a backwards clock step cannot revive their nonces.
+    while _seconds and _seconds[0] < now - SKEW_S:
+        _drop_second(_seconds[0], now)
+    for second in [x for x in _lost if x < now - SKEW_S]:
+        _lost.discard(second)
+    if ts <= _floor or ts in _lost:
+        return "replayed or older than the replay cache"
+    bucket = _seen.get(ts)
+    if bucket is None:
+        bucket = _seen[ts] = set()
+        bisect.insort(_seconds, ts)
+    elif nonce in bucket:
+        return "replayed"
+    bucket.add(nonce)
+    _count += 1
+    # The farthest second is always the oldest or the newest. The bucket just written is kept:
+    # the signed ts has one-second resolution, so dropping it would refuse the rest of that
+    # second's fresh requests. The cache is therefore bounded by _nonce_cap plus one second.
+    while _count > _nonce_cap and len(_seconds) > 1:
+        ends = [x for x in (_seconds[0], _seconds[-1]) if x != ts]
+        _drop_second(max(ends, key=lambda x: abs(x - now)), now)
+    return None
+
+
+# ---- D8: one nonce owner across both processes -------------------------------------------------
+#
+# This cache is the single admission authority for a nonce, whichever process verifies its
+# signature. A request delegated to the Rust process first RESERVES its (ts, nonce) here, atomically
+# with every other admission (`_seen_lock`): while the reservation is held, every other request with
+# that nonce is refused by `_remember_nonce` and cannot be reserved again, whatever path it takes
+# (another delegated copy, or a Python-served copy with any body framing). A reservation is not a
+# validation: it never enters `_seen`, never raises the floor or `_lost`, and is bounded on its own
+# (`_pending_cap`). It ends in exactly one of three ways:
+#   commit  - the Rust process answered that it verified and accepted the assertion: the nonce is
+#             inserted into `_seen` like one this process validated;
+#   release - the request was definitely NOT accepted: never dispatched (connection refused, no
+#             forward, a refusal before sending) or the child answered without the verified marker;
+#   expiry  - outcome unknown after dispatch (transport error, timeout, cancellation, lost reply):
+#             the reservation is kept until the nonce's validity horizon (ts + SKEW_S +
+#             RESTART_SKEW_S), after which no verifier can accept it any more. It is never released
+#             early, so no second request with that nonce is admitted meanwhile.
+# Commit and release act only on the caller's own reservation (identity), so a late callback can
+# never clear another request's claim or a committed nonce.
+
+_pending_cap = 4096
+
+
+class Claim:
+    """One request's reservation of its nonce (identity is the owner token)."""
+    __slots__ = ("key",)
+
+    def __init__(self, key):
+        self.key = key
+
+
+_pending: Dict[tuple, "Claim"] = {}
+
+
+def _prune_pending_locked(now: float) -> None:
+    horizon = now - SKEW_S - RESTART_SKEW_S
+    for key in [k for k in _pending if k[0] < horizon]:
+        del _pending[key]
+
+
+def reserve(raw: str, now: Optional[float] = None) -> Optional[Claim]:
+    """Reserve the nonce of assertion `raw` for a request about to be delegated, or None when it must
+    not be delegated (then this process verifies it, and refuses a replay): malformed, outside the
+    clock window, already accepted or below the floor, already reserved, or the reservation table is
+    full (backpressure: the request is verified here instead)."""
+    match = _ASSERTION_RE.fullmatch(raw or "")
+    if not match:
         return None
-
-
-def already_seen(raw: str, now: Optional[float] = None) -> bool:
-    """D8 forwarder: would this cache refuse the assertion `raw` as a replay right now? Read-only
-    (True also for a ts at or below the floor). A malformed header is not "seen"."""
-    match = _ASSERTION_RE.fullmatch(raw or "")
-    if not match:
-        return False
     ts, nonce = int(match.group(1)), match.group(2)
+    now = time.time() if now is None else now
+    if abs(now - ts) > SKEW_S:
+        return None
     with _seen_lock:
-        return ts <= _floor or ts in _lost or nonce in _seen.get(ts, ())
+        _prune_pending_locked(now)
+        key = (ts, nonce)
+        if key in _pending or ts <= _floor or ts in _lost or nonce in _seen.get(ts, ()):
+            return None
+        if len(_pending) >= _pending_cap:
+            return None
+        claim = _pending[key] = Claim(key)
+        return claim
 
 
-def record_verified(raw: str, now: Optional[float] = None) -> Optional[str]:
-    """D8 forwarder: the Rust process verified and accepted `raw`; consume its nonce here too, so this
-    process refuses a replay of it even while the Rust process is down. None when recorded, else the
-    replay reason (another request with the same nonce got here first)."""
-    match = _ASSERTION_RE.fullmatch(raw or "")
-    if not match:
-        return "missing or malformed assertion"
-    return _remember_nonce(match.group(2), int(match.group(1)), time.time() if now is None else now)
+def commit(claim: Optional[Claim], now: Optional[float] = None) -> None:
+    """The Rust process accepted the claimed assertion: the nonce is consumed here."""
+    if claim is None:
+        return
+    now = time.time() if now is None else now
+    with _seen_lock:
+        if _pending.get(claim.key) is claim:
+            del _pending[claim.key]
+            ts, nonce = claim.key
+            _insert_locked(nonce, ts, now)
+
+
+def release(claim: Optional[Claim]) -> None:
+    """The claimed request was definitely not accepted by the Rust process: drop the reservation."""
+    if claim is None:
+        return
+    with _seen_lock:
+        if _pending.get(claim.key) is claim:
+            del _pending[claim.key]
+
+
+def holds(claim: Optional[Claim]) -> bool:
+    with _seen_lock:
+        return claim is not None and _pending.get(claim.key) is claim
+
+
+def _pending_count() -> int:
+    with _seen_lock:
+        return len(_pending)
 
 
 def _nonce_count() -> int:
@@ -376,7 +464,7 @@ def _check(key: str, headers: Mapping[str, str], method: str, path: str, now: fl
 
 
 def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Optional[float] = None,
-           query: bytes = b"", body_hash: Optional[str] = None) -> Optional[str]:
+           query: bytes = b"", body_hash: Optional[str] = None, owner: Optional[Claim] = None) -> Optional[str]:
     """None when the request carries a valid assertion for its X-Cowork-User-ID, else a reason.
 
     `path` is the encoded wire path, `query` the raw query string, `body_hash`
@@ -389,7 +477,7 @@ def verify(key: str, headers: Mapping[str, str], method: str, path: str, now: Op
     if reason:
         return reason
     match = _ASSERTION_RE.fullmatch(headers.get(HEADER, "") or "")
-    return _remember_nonce(match.group(2), int(match.group(1)), now)
+    return _remember_nonce(match.group(2), int(match.group(1)), now, owner)
 
 
 def wire_path(scope) -> str:
@@ -427,6 +515,7 @@ def _reset_for_tests(started_at: Optional[float] = None) -> None:
         _lost.clear()
         _started_at = started_at
         _seen.clear()
+        _pending.clear()
         _seconds.clear()
         _count = 0
         _floor = -1

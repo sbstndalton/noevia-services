@@ -20,14 +20,25 @@ DECLINES it (421 + ``x-noevia-diary-decline: 1``) for anything it does not repro
 storage, a tenant this process has not recovered yet, pending journal / dirty / outbox work, an
 enabled INDEX.md, tenant detail in /api/health ...).
 
-Every reply to a request the Rust side verified carries ``x-noevia-diary-verified: 1``: its nonce is
-then also recorded in this process's cache (tenant_assertion.record_verified), and a declined one is
-served here as asserted, without verifying it again. A delegated request the Rust side declined
-WITHOUT that header, or never answered, is verified HERE before it is served (fail closed: nothing
-is ever served unverified). A nonce this cache already holds is never delegated, so a nonce is
-accepted at most once across both caches: Rust refuses its own replays, this process refuses the
-ones it recorded, and a restarted child refuses anything signed before it started (the same
-restart guard as here).
+ONE nonce owner. This process's replay cache is the single admission authority for every nonce,
+whichever process checks the signature (tenant_assertion "one nonce owner"). A request is delegated
+only after its nonce is RESERVED there, atomically with every other admission; until that
+reservation ends, every other request with the same nonce is refused, on either path and with any
+body framing. The reservation is settled from what is known about the forward:
+- the reply carries ``x-noevia-diary-verified: 1`` (the Rust side verified and accepted it): COMMIT,
+  and a declined one is served here as asserted, without a second signature check;
+- definitely not accepted (never dispatched: no forward, connection refused; or the child answered
+  without the marker): RELEASE, and a request still to be served here is verified here first;
+- unknown after dispatch (transport error, timeout, the caller cancelling, a lost reply): HELD until
+  the nonce's validity horizon, never released early. The exchange keeps running on its own (a
+  detached owner) and commits or releases if an authoritative reply still arrives. A read whose
+  forward ended this way answers 503 (UNCONFIRMED) while the child process had not exited; only when
+  it HAD exited (the accepted lost-child-before-reply case) is the SAME request served here once,
+  verified here with its own reservation as owner; no other request with that nonce is admitted
+  either way. A write answers 503 UNCERTAIN as before. The child is marked lost in every case.
+Exactly one signature check per accepted request (the lost-child fallback excepted). The Rust
+side's own cache stays as a second guard, and a restarted child refuses anything signed before it
+started.
 
 Only requests that declare no body are forwarded (the native routes are GETs that ignore one); a
 request with a body is never read here and goes to the app untouched, so its timing is exactly
@@ -91,6 +102,11 @@ TOO_LARGE = b'{"detail":"request body too large"}'
 RESTARTING = b'{"detail":"Diary saving is restarting. Try again in a moment."}'
 BUSY = b'{"detail":"Diary is saving another change. Try again in a moment."}'
 BODY_TIMEOUT = b'{"detail":"The request body did not arrive in time."}'
+# D8: a delegated read whose forward ended without an answer while the child had not exited: it may
+# have been accepted there, so it is neither served nor verified again here.
+UNCONFIRMED = b'{"detail":"The Diary did not answer in time. Try again in a moment."}'
+# How long a failed forward waits to see whether the child process has exited (the lost-child case).
+EXIT_PROBE_S = 0.2
 REAP_WAIT_S = 10.0
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 DECLINE_HEADER = b"x-noevia-diary-decline"
@@ -388,8 +404,9 @@ class ForwardMiddleware:
 
     def delegates(self, scope) -> bool:
         """True when this request will be forwarded to a ready Rust process now, so its assertion is
-        the Rust side's to verify (TenantAssertionMiddleware skips it). A request whose nonce this
-        process has already accepted is never delegated: it is verified (and refused) here."""
+        the Rust side's to verify (TenantAssertionMiddleware skips it). Call once per request: it
+        reserves the nonce (tenant_assertion.reserve, kept in scope state) and is False when it
+        cannot, so a nonce this process holds, accepted or reserved, is verified (and refused) here."""
         server = self.server or current()
         if scope.get("type") != "http" or server is None or not server.ready or not server.forward_secret:
             return False
@@ -399,12 +416,16 @@ class ForwardMiddleware:
                 return False
         elif not self._wants(scope, server) or self._declares_body(scope):
             return False
-        raw = ""
-        for name, value in scope.get("headers") or []:
-            if name == tenant_assertion.HEADER.lower().encode():
-                raw = value.decode("latin-1")
-                break
-        return not tenant_assertion.already_seen(raw)
+        # The single admission decision: reserve the nonce now (refused or full: verified here).
+        claim = tenant_assertion.reserve(self._assertion(scope))
+        if claim is None:
+            return False
+        scope.setdefault("state", {})["rust_claim"] = claim
+        return True
+
+    @staticmethod
+    def _claim(scope):
+        return (scope.get("state") or {}).get("rust_claim")
 
     @staticmethod
     def _delegated(scope) -> bool:
@@ -415,7 +436,7 @@ class ForwardMiddleware:
         verified here first, exactly as TenantAssertionMiddleware would have (fail closed)."""
         state = scope.setdefault("state", {})
         if self._delegated(scope) and not state.get("tenant_asserted"):
-            reason = await self._verify_here(scope, body)
+            reason = await self._verify_here(scope, body, self._claim(scope))
             if reason:
                 if reason != tenant_assertion.BUSY_REFUSAL:
                     log.warning("tenant assertion rejected: %s", reason)
@@ -425,7 +446,7 @@ class ForwardMiddleware:
         await self.app(scope, receive, send)
 
     @staticmethod
-    async def _verify_here(scope, body: bytes) -> Optional[str]:
+    async def _verify_here(scope, body: bytes, owner=None) -> Optional[str]:
         from starlette.concurrency import run_in_threadpool
         from starlette.datastructures import Headers
         headers = Headers(scope=scope)
@@ -436,16 +457,13 @@ class ForwardMiddleware:
                      else tenant_assertion.STREAM)
         return await run_in_threadpool(tenant_assertion.verify, key, headers, scope.get("method", "GET"),
                                        tenant_assertion.wire_path(scope), query=scope.get("query_string", b""),
-                                       body_hash=body_hash)
+                                       body_hash=body_hash, owner=owner)
 
     async def _after_decline(self, scope, receive, send, body: bytes = b""):
         """A forward that came back without a served reply (declined, or no answer)."""
         state = scope.setdefault("state", {})
         if state.pop("rust_verified", False):
-            # The Rust side verified and recorded this assertion; mark it consumed here too.
-            if tenant_assertion.record_verified(self._assertion(scope)):
-                await self._reply(send, 401, UNVERIFIED)
-                return
+            # The Rust side verified and accepted this assertion (its reservation is committed).
             state["tenant_asserted"] = True
         await self._serve_here(scope, receive, send, body)
 
@@ -495,6 +513,18 @@ class ForwardMiddleware:
         return user if self.writers == ALL_TENANTS or user in self.writers else ""
 
     async def __call__(self, scope, receive, send):
+        try:
+            await self._call(scope, receive, send)
+        finally:
+            # A reservation never dispatched to the child (a refusal before sending, a request that
+            # was not forwarded after all, a request verified here) is released: it consumed
+            # nothing. A dispatched one is settled by its forward (commit / release / hold).
+            state = scope.get("state") or {}
+            claim = state.get("rust_claim")
+            if claim is not None and not state.get("rust_dispatched"):
+                tenant_assertion.release(claim)
+
+    async def _call(self, scope, receive, send):
         server = self.server or current()
         writer = self._writer_tenant(scope)
         if writer:
@@ -506,10 +536,12 @@ class ForwardMiddleware:
             return
         deadline = time.monotonic() + FORWARD_DEADLINE_S
         reply = await self._forward(server, scope, deadline)
+        if reply == "unconfirmed":
+            await self._reply(send, 503, UNCONFIRMED, [(b"retry-after", b"1")])
+            return
         if reply is None:
             await self._after_decline(scope, receive, send)
             return
-        self._record_served(scope)
         status, headers, body = reply
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
@@ -630,15 +662,9 @@ class ForwardMiddleware:
         if outcome is None:
             await self._after_decline(scope, replay, send, body)
             return
-        self._record_served(scope)
         status, headers, content = outcome
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
-
-    def _record_served(self, scope) -> None:
-        """A reply the Rust side served: if it verified the assertion, its nonce is consumed here too."""
-        if (scope.get("state") or {}).pop("rust_verified", False):
-            tenant_assertion.record_verified(self._assertion(scope))
 
     def _uncertain(self, server, user) -> None:
         try:
@@ -666,7 +692,11 @@ class ForwardMiddleware:
             return None
         state = scope.setdefault("state", {})
         state.pop("rust_verified", None)
+        claim = self._claim(scope)
         delegated = self._delegated(scope) and not state.get("tenant_asserted")
+        if delegated and not tenant_assertion.holds(claim):
+            # Not this request's nonce to send for verification (never reserved, or settled).
+            return None
         asserted = bool(state.get("tenant_asserted"))
         user = self._user(scope)
         recovered = bool(user) and self.is_recovered(user.lower())
@@ -688,21 +718,53 @@ class ForwardMiddleware:
                                                                        content=body))
             return resp, await resp.aread()
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Never dispatched: the claim (if any) is released by __call__. A write keeps D5's
+            # conservative answer (UNCERTAIN), exactly as before.
+            log.warning("Rust Diary server did not answer (TimeoutError); falling back to Python")
+            server.lost()
+            return "uncertain" if writer else None
+        proc = getattr(server, "_proc", None)
+        if delegated:
+            state["rust_dispatched"] = True
+        task = asyncio.ensure_future(exchange())
         try:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("forward deadline passed before the call")
-            resp, content = await asyncio.wait_for(exchange(), remaining)
+            resp, content = await asyncio.wait_for(asyncio.shield(task), remaining)
+        except asyncio.CancelledError:
+            # The caller went away: the exchange keeps running on its own and settles the claim from
+            # its outcome; until then (and if it never answers) the nonce stays reserved.
+            if delegated:
+                _detach(task, claim)
+            else:
+                task.cancel()
+            raise
         except Exception as exc:  # noqa: BLE001 - lost or stuck process: Python serves from here on
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
+            not_sent = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+            exited = False
+            if delegated:
+                if not_sent:
+                    # Definitely never reached the child: nothing was accepted.
+                    tenant_assertion.release(claim)
+                else:
+                    # Unknown: keep the reservation; a late authoritative answer still settles it.
+                    _detach(task, claim)
+                    exited = await _exited(proc)
+            else:
+                task.cancel()
             server.lost()
-            if writer and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            if writer and not not_sent:
                 # The request may have reached the child, which may have committed it.
                 return "uncertain"
+            if delegated and not not_sent and not exited:
+                # The child may have accepted (and served) it: never served a second time here.
+                return "unconfirmed"
             return None
         raw = resp.headers.raw
-        if delegated and any(k.lower() == VERIFIED_HEADER and v == b"1" for k, v in raw):
-            state["rust_verified"] = True
+        if delegated:
+            if _settle(claim, raw):
+                state["rust_verified"] = True
         if any(k.lower() == DECLINE_HEADER for k, _ in raw):
             return None
         kept = [(k.lower(), v) for k, v in raw
@@ -711,6 +773,50 @@ class ForwardMiddleware:
         order = {b"content-length": 1, b"content-type": 2}
         kept.sort(key=lambda kv: order.get(kv[0], 0))
         return resp.status_code, kept, content
+
+
+async def _exited(proc) -> bool:
+    """Has the child process exited (checked for at most EXIT_PROBE_S)? Unknown counts as no."""
+    if proc is None:
+        return False
+    deadline = time.monotonic() + EXIT_PROBE_S
+    while True:
+        try:
+            if proc.poll() is not None:
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+
+
+def _settle(claim, raw_headers) -> bool:
+    """An authoritative reply from the child for a delegated request: commit the reservation when it
+    carries the verified marker (True), else release it (the child did not accept the nonce)."""
+    if any(k.lower() == VERIFIED_HEADER and v == b"1" for k, v in raw_headers):
+        tenant_assertion.commit(claim)
+        return True
+    tenant_assertion.release(claim)
+    return False
+
+
+# Exchanges whose caller stopped waiting (cancelled, timed out, transport error) but that still own a
+# reservation: kept referenced until they finish.
+_detached: set = set()
+
+
+def _detach(task, claim) -> None:
+    """Hand a dispatched exchange its claim: a reply that still arrives settles it (commit/release);
+    a failure or cancellation leaves it reserved until its validity horizon. Never releases early."""
+    def done(t):
+        _detached.discard(t)
+        if t.cancelled() or t.exception() is not None:
+            return
+        resp, _ = t.result()
+        _settle(claim, resp.headers.raw)
+    _detached.add(task)
+    task.add_done_callback(done)
 
 
 _server: Optional[RustServer] = None

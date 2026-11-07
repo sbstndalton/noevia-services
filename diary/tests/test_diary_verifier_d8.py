@@ -50,6 +50,12 @@ def leaf_calls(monkeypatch):
     return calls
 
 
+def consumed(raw):
+    """Is the nonce of `raw` accepted (committed) in Python's cache?"""
+    m = ta._ASSERTION_RE.fullmatch(raw)
+    return m.group(2) in ta._seen.get(int(m.group(1)), ())
+
+
 def wire(resp):
     return resp.status_code, resp.headers.get('content-type'), resp.content
 
@@ -150,7 +156,7 @@ def test_delegated_request_carries_verify_and_python_does_not_check(keyed, leaf_
         assert child.requests[0][b'x-noevia-diary-asserted'] == b'0'
         assert leaf_calls == [] and spy.calls == []
         # The nonce Rust accepted is consumed here too: a replay is no longer delegated and is refused.
-        assert ta.already_seen(headers[ta.HEADER])
+        assert consumed(headers[ta.HEADER])
         assert run(app, headers)[0::2] == (401, UNVERIFIED)
         assert len(child.requests) == 1
     finally:
@@ -192,24 +198,31 @@ def test_verified_decline_is_served_here_without_a_second_check(keyed, leaf_call
         headers = signed(DAILY, 'GET', '/api/months')
         assert run(app, headers)[0] == 200
         assert spy.calls[-1].get('tenant_asserted') is True and leaf_calls == []
-        assert ta.already_seen(headers[ta.HEADER])
+        assert consumed(headers[ta.HEADER])
     finally:
         child.close()
 
 
-def test_not_delegated_when_no_forwarder_route_or_unready():
+def test_not_delegated_when_no_forwarder_route_or_unready(keyed):
     child = Child(VERIFIED_OK)
     try:
         _, forward, _ = stack(child.port)
-        scope = {'type': 'http', 'method': 'GET', 'path': '/api/day', 'headers': [], 'state': {}}
-        assert not forward.delegates(scope)
-        scope['path'] = '/api/months'
-        assert forward.delegates(scope)
-        scope['headers'] = [(b'content-length', b'3')]
-        assert not forward.delegates(scope), 'a read with a body is served (and verified) by Python'
-        scope['headers'] = []
+
+        def scope(path='/api/months', extra=()):
+            h = signed(DAILY, 'GET', path)
+            return {'type': 'http', 'method': 'GET', 'path': path, 'state': {},
+                    'headers': [(b'x-cowork-tenant-assertion', h[ta.HEADER].encode()), *extra]}
+        assert not forward.delegates(scope('/api/day'))
+        claimed = scope()
+        assert forward.delegates(claimed)
+        assert not forward.delegates(claimed), 'one reservation per nonce'
+        ta.release(claimed['state']['rust_claim'])
+        assert forward.delegates(claimed), 'a released reservation is free again'
+        assert not forward.delegates(scope(extra=[(b'content-length', b'3')])), \
+            'a read with a body is served (and verified) by Python'
+        assert not forward.delegates({**scope(), 'headers': []}), 'no assertion: verified (refused) here'
         forward.server.ready = False
-        assert not forward.delegates(scope)
+        assert not forward.delegates(scope())
     finally:
         child.close()
 
@@ -371,3 +384,4 @@ def test_differential_write_tampering_oversize_and_tombstone(writers, leaf_calls
         mode()
         answers.append(wire(put(client, good, sign(DAILY, 'PUT', '/api/file', good, None, b'', 'application/json'))))
     assert answers[0] == answers[1] and answers[0][0] == 410
+    assert ta._pending_count() == 0, 'every reservation of these writes was settled'
