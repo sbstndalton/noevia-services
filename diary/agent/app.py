@@ -944,6 +944,10 @@ def delete_tenant(request: Request) -> JSONResponse:
 def _delete_tenant(user_id: str) -> JSONResponse:
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
     backup_effect.require_clear(root)
+    # Reserve future-incarnation admission and prove current/old process absence or fencing
+    # BEFORE destroying cached state or publishing a tombstone.
+    rust_forward.fence_tenant(user_id)
+    backup_effect.require_clear(root)
     # Under _tenant_lock only bookkeeping (#804): tombstone first, so every new
     # request for this tenant is refused (410) from here on, then unregister its
     # states and sessions. _close_state waits for the tenant's store write lock,
@@ -972,7 +976,6 @@ def _delete_tenant(user_id: str) -> JSONResponse:
         _close_state(state)
     # D5: the Rust process (when it writes for tenants) finishes its write in flight and refuses
     # the tenant from here on, before the root disappears.
-    rust_forward.fence_tenant(user_id)
     backup_effect.require_clear(root)
     shutil.rmtree(root, ignore_errors=True)
     return JSONResponse({"ok": True})

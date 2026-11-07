@@ -41,7 +41,7 @@ def lab(tmp_path, monkeypatch):
     backend.activate({'a ü!@.md': b'synthetic one', 'b.md': b'synthetic two'}, {}, ['empty'])
     with backend.db() as db:
         db.execute("UPDATE meta SET value='0' WHERE key='due'")
-    state = {'objects': {}, 'status': 0, 'partial': False, 'calls': 0, 'entered': threading.Event(), 'release': threading.Event(), 'block': False, 'mutations': 0, 'delay_manifest': False, 'drop_reply': False, 'committed': threading.Event(), 'slow_read': None, 'slow_used': False}
+    state = {'objects': {}, 'status': 0, 'partial': False, 'calls': 0, 'entered': threading.Event(), 'release': threading.Event(), 'block': False, 'mutations': 0, 'delay_manifest': False, 'drop_reply': False, 'committed': threading.Event(), 'slow_read': None, 'slow_used': False, 'hold_get_objects': None, 'get_entered': threading.Event(), 'get_release': threading.Event(), 'get_held': False}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -62,6 +62,10 @@ def lab(tmp_path, monkeypatch):
 
         def do_GET(self):
             state['calls'] += 1
+            if state['hold_get_objects'] is not None and len(state['objects']) == state['hold_get_objects'] and not state['get_held']:
+                state['get_held'] = True
+                state['get_entered'].set()
+                assert state['get_release'].wait(12)
             if state['slow_read'] and not state['slow_used']:
                 state['slow_used'] = True
                 body = b'synthetic one'
@@ -159,6 +163,7 @@ def lab(tmp_path, monkeypatch):
     state['cfg'] = cfg
     state['data_root'] = tmp_path
     yield backend, state, storage, call, base
+    state['get_release'].set()
     state['release'].set()
     proc.terminate()
     proc.wait(timeout=10)

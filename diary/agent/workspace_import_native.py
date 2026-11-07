@@ -68,7 +68,7 @@ def _response(code, out, report):
                 raise _fault('frame', uncertain=False)
     if code == 3:
         match = UNAVAILABLE.fullmatch(out)
-        if match and match.group(1) in {b'schema', b'tenant', b'inactive', b'clock', b'generation'}:
+        if match and match.group(1) in {b'schema', b'tenant', b'inactive', b'clock', b'generation', b'backup_pending'}:
             raise _fault(match.group(1).decode('ascii'), uncertain=False)
     if code != 0:
         raise _fault('child_exit')

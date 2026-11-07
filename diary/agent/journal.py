@@ -20,6 +20,11 @@ from functools import wraps
 def synchronized(fn):
     @wraps(fn)
     def call(self, *args, **kwargs):
+        # Lock order is primary authority then journal lock, also when another caller drains
+        # the outbox under an already-held primary transaction.
+        if fn.__name__ in {'enqueue', 'mark_applied', 'quarantine', 'mark_failed', 'mark_dirty', 'clear_dirty'}:
+            with tenant_writer.index_publication(self.db_path), self._lock:
+                return fn(self, *args, **kwargs)
         with self._lock:
             return fn(self, *args, **kwargs)
     return call

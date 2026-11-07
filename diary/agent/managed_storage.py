@@ -118,7 +118,7 @@ class ManagedCorpusBackend:
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA synchronous=FULL')
         try:
-            with db:
+            with db, tenant_writer.primary_scope(self.db_path, db):
                 yield db
         finally:
             db.close()

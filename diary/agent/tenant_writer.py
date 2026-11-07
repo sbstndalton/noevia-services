@@ -381,6 +381,52 @@ class TenantWriteLock:
         return self._rlock._is_owned()
 
 
+# A Python journal/index publication shares the same primary authority reservation as native
+# helpers. Borrow a primary transaction already held by this context (outbox draining), rather
+# than deadlocking by opening a second connection to the same SQLite write reservation.
+_primary_scopes = contextvars.ContextVar("diary_primary_scopes", default=())
+
+
+@contextmanager
+def primary_scope(path, conn):
+    token = _primary_scopes.set(_primary_scopes.get() + ((str(Path(path).resolve()), conn),))
+    try:
+        yield
+    finally:
+        _primary_scopes.reset(token)
+
+
+@contextmanager
+def index_publication(path):
+    path = Path(path)
+    if path.name != 'managed-index.db' or tenant_of(path) is None:
+        yield  # Legacy/non-managed index cannot meet an app-managed backup.
+        return
+    primary = path.with_name('managed-diary.db').resolve()
+    if not primary.exists():
+        yield  # No managed primary exists to back up.
+        return
+    borrowed = next((conn for name, conn in reversed(_primary_scopes.get())
+                     if name == str(primary) and conn.in_transaction), None)
+    if borrowed is not None:
+        # Upgrade a read transaction before checking; a concurrent snapshot change fails closed.
+        borrowed.execute('UPDATE meta SET value=value WHERE 0')
+        if borrowed.execute("SELECT 1 FROM meta WHERE key='backup_effect_pending'").fetchone():
+            raise WriterBusy(tenant_of(path), 'backup settlement uncertain')
+        yield
+        return
+    guard = connect(primary.as_uri() + '?mode=rw', uri=True, timeout=30)
+    try:
+        guard.execute('BEGIN IMMEDIATE')
+        if guard.execute("SELECT 1 FROM meta WHERE key='backup_effect_pending'").fetchone():
+            raise WriterBusy(tenant_of(path), 'backup settlement uncertain')
+        with primary_scope(primary, guard):
+            yield
+        guard.commit()
+    finally:
+        guard.close()
+
+
 # ------------------------------------------------------------------ connections and the guard
 
 _WRITE_ACTIONS = frozenset(getattr(sqlite3, name) for name in (
@@ -435,14 +481,15 @@ def ensure_schema(conn: sqlite3.Connection, path, script: str, existed: bool) ->
         return
     uid = tenant_of(path)
     if uid is not None and is_exempt(uid):
-        conn.executescript(script)
-        conn.commit()
+        with index_publication(path):
+            conn.executescript(script)
+            conn.commit()
         return
     if not existed and uid is not None:
         with exempt(uid, "creating a database file this process just created"):
             conn.executescript(script)
             conn.commit()
         return
-    with hold(uid):
+    with hold(uid), index_publication(path):
         conn.executescript(script)
         conn.commit()

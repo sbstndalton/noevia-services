@@ -196,6 +196,10 @@ class RustServer:
         self._delays = tuple(restart_delays)
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
+        self._spawning = False
+        # Reserved before deletion. New incarnations cannot receive a forwarded request for
+        # these tenants, including while the caller has not yet published its tombstone.
+        self._deleting = {}
         self._token = ""
         self.forward_secret = ""
         self._stopping = threading.Event()
@@ -220,25 +224,64 @@ class RustServer:
             self._thread.join(timeout=5)
 
     def _spawn(self) -> Optional[subprocess.Popen]:
-        binary = self._binary or _binary()
-        if binary is None:
-            log.warning("Rust Diary server binary not found; Python serves every route")
-            return None
-        token, forward = secrets.token_hex(16), secrets.token_hex(32)
+        with self._lock:
+            self._spawning = True
+        proc = None
         try:
+            binary = self._binary or _binary()
+            if binary is None:
+                log.warning("Rust Diary server binary not found; Python serves every route")
+                return None
+            token, forward = secrets.token_hex(16), secrets.token_hex(32)
             config = json.dumps(self._config_factory(self.port, token, forward), separators=(",", ":"))
             proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                     stderr=None, close_fds=True,
                                     env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
                                          "TZ": os.environ.get("TZ", ""), "HOME": "/nonexistent"})
+            # Publish ownership before feeding config: a broken pipe must never leave an
+            # untracked child which an absence check could mistake for settled.
+            with self._lock:
+                self._proc, self._token, self.forward_secret = proc, token, forward
             proc.stdin.write(config.encode() + b"\n")
             proc.stdin.close()
-        except Exception as exc:  # noqa: BLE001 - never take the service down
+            return proc
+        except Exception as exc:
             log.warning("Rust Diary server could not start (%s); Python serves every route", type(exc).__name__)
+            if proc is not None:
+                self._mark_lost(proc, quiet=True)
             return None
+        finally:
+            with self._lock:
+                self._spawning = False
+
+    def prepare_delete(self, user_id: str) -> bool:
+        """Reserve deletion against all future forwards, then prove old-child coverage.
+
+        The caller checks the durable intent before and after this and retains its tenant
+        hold through removal. An absent process is safe only outside spawn/reap transitions.
+        A failed live fence keeps the reservation and may be retried; it never authorizes
+        tombstoning or removal. No transport error/exit retires a remote effect intent.
+        """
         with self._lock:
-            self._proc, self._token, self.forward_secret = proc, token, forward
-        return proc
+            if self._spawning or self.reaping:
+                return False
+            proc = self._proc
+            if proc is None:
+                self._deleting[user_id] = time.monotonic()
+                return True
+            if not self.ready or not self._token:
+                return False
+            self._deleting[user_id] = time.monotonic()
+        return self.fence(user_id)
+
+    def forward_secret_for(self, user_id: str) -> str:
+        with self._lock:
+            reserved = self._deleting.get(user_id.lower())
+            # Same 24-hour tombstone lifetime as the Python registry and native fence.
+            if reserved is not None and time.monotonic() - reserved < 24 * 60 * 60:
+                return ""
+            self._deleting.pop(user_id.lower(), None)
+            return self.forward_secret
 
     def _wait_ready(self, proc: subprocess.Popen) -> bool:
         deadline = time.monotonic() + READY_TIMEOUT_S
@@ -580,7 +623,8 @@ class ForwardMiddleware:
         if url.raw_path != target:
             # httpx would re-encode this request target: keep it here, unaltered.
             return None
-        secret = server.forward_secret
+        effective_user = self._user(scope) or os.environ.get("DIARY_LEGACY_USER_ID", "")
+        secret = server.forward_secret_for(effective_user)
         if not secret:
             return None
         asserted = bool((scope.get("state") or {}).get("tenant_asserted"))
@@ -653,6 +697,6 @@ def fence_tenant(user_id: str) -> None:
     """DELETE /api/internal/tenant, after Python's tombstone: the Rust side stops writing the tenant
     (and finishes the write in flight) before its root is removed."""
     server = current()
-    if server is not None and not server.fence(user_id):
+    if server is not None and not server.prepare_delete(user_id):
         from fastapi import HTTPException
         raise HTTPException(503, "Diary saving did not confirm the tenant fence. Deletion remains paused.")
