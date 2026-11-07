@@ -100,6 +100,7 @@ def test_more_signed_requests_than_the_cache_cap_are_all_accepted_and_replays_st
     # #1680: over the cap the Diary used to raise NonceCacheFull (503) for fresh, legitimate requests.
     monkeypatch.setattr(ta, '_nonce_cap', 5)
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, "time", lambda: now)
     sent = []
     for i in range(40):  # 8x the cap inside one replay window, spread over 20 seconds
         t = now + i * 0.5
@@ -116,6 +117,7 @@ def test_more_signed_requests_than_the_cache_cap_are_all_accepted_and_replays_st
 def test_expired_nonces_are_purged_first_and_never_raise_the_floor_for_live_traffic(monkeypatch):
     monkeypatch.setattr(ta, '_nonce_cap', 3)
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, "time", lambda: now)
     for i in range(3):
         assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now)), 'GET', '/x', now=now) is None
     later = now + ta.SKEW_S + 1  # all three are outside the clock window now
@@ -126,6 +128,7 @@ def test_expired_nonces_are_purged_first_and_never_raise_the_floor_for_live_traf
 
 def test_a_replay_after_the_clock_steps_back_is_refused(monkeypatch):
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, "time", lambda: now)
     h = signed(A, 'GET', '/x', ts=int(now))
     assert ta.verify(KEY, h, 'GET', '/x', now=now) is None
     # Purge it (clock far ahead), then step the clock back into its window: still a replay.
@@ -332,9 +335,10 @@ def test_backup_without_the_secret_asks_for_it(volume, monkeypatch):  # noqa: F8
     assert r.json()['detail'] == {'code': 'storage_credential_required'}
 
 
-def test_real_cap_sustains_2000_signed_requests_per_second_for_a_full_window():
+def test_real_cap_sustains_2000_signed_requests_per_second_for_a_full_window(monkeypatch):
     # #1680 at the shipped cap: 2,000 req/s for 60 s is 120,000 nonces, over the 100k cap.
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, "time", lambda: now)
     for i in range(120_000):
         t = now + i / 2000
         assert ta._remember_nonce(f'{i:032x}', int(t), t) is None, f'request {i} refused'
@@ -347,6 +351,7 @@ def test_real_cap_sustains_2000_signed_requests_per_second_for_a_full_window():
 def test_future_dated_flood_does_not_lock_out_legitimate_traffic(monkeypatch):
     monkeypatch.setattr(ta, '_nonce_cap', 20)
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, "time", lambda: now)
     # A flood across every future second the clock window accepts overflows the cap many times over.
     for i in range(400):
         ts = int(now) + 1 + i % ta.SKEW_S
@@ -360,6 +365,7 @@ def test_future_dated_flood_does_not_lock_out_legitimate_traffic(monkeypatch):
 def test_flood_at_exactly_now_plus_skew_then_legitimate_now(monkeypatch):
     monkeypatch.setattr(ta, '_nonce_cap', 10)
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, "time", lambda: now)
     assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) - 1), 'GET', '/x', now=now) is None
     for _ in range(50):
         ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + ta.SKEW_S), 'GET', '/x', now=now)
@@ -369,8 +375,9 @@ def test_flood_at_exactly_now_plus_skew_then_legitimate_now(monkeypatch):
     assert ta.verify(KEY, signed(A, 'GET', '/x', ts=int(now) + ta.SKEW_S), 'GET', '/x', now=now) is not None
 
 
-def test_assertion_signed_before_process_start_is_refused_but_a_fresh_one_is_not():
+def test_assertion_signed_before_process_start_is_refused_but_a_fresh_one_is_not(monkeypatch):
     start = 1_000_000.4
+    monkeypatch.setattr(ta.time, "time", lambda: start)
     ta._reset_for_tests(started_at=start)
     old = signed(A, 'GET', '/x', ts=1_000_000 - ta.RESTART_SKEW_S - 1)  # inside the replay window, signed pre-restart
     assert ta.verify(KEY, old, 'GET', '/x', now=start + 0.1) == 'signed before this process started'

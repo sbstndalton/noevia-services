@@ -13,6 +13,9 @@ from the person resets a login cool-down immediately.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
+import sqlite3
 import hashlib
 import logging
 import threading
@@ -97,16 +100,39 @@ def parse_retry_after(value: Optional[str], default: float = DEFAULT_RETRY_AFTER
 
 
 class StorageGate:
-    def __init__(self, clock=time.monotonic, label: str = ""):
-        self._clock = clock
+    def __init__(self, clock=time.monotonic, label: str = "", shared_path=None, key=None):
+        self._clock = time.time if shared_path is not None else clock
+        self._shared_path, self._key = shared_path, key
         self._label = label  # short credential-hash prefix for logs; never a secret
         self._lock = threading.Lock()
         self._until = 0.0
         self._kind = ""
         self._last_reset = -RETRY_RESET_MIN_INTERVAL_S
 
-    def check(self) -> None:
+    @contextmanager
+    def _guard(self):
         with self._lock:
+            if self._shared_path is None:
+                yield
+                return
+            self._shared_path.parent.mkdir(parents=True, exist_ok=True)
+            from . import tenant_writer
+            db = tenant_writer.connect(self._shared_path, timeout=1)
+            try:
+                db.execute('PRAGMA synchronous=FULL')
+                db.execute('CREATE TABLE IF NOT EXISTS storage_gates (key TEXT PRIMARY KEY, until REAL NOT NULL, kind TEXT NOT NULL, last_reset REAL NOT NULL)')
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute('SELECT until,kind,last_reset FROM storage_gates WHERE key=?', (self._key,)).fetchone()
+                self._until, self._kind, self._last_reset = row or (0.0, '', -RETRY_RESET_MIN_INTERVAL_S)
+                yield
+                db.execute('INSERT OR REPLACE INTO storage_gates VALUES (?,?,?,?)',
+                           (self._key, self._until, self._kind, self._last_reset))
+                db.commit()
+            finally:
+                db.close()
+
+    def check(self) -> None:
+        with self._guard():
             remaining = self._until - self._clock()
             if remaining > 0:
                 raise StorageBackoff(self._kind, remaining)
@@ -115,7 +141,7 @@ class StorageGate:
         """A 401 always closes the gate. A 403 only does when it answers the account root (the auth
         probe): elsewhere it is a per-path refusal (S3 without ListBucket, a forbidden folder) and
         must not block other paths."""
-        with self._lock:
+        with self._guard():
             now = self._clock()
             if status == 401 or (status == 403 and root):
                 self._kind, self._until = "login", now + LOGIN_COOLDOWN_S
@@ -131,7 +157,7 @@ class StorageGate:
         """Explicit retry: clear a login cool-down (a throttle still has to be waited out). At most
         one reset per RETRY_RESET_MIN_INTERVAL_S, so a client loop cannot rebuild the brute-force
         pattern the cool-down exists to stop."""
-        with self._lock:
+        with self._guard():
             now = self._clock()
             if self._kind == "login" and self._until > now:
                 if now - self._last_reset >= RETRY_RESET_MIN_INTERVAL_S:
@@ -143,17 +169,31 @@ class StorageGate:
             return False
 
     def state(self):
-        with self._lock:
+        with self._guard():
             remaining = self._until - self._clock()
             return (self._kind, remaining) if remaining > 0 else ("", 0.0)
 
 
 _gates: "dict[str, StorageGate]" = {}
 _gates_lock = threading.Lock()
+_shared_path = None
+
+
+def configure_shared(path):
+    """Startup wiring for the same credential authority the native process opens."""
+    global _shared_path
+    path = Path(path) if path is not None else None
+    with _gates_lock:
+        if path != _shared_path:
+            _gates.clear()
+            _shared_path = path
+
 
 
 def gate_for(*credential_parts: str) -> StorageGate:
     """The shared gate for one credential. Secrets are only hashed, never stored."""
+    if credential_parts and credential_parts[0] == 'webdav':
+        credential_parts = (credential_parts[0], credential_parts[1].rstrip('/') + '/', *credential_parts[2:])
     digest = hashlib.sha256("\x00".join(credential_parts).encode()).hexdigest()
     with _gates_lock:
         gate = _gates.get(digest)
@@ -164,7 +204,7 @@ def gate_for(*credential_parts: str) -> StorageGate:
                     del _gates[key]
                 if len(_gates) >= _MAX_GATES:  # hard cap: drop the gate closest to expiry
                     del _gates[min(_gates, key=lambda k: _gates[k].state()[1])]
-            gate = _gates[digest] = StorageGate(label=digest[:8])
+            gate = _gates[digest] = StorageGate(label=digest[:8], shared_path=_shared_path, key=digest)
         return gate
 
 

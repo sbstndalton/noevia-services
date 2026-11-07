@@ -48,6 +48,7 @@ from . import corpus_write_native as native_write
 from .config import Config
 from .journal import Journal, JournalEntry
 from .storage import CorpusBackend
+from . import tenant_writer
 
 log = logging.getLogger(__name__)
 
@@ -136,7 +137,9 @@ def is_transient_failure(exc: Optional[BaseException]) -> bool:
 
 class CorpusStore:
     def __init__(self, cfg: Config, backend: CorpusBackend, journal: Journal):
-        self._write_lock = threading.RLock()
+        # D5: the tenant writer lock (shared with the Rust process for a writer tenant), then the
+        # store's RLock. app.py sets .tenant on tenant states.
+        self._write_lock = tenant_writer.TenantWriteLock()
         self._corpus_write_impl = native_write.implementation()
         self.closed = False
         self.cfg = cfg
