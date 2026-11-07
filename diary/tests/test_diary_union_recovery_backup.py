@@ -254,3 +254,55 @@ def test_an_intent_after_the_native_append_row_commits_is_pythons_busy_and_repla
     finally:
         st.store.apply_pending, st.store.log_exchange = saved
         tenant_writer.configure_data_root(None)
+
+
+@needs_binary
+@needs_server
+@needs_cw
+def test_a_tenant_deletion_cannot_remove_the_primary_while_a_native_write_holds_its_reservation(writers):
+    """SOL1-01 lifecycle exclusion: the only sanctioned removal of a managed primary is
+    DELETE /api/internal/tenant (tenant hold, native fence, tombstone, rmtree). A native write
+    waits for the one primary reservation (held here by a synthetic holder); the deletion waits for
+    that write, so the primary the write reserved is still in place through its effect and commit.
+    Only then is the root removed, and later writes are refused."""
+    import concurrent.futures
+    import threading
+    client, start, state = writers
+    start()
+    tenant = state / 'users' / DAILY
+    held, go = threading.Event(), threading.Event()
+
+    def holder():
+        db = sqlite3.connect(tenant / 'managed-diary.db', isolation_level=None, timeout=30)
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            held.set()
+            go.wait(10)
+            db.execute('ROLLBACK')
+        finally:
+            db.close()
+
+    def delete():
+        return client.request('DELETE', '/api/internal/tenant', headers=sign(DAILY, 'DELETE', '/api/internal/tenant'))
+    Recorder.served = []
+    with concurrent.futures.ThreadPoolExecutor(3) as pool:
+        hold = pool.submit(holder)
+        assert held.wait(10)
+        pending = pool.submit(request, client, DAILY, 'PUT', '/api/file',
+                              {'path': 'fenced-union.md', 'content': 'x', 'version': None})
+        time.sleep(0.5)
+        assert not pending.done(), 'the native write must wait for the held primary'
+        deleting = pool.submit(delete)
+        time.sleep(0.5)
+        assert not deleting.done(), 'the deletion must wait for the reserved native write'
+        assert (tenant / 'managed-diary.db').exists()
+        go.set()
+        hold.result(timeout=10)
+        r = pending.result(timeout=20)
+        d = deleting.result(timeout=20)
+    assert r.status_code == 200, r.text
+    assert Recorder.served == [True]
+    assert d.status_code == 200, d.text
+    assert not tenant.exists()
+    r = request(client, DAILY, 'PUT', '/api/file', {'path': 'after.md', 'content': 'x', 'version': None})
+    assert r.status_code == 410 and not tenant.exists()
