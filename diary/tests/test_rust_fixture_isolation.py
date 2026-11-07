@@ -70,7 +70,10 @@ def test_backup_false_restores_incoming_before_parity_seed(tmp_path, incoming, r
                 owned = [owned_state, *owned_tenants.values()]
             finally:
                 pair.close()
-                world.close()
+                # Pytest resumes a yield fixture normally during teardown.
+                # close() would inject GeneratorExit and hide a cleanup error.
+                with pytest.raises(StopIteration):
+                    next(world)
             assert all(state.store.closed for state in owned)
             assert owned_tenants == {}
         assert appmod._tenant_states is incoming_tenants

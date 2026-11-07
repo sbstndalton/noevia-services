@@ -87,7 +87,7 @@ def world(tmp_path, monkeypatch):
         states = {id(state): state for state in (owned_state, *owned_tenants.values())}
         _close_fixture_resources(*(lambda state=state: appmod._close_state(state)
                                    for state in states.values()),
-                                 owned_tenants.clear, ta._reset_for_tests())
+                                 owned_tenants.clear, ta._reset_for_tests)
 
 
 def clear_dirty(st):
