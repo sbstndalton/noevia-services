@@ -143,3 +143,54 @@ def test_native_recovery_waits_for_backup_settlement_then_drains_once_without_se
         assert _outbox(tenant) == [] and _markers(tenant, 'abcdef34') == per
     finally:
         tenant_writer.configure_data_root(None)
+
+
+@needs_binary
+@needs_server
+@needs_cw
+def test_an_intent_committed_while_native_waits_for_the_held_primary_is_pythons_busy(writers):
+    """Admitted with no intent; the intent commits while the native write waits for the one primary
+    reservation. The native refusal is app.py's writer_busy reply byte for byte (status, Retry-After,
+    content type, body) and nothing of the request is stored. Before G1 it was a 500."""
+    import concurrent.futures
+    import threading
+    client, start, state = writers
+    start()
+    tenant = state / 'users' / DAILY
+    tenant_writer.configure_data_root(state)
+    held, go = threading.Event(), threading.Event()
+
+    def holder():
+        db = sqlite3.connect(tenant / 'managed-diary.db', isolation_level=None, timeout=30)
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            held.set()
+            go.wait(10)
+            db.execute("INSERT INTO meta VALUES ('backup_effect_pending', ?)", (INTENT,))
+            db.execute('COMMIT')
+        finally:
+            db.close()
+    try:
+        before, dirty_before, outbox_before = storage(state, DAILY), _dirty(tenant), _outbox(tenant)
+        expected = asyncio.run(appmod.writer_busy(None, tenant_writer.WriterBusy(DAILY, 'backup settlement uncertain')))
+        Recorder.served = []
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            hold = pool.submit(holder)
+            assert held.wait(10)
+            pending = pool.submit(request, client, DAILY, 'POST', '/api/directory', {'path': 'Busy union'})
+            time.sleep(0.5)
+            assert not pending.done(), 'the native write must wait for the held primary'
+            go.set()
+            hold.result(timeout=10)
+            r = pending.result(timeout=20)
+        assert Recorder.served == [True]
+        assert (r.status_code, r.headers.get('retry-after'), r.headers.get('content-type'), r.content) == \
+            (expected.status_code, expected.headers['retry-after'], expected.headers['content-type'], expected.body)
+        assert (r.status_code, r.headers.get('retry-after'), r.content) == (503, '1', rust_forward.BUSY)
+        assert storage(state, DAILY) == before and _dirty(tenant) == dirty_before and _outbox(tenant) == outbox_before
+        # The intent stays the exclusion: refused before forwarding from here on, nothing stored.
+        r = request(client, DAILY, 'POST', '/api/directory', {'path': 'Busy union'})
+        assert (r.status_code, r.content) == (503, BLOCKED) and Recorder.served == [True]
+        assert storage(state, DAILY) == before
+    finally:
+        tenant_writer.configure_data_root(None)
