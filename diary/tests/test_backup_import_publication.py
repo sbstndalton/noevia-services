@@ -5,6 +5,8 @@ reply. Caller cancellation frees Python admission while the native task survives
 No fake import executor or pre-launch check stands in for its real transaction.
 """
 import asyncio
+import base64
+import json
 import os
 import subprocess
 import threading
@@ -29,7 +31,7 @@ pytestmark = pytest.mark.skipif(not (BIN and HELPER), reason='actual server/impo
 @pytest.mark.parametrize('gap', [0, 1], ids=['initial-get', 'terminal-next-intent'])
 @pytest.mark.parametrize('child_loss', [False, True])
 def test_admitted_import_cannot_publish_after_late_uncertain_effect(lab, tmp_path, monkeypatch, gap, child_loss):
-    backend, state, _, _, base = lab
+    backend, state, storage, _, base = lab
     source = ManagedCorpusBackend(tmp_path / 'source', '00000000-0000-0000-0000-000000000001')
     source.activate({'synthetic.md': b'import must remain uncommitted'}, {})
     body = archive(source, '', {})
@@ -69,7 +71,8 @@ def test_admitted_import_cannot_publish_after_late_uncertain_effect(lab, tmp_pat
 
     async def run():
         mw = rust_forward.ForwardMiddleware(None, server=server, routes={}, writers=frozenset({UID}))
-        request = asyncio.create_task(asgi(mw, [(b'x-cowork-user-id', UID.encode()), (b'content-length', b'0')],
+        request = asyncio.create_task(asgi(mw, [(b'x-cowork-user-id', UID.encode()), (b'content-length', b'0'),
+                    (b'x-cowork-storage', base64.urlsafe_b64encode(json.dumps(storage).encode()).rstrip(b'='))],
                                            [b''], method='POST', path='/api/storage-backup'))
         importing = None
         try:
