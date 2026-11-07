@@ -125,7 +125,9 @@ def test_failed_seed_restores_only_owned_fixture_resources(tmp_path, module, fix
     saved, stack = list(appmod.app.user_middleware), appmod.app.middleware_stack
     sentinel = object()
     incoming_tenants = OrderedDict([('synthetic-existing-state', sentinel)])
-    incoming_registry = frozenset({reads.DAILY, reads.MONTHLY})
+    # Keep baseline setup valid too: these cases diagnose cleanup after the
+    # injected failure, independently of the registered-seed locking regression.
+    incoming_registry = frozenset({reads.OTHER})
     failure = RuntimeError('synthetic failure after valid seed')
     clients_closed, states_closed, native_starts = [], [], []
     real_client, real_close_state = module.TestClient, appmod._close_state
@@ -256,6 +258,8 @@ def test_body_failure_closes_all_owned_servers_even_if_first_stop_fails(tmp_path
         client.close = tracked_close
         return client
 
+    # Isolate the body/cleanup witness from the separate incoming-writer seed bug.
+    monkeypatch.setattr(tenant_writer, '_writers', frozenset({reads.OTHER}))
     world = reads.world.__wrapped__(tmp_path, monkeypatch)
     state = next(world)
     monkeypatch.setattr(fixture_module, 'start_server', start)
