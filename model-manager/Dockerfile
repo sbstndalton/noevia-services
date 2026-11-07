@@ -10,8 +10,8 @@ FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de
 # Merged Rust runtime dependency; checksum verified below. The inference gate (noevia#2115)
 # is built from the same source in its own cargo invocation, so its dependencies' features never
 # unify into the model manager's build.
-ARG NOEVIA_RS_REF=259772fbba47a05a9e8e121a67b6d0b4535810e1
-ARG NOEVIA_RS_SHA256=615b5e404ac3ce78e8866d51f54fda393e4821c0f66ec07802bac3a8109cae95
+ARG NOEVIA_RS_REF=56df0e57bedc8b34ac39ad202611d4028ba18947
+ARG NOEVIA_RS_SHA256=c3a608a0c5447eaf32c88678a4ff93884ff785278fbf98165543727870c7ec06
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=8
@@ -82,7 +82,11 @@ COPY --from=legacy-builder /src/target/release/model-files /usr/local/bin/model-
 COPY --from=legacy-builder /src/target/release/model-autoconfig /usr/local/bin/model-autoconfig
 COPY --from=legacy-builder /src/target/release/noevia-model-manager /usr/local/bin/noevia-model-manager
 COPY LICENSE ./
-COPY app ./app
+# Historical source is fetched only in this test-only stage, never kept as application code.
+ADD --checksum=sha256:f3c62670d50380937377a4a1cb06bf8b2bed2cbe0acd14d169a7998a0355f225 https://codeload.github.com/sbstndalton/noevia-services/tar.gz/ce1af82e055397df715ae837fa7cd393f02281c7 /tmp/python-oracle.tar.gz
+COPY qualification/restore_python_oracle.py qualification/python-oracle.json ./qualification/
+RUN python qualification/restore_python_oracle.py /tmp/python-oracle.tar.gz /srv \
+ && rm /tmp/python-oracle.tar.gz
 EXPOSE 8090
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8090/api/v1/health',timeout=4)"
 CMD ["noevia-model-manager"]
