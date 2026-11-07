@@ -160,13 +160,16 @@ def lab(tmp_path, monkeypatch):
             return exc.status_code, {'detail': exc.detail}
 
     state['proc'] = proc
+    state['owned_procs'] = [proc]
     state['cfg'] = cfg
     state['data_root'] = tmp_path
     yield backend, state, storage, call, base
     state['get_release'].set()
     state['release'].set()
-    proc.terminate()
-    proc.wait(timeout=10)
+    for child in state['owned_procs']:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=10)
     dav.shutdown()
     thread.join(timeout=5)
     appmod._backup_backends.clear()
@@ -428,6 +431,7 @@ def restart_native(lab):
     proc = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     proc.stdin.write(json.dumps(state['cfg']).encode() + b'\n')
     proc.stdin.flush()
+    state['owned_procs'].append(proc)
     state['proc'] = proc
     for _ in range(200):
         try:
