@@ -194,3 +194,63 @@ def test_an_intent_committed_while_native_waits_for_the_held_primary_is_pythons_
         assert storage(state, DAILY) == before
     finally:
         tenant_writer.configure_data_root(None)
+
+
+@needs_binary
+@needs_server
+@needs_cw
+def test_an_intent_after_the_native_append_row_commits_is_pythons_busy_and_replays_once(writers):
+    """Root stop-seam ruling: the append's journal row is durable and its own corpus write commits
+    together with the intent (test-only trigger); marking the row then meets the intent. The native
+    reply is app.py's writer_busy reply (as log_exchange gives after the same journal commit), it is
+    not a decline (no Python fallback), the row stays pending without a failure mark, and after
+    synthetic settlement the next native request applies it exactly once."""
+    from tests.test_rust_forward_d5 import now_iso
+    client, start, state = writers
+    start()
+    tenant = state / 'users' / DAILY
+    rid = 'cccccccc-dddd-4eee-8fff-000000000002'
+    marker = f'xid:{rid}'
+    tenant_writer.configure_data_root(state)
+    with sqlite3.connect(tenant / 'managed-diary.db') as db:
+        for event in ('INSERT', 'UPDATE'):
+            db.execute(f"CREATE TRIGGER synthetic_intent_{event.lower()} AFTER {event} ON files "
+                       f"WHEN instr(NEW.data, '{marker}') > 0 BEGIN "
+                       "INSERT OR IGNORE INTO meta VALUES ('backup_effect_pending', 'synthetic'); END")
+    st = next(v for k, v in appmod._tenant_states.items() if k.startswith(DAILY + ':'))
+    saved = st.store.apply_pending, st.store.log_exchange
+
+    def no_python(*_a, **_k):
+        raise AssertionError('Python replay or append used')
+
+    def row():
+        with sqlite3.connect(tenant / 'managed-index.db') as db:
+            rows = [r for r in db.execute('SELECT payload, applied, attempts, last_error FROM journal')
+                    if json.loads(r[0]).get('xid') == rid]
+        assert len(rows) == 1, rows
+        return rows[0][1:]
+
+    def intent():
+        with sqlite3.connect(tenant / 'managed-diary.db') as db:
+            return db.execute("SELECT value FROM meta WHERE key='backup_effect_pending'").fetchone()
+    body = {'text': 'Synthetic union note.', 'title': 't', 'requestId': rid, 'entryTime': now_iso()}
+    try:
+        st.store.apply_pending = st.store.log_exchange = no_python
+        expected = asyncio.run(appmod.writer_busy(None, tenant_writer.WriterBusy(DAILY, 'backup settlement uncertain')))
+        Recorder.served = []
+        r = request(client, DAILY, 'POST', '/api/entries/append', body)
+        assert Recorder.served == [True], 'answered natively, never declined to Python'
+        assert (r.status_code, r.headers.get('retry-after'), r.headers.get('content-type'), r.content) == \
+            (expected.status_code, expected.headers['retry-after'], expected.headers['content-type'], expected.body)
+        assert row() == (0, 0, None) and _markers(tenant, rid) == 1 and intent() == ('synthetic',)
+        # Synthetic settlement (test-only removal); the next native request replays the row once.
+        with sqlite3.connect(tenant / 'managed-diary.db') as db:
+            db.execute("DELETE FROM meta WHERE key='backup_effect_pending'")
+        for path in ('After settlement', 'After settlement again'):
+            r = request(client, DAILY, 'POST', '/api/directory', {'path': path})
+            assert r.status_code == 200, r.text
+            assert row() == (1, 0, None) and _markers(tenant, rid) == 1 and intent() is None
+        assert Recorder.served == [True, True, True]
+    finally:
+        st.store.apply_pending, st.store.log_exchange = saved
+        tenant_writer.configure_data_root(None)
