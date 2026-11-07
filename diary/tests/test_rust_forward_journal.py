@@ -159,3 +159,74 @@ def test_python_writer_waits_until_native_replay_settles(writers):
         assert pending.result(timeout=20).status_code == 200
         other.result(timeout=20)
     assert entered.is_set()
+
+
+@needs_binary
+@needs_server
+@needs_cw
+@pytest.mark.parametrize('case', [
+    'nan', 'infinity', 'surrogate', 'known-nan', 'known-surrogate', 'malformed',
+    'month-0', 'month-19', 'short-0', 'short-19',
+])
+@pytest.mark.parametrize('runtime', ['reference', 'forwarded'])
+def test_noncanonical_replay_uses_reference_before_effects(writers, case, runtime):
+    import sys
+    client, start, state = writers
+    modes = start()
+    client._transport.raise_server_exceptions = False
+    tenant = state / 'users' / DAILY
+    st = next(v for k, v in appmod._tenant_states.items() if k.startswith(DAILY + ':'))
+    kind = 'unknown'
+    payload = {'nan':'{"extra":NaN}', 'infinity':'{"extra":Infinity}',
+               'surrogate':'{"extra":"\\ud800"}', 'malformed':'{"extra":'}.get(case)
+    attempts = 0
+    if case.startswith('known-'):
+        kind = 'index_month'
+        extension = 'NaN' if case == 'known-nan' else '"\\ud800"'
+        payload = '{"label":"Synthetic","month":"2030-01.md","extra":' + extension + '}'
+    if case.startswith(('month-', 'short-')):
+        kind = 'exchange_edit'
+        attempts = int(case.split('-')[1])
+        payload = json.dumps({'xid':'abcdef12','new_me':'Synthetic bad hint', 'new_claude':'',
+                              'month':'2030-13' if case.startswith('month-') else 'x'})
+    with sqlite3.connect(tenant / 'managed-index.db') as db:
+        db.execute('INSERT INTO journal(id,created_at,kind,payload,attempts) VALUES (?,?,?,?,?)',
+                   ('compat', '2030', kind, payload, attempts))
+        if kind == 'exchange_edit':
+            db.execute('INSERT INTO journal(id,created_at,kind,payload) VALUES (?,?,?,?)',
+                       ('dependent','2030','exchange_edit',json.dumps({'xid':'abcdef12',
+                        'month':'2030-01','new_me':'Synthetic valid hint','new_claude':''})))
+    before = snapshot(state, DAILY)
+    body = {'path':'Compatibility result'}
+    modes.python()
+    st.recovered = False
+    expected_reply = request(client, DAILY, 'POST', '/api/directory', body)
+    expected = storage(state, DAILY)
+    print('reference diagnostic provenance:', sys.version, case, expected[3])
+    rows = {row[0]: row[1:] for row in sqlite3.connect(tenant / 'managed-index.db').execute(
+        "SELECT id,applied,attempts,last_error FROM journal WHERE id IN ('compat','dependent')")}
+    if kind == 'exchange_edit':
+        assert rows['compat'][1] == attempts + 1
+        assert rows['compat'][0] == int(attempts == 19)
+        assert rows['dependent'][:2] == ((1, 1) if attempts == 19 else (0, 0))
+    elif case == 'malformed':
+        assert rows['compat'] == (0, 0, None)
+    else:
+        assert rows['compat'][0] == 1
+    if runtime == 'reference':
+        return
+    restore(state, DAILY, before)
+    st.recovered = False
+    modes.rust()
+    Recorder.served = []
+    reply = request(client, DAILY, 'POST', '/api/directory', body)
+    assert Recorder.served == [False], 'must decline to real Python before any recovery effect'
+    assert (reply.status_code, reply.content) == (expected_reply.status_code, expected_reply.content)
+    assert storage(state, DAILY) == expected
+    # Recoverable extensions retire and permit the next native request. An invalid
+    # month at attempts 0 or malformed JSON must continue using reference recovery.
+    Recorder.served = []
+    follow = request(client, DAILY, 'POST', '/api/directory', {'path':'Compatibility followup'})
+    pending = case == 'malformed' or case in ('month-0', 'short-0')
+    assert Recorder.served == [not pending]
+    assert follow.status_code == (500 if case == 'malformed' else 200)
