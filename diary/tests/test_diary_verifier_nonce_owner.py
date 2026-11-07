@@ -452,6 +452,7 @@ def test_bad_signature_and_capacity_release_without_poisoning_the_floor(rig):
 def test_reservations_are_exclusive_owned_bounded_and_never_raise_the_floor(monkeypatch):
     ta._reset_for_tests()
     now = 1_000_000.0
+    monkeypatch.setattr(ta.time, 'time', lambda: now)
     raw = ta.sign(KEY, DAILY, 'GET', '/api/months', {}, int(now), 'a' * 32)
     claim = ta.reserve(raw, now=now)
     assert claim is not None and ta.reserve(raw, now=now) is None
