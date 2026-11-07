@@ -192,6 +192,10 @@ MAX_STORAGE_HEADER_LEN = 4096
 _TENANT_STATE_CAP = 128
 _TENANT_STATE_TTL_S = 24 * 60 * 60
 _base_cfg = load_config()
+# One credential gate and durable backup intent authority shared by both processes.
+from . import storage_backoff, backup_effect
+storage_backoff.configure_shared(Path(_base_cfg.get("retrieval.db_path")).parent / 'storage-gates.db')
+tenant_writer.configure_data_root(Path(_base_cfg.get("retrieval.db_path")).parent)
 # #1636: one embedding configuration for the whole service, saved beside the service index (not
 # per tenant): tenant configs are copies of this one and inherit the path.
 if not _base_cfg.get("retrieval.embedding_state_path"):
@@ -948,6 +952,11 @@ def delete_tenant(request: Request) -> JSONResponse:
 
 def _delete_tenant(user_id: str) -> JSONResponse:
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    backup_effect.require_clear(root)
+    # Reserve future-incarnation admission and prove current/old process absence or fencing
+    # BEFORE destroying cached state or publishing a tombstone.
+    rust_forward.fence_tenant(user_id)
+    backup_effect.require_clear(root)
     # Under _tenant_lock only bookkeeping (#804): tombstone first, so every new
     # request for this tenant is refused (410) from here on, then unregister its
     # states and sessions. _close_state waits for the tenant's store write lock,
@@ -976,7 +985,7 @@ def _delete_tenant(user_id: str) -> JSONResponse:
         _close_state(state)
     # D5: the Rust process (when it writes for tenants) finishes its write in flight and refuses
     # the tenant from here on, before the root disappears.
-    rust_forward.fence_tenant(user_id)
+    backup_effect.require_clear(root)
     shutil.rmtree(root, ignore_errors=True)
     return JSONResponse({"ok": True})
 
@@ -1474,6 +1483,7 @@ def api_storage_backup(request: Request):
         raise HTTPException(400, "invalid tenant")
     _require_tenant_assertion(request)
     root = Path(_base_cfg.get("retrieval.db_path")).parent / "users" / user_id
+    backup_effect.require_clear(root)
     # Opening a ManagedCorpusBackend creates the folder and database, so a backup
     # racing an account deletion must not open one for a deleted tenant (#805).
     with _tenant_lock:

@@ -93,7 +93,7 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/workspace-export": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
-                "/api/entries/edit": "POST"}
+                "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024
@@ -224,6 +224,10 @@ class RustServer:
         self._delays = tuple(restart_delays)
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
+        self._spawning = False
+        # Reserved before deletion. New incarnations cannot receive a forwarded request for
+        # these tenants, including while the caller has not yet published its tombstone.
+        self._deleting = {}
         self._token = ""
         self.forward_secret = ""
         self._stopping = threading.Event()
@@ -248,25 +252,64 @@ class RustServer:
             self._thread.join(timeout=5)
 
     def _spawn(self) -> Optional[subprocess.Popen]:
-        binary = self._binary or _binary()
-        if binary is None:
-            log.warning("Rust Diary server binary not found; Python serves every route")
-            return None
-        token, forward = secrets.token_hex(16), secrets.token_hex(32)
+        with self._lock:
+            self._spawning = True
+        proc = None
         try:
+            binary = self._binary or _binary()
+            if binary is None:
+                log.warning("Rust Diary server binary not found; Python serves every route")
+                return None
+            token, forward = secrets.token_hex(16), secrets.token_hex(32)
             config = json.dumps(self._config_factory(self.port, token, forward), separators=(",", ":"))
             proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                     stderr=None, close_fds=True,
                                     env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
                                          "TZ": os.environ.get("TZ", ""), "HOME": "/nonexistent"})
+            # Publish ownership before feeding config: a broken pipe must never leave an
+            # untracked child which an absence check could mistake for settled.
+            with self._lock:
+                self._proc, self._token, self.forward_secret = proc, token, forward
             proc.stdin.write(config.encode() + b"\n")
             proc.stdin.close()
-        except Exception as exc:  # noqa: BLE001 - never take the service down
+            return proc
+        except Exception as exc:
             log.warning("Rust Diary server could not start (%s); Python serves every route", type(exc).__name__)
+            if proc is not None:
+                self._mark_lost(proc, quiet=True)
             return None
+        finally:
+            with self._lock:
+                self._spawning = False
+
+    def prepare_delete(self, user_id: str) -> bool:
+        """Reserve deletion against all future forwards, then prove old-child coverage.
+
+        The caller checks the durable intent before and after this and retains its tenant
+        hold through removal. An absent process is safe only outside spawn/reap transitions.
+        A failed live fence keeps the reservation and may be retried; it never authorizes
+        tombstoning or removal. No transport error/exit retires a remote effect intent.
+        """
         with self._lock:
-            self._proc, self._token, self.forward_secret = proc, token, forward
-        return proc
+            if self._spawning or self.reaping:
+                return False
+            proc = self._proc
+            if proc is None:
+                self._deleting[user_id] = time.monotonic()
+                return True
+            if not self.ready or not self._token:
+                return False
+            self._deleting[user_id] = time.monotonic()
+        return self.fence(user_id)
+
+    def forward_secret_for(self, user_id: str) -> str:
+        with self._lock:
+            reserved = self._deleting.get(user_id.lower())
+            # Same 24-hour tombstone lifetime as the Python registry and native fence.
+            if reserved is not None and time.monotonic() - reserved < 24 * 60 * 60:
+                return ""
+            self._deleting.pop(user_id.lower(), None)
+            return self.forward_secret
 
     def _wait_ready(self, proc: subprocess.Popen) -> bool:
         deadline = time.monotonic() + READY_TIMEOUT_S
@@ -459,6 +502,34 @@ class ForwardMiddleware:
                                        tenant_assertion.wire_path(scope), query=scope.get("query_string", b""),
                                        body_hash=body_hash, owner=owner)
 
+    async def _refuse_effect_blocked(self, scope, receive, send):
+        """A mutation while the tenant's backup effect is unsettled: 503 (backup_effect.MESSAGE). A
+        request delegated to the Rust verifier is verified here first, exactly as `_serve_here`
+        would, so an unverified caller gets the 401 and never learns the tenant's backup state."""
+        from .backup_effect import MESSAGE
+        state = scope.setdefault("state", {})
+        if self._delegated(scope) and not state.get("tenant_asserted"):
+            body = b""
+            if self._declares_body(scope):
+                # Delegation admitted only a bounded JSON write body (see `delegates`).
+                body, failure = await self._collect(receive, time.monotonic() + FORWARD_DEADLINE_S)
+                if failure == "too_large":
+                    await self._reply(send, 413, TOO_LARGE)
+                    return
+                if failure == "timeout":
+                    await self._reply(send, 408, BODY_TIMEOUT)
+                    return
+                if failure == "disconnected":
+                    return
+            reason = await self._verify_here(scope, body, self._claim(scope))
+            if reason:
+                if reason != tenant_assertion.BUSY_REFUSAL:
+                    log.warning("tenant assertion rejected: %s", reason)
+                await self._reply(send, 401, UNVERIFIED)
+                return
+            state["tenant_asserted"] = True
+        await self._reply(send, 503, json.dumps({"detail": MESSAGE}, separators=(",", ":")).encode())
+
     async def _after_decline(self, scope, receive, send, body: bytes = b""):
         """A forward that came back without a served reply (declined, or no answer)."""
         state = scope.setdefault("state", {})
@@ -525,6 +596,10 @@ class ForwardMiddleware:
                 tenant_assertion.release(claim)
 
     async def _call(self, scope, receive, send):
+        user = (self._user(scope) or os.environ.get("DIARY_LEGACY_USER_ID", "")).lower()
+        if scope.get("type") == "http" and scope.get("method") not in ("GET", "HEAD", "OPTIONS") and tenant_writer.effect_blocked(user):
+            await self._refuse_effect_blocked(scope, receive, send)
+            return
         server = self.server or current()
         writer = self._writer_tenant(scope)
         if writer:
@@ -653,7 +728,10 @@ class ForwardMiddleware:
             # The request may have reached the child, which may still be writing: the same as a
             # lost reply. The child is killed (the barrier is up before this lock is released) and
             # the tenant recovers before its next write.
-            self._uncertain(server, user)
+            if scope.get("path") != "/api/storage-backup":
+                self._uncertain(server, user)
+            # Backup retains its own flock and native writer until transport settles.
+            # Killing the process here could unlock while a remote PUT still commits.
             raise
         if outcome == "uncertain":
             self.on_uncertain(user)
@@ -690,7 +768,8 @@ class ForwardMiddleware:
         if url.raw_path != target:
             # httpx would re-encode this request target: keep it here, unaltered.
             return None
-        secret = server.forward_secret
+        effective_user = self._user(scope) or os.environ.get("DIARY_LEGACY_USER_ID", "")
+        secret = server.forward_secret_for(effective_user)
         if not secret:
             return None
         state = scope.setdefault("state", {})
@@ -726,7 +805,8 @@ class ForwardMiddleware:
             # Never dispatched: the claim (if any) is released by __call__. A write keeps D5's
             # conservative answer (UNCERTAIN), exactly as before.
             log.warning("Rust Diary server did not answer (TimeoutError); falling back to Python")
-            server.lost()
+            if scope.get("path") != "/api/storage-backup":
+                server.lost()  # a backup keeps its settling child (as below)
             return "uncertain" if writer else None
         proc = getattr(server, "_proc", None)
         if delegated:
@@ -761,7 +841,10 @@ class ForwardMiddleware:
             finally:
                 # Cancellation inside the read's exit probe still retires this child. Writes
                 # skip that probe and raise the D5 barrier without awaiting an unused verdict.
-                server.lost()
+                # A backup keeps its child: its flock and native writer stay held until the
+                # remote transport settles (killing it could unlock while a PUT still commits).
+                if scope.get("path") != "/api/storage-backup":
+                    server.lost()
             if writer and not not_sent:
                 # The request may have reached the child, which may have committed it.
                 return "uncertain"
@@ -855,5 +938,6 @@ def fence_tenant(user_id: str) -> None:
     """DELETE /api/internal/tenant, after Python's tombstone: the Rust side stops writing the tenant
     (and finishes the write in flight) before its root is removed."""
     server = current()
-    if server is not None and not server.fence(user_id):
-        log.warning("Rust Diary server did not confirm the tenant fence; removing the tenant anyway")
+    if server is not None and not server.prepare_delete(user_id):
+        from fastapi import HTTPException
+        raise HTTPException(503, "Diary saving did not confirm the tenant fence. Deletion remains paused.")

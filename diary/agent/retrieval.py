@@ -22,6 +22,10 @@ from functools import wraps
 def synchronized(fn):
     @wraps(fn)
     def call(self, *args, **kwargs):
+        if fn.__name__ == 'apply_reindex':
+            # Only the prepared publication is covered; embeddings happen before this call.
+            with tenant_writer.index_publication(self.db_path), self._lock:
+                return fn(self, *args, **kwargs)
         with self._lock:
             return fn(self, *args, **kwargs)
     return call
@@ -149,14 +153,18 @@ class Retriever:
         # D5: adoption is a write. Without the tenant's writer lock (a search) it is left to the
         # next re-index, which adopts under the lock (apply_reindex); reads never take the lock.
         adopt = not (getattr(self, "_guarded", False) and tenant_writer.is_writer(tid) and not tenant_writer.held(tid))
+        # Probe without acquiring primary under the instance lock. If no adoption is needed,
+        # this remains a genuine read even during uncertain effects or authority contention.
         with self._lock:
-            if not adopt:
-                pass
-            elif self._conn.in_transaction:
-                slots.adopt_legacy(self._conn, target)
-            else:
-                with self._conn:
-                    slots.adopt_legacy(self._conn, target)
+            needs_adoption = adopt and not self._conn.in_transaction and slots.needs_legacy_adoption(self._conn, target)
+        if needs_adoption:
+            with tenant_writer.index_publication(self.db_path), self._lock:
+                # An unrelated caller's open index transaction must not receive a mutation whose
+                # later COMMIT we do not own. The next guarded apply_reindex can adopt instead.
+                if not self._conn.in_transaction:
+                    with self._conn:
+                        slots.adopt_legacy(self._conn, target)
+        with self._lock:
             slot = slots.find_slot(self._conn, target)
         self._dim = slot["dim"] if slot else None
         return target, slot
@@ -344,7 +352,8 @@ class Retriever:
     def _search_vector(self, q: Optional[List[float]], top_k: int, min_score: float, slot: Optional[dict] = None,
                        with_ids: bool = False, diag: Optional[dict] = None) -> List[dict]:
         if slot is None:
-            slot = self._active_slot()[1]
+            # Called under the instance lock: never attempt a migration/primary acquisition here.
+            slot = slots.find_slot(self._conn, self.embedding.active())
         if q is None or slot is None or len(q) != slot["dim"]:
             if diag is not None:
                 diag["status"] = ("index_unavailable" if slot is None else
