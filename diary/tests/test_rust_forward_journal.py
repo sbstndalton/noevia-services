@@ -6,8 +6,9 @@ import pytest
 import agent.app as appmod
 from agent import corpus as fmt, tenant_writer
 from tests.test_rust_forward import world, DAILY  # noqa: F401
+from tests.test_rust_forward import MONTHLY
 from tests.test_rust_forward_d5 import (writers, _writer_registry, needs_binary, needs_server, needs_cw,
-    request, snapshot, restore, storage, Recorder)  # noqa: F401
+    request, snapshot, restore, storage, differential, Recorder)  # noqa: F401
 
 
 @needs_binary
@@ -167,6 +168,7 @@ def test_python_writer_waits_until_native_replay_settles(writers):
 @pytest.mark.parametrize('case', [
     'nan', 'infinity', 'surrogate', 'known-nan', 'known-surrogate', 'malformed',
     'month-0', 'month-19', 'short-0', 'short-19',
+    'year0-0', 'year0-19', 'day0',
 ])
 @pytest.mark.parametrize('runtime', ['reference', 'forwarded'])
 def test_noncanonical_replay_uses_reference_before_effects(writers, case, runtime):
@@ -184,11 +186,17 @@ def test_noncanonical_replay_uses_reference_before_effects(writers, case, runtim
         kind = 'index_month'
         extension = 'NaN' if case == 'known-nan' else '"\\ud800"'
         payload = '{"label":"Synthetic","month":"2030-01.md","extra":' + extension + '}'
-    if case.startswith(('month-', 'short-')):
+    if case.startswith(('month-', 'short-', 'year0-')):
         kind = 'exchange_edit'
         attempts = int(case.split('-')[1])
+        hint = {'month': '2030-13', 'short': 'x', 'year0': '0000-01'}[case.split('-')[0]]
         payload = json.dumps({'xid':'abcdef12','new_me':'Synthetic bad hint', 'new_claude':'',
-                              'month':'2030-13' if case.startswith('month-') else 'x'})
+                              'month':hint})
+    if case == 'day0':
+        # Legacy/manual row: fromisoformat refuses year 0, so the reference quarantines it at once.
+        kind = 'exchange'
+        payload = json.dumps({'day':'0000-01-01','xid':'abcdef12','sub_header':'12:00 | Synthetic',
+                              'body':fmt.render_exchange('Synthetic year zero', '', 'abcdef12')})
     with sqlite3.connect(tenant / 'managed-index.db') as db:
         db.execute('INSERT INTO journal(id,created_at,kind,payload,attempts) VALUES (?,?,?,?,?)',
                    ('compat', '2030', kind, payload, attempts))
@@ -227,6 +235,36 @@ def test_noncanonical_replay_uses_reference_before_effects(writers, case, runtim
     # month at attempts 0 or malformed JSON must continue using reference recovery.
     Recorder.served = []
     follow = request(client, DAILY, 'POST', '/api/directory', {'path':'Compatibility followup'})
-    pending = case == 'malformed' or case in ('month-0', 'short-0')
+    pending = case == 'malformed' or case in ('month-0', 'short-0', 'year0-0')
     assert Recorder.served == [not pending]
     assert follow.status_code == (500 if case == 'malformed' else 200)
+
+
+@needs_binary
+@needs_server
+@needs_cw
+def test_year_zero_edit_hint_is_decided_by_the_reference_and_adjacent_years_stay_native(writers):
+    """Y0-2: month "0000-01" matches MONTH_ID_RE but date(0, 1, 1) raises, so the reference answers
+    502 'edit failed'; the native edit must decline to it before any effect, on both layouts.
+    Years 1 and 9999 are valid dates and stay native (404: no such document)."""
+    client, start, state = writers
+    modes = start()
+    client._transport.raise_server_exceptions = False
+    xid = 'ffffffff-0000-4000-8000-000000000000'
+    cases = []
+    for label, user in (('daily', DAILY), ('monthly', MONTHLY)):
+        cases += [
+            (f'edit year-zero month, {label} (Python decides)', user, 'POST', '/api/entries/edit',
+             {'xid': xid, 'me': 'x', 'month': '0000-01'}, 502, False),
+            (f'edit year-zero month 12, {label} (Python decides)', user, 'POST', '/api/entries/edit',
+             {'xid': xid, 'me': 'x', 'month': '0000-12'}, 502, False),
+            (f'edit month 0000-13 stays a 400, {label}', user, 'POST', '/api/entries/edit',
+             {'xid': xid, 'me': 'x', 'month': '0000-13'}, 400, True),
+        ]
+    cases += [
+        ('edit year 1 stays native', DAILY, 'POST', '/api/entries/edit',
+         {'xid': xid, 'me': 'x', 'month': '0001-01'}, 404, True),
+        ('edit year 9999 stays native', DAILY, 'POST', '/api/entries/edit',
+         {'xid': xid, 'me': 'x', 'month': '9999-12'}, 404, True),
+    ]
+    differential(client, modes, state, cases)
