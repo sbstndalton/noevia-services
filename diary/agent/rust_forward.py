@@ -413,6 +413,11 @@ class ForwardMiddleware:
         return user if self.writers == ALL_TENANTS or user in self.writers else ""
 
     async def __call__(self, scope, receive, send):
+        user = (self._user(scope) or os.environ.get("DIARY_LEGACY_USER_ID", "")).lower()
+        if scope.get("type") == "http" and scope.get("method") not in ("GET", "HEAD", "OPTIONS") and tenant_writer.effect_blocked(user):
+            from .backup_effect import MESSAGE
+            await self._reply(send, 503, json.dumps({"detail": MESSAGE}, separators=(",", ":")).encode())
+            return
         server = self.server or current()
         writer = self._writer_tenant(scope)
         if writer:
@@ -649,4 +654,5 @@ def fence_tenant(user_id: str) -> None:
     (and finishes the write in flight) before its root is removed."""
     server = current()
     if server is not None and not server.fence(user_id):
-        log.warning("Rust Diary server did not confirm the tenant fence; removing the tenant anyway")
+        from fastapi import HTTPException
+        raise HTTPException(503, "Diary saving did not confirm the tenant fence. Deletion remains paused.")

@@ -31,12 +31,17 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, 'check_auth', lambda _: True)
     monkeypatch.setattr(appmod, '_deleted_tenants', {})
     appmod._backup_backends.clear()
+    from agent import storage_backoff, tenant_writer
+    if hasattr(storage_backoff, 'configure_shared'):
+        storage_backoff.configure_shared(tmp_path / 'storage-gates.db')
+    if hasattr(tenant_writer, 'configure_data_root'):
+        tenant_writer.configure_data_root(tmp_path)
     root = tmp_path / 'users' / UID
     backend = ManagedCorpusBackend(root, UID)
     backend.activate({'a ü!@.md': b'synthetic one', 'b.md': b'synthetic two'}, {}, ['empty'])
     with backend.db() as db:
         db.execute("UPDATE meta SET value='0' WHERE key='due'")
-    state = {'objects': {}, 'status': 0, 'partial': False, 'calls': 0, 'entered': threading.Event(), 'release': threading.Event(), 'block': False}
+    state = {'objects': {}, 'status': 0, 'partial': False, 'calls': 0, 'entered': threading.Event(), 'release': threading.Event(), 'block': False, 'mutations': 0, 'delay_manifest': False, 'drop_reply': False, 'committed': threading.Event(), 'slow_read': None, 'slow_used': False}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -46,13 +51,45 @@ def lab(tmp_path, monkeypatch):
             self.send_response(code)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def do_MKCOL(self):
+            state['mutations'] += 1
             self.answer(201)
 
         def do_GET(self):
             state['calls'] += 1
+            if state['slow_read'] and not state['slow_used']:
+                state['slow_used'] = True
+                body = b'synthetic one'
+                mode = state['slow_read']
+                state['entered'].set()
+                if mode == 'headers':
+                    assert state['release'].wait(25)
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                try:
+                    if mode == 'body':
+                        self.wfile.write(body[:1])
+                        self.wfile.flush()
+                        assert state['release'].wait(25)
+                        self.wfile.write(body[1:])
+                    elif mode == 'trickle':
+                        for start in (0, 3, 6, 9):
+                            if start:
+                                time.sleep(6)
+                            self.wfile.write(body[start:start + 3])
+                            self.wfile.flush()
+                        state['objects'][self.path] = body
+                    else:
+                        self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             if state['status'] or (state['partial'] and len(state['objects']) >= 1 and self.path not in state['objects']):
                 self.answer(state['status'] or 503, b'synthetic reflected secret')
             elif self.path in state['objects']:
@@ -62,9 +99,18 @@ def lab(tmp_path, monkeypatch):
 
         def do_PUT(self):
             body = self.rfile.read(int(self.headers['Content-Length']))
+            state['mutations'] += 1
+            if state['drop_reply'] or (state['delay_manifest'] and '/manifests/' in self.path):
+                state['entered'].set()
+                assert state['release'].wait(25)
+                state['objects'][self.path] = body
+                state['committed'].set()
+                if state['drop_reply']:
+                    self.close_connection = True
+                    return
             if state['block']:
                 state['entered'].set()
-                assert state['release'].wait(10)
+                assert state['release'].wait(25)
             state['objects'][self.path] = body
             self.answer(201)
 
@@ -101,7 +147,7 @@ def lab(tmp_path, monkeypatch):
         headers = {'x-cowork-user-id': UID, 'x-cowork-storage': descriptor,
                    'x-noevia-diary-forward': 'forward', 'x-noevia-diary-writer': '1'}
         if native:
-            reply = httpx.post(base + '/api/storage-backup', headers=headers, timeout=20)
+            reply = httpx.post(base + '/api/storage-backup', headers=headers, timeout=30)
             return reply.status_code, reply.json()
         req = Request({'type': 'http', 'headers': [(k.encode(), v.encode()) for k, v in headers.items()]})
         try:
@@ -109,6 +155,8 @@ def lab(tmp_path, monkeypatch):
         except HTTPException as exc:
             return exc.status_code, {'detail': exc.detail}
 
+    state['proc'] = proc
+    state['data_root'] = tmp_path
     yield backend, state, storage, call, base
     state['release'].set()
     proc.terminate()
@@ -116,6 +164,10 @@ def lab(tmp_path, monkeypatch):
     dav.shutdown()
     thread.join(timeout=5)
     appmod._backup_backends.clear()
+    if hasattr(storage_backoff, 'configure_shared'):
+        storage_backoff.configure_shared(None)
+    if hasattr(tenant_writer, 'configure_data_root'):
+        tenant_writer.configure_data_root(None)
 
 
 def reset(backend, state):
@@ -124,6 +176,11 @@ def reset(backend, state):
     state['objects'].clear()
     from agent import storage_backoff
     storage_backoff._gates.clear()
+    shared = backend.root.parent.parent / 'storage-gates.db'
+    if shared.exists():
+        import sqlite3
+        with sqlite3.connect(shared) as db:
+            db.execute('DELETE FROM storage_gates')
 
 
 @pytest.mark.parametrize('mode', ['success', '401', '403', '500', '503', '429', '302', 'partial', 'locked', 'missing'])
@@ -204,3 +261,140 @@ def test_login_cooldown_and_changed_secret(lab):
         db.execute('DELETE FROM backups')
     assert call(True)[1]['loginRefused'] is True
     assert state['calls'] > calls
+
+
+@pytest.mark.parametrize('reference', [True, 1, -1, [1], {'x': 1}, False, 0, [], {}, None, ''])
+def test_secret_ref_python_truthiness(lab, reference):
+    backend, state, storage, call, _ = lab
+    storage.pop('secret')
+    storage['secretRef'] = reference
+    replies = []
+    for native in (False, True):
+        reset(backend, state)
+        before = state['calls'] + state['mutations']
+        status, body = call(native)
+        replies.append((status, body.get('detail'), body.get('storageContacted')))
+        if reference:
+            assert state['calls'] + state['mutations'] == before
+    assert replies[0] == replies[1]
+    assert replies[0][0] == (428 if reference else 200)
+
+
+@pytest.mark.parametrize('status', [401, 429])
+@pytest.mark.parametrize('native_first', [False, True])
+def test_shared_credential_cooldown(lab, status, native_first):
+    from agent.webdav import WebDAVCorpusBackend
+    backend, state, storage, call, _ = lab
+    state['status'] = status
+    assert call(native_first)[1]['backup'] == 'failed'
+    before = state['calls']
+    with backend.db() as db:
+        db.execute('DELETE FROM backups')
+    # One credential, even when spelling the collection with no trailing slash.
+    storage['baseUrl'] = storage['baseUrl'].rstrip('/')
+    assert call(not native_first)[1]['backup'] == 'failed'
+    assert state['calls'] == before
+    remote = WebDAVCorpusBackend(storage['baseUrl'], storage['username'], storage['secret'])
+    try:
+        assert remote.storage_gate.reset_login() is (status == 401)
+        with backend.db() as db:
+            db.execute('DELETE FROM backups')
+        call(True)
+        assert (state['calls'] > before) is (status == 401)
+        if status == 401:
+            assert remote.storage_gate.reset_login() is False  # shared minimum-reset interval
+        gate_bytes = (backend.root.parent.parent / 'storage-gates.db').read_bytes()
+        assert storage['secret'].encode() not in gate_bytes
+        assert storage['baseUrl'].encode() not in gate_bytes
+    finally:
+        remote.close()
+
+
+def assert_durable_fence(lab):
+    backend, _, _, call, base = lab
+    assert call(False)[0] == 503
+    assert backend.db_path.exists()
+    with pytest.raises(HTTPException) as failure:
+        appmod._delete_tenant(UID)
+    assert failure.value.status_code == 503
+    assert backend.db_path.exists()
+
+
+def test_manifest_commits_after_native_timeout_stays_fenced(lab):
+    import concurrent.futures
+    backend, state, _, call, _ = lab
+    state['delay_manifest'] = True
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        request = pool.submit(call, True)
+        assert state['entered'].wait(5)
+        # Real native 15-second transport timeout, not a shortened mock timeout.
+        result = request.result(timeout=20)
+        try:
+            assert result[0] == 503
+            with (backend.root / 'managed-backup.lock').open('a') as held:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert_durable_fence(lab)
+        finally:
+            state['release'].set()
+        assert state['committed'].wait(5)
+        # Remote commit/readback is not a receipt for the original uncertain operation.
+        assert_durable_fence(lab)
+        state['proc'].kill()
+        state['proc'].wait(timeout=5)
+        assert_durable_fence(lab)
+
+
+def test_unrelated_forward_failure_kills_child_but_retains_effect_fence(lab, monkeypatch):
+    import asyncio
+    import concurrent.futures
+    from agent import rust_forward
+    backend, state, _, call, base = lab
+    state['block'] = True
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        request = pool.submit(call, True)
+        assert state['entered'].wait(5)
+        server = rust_forward.RustServer(lambda *args: {}, port=httpx.URL(base).port, restart_delays=())
+        server.ready, server.forward_secret, server._proc = True, 'forward', state['proc']
+        async def fail_unrelated_headerless_read():
+            async def fail(req):
+                raise httpx.ReadTimeout('synthetic timeout')
+            middleware = rust_forward.ForwardMiddleware(None, routes={})
+            middleware._client = httpx.AsyncClient(transport=httpx.MockTransport(fail))
+            middleware._client_loop = asyncio.get_running_loop()
+            await middleware._forward(server, {'type': 'http', 'path': '/api/months', 'method': 'GET', 'headers': []}, time.monotonic() + 2)
+            await middleware._client.aclose()
+        try:
+            asyncio.run(fail_unrelated_headerless_read())
+            state['proc'].wait(timeout=5)
+            assert_durable_fence(lab)
+            # Even after switching off writer selectors, fallback cannot replay/delete.
+            from agent import tenant_writer
+            tenant_writer.configure(frozenset())
+            assert_durable_fence(lab)
+        finally:
+            state['release'].set()
+            try:
+                request.result(timeout=5)
+            except httpx.TransportError:
+                pass
+        assert_durable_fence(lab)
+
+
+@pytest.mark.parametrize('phase', ['headers', 'body', 'trickle'])
+def test_read_timeout_is_inactivity_not_total_response_time(lab, phase):
+    backend, state, _, call, _ = lab
+    state['slow_read'] = phase
+    started = time.monotonic()
+    status, body = call(True)
+    elapsed = time.monotonic() - started
+    assert status == 200
+    if phase == 'trickle':
+        assert elapsed >= 17
+        assert body['storageContacted'] is True
+    else:
+        assert 14 <= elapsed < 23
+        assert body['backup'] == 'failed'
+        from agent.backup_effect import pending
+        assert not pending(backend.root)  # no mutation was dispatched by a stalled GET
+    state['release'].set()

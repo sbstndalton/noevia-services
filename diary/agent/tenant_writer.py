@@ -58,6 +58,18 @@ _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _GUARDED_FILES = ("managed-diary.db", "managed-index.db")
 
 _writers = frozenset()
+_data_root = None
+
+
+def configure_data_root(root):
+    global _data_root
+    _data_root = Path(root) if root is not None else None
+
+
+def effect_blocked(uid):
+    from .backup_effect import pending
+    return bool(_data_root is not None and uid and _UUID_RE.fullmatch(uid) and pending(_data_root / 'users' / uid))
+
 
 
 class WriterBusy(Exception):
@@ -194,6 +206,8 @@ def _check_order(uid: str) -> None:
 
 def _try(uid: str, token) -> Optional[str]:
     """Caller holds _cond. None when acquired, else why not ("busy" or a barrier's reason)."""
+    if effect_blocked(uid):
+        return "backup settlement uncertain"
     reason = _blocked()
     if reason:
         return reason
@@ -254,6 +268,8 @@ _NOOP._done = True
 
 def _enter(uid: str) -> Optional[Hold]:
     """A no-op or joined hold, or None when the caller must acquire."""
+    if effect_blocked(uid):
+        raise WriterBusy(uid, "backup settlement uncertain")
     if not is_writer(uid):
         return _NOOP
     entry = _held.get()
@@ -382,6 +398,8 @@ def _authorizer(uid: Optional[str]):
             # Nothing here attaches databases; refusing it keeps every write on the connection
             # opened for that file, where its tenant's guard applies.
             denials.append((uid, action, arg1))
+            return sqlite3.SQLITE_DENY
+        if uid is not None and action in _WRITE_ACTIONS and effect_blocked(uid):
             return sqlite3.SQLITE_DENY
         if uid is not None and action in _WRITE_ACTIONS and dbname != "temp" and is_writer(uid) \
                 and not held(uid) and not any(e[0] == uid for e in _exempt.get()):
