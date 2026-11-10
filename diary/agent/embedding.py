@@ -339,10 +339,6 @@ class EmbeddingConfig:
         with self._lock:
             return self._state["previous"]
 
-    def model_names(self) -> List[str]:
-        with self._lock:
-            return [t.model for t in self._state.values() if t]
-
     def set_next(self, raw) -> Dict[str, Any]:
         t = normalize_target(raw)
         with self._lock:
