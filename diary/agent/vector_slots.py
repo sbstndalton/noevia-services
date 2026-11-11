@@ -76,16 +76,22 @@ def _legacy_claimed(conn: sqlite3.Connection) -> bool:
     return any(s["table"] == LEGACY_TABLE for s in list_slots(conn))
 
 
-def adopt_legacy(conn: sqlite3.Connection, active: Optional[Target]) -> None:
-    """Records the pre-#1636 table as ``active``'s slot when ``active`` uses raw text (nomic-v1)."""
+def needs_legacy_adoption(conn: sqlite3.Connection, active: Optional[Target]) -> bool:
+    """Read-only readiness probe; any actual adoption needs the caller's publication guard."""
     if not active or active.profile != "nomic-v1":
-        return
+        return False
     try:
         dim = int(_meta(conn, "dim") or 0)
     except ValueError:
+        return False
+    return dim > 0 and _exists(conn, LEGACY_TABLE) and not _legacy_claimed(conn) and not _meta(conn, f"slot:{active.slot_id}")
+
+
+def adopt_legacy(conn: sqlite3.Connection, active: Optional[Target]) -> None:
+    """Records the legacy table under an already-covered write transaction."""
+    if not needs_legacy_adoption(conn, active):
         return
-    if dim <= 0 or not _exists(conn, LEGACY_TABLE) or _legacy_claimed(conn) or _meta(conn, f"slot:{active.slot_id}"):
-        return
+    dim = int(_meta(conn, "dim"))
     _set_meta(conn, f"slot:{active.slot_id}", json.dumps({"model": active.model, "profile": active.profile, "dim": dim, "table": LEGACY_TABLE, "map": None}))
 
 

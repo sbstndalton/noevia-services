@@ -18,6 +18,7 @@ needed: skipped without it unless TENANT_ASSERTION_REQUIRED=1 (CI builds it and 
 import hashlib
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -43,8 +44,10 @@ def decide(i, started_at=None):
         return 'accept' if ta.secret_ref_matches(i['key'], i['user_id'], i['secret'], i['ref']) else 'reject: bad signature'
     headers = {'X-Cowork-User-ID': i['user_id'], ta.HEADER: i['assertion'], 'X-Cowork-Storage': i['storage'],
                'X-Cowork-Legacy-Owner': i['legacy_owner'], 'X-Cowork-Storage-Blocked': i['blocked']}
-    reason = ta.verify(i['key'], headers, i['method'], i['path'], now=float(i['now']),
-                       query=bytes.fromhex(i['query_hex']), body_hash=i['body_hash'])
+    # The frozen request clock also governs the admission-lock freshness check.
+    with patch.object(ta.time, 'time', return_value=float(i['now'])):
+        reason = ta.verify(i['key'], headers, i['method'], i['path'], now=float(i['now']),
+                           query=bytes.fromhex(i['query_hex']), body_hash=i['body_hash'])
     return 'accept' if reason is None else 'reject: ' + reason
 
 
@@ -75,8 +78,9 @@ def frozen_headers(c):
 
 def verify_frozen(c, started_at=None):
     ta._reset_for_tests(started_at)
-    return ta.verify(c['key'], frozen_headers(c), c['method'], c['path'], now=float(c['now']),
-                     query=bytes.fromhex(c['query_hex']), body_hash=c['body_hash'])
+    with patch.object(ta.time, 'time', return_value=float(c['now'])):
+        return ta.verify(c['key'], frozen_headers(c), c['method'], c['path'], now=float(c['now']),
+                         query=bytes.fromhex(c['query_hex']), body_hash=c['body_hash'])
 
 
 @needs_binary
