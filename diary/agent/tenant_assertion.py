@@ -108,10 +108,6 @@ _logged: set = set()
 _logged_lock = threading.Lock()
 
 
-class NonceCacheFull(Exception):
-    """No longer raised (#1680); kept so older callers that name it still import."""
-
-
 def tenant_key() -> str:
     return (os.environ.get("DIARY_TENANT_KEY") or "").strip()
 

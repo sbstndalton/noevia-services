@@ -24,7 +24,6 @@ ALLOWED_EXTENSIONS = {".txt", ".md", ".markdown"}
 
 # Safety valves: a misconfigured path pointing at a huge tree must not hang
 # the sidecar or produce an unbounded response.
-MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024
 MAX_FILES_PER_SOURCE = 500
 
 _FILENAME_DATE_PATTERNS = (
