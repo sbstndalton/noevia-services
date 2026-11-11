@@ -142,12 +142,15 @@ class FakeChild:
             if self.mode == 'slow':
                 time.sleep(self.delay)
             if self.mode == 'decline':
-                reply = b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n'
+                reply = (b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\nconnection: close\r\n'
+                         b'content-length: 0\r\n\r\n')
             else:
                 body = b'{"native":true}'
-                reply = (b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n' % len(body)
-                         + body)
+                reply = (b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n'
+                         b'content-length: %d\r\n\r\n' % len(body) + body)
             finish()
+            # One request per connection, said so on the wire: the forwarder's pool must never reuse
+            # a socket this fake is closing (a race that read as a lost child under load).
             conn.sendall(reply)
             conn.close()
             time.sleep(self.cleanup_lag)

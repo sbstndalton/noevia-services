@@ -227,7 +227,8 @@ def test_start_server_reaps_its_partial_start_and_preserves_exception(monkeypatc
     if failed_stage == 'start':
         assert caught.value is failure
     else:
-        assert str(caught.value) == 'noevia-diary did not become ready'
+        # pytest's assertion rewriting appends its explanation after the message's own line.
+        assert str(caught.value).splitlines()[0] == 'noevia-diary did not become ready'
     assert events == ['owned-start-attempt', 'owned-stop']
 
 
