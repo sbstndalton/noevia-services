@@ -15,9 +15,9 @@
 # /out/ bundle, so an overlaid image carries the binaries at the same paths without a pip install.
 FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS tenant-assertion
 # Merged decode-v1 Rust runtime dependency (noevia-rs#301); checksum verified below.
-ARG NOEVIA_RS_REF=d8874d7ce7f91c19392f34e738bac77e600d9f45
-ARG NOEVIA_RS_SHA256=b2c47435726963abd5e9ad23822a83453dfaffab3ec98cead746ca616373c024
-ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+ARG NOEVIA_RS_REF=cb72e3e3f380a6da8b6ff6d03c55f866f752cfbc
+ARG NOEVIA_RS_SHA256=7d1734b64be8b0a56ff2c1f1bd1951cf95a9e7d4633ebf33a7bcdfd4834bdc66
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=2
 WORKDIR /src
 ADD https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/${NOEVIA_RS_REF} /tmp/noevia-rs.tar.gz
 RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
@@ -26,7 +26,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && cargo build --release --locked -p tenant-assertion-cli -p workspace-restore-verify-cli \
       -p diary-corpus-write-cli -p diary-corpus-parse -p diary-score-gap -p diary-temporal-focus \
       -p diary-workspace-export -p diary-workspace-import-apply \
-      -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run \
+      -p diary-entity-focus -p diary-index-transform -p diary-storage-backoff -p diary-workspace-rules -p diary-backup-format -p diary-backup-run -p diary-operator \
       -p noevia-diary \
  && ./target/release/tenant-assertion self-test | grep -qx ok \
  && ./target/release/workspace-restore-verify self-test | grep -qx ok \
@@ -34,7 +34,7 @@ RUN echo "${NOEVIA_RS_SHA256}  /tmp/noevia-rs.tar.gz" | sha256sum -c - \
  && cd target/release \
  && cp tenant-assertion workspace-restore-verify diary-corpus-write-cli diary-corpus-parse diary-score-gap \
       diary-temporal-cli diary-workspace-export diary-workspace-import-apply \
-      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run noevia-diary /out/ \
+      diary-entity-focus diary-index-transform diary-storage-backoff diary-workspace-rules diary-backup-format diary-backup-run diary-backup-restore diary-config noevia-diary /out/ \
  && cd /src \
  && rm -rf /src/target /usr/local/cargo/registry
 
@@ -62,6 +62,15 @@ RUN test -x "$DIARY_RUST_SERVER_BIN" && test -x "$DIARY_WORKSPACE_EXPORT_BIN" &&
 COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY entrypoint.sh /usr/local/bin/diary-entrypoint
+RUN chmod 755 /usr/local/bin/diary-entrypoint \
+ && diary-backup-restore --help | grep -q '^usage: backup_restore.py ' \
+ && diary-config /nonexistent/diary-config-smoke.yaml | grep -qx '{"configured":true}'
+# Prove real installed binaries and historical Python spellings offline, including
+# credential-canary checks. Build args bind this candidate to a verified Rust archive.
+RUN mkdir /operator-smoke-evidence \
+ && DIARY_OPERATOR_SMOKE_ROOT=/operator-smoke-evidence python scripts/smoke_operator_image.py \
+ && rm -rf /operator-smoke-evidence
 # Prove the installed binary speaks decode-v1, including payload/version/EOF checks.
 RUN python scripts/smoke_workspace_decode.py
 # Every other leaf answers through its real adapter and agrees with Python on synthetic data. The selectors
@@ -78,4 +87,5 @@ EXPOSE 8010
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
   CMD ["python", "-c", "import os,urllib.request; h={'Authorization':'Bearer '+os.environ.get('DIARY_AUTH_TOKEN','')} if os.environ.get('DIARY_AUTH_TOKEN') else {}; print(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/api/health', headers=h), timeout=5).status)"]
 
+ENTRYPOINT ["diary-entrypoint"]
 CMD ["uvicorn", "agent.app:app", "--host", "0.0.0.0", "--port", "8010"]

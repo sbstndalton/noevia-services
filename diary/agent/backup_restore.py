@@ -1,10 +1,10 @@
 """Verify a downloaded immutable manifest and restore into a NEW directory only.
 
-Run: python -m agent.backup_restore BACKUP_ROOT MANIFEST_JSON NEW_DIRECTORY
+Run: diary-backup-restore BACKUP_ROOT MANIFEST_JSON NEW_DIRECTORY
+The python -m agent.backup_restore spelling dispatches to the same native CLI.
 BACKUP_ROOT contains the downloaded WebDAV tree (including corpusRoot).
 Never points at a live corpus, chooses a latest manifest, or overwrites files.
 """
-import argparse
 import hashlib
 import json
 import os
@@ -66,9 +66,7 @@ def restore(root, manifest_path, destination):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('backup_root')
-    parser.add_argument('manifest')
-    parser.add_argument('new_directory')
-    args = parser.parse_args()
-    print(json.dumps(restore(args.backup_root, args.manifest, args.new_directory), indent=2))
+    # Keep the imported restore API as the frozen test/smoke oracle. Operator
+    # execution has one owner, including callers using the historical spelling.
+    import sys
+    os.execvp('diary-backup-restore', ['diary-backup-restore', *sys.argv[1:]])
