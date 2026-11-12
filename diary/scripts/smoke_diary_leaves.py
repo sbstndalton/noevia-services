@@ -12,10 +12,17 @@ import argparse
 from contextlib import contextmanager
 from datetime import date, datetime
 import io
+import json
 import os
 from pathlib import Path
+import secrets
+import socket
+import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -23,6 +30,7 @@ from agent import corpus as fmt  # noqa: E402
 from agent import corpus_parse  # noqa: E402
 from agent import corpus_write_native  # noqa: E402
 from agent import entity_focus  # noqa: E402
+from agent import rust_forward  # noqa: E402
 from agent import score_gap  # noqa: E402
 from agent import score_gap_native  # noqa: E402
 from agent import temporal_native  # noqa: E402
@@ -153,6 +161,63 @@ def workspace_import_apply(temp):
     check(rows['rust'] == rows['python'], 'imported rows differ')
 
 
+def noevia_diary_leaf(temp):
+    """D4-D5: the Rust Diary server starts from the config line Python sends, answers its control probe, refuses a
+    wrong control token, refuses a route without the forward secret and declines a route it does not serve. Nothing but 127.0.0.1 on a free port is touched, no model
+    or tenant is involved, and the process is always stopped. The service itself never starts it unless
+    DIARY_RUST_ROUTES or DIARY_RUST_WRITES is set."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    token, forward = secrets.token_hex(16), secrets.token_hex(32)
+    client = {'base_url': 'http://127.0.0.1:9', 'api_key': '', 'chat_model': '', 'fallback_model': '',
+              'setting_key': 'llm.chat_model', 'fallback_setting_key': 'llm.fallback_model'}
+    data_root = temp / 'noevia-diary'
+    data_root.mkdir()
+    config = {'port': port, 'control_token': token, 'forward_secret': forward, 'auth_token': '', 'tenant_key': '',
+              'data_root': str(data_root), 'legacy_user_id': '', 'corpus': {},
+              'llm': {'main': client, 'aux': dict(client)}, 'workspace_export': {}}
+    proc = subprocess.Popen([rust_forward.DEFAULT_BIN], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, close_fds=True,
+                            env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/nonexistent'})
+    base = f'http://127.0.0.1:{port}'
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def get(path, headers=None):
+        try:
+            with opener.open(urllib.request.Request(base + path, headers=headers or {}), timeout=2) as reply:
+                return reply.status, dict(reply.headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers)
+
+    try:
+        proc.stdin.write(json.dumps(config).encode() + b'\n')
+        proc.stdin.close()
+        deadline = time.monotonic() + rust_forward.READY_TIMEOUT_S
+        ready = False
+        while time.monotonic() < deadline and proc.poll() is None:
+            try:
+                ready = get('/internal/ready', {rust_forward.CONTROL_HEADER: token})[0] == 200
+            except OSError:
+                ready = False
+            if ready:
+                break
+            time.sleep(0.05)
+        check(ready, 'noevia-diary did not become ready')
+        check(get('/internal/ready', {rust_forward.CONTROL_HEADER: 'wrong'})[0] != 200,
+              'noevia-diary accepted a wrong control token')
+        check(get('/internal/ready')[0] != 200, 'noevia-diary answered a control probe without a token')
+        check(get('/api/months')[0] == 401, 'noevia-diary served a route without the forward secret')
+        status, headers = get('/api/not-a-diary-route', {rust_forward.FORWARD_HEADER.decode(): forward})
+        check(status == 421 and any(k.lower() == rust_forward.DECLINE_HEADER.decode() for k in headers),
+              'noevia-diary did not decline a route it does not serve')
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        proc.stderr.close()
+
+
 # Leaf name (the installed binary's name) -> adapter attribute holding its fixed path, and the check.
 def entity_focus_leaf(_temp):
     for impl in ('python', 'rust'):
@@ -257,6 +322,7 @@ LEAVES = {
     'diary-temporal-cli': (temporal_native, 'DEFAULT_BIN', temporal),
     'diary-workspace-export': (workspace_export_native, 'BINARY', workspace_export_leaf),
     'diary-workspace-import-apply': (workspace_import_native, 'DEFAULT_BIN', workspace_import_apply),
+    'noevia-diary': (rust_forward, 'DEFAULT_BIN', noevia_diary_leaf),
 }
 
 
