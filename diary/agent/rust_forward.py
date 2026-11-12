@@ -5,20 +5,40 @@ serves, comma-separated, e.g. ``/api/months,/api/day``. Empty (the default) mean
 everything: no process is started and no middleware is installed, so behaviour is byte-identical to
 a release without this module.
 
-ONE verifier, ONE nonce cache. While both processes exist, the tenant assertion is checked only by
-this process, by TenantAssertionMiddleware exactly as before (same refusals, bytes and order).
-ForwardMiddleware sits INSIDE it, so it only ever sees requests that middleware let through. It
-forwards the configured routes with their raw wire path, raw query, headers and body plus three
-loopback-only headers: the per-process forward secret (sent to the child on stdin, never argv or
-environment; a client-supplied copy of any of these headers is dropped), whether this request's
-tenant was asserted, and whether this process already holds a recovered managed state for the
-tenant. The Rust side refuses anything without the secret with this app's own 401 bytes, never
-verifies an assertion itself, and either serves the request exactly as this app would or DECLINES it
-(421 + ``x-noevia-diary-decline: 1``) for anything it does not reproduce (non-managed storage, a
-tenant this process has not recovered yet, pending journal / dirty / outbox work, an enabled
-INDEX.md, tenant detail in /api/health ...). A declined request, like one the child never answered,
-is served here without verifying it again, so each nonce is consumed exactly once whichever process
-answers, across declines, restarts and a dead child.
+ONE verifier per request (D8 verifier move). A request this forwarder will send to a ready Rust
+process (`delegates`) is NOT verified here: TenantAssertionMiddleware lets it through unread and
+the Rust side (noevia-rs bins/noevia-diary assertion.rs) verifies it first, with the middleware's
+exact refusals (401 ``invalid tenant assertion``, 413 above MAX_SIGNED_BODY). Every other request is
+verified here exactly as before. ForwardMiddleware sits INSIDE the middleware. It forwards with the
+raw wire path, raw query, headers and body plus loopback-only headers: the per-process forward
+secret (sent to the child on stdin, never argv or environment; a client-supplied copy of any
+``x-noevia-diary-*`` header is dropped), ``x-noevia-diary-verify: 1`` for a delegated request (else
+``x-noevia-diary-asserted`` says whether this process verified it), and whether this process
+already holds a recovered managed state for the tenant. The Rust side refuses anything without the
+secret with this app's own 401 bytes, and either serves the request exactly as this app would or
+DECLINES it (421 + ``x-noevia-diary-decline: 1``) for anything it does not reproduce (non-managed
+storage, a tenant this process has not recovered yet, pending journal / dirty / outbox work, an
+enabled INDEX.md, tenant detail in /api/health ...).
+
+ONE nonce owner. This process's replay cache is the single admission authority for every nonce,
+whichever process checks the signature (tenant_assertion "one nonce owner"). A request is delegated
+only after its nonce is RESERVED there, atomically with every other admission; until that
+reservation ends, every other request with the same nonce is refused, on either path and with any
+body framing. The reservation is settled from what is known about the forward:
+- the reply carries ``x-noevia-diary-verified: 1`` (the Rust side verified and accepted it): COMMIT,
+  and a declined one is served here as asserted, without a second signature check;
+- definitely not accepted (never dispatched: no forward, connection refused; or the child answered
+  without the marker): RELEASE, and a request still to be served here is verified here first;
+- unknown after dispatch (transport error, timeout, the caller cancelling, a lost reply): HELD until
+  the nonce's validity horizon, never released early. The exchange keeps running on its own (a
+  detached owner) and commits or releases if an authoritative reply still arrives. A read whose
+  forward ended this way answers 503 (UNCONFIRMED) while the child process had not exited; only when
+  it HAD exited (the accepted lost-child-before-reply case) is the SAME request served here once,
+  verified here with its own reservation as owner; no other request with that nonce is admitted
+  either way. A write answers 503 UNCERTAIN as before. The child is marked lost in every case.
+Exactly one signature check per accepted request (the lost-child fallback excepted). The Rust
+side's own cache stays as a second guard, and a restarted child refuses anything signed before it
+started.
 
 Only requests that declare no body are forwarded (the native routes are GETs that ignore one); a
 request with a body is never read here and goes to the app untouched, so its timing is exactly
@@ -73,7 +93,7 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/workspace-export": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
-                "/api/entries/edit": "POST"}
+                "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
 WRITER_HEADER = b"x-noevia-diary-writer"
 # app.MAX_SIGNED_BODY: the largest JSON body this service buffers.
 MAX_WRITE_BODY = 64 * 1024 * 1024
@@ -82,9 +102,17 @@ TOO_LARGE = b'{"detail":"request body too large"}'
 RESTARTING = b'{"detail":"Diary saving is restarting. Try again in a moment."}'
 BUSY = b'{"detail":"Diary is saving another change. Try again in a moment."}'
 BODY_TIMEOUT = b'{"detail":"The request body did not arrive in time."}'
+# D8: a delegated read whose forward ended without an answer while the child had not exited: it may
+# have been accepted there, so it is neither served nor verified again here.
+UNCONFIRMED = b'{"detail":"The Diary did not answer in time. Try again in a moment."}'
+# How long a failed forward waits to see whether the child process has exited (the lost-child case).
+EXIT_PROBE_S = 0.2
 REAP_WAIT_S = 10.0
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 DECLINE_HEADER = b"x-noevia-diary-decline"
+VERIFY_HEADER = b"x-noevia-diary-verify"
+VERIFIED_HEADER = b"x-noevia-diary-verified"
+UNVERIFIED = b'{"detail":"invalid tenant assertion"}'
 CONTROL_HEADER = "x-noevia-diary-control"
 FORWARD_HEADER = b"x-noevia-diary-forward"
 ASSERTED_HEADER = b"x-noevia-diary-asserted"
@@ -196,6 +224,10 @@ class RustServer:
         self._delays = tuple(restart_delays)
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
+        self._spawning = False
+        # Reserved before deletion. New incarnations cannot receive a forwarded request for
+        # these tenants, including while the caller has not yet published its tombstone.
+        self._deleting = {}
         self._token = ""
         self.forward_secret = ""
         self._stopping = threading.Event()
@@ -220,25 +252,64 @@ class RustServer:
             self._thread.join(timeout=5)
 
     def _spawn(self) -> Optional[subprocess.Popen]:
-        binary = self._binary or _binary()
-        if binary is None:
-            log.warning("Rust Diary server binary not found; Python serves every route")
-            return None
-        token, forward = secrets.token_hex(16), secrets.token_hex(32)
+        with self._lock:
+            self._spawning = True
+        proc = None
         try:
+            binary = self._binary or _binary()
+            if binary is None:
+                log.warning("Rust Diary server binary not found; Python serves every route")
+                return None
+            token, forward = secrets.token_hex(16), secrets.token_hex(32)
             config = json.dumps(self._config_factory(self.port, token, forward), separators=(",", ":"))
             proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                     stderr=None, close_fds=True,
                                     env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
                                          "TZ": os.environ.get("TZ", ""), "HOME": "/nonexistent"})
+            # Publish ownership before feeding config: a broken pipe must never leave an
+            # untracked child which an absence check could mistake for settled.
+            with self._lock:
+                self._proc, self._token, self.forward_secret = proc, token, forward
             proc.stdin.write(config.encode() + b"\n")
             proc.stdin.close()
-        except Exception as exc:  # noqa: BLE001 - never take the service down
+            return proc
+        except Exception as exc:
             log.warning("Rust Diary server could not start (%s); Python serves every route", type(exc).__name__)
+            if proc is not None:
+                self._mark_lost(proc, quiet=True)
             return None
+        finally:
+            with self._lock:
+                self._spawning = False
+
+    def prepare_delete(self, user_id: str) -> bool:
+        """Reserve deletion against all future forwards, then prove old-child coverage.
+
+        The caller checks the durable intent before and after this and retains its tenant
+        hold through removal. An absent process is safe only outside spawn/reap transitions.
+        A failed live fence keeps the reservation and may be retried; it never authorizes
+        tombstoning or removal. No transport error/exit retires a remote effect intent.
+        """
         with self._lock:
-            self._proc, self._token, self.forward_secret = proc, token, forward
-        return proc
+            if self._spawning or self.reaping:
+                return False
+            proc = self._proc
+            if proc is None:
+                self._deleting[user_id] = time.monotonic()
+                return True
+            if not self.ready or not self._token:
+                return False
+            self._deleting[user_id] = time.monotonic()
+        return self.fence(user_id)
+
+    def forward_secret_for(self, user_id: str) -> str:
+        with self._lock:
+            reserved = self._deleting.get(user_id.lower())
+            # Same 24-hour tombstone lifetime as the Python registry and native fence.
+            if reserved is not None and time.monotonic() - reserved < 24 * 60 * 60:
+                return ""
+            self._deleting.pop(user_id.lower(), None)
+            return self.forward_secret
 
     def _wait_ready(self, proc: subprocess.Popen) -> bool:
         deadline = time.monotonic() + READY_TIMEOUT_S
@@ -374,6 +445,106 @@ class ForwardMiddleware:
         if writers:
             tenant_writer.configure(writers)
 
+    def delegates(self, scope) -> bool:
+        """True when this request will be forwarded to a ready Rust process now, so its assertion is
+        the Rust side's to verify (TenantAssertionMiddleware skips it). Call once per request: it
+        reserves the nonce (tenant_assertion.reserve, kept in scope state) and is False when it
+        cannot, so a nonce this process holds, accepted or reserved, is verified (and refused) here."""
+        server = self.server or current()
+        if scope.get("type") != "http" or server is None or not server.ready or not server.forward_secret:
+            return False
+        if self._writer_tenant(scope):
+            declared = self._declared_length(scope)
+            if not self._json_media(scope) or (declared is not None and declared > MAX_WRITE_BODY):
+                return False
+        elif not self._wants(scope, server) or self._declares_body(scope):
+            return False
+        # The single admission decision: reserve the nonce now (refused or full: verified here).
+        claim = tenant_assertion.reserve(self._assertion(scope))
+        if claim is None:
+            return False
+        scope.setdefault("state", {})["rust_claim"] = claim
+        return True
+
+    @staticmethod
+    def _claim(scope):
+        return (scope.get("state") or {}).get("rust_claim")
+
+    @staticmethod
+    def _delegated(scope) -> bool:
+        return bool((scope.get("state") or {}).get("rust_verifies"))
+
+    async def _serve_here(self, scope, receive, send, body: bytes = b""):
+        """Serve a request in this process. A delegated request the Rust side did not verify is
+        verified here first, exactly as TenantAssertionMiddleware would have (fail closed)."""
+        state = scope.setdefault("state", {})
+        if self._delegated(scope) and not state.get("tenant_asserted"):
+            reason = await self._verify_here(scope, body, self._claim(scope))
+            if reason:
+                if reason != tenant_assertion.BUSY_REFUSAL:
+                    log.warning("tenant assertion rejected: %s", reason)
+                await self._reply(send, 401, UNVERIFIED)
+                return
+            state["tenant_asserted"] = True
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _verify_here(scope, body: bytes, owner=None) -> Optional[str]:
+        from starlette.concurrency import run_in_threadpool
+        from starlette.datastructures import Headers
+        headers = Headers(scope=scope)
+        key = tenant_assertion.tenant_key()
+        if not key or not headers.get("x-cowork-user-id", ""):
+            return None
+        body_hash = (tenant_assertion.sha256_hex(body) if tenant_assertion.body_is_hashed(headers.get("content-type", ""))
+                     else tenant_assertion.STREAM)
+        return await run_in_threadpool(tenant_assertion.verify, key, headers, scope.get("method", "GET"),
+                                       tenant_assertion.wire_path(scope), query=scope.get("query_string", b""),
+                                       body_hash=body_hash, owner=owner)
+
+    async def _refuse_effect_blocked(self, scope, receive, send):
+        """A mutation while the tenant's backup effect is unsettled: 503 (backup_effect.MESSAGE). A
+        request delegated to the Rust verifier is verified here first, exactly as `_serve_here`
+        would, so an unverified caller gets the 401 and never learns the tenant's backup state."""
+        from .backup_effect import MESSAGE
+        state = scope.setdefault("state", {})
+        if self._delegated(scope) and not state.get("tenant_asserted"):
+            body = b""
+            if self._declares_body(scope):
+                # Delegation admitted only a bounded JSON write body (see `delegates`).
+                body, failure = await self._collect(receive, time.monotonic() + FORWARD_DEADLINE_S)
+                if failure == "too_large":
+                    await self._reply(send, 413, TOO_LARGE)
+                    return
+                if failure == "timeout":
+                    await self._reply(send, 408, BODY_TIMEOUT)
+                    return
+                if failure == "disconnected":
+                    return
+            reason = await self._verify_here(scope, body, self._claim(scope))
+            if reason:
+                if reason != tenant_assertion.BUSY_REFUSAL:
+                    log.warning("tenant assertion rejected: %s", reason)
+                await self._reply(send, 401, UNVERIFIED)
+                return
+            state["tenant_asserted"] = True
+        await self._reply(send, 503, json.dumps({"detail": MESSAGE}, separators=(",", ":")).encode())
+
+    async def _after_decline(self, scope, receive, send, body: bytes = b""):
+        """A forward that came back without a served reply (declined, or no answer)."""
+        state = scope.setdefault("state", {})
+        if state.pop("rust_verified", False):
+            # The Rust side verified and accepted this assertion (its reservation is committed).
+            state["tenant_asserted"] = True
+        await self._serve_here(scope, receive, send, body)
+
+    @staticmethod
+    def _assertion(scope) -> str:
+        for name, value in scope.get("headers") or []:
+            if name == b"x-cowork-tenant-assertion":
+                return value.decode("latin-1")
+        return ""
+
     @staticmethod
     def _user(scope) -> str:
         for name, value in scope.get("headers") or []:
@@ -413,6 +584,22 @@ class ForwardMiddleware:
         return user if self.writers == ALL_TENANTS or user in self.writers else ""
 
     async def __call__(self, scope, receive, send):
+        try:
+            await self._call(scope, receive, send)
+        finally:
+            # A reservation never dispatched to the child (a refusal before sending, a request that
+            # was not forwarded after all, a request verified here) is released: it consumed
+            # nothing. A dispatched one is settled by its forward (commit / release / hold).
+            state = scope.get("state") or {}
+            claim = state.get("rust_claim")
+            if claim is not None and not state.get("rust_dispatched"):
+                tenant_assertion.release(claim)
+
+    async def _call(self, scope, receive, send):
+        user = (self._user(scope) or os.environ.get("DIARY_LEGACY_USER_ID", "")).lower()
+        if scope.get("type") == "http" and scope.get("method") not in ("GET", "HEAD", "OPTIONS") and tenant_writer.effect_blocked(user):
+            await self._refuse_effect_blocked(scope, receive, send)
+            return
         server = self.server or current()
         writer = self._writer_tenant(scope)
         if writer:
@@ -420,12 +607,15 @@ class ForwardMiddleware:
             return
         # A read with a body is never forwarded or read here: the app handles it as today.
         if not self._wants(scope, server) or self._declares_body(scope):
-            await self.app(scope, receive, send)
+            await self._serve_here(scope, receive, send)
             return
         deadline = time.monotonic() + FORWARD_DEADLINE_S
         reply = await self._forward(server, scope, deadline)
+        if reply == "unconfirmed":
+            await self._reply(send, 503, UNCONFIRMED, [(b"retry-after", b"1")])
+            return
         if reply is None:
-            await self.app(scope, receive, send)
+            await self._after_decline(scope, receive, send)
             return
         status, headers, body = reply
         await send({"type": "http.response.start", "status": status, "headers": headers})
@@ -530,7 +720,7 @@ class ForwardMiddleware:
             # The Rust process is not running (nothing of it can still write: the admission
             # barrier held this lock closed until any lost child was confirmed exited), or the
             # body is not JSON (the app answers 422 without writing).
-            await self.app(scope, replay, send)
+            await self._serve_here(scope, replay, send, body)
             return
         try:
             outcome = await self._forward(server, scope, deadline, body=body, writer=True)
@@ -538,16 +728,22 @@ class ForwardMiddleware:
             # The request may have reached the child, which may still be writing: the same as a
             # lost reply. The child is killed (the barrier is up before this lock is released) and
             # the tenant recovers before its next write.
-            self._uncertain(server, user)
+            if scope.get("path") != "/api/storage-backup":
+                self._uncertain(server, user)
+            # Backup retains its own flock and native writer until transport settles.
+            # Killing the process here could unlock while a remote PUT still commits.
             raise
         if outcome == "uncertain":
             self.on_uncertain(user)
             await self._reply(send, 503, UNCERTAIN)
             return
         if outcome is None:
-            await self.app(scope, replay, send)
+            await self._after_decline(scope, replay, send, body)
             return
         status, headers, content = outcome
+        # Native replay and writes leave durable dirty marks for Python retrieval.
+        # Invalidate the cached recovery state before any later read can skip indexing.
+        self.on_uncertain(user)
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": content})
 
@@ -572,16 +768,26 @@ class ForwardMiddleware:
         if url.raw_path != target:
             # httpx would re-encode this request target: keep it here, unaltered.
             return None
-        secret = server.forward_secret
+        effective_user = self._user(scope) or os.environ.get("DIARY_LEGACY_USER_ID", "")
+        secret = server.forward_secret_for(effective_user)
         if not secret:
             return None
-        asserted = bool((scope.get("state") or {}).get("tenant_asserted"))
+        state = scope.setdefault("state", {})
+        state.pop("rust_verified", None)
+        claim = self._claim(scope)
+        delegated = self._delegated(scope) and not state.get("tenant_asserted")
+        if delegated and not tenant_assertion.holds(claim):
+            # Not this request's nonce to send for verification (never reserved, or settled).
+            return None
+        asserted = bool(state.get("tenant_asserted"))
         user = self._user(scope)
         recovered = bool(user) and self.is_recovered(user.lower())
         headers = [(k, v) for k, v in scope.get("headers") or []
                    if k.lower() not in _HOP and not k.lower().startswith(INTERNAL_PREFIX)]
         headers += [(FORWARD_HEADER, secret.encode()), (ASSERTED_HEADER, b"1" if asserted else b"0"),
                     (RECOVERED_HEADER, b"1" if recovered else b"0")]
+        if delegated:
+            headers.append((VERIFY_HEADER, b"1"))
         if writer:
             headers.append((WRITER_HEADER, b"1"))
         loop = asyncio.get_running_loop()
@@ -594,26 +800,114 @@ class ForwardMiddleware:
                                                                        content=body))
             return resp, await resp.aread()
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Never dispatched: the claim (if any) is released by __call__. A write keeps D5's
+            # conservative answer (UNCERTAIN), exactly as before.
+            log.warning("Rust Diary server did not answer (TimeoutError); falling back to Python")
+            if scope.get("path") != "/api/storage-backup":
+                server.lost()  # a backup keeps its settling child (as below)
+            return "uncertain" if writer else None
+        proc = getattr(server, "_proc", None)
+        if delegated:
+            state["rust_dispatched"] = True
+        task = asyncio.ensure_future(exchange())
         try:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("forward deadline passed before the call")
-            resp, content = await asyncio.wait_for(exchange(), remaining)
+            resp, content = await asyncio.wait_for(asyncio.shield(task), remaining)
+        except asyncio.CancelledError:
+            # The caller went away: the exchange keeps running on its own and settles the claim from
+            # its outcome; until then (and if it never answers) the nonce stays reserved.
+            if delegated:
+                _detach(task, claim)
+            else:
+                task.cancel()
+            raise
         except Exception as exc:  # noqa: BLE001 - lost or stuck process: Python serves from here on
             log.warning("Rust Diary server did not answer (%s); falling back to Python", type(exc).__name__)
-            server.lost()
-            if writer and not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            not_sent = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+            exited = False
+            try:
+                if delegated:
+                    if not_sent:
+                        # Definitely never reached the child: nothing was accepted.
+                        tenant_assertion.release(claim)
+                    else:
+                        # Unknown: keep the reservation; a late authoritative answer still settles it.
+                        _detach(task, claim)
+                        if not writer:
+                            exited = await _exited(proc)
+                else:
+                    task.cancel()
+            finally:
+                # Cancellation inside the read's exit probe still retires this child. Writes
+                # skip that probe and raise the D5 barrier without awaiting an unused verdict.
+                # A backup keeps its child: its flock and native writer stay held until the
+                # remote transport settles (killing it could unlock while a PUT still commits).
+                if scope.get("path") != "/api/storage-backup":
+                    server.lost()
+            if writer and not not_sent:
                 # The request may have reached the child, which may have committed it.
                 return "uncertain"
+            if delegated and not not_sent and not exited:
+                # The child may have accepted (and served) it: never served a second time here.
+                return "unconfirmed"
             return None
         raw = resp.headers.raw
+        if delegated:
+            if _settle(claim, raw):
+                state["rust_verified"] = True
         if any(k.lower() == DECLINE_HEADER for k, _ in raw):
             return None
-        kept = [(k.lower(), v) for k, v in raw if k.lower() not in _DROP_REPLY]
+        kept = [(k.lower(), v) for k, v in raw
+                if k.lower() not in _DROP_REPLY and not k.lower().startswith(INTERNAL_PREFIX)]
         # Starlette's order: the response's own headers, then content-length, then content-type.
         order = {b"content-length": 1, b"content-type": 2}
         kept.sort(key=lambda kv: order.get(kv[0], 0))
         return resp.status_code, kept, content
+
+
+async def _exited(proc) -> bool:
+    """Has the child process exited (checked for at most EXIT_PROBE_S)? Unknown counts as no."""
+    if proc is None:
+        return False
+    deadline = time.monotonic() + EXIT_PROBE_S
+    while True:
+        try:
+            if proc.poll() is not None:
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+
+
+def _settle(claim, raw_headers) -> bool:
+    """An authoritative reply from the child for a delegated request: commit the reservation when it
+    carries the verified marker (True), else release it (the child did not accept the nonce)."""
+    if any(k.lower() == VERIFIED_HEADER and v == b"1" for k, v in raw_headers):
+        tenant_assertion.commit(claim)
+        return True
+    tenant_assertion.release(claim)
+    return False
+
+
+# Exchanges whose caller stopped waiting (cancelled, timed out, transport error) but that still own a
+# reservation: kept referenced until they finish.
+_detached: set = set()
+
+
+def _detach(task, claim) -> None:
+    """Hand a dispatched exchange its claim: a reply that still arrives settles it (commit/release);
+    a failure or cancellation leaves it reserved until its validity horizon. Never releases early."""
+    def done(t):
+        _detached.discard(t)
+        if t.cancelled() or t.exception() is not None:
+            return
+        resp, _ = t.result()
+        _settle(claim, resp.headers.raw)
+    _detached.add(task)
+    task.add_done_callback(done)
 
 
 _server: Optional[RustServer] = None
@@ -644,5 +938,6 @@ def fence_tenant(user_id: str) -> None:
     """DELETE /api/internal/tenant, after Python's tombstone: the Rust side stops writing the tenant
     (and finishes the write in flight) before its root is removed."""
     server = current()
-    if server is not None and not server.fence(user_id):
-        log.warning("Rust Diary server did not confirm the tenant fence; removing the tenant anyway")
+    if server is not None and not server.prepare_delete(user_id):
+        from fastapi import HTTPException
+        raise HTTPException(503, "Diary saving did not confirm the tenant fence. Deletion remains paused.")

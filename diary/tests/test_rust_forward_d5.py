@@ -142,12 +142,15 @@ class FakeChild:
             if self.mode == 'slow':
                 time.sleep(self.delay)
             if self.mode == 'decline':
-                reply = b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\ncontent-length: 0\r\n\r\n'
+                reply = (b'HTTP/1.1 421 Misdirected Request\r\nx-noevia-diary-decline: 1\r\nconnection: close\r\n'
+                         b'content-length: 0\r\n\r\n')
             else:
                 body = b'{"native":true}'
-                reply = (b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n' % len(body)
-                         + body)
+                reply = (b'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n'
+                         b'content-length: %d\r\n\r\n' % len(body) + body)
             finish()
+            # One request per connection, said so on the wire: the forwarder's pool must never reuse
+            # a socket this fake is closing (a race that read as a lost child under load).
             conn.sendall(reply)
             conn.close()
             time.sleep(self.cleanup_lag)
@@ -609,7 +612,7 @@ def test_decline_paths_outbox_pending_journal_and_recovery(writers):
         db.execute("INSERT INTO workspace_index_outbox VALUES ('Notes/x.md')")
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', body).status_code == 200
-    assert Recorder.served == [False]
+    assert Recorder.served == [True]
     with sqlite3.connect(state / 'users' / DAILY / 'managed-diary.db') as db:
         db.execute('DELETE FROM workspace_index_outbox')
     # A pending journal entry: Python replays it first.
@@ -617,7 +620,7 @@ def test_decline_paths_outbox_pending_journal_and_recovery(writers):
         idx.execute("INSERT INTO journal (id, created_at, kind, payload) VALUES ('synthetic-pending', 't', 'index_month', '{}')")
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', {**body, 'path': 'decline2.md'}).status_code == 200
-    assert Recorder.served == [False]
+    assert Recorder.served == [True]
     with sqlite3.connect(state / 'users' / DAILY / 'managed-index.db') as idx:
         idx.execute('UPDATE journal SET applied=1')
     # Dirty documents do not stop a write (the index lags; Python reindexes later).
@@ -630,7 +633,7 @@ def test_decline_paths_outbox_pending_journal_and_recovery(writers):
     appmod._tenant_states.clear()
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', {**body, 'path': 'after-restart.md'}).status_code == 200
-    assert Recorder.served == [False]
+    assert Recorder.served == [True]
     Recorder.served = []
     assert request(client, DAILY, 'PUT', '/api/file', {**body, 'path': 'after-recovery.md'}).status_code == 200
     assert Recorder.served == [True]

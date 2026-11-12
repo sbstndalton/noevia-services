@@ -166,10 +166,6 @@ class ContextAssembler:
         default = Path(__file__).resolve().parent.parent / "config" / "prompts" / "system.md"
         return default.read_text(encoding="utf-8")
 
-    def _retrieve(self, user_message: str, session_turns: Optional[List[dict]],
-                  trace: Optional[RetrievalTrace] = None) -> List[dict]:
-        return self._retrieve_focused(user_message, session_turns, trace)[0]
-
     def _retrieve_focused(self, user_message: str, session_turns: Optional[List[dict]],
                           trace: Optional[RetrievalTrace] = None):
         """(loaded entries, a header label per entry, note lines opening the block).

@@ -28,11 +28,14 @@ def run(backend, remote, storage, now=None):
     destination = backend.destination(storage)
     if not destination or not backend.active():
         return backend.status(storage)
+    from .backup_effect import require_clear
+    require_clear(backend.root)
     with (backend.root / 'managed-backup.lock').open('a') as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return backend.status(storage)
+        require_clear(backend.root)
         try:
             return _worker(backend, remote, storage, destination, now, handle.fileno())
         except LeafUnavailable:

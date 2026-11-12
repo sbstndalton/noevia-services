@@ -12,8 +12,6 @@ import re
 from typing import Dict, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
-import httpx
-
 from .storage_backoff import StorageReply, gate_for
 from .util import ensure_not_redirect, make_client
 

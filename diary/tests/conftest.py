@@ -10,13 +10,13 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _fresh_storage_gates():
+def _fresh_storage_gates(tmp_path):
     """Back-off gates are shared per credential fingerprint (#1166); tests reuse fake credentials."""
     from agent import storage_backoff
 
-    with storage_backoff._gates_lock:
-        storage_backoff._gates.clear()
+    storage_backoff.configure_shared(tmp_path / 'storage-gates.db')
     yield
+    storage_backoff.configure_shared(None)
 
 
 # P0 (noevia#1071): CI builds every Diary Rust leaf at the Dockerfile's pinned noevia-rs ref and sets

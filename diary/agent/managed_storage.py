@@ -118,7 +118,7 @@ class ManagedCorpusBackend:
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA synchronous=FULL')
         try:
-            with db:
+            with db, tenant_writer.primary_scope(self.db_path, db):
                 yield db
         finally:
             db.close()
@@ -309,11 +309,14 @@ class ManagedCorpusBackend:
         if not destination or not self.active():
             return self.status(storage)
         # Serialize workers across processes, while ordinary SQLite saves proceed.
+        from .backup_effect import require_clear
+        require_clear(self.root)
         with (self.root / 'managed-backup.lock').open('a') as handle:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return self.status(storage)
+            require_clear(self.root)
             with self.db() as db:
                 db.execute('BEGIN')
                 generation = int(self.meta(db, 'generation', '0'))
