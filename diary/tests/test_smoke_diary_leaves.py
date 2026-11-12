@@ -126,3 +126,15 @@ def test_unknown_or_no_leaf_is_a_usage_error():
 def test_required_mode_covers_existing_leaf_modules():
     for module in RUST_LEAF_MODULES:
         assert (ROOT / 'tests' / f'{module}.py').is_file(), module
+
+
+def test_the_image_copies_the_operator_entrypoint_and_makes_it_the_entrypoint():
+    # Guard for the operator port (review of noevia-services#220): the entrypoint script, its chmod and the
+    # operator smoke were dropped by a merge, and OPERATOR-PORT.md then described a path the image never used.
+    text = dockerfile()
+    final = text.split('\nFROM ')[-1]
+    assert 'COPY entrypoint.sh /usr/local/bin/diary-entrypoint' in final
+    assert 'RUN chmod 755 /usr/local/bin/diary-entrypoint' in final
+    assert 'DIARY_OPERATOR_SMOKE_ROOT=/operator-smoke-evidence python scripts/smoke_operator_image.py' in final
+    assert re.search(r'(?m)^ENTRYPOINT \["diary-entrypoint"\]$', final)
+    assert final.index('ENTRYPOINT ["diary-entrypoint"]') < final.index('CMD ["uvicorn"')

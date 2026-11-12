@@ -62,6 +62,15 @@ RUN test -x "$DIARY_RUST_SERVER_BIN" && test -x "$DIARY_WORKSPACE_EXPORT_BIN" &&
 COPY agent/ ./agent/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY entrypoint.sh /usr/local/bin/diary-entrypoint
+RUN chmod 755 /usr/local/bin/diary-entrypoint \
+ && diary-backup-restore --help | grep -q '^usage: backup_restore.py ' \
+ && diary-config /nonexistent/diary-config-smoke.yaml | grep -qx '{"configured":true}'
+# Prove real installed binaries and historical Python spellings offline, including
+# credential-canary checks. Build args bind this candidate to a verified Rust archive.
+RUN mkdir /operator-smoke-evidence \
+ && DIARY_OPERATOR_SMOKE_ROOT=/operator-smoke-evidence python scripts/smoke_operator_image.py \
+ && rm -rf /operator-smoke-evidence
 # Prove the installed binary speaks decode-v1, including payload/version/EOF checks.
 RUN python scripts/smoke_workspace_decode.py
 # Every other leaf answers through its real adapter and agrees with Python on synthetic data. The selectors
@@ -78,4 +87,5 @@ EXPOSE 8010
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
   CMD ["python", "-c", "import os,urllib.request; h={'Authorization':'Bearer '+os.environ.get('DIARY_AUTH_TOKEN','')} if os.environ.get('DIARY_AUTH_TOKEN') else {}; print(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8010/api/health', headers=h), timeout=5).status)"]
 
+ENTRYPOINT ["diary-entrypoint"]
 CMD ["uvicorn", "agent.app:app", "--host", "0.0.0.0", "--port", "8010"]
