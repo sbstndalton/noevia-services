@@ -1,5 +1,6 @@
 """P0 packaging (noevia#1071): the leaf smoke, the image's /out/ bundle and the adapters name the same binaries."""
 from pathlib import Path
+import os
 import re
 import sys
 
@@ -48,7 +49,59 @@ def test_every_named_package_is_built():
                         'diary-corpus-parse', 'diary-score-gap', 'diary-temporal-focus',
                         'diary-workspace-export', 'diary-workspace-import-apply',
                         'diary-entity-focus', 'diary-index-transform', 'diary-storage-backoff',
-                        'diary-workspace-rules', 'diary-backup-format', 'diary-backup-run', 'diary-operator'}
+                        'diary-workspace-rules', 'diary-backup-format', 'diary-backup-run', 'diary-operator', 'noevia-diary'}
+
+
+def native_stage_env():
+    """{NAME: value} of the image's own ENV instructions in the final stage."""
+    final = dockerfile().split('\nFROM ')[-1].replace('\\\n', ' ')
+    env = {}
+    for line in final.splitlines():
+        if line.startswith('ENV '):
+            env.update(re.findall(r'([A-Z_]+)=(\S*)', line))
+    return env
+
+
+def test_the_image_sets_the_three_native_bin_defaults_to_the_paths_the_code_already_uses():
+    from agent import rust_forward, tenant_assertion, workspace_export_native
+    env = native_stage_env()
+    assert env['DIARY_RUST_SERVER_BIN'] == rust_forward.DEFAULT_BIN == '/usr/local/bin/noevia-diary'
+    assert env['TENANT_ASSERTION_BIN'] == tenant_assertion.DEFAULT_BIN == '/usr/local/bin/tenant-assertion'
+    assert env['DIARY_WORKSPACE_EXPORT_BIN'] == workspace_export_native.BINARY == '/usr/local/bin/diary-workspace-export'
+    # Each one is a bin the same /out/ bundle installs, and the build checks they are executable.
+    for key in ('DIARY_RUST_SERVER_BIN', 'DIARY_WORKSPACE_EXPORT_BIN', 'TENANT_ASSERTION_BIN'):
+        assert Path(env[key]).name in set(smoke.LEAVES) | {'tenant-assertion'}, key
+    assert 'RUN test -x "$DIARY_RUST_SERVER_BIN" && test -x "$DIARY_WORKSPACE_EXPORT_BIN" && test -x "$TENANT_ASSERTION_BIN"' in dockerfile()
+
+
+def test_the_image_leaves_every_native_switch_off():
+    # An empty route and writer list means the Rust server is never started and no selector is rust: the
+    # image behaves as the Python-only one until the owner sets them.
+    text = dockerfile()
+    assert not re.search(r'(?m)^\s*(ENV|ARG)\b[^\n]*\b(DIARY_RUST_ROUTES|DIARY_RUST_WRITES)\b', text)
+    assert not re.search(r'(?m)^ENV .*_IMPL', text)
+    ours = {key for key in native_stage_env() if key.startswith(('DIARY_', 'TENANT_', 'WORKSPACE_'))}
+    assert ours == {'DIARY_RUST_SERVER_BIN', 'DIARY_WORKSPACE_EXPORT_BIN', 'TENANT_ASSERTION_BIN'}
+    from agent import rust_forward
+    assert rust_forward.configured_routes('') == {}
+    if hasattr(rust_forward, 'configured_writers'):  # D5 (DIARY_RUST_WRITES); absent on the D4b base
+        assert rust_forward.configured_writers('') == frozenset()
+
+
+def test_the_smoke_names_noevia_diary_with_its_fixed_path_and_the_start_up_probe():
+    module, attribute, run = smoke.LEAVES['noevia-diary']
+    assert (module.__name__, attribute) == ('agent.rust_forward', 'DEFAULT_BIN')
+    assert run is smoke.noevia_diary_leaf
+
+
+@pytest.mark.skipif(not os.environ.get('DIARY_RUST_SERVER_BIN') and os.environ.get('DIARY_RUST_SERVER_REQUIRED') != '1',
+                    reason='noevia-diary not built (set DIARY_RUST_SERVER_BIN)')
+def test_the_real_noevia_diary_binary_passes_the_start_up_smoke(tmp_path, monkeypatch, capsys):
+    # In required mode (CI) an unset DIARY_RUST_SERVER_BIN is a failure (KeyError), not a skip.
+    (tmp_path / 'noevia-diary').symlink_to(Path(os.environ['DIARY_RUST_SERVER_BIN']).resolve())
+    monkeypatch.setattr(smoke.rust_forward, 'DEFAULT_BIN', smoke.rust_forward.DEFAULT_BIN)
+    assert smoke.main(['noevia-diary', '--bin-dir', str(tmp_path)]) == 0
+    assert 'noevia-diary: ok' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('name', sorted(smoke.LEAVES))
