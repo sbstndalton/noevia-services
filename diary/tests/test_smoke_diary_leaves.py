@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import smoke_diary_leaves as smoke  # noqa: E402
 
-SELF_TESTED = {'tenant-assertion', 'workspace-restore-verify'}
+SELF_TESTED = {'tenant-assertion', 'workspace-restore-verify', 'diary-backup-restore', 'diary-config'}
 
 
 def dockerfile():
@@ -48,7 +48,7 @@ def test_every_named_package_is_built():
                         'diary-corpus-parse', 'diary-score-gap', 'diary-temporal-focus',
                         'diary-workspace-export', 'diary-workspace-import-apply',
                         'diary-entity-focus', 'diary-index-transform', 'diary-storage-backoff',
-                        'diary-workspace-rules', 'diary-backup-format', 'diary-backup-run'}
+                        'diary-workspace-rules', 'diary-backup-format', 'diary-backup-run', 'diary-operator'}
 
 
 @pytest.mark.parametrize('name', sorted(smoke.LEAVES))
