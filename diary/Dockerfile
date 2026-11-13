@@ -45,8 +45,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade "pip>=26.2" && pip install --no-cache-dir -r requirements.txt
+# constraints.txt holds the exact version of every installed distribution, pip included (noevia#2523):
+# requirements.txt names what the Diary needs, the constraints decide which version gets installed.
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir --upgrade -c constraints.txt "pip>=26.2" && pip install --no-cache-dir -c constraints.txt -r requirements.txt
 
 COPY --from=tenant-assertion /out/ /usr/local/bin/
 RUN tenant-assertion self-test | grep -qx ok && workspace-restore-verify self-test | grep -qx ok

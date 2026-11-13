@@ -19,14 +19,20 @@ supported with `DIARY_ENTRY_LAYOUT=monthly` and
 ```sh
 python -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
+pip install -c constraints.txt -r requirements.txt
 uvicorn agent.app:app --reload --port 8010
 ```
+
+`constraints.txt` pins the exact version of every distribution the image installs (the versions the
+production image runs); `requirements.txt` only names what the Diary needs. Change a version in
+`constraints.txt` on purpose, in its own change; `tests/test_requirements_pinned.py` fails when something
+is left unpinned (the transitive part needs the requirements installed; CI also compares the built image's
+`pip freeze --all` with this file).
 
 To run the tests, install the dev requirements (pytest, moto; not part of the Docker image) instead:
 
 ```sh
-pip install -r requirements-dev.txt
+pip install -c constraints.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 

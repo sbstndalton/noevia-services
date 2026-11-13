@@ -63,7 +63,8 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+      # The suite runs against the image's exact dependency versions (constraints.txt, noevia#2523).
+      - run: pip install -c constraints.txt -r requirements-dev.txt
       # tenant-assertion (the only tenant signature check since noevia#1071, TENANT_ASSERTION_IMPL is retired)
       # at the Dockerfile's pinned noevia-rs ref, which must equal the OCR and model-manager pins; the fixture
       # table must be byte-identical to noevia-rs' copy, and the suite (built after the leaf, below) runs with
@@ -137,6 +138,7 @@ jobs:
           DIARY_RUST_SERVER_BIN: ${{ runner.temp }}/noevia-rs/target/release/noevia-diary
           DIARY_RUST_SERVER_REQUIRED: "1"
           DIARY_WORKSPACE_EXPORT_BIN: ${{ runner.temp }}/noevia-rs/target/release/diary-workspace-export
+          DIARY_PINS_REQUIRED: "1"
         run: python -m pytest -q -rs
       - name: D2 rules and D3 backup through real native leaves
         env:
@@ -165,8 +167,18 @@ jobs:
         with:
           context: ws/services/diary
           push: false
+          load: true
+          tags: noevia-diary-ci:pins
           cache-from: type=gha,scope=diary
           cache-to: type=gha,mode=max,scope=diary
+      # noevia#2523: the built image holds exactly the versions constraints.txt pins, nothing more or less.
+      - name: The image's installed distributions equal constraints.txt
+        run: |
+          set -euo pipefail
+          norm() { tr 'A-Z_' 'a-z-' | LC_ALL=C sort; }
+          docker run --rm --network none --entrypoint python noevia-diary-ci:pins -m pip freeze --all | norm > "$RUNNER_TEMP/image-freeze.txt"
+          grep -vE '^[[:space:]]*(#|$)' constraints.txt | norm > "$RUNNER_TEMP/constraints.txt"
+          diff -u "$RUNNER_TEMP/constraints.txt" "$RUNNER_TEMP/image-freeze.txt"
 
   docling:
     name: Docling extraction contract

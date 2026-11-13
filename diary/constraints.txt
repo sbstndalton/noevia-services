@@ -1,0 +1,38 @@
+# Exact versions of every Python distribution in the Diary image (sbstndalton/noevia#2523).
+# requirements.txt says what the Diary needs; this file says which version of each is installed,
+# so a rebuild never moves a dependency by itself. The Dockerfile passes it with -c to both pip
+# commands (pip itself included), and tests/test_requirements_pinned.py fails when a requirement
+# or anything it pulls in has no == line here.
+#
+# Taken from the running production image (cowork-diary:75089810, image sha256:adf5b99c48f8...)
+# with: docker run --rm --network none --read-only --entrypoint python <image> -m pip freeze --all
+# To move a version, change it here on purpose, in its own reviewed change.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.10.18
+click==8.5.0
+fastapi==0.146.0
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.9.0
+httpx==0.28.1
+idna==3.20
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+numpy==2.5.4
+opentelemetry-api==1.45.1
+pip==26.2.1
+pydantic==2.14.1
+pydantic_core==2.50.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+PyYAML==6.0.3
+sqlite-vec==0.1.9
+starlette==1.9.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.54.0
+uvloop==0.23.0
+watchfiles==1.3.0
+websockets==17.2
