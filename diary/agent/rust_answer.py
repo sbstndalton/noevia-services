@@ -27,6 +27,15 @@ exchange on an in-memory corpus (``POST /api/local-exchange``) or any other stor
 Not compared: the retrieval trace, and an exchange that carries a local reference (the streamed
 route's file reference, which the Rust answer half does not build): such an exchange is counted
 ``skipped``.
+
+- ``on``: the Rust process builds the context and gets the companion's answer (``mode: "answer"``;
+  streamed, its events are relayed to the caller as they come), and Python saves it as before:
+  the session, the save, the writer lock and the re-index stay here. Python's exchange deadline
+  bounds the whole call and closes it when it passes (the first-token deadline is the Rust side's,
+  which sees the model's progress). The Rust side's failures map to the exceptions Python's own
+  model call raises, so every route answers as before. Whatever the Rust side does not take (the
+  conditions of the shadow above, a decline, or a process that cannot be reached or refuses before
+  any answer began) is answered by Python itself, and counted.
 """
 from __future__ import annotations
 
@@ -41,14 +50,23 @@ import httpx
 
 log = logging.getLogger("diary.rust.answer")
 
-MODES = ("", "shadow")
+MODES = ("", "shadow", "on")
 # One shadow request: connect, the Rust context build (one query embedding plus the index) and the
 # reply. The save waits for it at most this long after the shadow started.
 SHADOW_DEADLINE_S = 10.0
 OUTCOMES = ("match", "mismatch", "declined", "refused", "failed", "late", "skipped")
 
+# DIARY_RUST_ANSWER=on: who answered. ``rust`` (an answer or a model failure from the Rust side),
+# ``declined`` / ``unavailable`` (Python answered: the Rust side declined, or could not be reached or
+# refused before any answer began), ``skipped`` (Python answered: not a case the Rust side takes).
+ANSWER_OUTCOMES = ("rust", "declined", "unavailable", "skipped")
+# Reading the Rust reply: connect and send are short; the answer itself is bounded by the exchange
+# deadline (which closes the connection), never by a socket timeout.
+ANSWER_TIMEOUT = httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
+
 _stats_lock = threading.Lock()
 STATS = {k: 0 for k in OUTCOMES}
+ANSWER_STATS = {k: 0 for k in ANSWER_OUTCOMES}
 _warned = set()
 
 
@@ -65,6 +83,11 @@ def mode(raw: Optional[str] = None) -> str:
 
 def wanted() -> bool:
     return mode() != ""
+
+
+def answering() -> bool:
+    """DIARY_RUST_ANSWER=on: the Rust process answers (Python still saves)."""
+    return mode() == "on"
 
 
 def answer_config(base_cfg, reasoning_tokens: int) -> Optional[dict]:
@@ -91,6 +114,16 @@ def _count(outcome: str) -> None:
 def stats() -> dict:
     with _stats_lock:
         return dict(STATS)
+
+
+def _count_answer(outcome: str) -> None:
+    with _stats_lock:
+        ANSWER_STATS[outcome] += 1
+
+
+def answer_stats() -> dict:
+    with _stats_lock:
+        return dict(ANSWER_STATS)
 
 
 def _plain(messages) -> list:
@@ -248,7 +281,7 @@ def begin(st, tenant_id: str, message: str, snap: Optional[Snapshot], day, extra
           transport: Optional[httpx.BaseTransport] = None) -> Optional[Shadow]:
     """Start the shadow comparison for one exchange, or None when it does not apply (off, legacy
     tenant, no ready Rust process) or is skipped. Never raises."""
-    if snap is None or not wanted() or tenant_id == "legacy":
+    if snap is None or mode() != "shadow" or tenant_id == "legacy":
         return None
     try:
         if server_lookup is None:
@@ -294,3 +327,171 @@ def _skip(reason: str) -> None:
     _count("skipped")
     log.info("Diary answer shadow: skipped (%s)", reason)
     return None
+
+
+# ---------------- DIARY_RUST_ANSWER=on ----------------
+
+
+class Declined(Exception):
+    """Python answers this exchange itself (counted; nothing was sent to the model)."""
+
+
+class Answered:
+    """The Rust side's answer: what Python's own model call and marker split would give."""
+
+    def __init__(self, visible: str, marker: Optional[str], truncated: bool, trace):
+        self.visible = visible
+        self.marker = marker
+        self.truncated = truncated
+        self.trace = trace
+
+
+class _Trace:
+    """The Rust side's retrieval trace, in the shape ``retrieval_trace.attach`` reads."""
+
+    def __init__(self, data):
+        self.data = data
+        self.failed = not isinstance(data, dict)
+
+
+def trace_of(answered: Answered) -> _Trace:
+    """The trace to attach for a traced exchange the Rust side answered (none when it sent none)."""
+    return _Trace(answered.trace)
+
+
+def _python_failure(failure, setting: str) -> BaseException:
+    """The exception Python's own model call raises for a failure the Rust side reports."""
+    from .deadline import ExchangeTimeout
+    from .llm import EmptyAnswerError, EngineUnreachable, LengthCapError, LLMError, ModelNotServed
+    failure = failure if isinstance(failure, dict) else {}
+    message = str(failure.get("message") or "the Rust answer failed")[:500]
+    kind = failure.get("kind")
+    if kind == "timeout":
+        return ExchangeTimeout(message)
+    if kind == "model":
+        cls = failure.get("class")
+        if cls == "LengthCapError":
+            return LengthCapError()
+        if cls == "EmptyAnswerError":
+            return EmptyAnswerError()
+        if cls == "ModelNotServed":
+            return ModelNotServed(setting, message)
+        if cls == "EngineUnreachable":
+            return EngineUnreachable(message)
+    return LLMError(message)
+
+
+def _answered(data, setting: str) -> Answered:
+    from .llm import LLMError
+    if not isinstance(data, dict):
+        raise LLMError("unreadable Rust answer")
+    if "failed" in data:
+        raise _python_failure(data.get("failed"), setting)
+    visible, marker = data.get("visible"), data.get("marker")
+    if not isinstance(visible, str) or marker not in (None, "ok", "skip"):
+        raise LLMError("unreadable Rust answer")
+    return Answered(visible, marker, data.get("truncated") is True, data.get("trace"))
+
+
+def answer(st, tenant_id: str, message: str, snap: Optional[Snapshot], day, extra_context: str, max_answer_tokens: int,
+           budget, emit=None, trace: bool = False, server_lookup: Optional[Callable[[], object]] = None,
+           transport: Optional[httpx.BaseTransport] = None) -> Answered:
+    """The companion's answer from the Rust process, within ``budget``. Raises Declined when Python
+    must answer itself; otherwise the answer, or the exception Python's model call would raise.
+    ``emit`` (a streamed exchange) receives the model's events as the Rust side relays them."""
+    if snap is None or not answering() or tenant_id == "legacy":
+        raise Declined("off")
+    try:
+        if server_lookup is None:
+            from . import rust_forward
+            server_lookup = rust_forward.current
+        server = server_lookup()
+        token, ready = server.control() if server is not None else ("", False)
+        if not ready or not token:
+            raise _decline("unavailable", "no ready Rust process")
+        if not _managed_state_of(st, tenant_id):
+            raise _decline("skipped", "not the tenant's managed storage")
+        if getattr(st.assembler, "local_reference", ""):
+            raise _decline("skipped", "local reference")
+        if snap.embedding is None:
+            raise _decline("skipped", "no shared embedding configuration")
+        cfg = st.assembler.cfg
+        request = {
+            "mode": "answer",
+            "message": message,
+            "turns": snap.turns,
+            "day": day.isoformat(),
+            "extra_context": extra_context,
+            "trace": bool(trace),
+            "max_answer_tokens": int(max_answer_tokens),
+            "cfg": {"context": cfg.get("context") or {}, "retrieval": cfg.get("retrieval") or {}},
+            "system_prompt": st.assembler._system_prompt(),
+            "stream": emit is not None,
+            "embedding": snap.embedding,
+        }
+        body = json.dumps(request)
+    except Declined:
+        raise
+    except Exception as exc:  # noqa: BLE001 - Python answers; no content in the log
+        raise _decline("skipped", type(exc).__name__)
+    setting = str(getattr(getattr(st, "llm_main", None), "setting_key", "") or "")
+    started = threading.Event()  # set once the Rust side has accepted (200): no fallback after it
+
+    def call(gate, alive):
+        from .rust_forward import CONTROL_HEADER, DECLINE_HEADER
+        from .llm import LLMError
+        try:
+            with httpx.Client(base_url=server.base_url, timeout=ANSWER_TIMEOUT, trust_env=False,
+                              transport=transport) as client:
+                with client.stream("POST", "/internal/answer", params={"tenant": tenant_id}, content=body,
+                                   headers={CONTROL_HEADER: token, "content-type": "application/json"}) as resp:
+                    unregister = alive.on_abandon(resp.close) if hasattr(alive, "on_abandon") else None
+                    try:
+                        if resp.status_code == 421 and resp.headers.get(DECLINE_HEADER.decode()) == "1":
+                            raise _decline("declined", "")
+                        if resp.status_code != 200:
+                            raise _decline("unavailable", f"HTTP {resp.status_code}")
+                        started.set()
+                        if emit is None:
+                            return _answered(json.loads(resp.read()), setting)
+                        for line in resp.iter_lines():
+                            alive()
+                            if not line.startswith("data:"):
+                                continue
+                            event = json.loads(line[5:].strip())
+                            kind = event.get("type") if isinstance(event, dict) else None
+                            if kind == "answered":
+                                return _answered(event, setting)
+                            if kind == "failed":
+                                raise _python_failure(event.get("failure"), setting)
+                            if kind is not None:
+                                gate(event)
+                        raise LLMError("the Rust answer stream ended before its outcome")
+                    finally:
+                        if unregister is not None:
+                            unregister()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            if started.is_set():
+                raise LLMError(f"Rust answer failed: {type(exc).__name__}") from exc
+            raise _decline("unavailable", type(exc).__name__) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LLMError(f"Rust answer failed: {type(exc).__name__}") from exc
+
+    try:
+        result = budget.run(call, emit=emit, first_token=False)
+    except Declined:
+        raise
+    except BaseException:
+        _count_answer("rust")  # the Rust side took the exchange: its failure is the exchange's
+        raise
+    _count_answer("rust")
+    return result
+
+
+def _decline(outcome: str, reason: str) -> Declined:
+    _count_answer(outcome)
+    if reason:
+        log.info("Diary answer: Python answers (%s: %s)", outcome, reason)
+    else:
+        log.info("Diary answer: Python answers (%s)", outcome)
+    return Declined(outcome)
