@@ -7,6 +7,7 @@ requirements.txt allows, or when the Dockerfile installs without the constraints
 need no network; the closure check reads the installed metadata (CI installs with the constraints).
 """
 
+import os
 import re
 from importlib import metadata
 from pathlib import Path
@@ -68,18 +69,52 @@ def test_pip_itself_is_pinned_because_the_dockerfile_upgrades_it():
     assert "pip" in _constraints(), "the Dockerfile upgrades pip, so constraints.txt must pin it"
 
 
-def test_dockerfile_installs_only_with_the_constraints():
-    text = (HERE / "Dockerfile").read_text(encoding="utf-8")
-    code = "\n".join(l for l in text.replace("\\\n", " ").splitlines() if not l.lstrip().startswith("#"))
-    final = re.split(r"^FROM python:", code, flags=re.M)
+PIP_INSTALL = re.compile(r"(^|[\s/])(pip3?(\.\d+)?|python3?(\.\d+)?\s+-m\s+pip)\s+install(\s|$)")
+
+
+def _final_stage_installs(text):
+    """Every pip install command of the final stage. Comment lines go first (Docker drops them before it joins
+    continuations), then each RUN is split at its shell separators. A RUN form this cannot read fails."""
+    lines = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+    code = "\n".join(lines).replace("\\\n", " ")
+    final = re.split(r"(?mi)^\s*FROM\s+python:", code)
     assert len(final) == 2, "expected one final FROM python: stage"
     stage = final[1]
-    copies = re.findall(r"^COPY ([^\n]*)$", stage, re.M)
+    copies = re.findall(r"(?mi)^\s*COPY\s+([^\n]*)$", stage)
     assert any("constraints.txt" in c.split() for c in copies), "the final stage never copies constraints.txt"
-    installs = [cmd for run in re.findall(r"^RUN ([^\n]*)$", stage, re.M) for cmd in run.split("&&") if "pip install" in cmd]
+    installs = []
+    for run in re.findall(r"(?mi)^\s*RUN\s+([^\n]*)$", stage):
+        assert not run.lstrip().startswith("[") and "<<" not in run, f"RUN form the pin check cannot read: {run[:60]}"
+        installs += [cmd for cmd in re.split(r"&&|\|\||;|\|", run) if PIP_INSTALL.search(cmd)]
+    return installs
+
+
+def _check_dockerfile(text):
+    installs = _final_stage_installs(text)
     assert installs, "Dockerfile has no pip install"
     for cmd in installs:
         assert re.search(r"(^|\s)-c\s+constraints\.txt(\s|$)", cmd), f"pip install without -c constraints.txt: {cmd.strip()}"
+
+
+def test_dockerfile_installs_only_with_the_constraints():
+    _check_dockerfile((HERE / "Dockerfile").read_text(encoding="utf-8"))
+
+
+def test_the_dockerfile_check_catches_every_unconstrained_install_form():
+    head = "FROM python:3.12-slim\nCOPY requirements.txt constraints.txt ./\n"
+    good = "RUN pip install -c constraints.txt -r requirements.txt\n"
+    _check_dockerfile(head + good)
+    for bad in ("RUN pip install -c constraints.txt a; pip install b\n",
+                "RUN pip3 install -r requirements.txt\n",
+                "RUN python -m pip install -r requirements.txt\n",
+                "RUN true || pip install b\n",
+                "RUN pip install -c constraints.txt a \\\n && /usr/local/bin/pip install b\n",
+                "# a comment ending in a backslash \\\nRUN pip install b\n"):
+        with pytest.raises(AssertionError, match="without -c"):
+            _check_dockerfile(head + good + bad)
+    for unreadable in ('RUN ["pip", "install", "b"]\n', "RUN <<EOF\npip install b\nEOF\n"):
+        with pytest.raises(AssertionError, match="cannot read"):
+            _check_dockerfile(head + good + unreadable)
 
 
 def _closure():
@@ -91,6 +126,9 @@ def _closure():
         try:
             dist = metadata.distribution(req.name)
         except metadata.PackageNotFoundError:
+            # CI sets DIARY_PINS_REQUIRED=1: there a missing distribution fails instead of skipping.
+            if os.environ.get("DIARY_PINS_REQUIRED") == "1":
+                raise AssertionError(f"{req.name} is required but not installed")
             pytest.skip(f"{req.name} is not installed here (pip install -c constraints.txt -r requirements-dev.txt)")
         key = (name, extras)
         if key in seen:
@@ -109,6 +147,12 @@ def test_everything_the_requirements_pull_in_is_pinned_and_installed_at_its_pin(
     for name, version in sorted(_closure().items()):
         assert name in pins, f"{name} (pulled in by requirements.txt) has no pinned constraint in constraints.txt"
         assert Version(version) == Version(pins[name]), f"{name} is installed at {version}, constraints.txt pins {pins[name]}"
+
+
+def test_every_pin_is_something_the_requirements_pull_in():
+    """The other direction: a pin nothing needs would be a production distribution a rebuild silently drops."""
+    unused = set(_constraints()) - {"pip"} - set(_closure())
+    assert not unused, f"constraints.txt pins distributions requirements.txt does not pull in: {sorted(unused)}"
 
 
 def test_the_pin_check_catches_a_missing_a_ranged_and_an_out_of_range_pin(tmp_path):
