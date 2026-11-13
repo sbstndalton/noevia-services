@@ -21,6 +21,9 @@ exchange.
 Another write of the same tenant landing while the shadow reads (an edit, an import) can still make
 a comparison differ; a mismatch is a lead to check, not proof of a fault.
 
+Only an exchange on the tenant's own managed storage is compared (what the Rust side reads): an
+exchange on an in-memory corpus (``POST /api/local-exchange``) or any other storage is skipped.
+
 Not compared: the retrieval trace, and an exchange that carries a local reference (the streamed
 route's file reference, which the Rust answer half does not build): such an exchange is counted
 ``skipped``.
@@ -151,6 +154,12 @@ class Shadow:
             log.info("Diary answer shadow: %s%s", outcome, f" ({detail})" if detail else "")
 
     def _run(self) -> None:
+        try:
+            self._compare()
+        except Exception as exc:  # noqa: BLE001 - counted, type name only (no content in logs)
+            self._settle("failed", type(exc).__name__)
+
+    def _compare(self) -> None:
         from .rust_forward import CONTROL_HEADER, DECLINE_HEADER
         try:
             with httpx.Client(base_url=self._base_url, timeout=self._deadline_s, trust_env=False,
@@ -180,22 +189,66 @@ class Shadow:
         remaining = self._deadline_s - (time.monotonic() - self._started)
         if remaining > 0:
             self._thread.join(remaining)
+        return self.close(late_if_running=True)
+
+    def close(self, late_if_running: bool = False) -> Optional[str]:
+        """End the comparison now (an exchange that failed before its save: whatever it finds later
+        is ignored, uncounted)."""
         with self._lock:
+            already = self._closed
             self._closed = True
             late = self.outcome is None
-        if late:
+        if late and late_if_running and not already:
             _count("late")
             log.info("Diary answer shadow: late (no reply before the save)")
             return "late"
         return self.outcome
 
 
-def begin(st, tenant_id: str, message: str, turns: list, day, extra_context: str, messages: list,
+class Snapshot:
+    """The inputs both sides build from, taken once before Python's build."""
+
+    def __init__(self, turns: list, embedding):
+        self.turns = turns
+        self.embedding = embedding
+
+
+def snapshot(st, turns: list) -> Optional[Snapshot]:
+    """None when the shadow is off (Python then builds from the live session turns, as before)."""
+    if not wanted():
+        return None
+    try:
+        config = getattr(getattr(st.retrieval, "embedding", None), "config", None)
+        return Snapshot([dict(t) for t in list(turns)], config.get() if config is not None else None)
+    except Exception as exc:  # noqa: BLE001 - the shadow never fails an exchange
+        log.info("Diary answer shadow: no snapshot (%s)", type(exc).__name__)
+        return None
+
+
+def finish(shadow: Optional[Shadow]) -> None:
+    if shadow is not None:
+        shadow.finish()
+
+
+def close(shadow: Optional[Shadow]) -> None:
+    if shadow is not None:
+        shadow.close()
+
+
+def _managed_state_of(st, tenant_id: str) -> bool:
+    """The exchange runs on the tenant's own managed state (what the Rust side reads), not on an
+    in-memory corpus (POST /api/local-exchange) or another storage."""
+    from .managed_storage import ManagedCorpusBackend
+    backend = getattr(st, "backend", None)
+    return isinstance(backend, ManagedCorpusBackend) and backend.tenant == tenant_id
+
+
+def begin(st, tenant_id: str, message: str, snap: Optional[Snapshot], day, extra_context: str, messages: list,
           max_answer_tokens: int, server_lookup: Optional[Callable[[], object]] = None,
           transport: Optional[httpx.BaseTransport] = None) -> Optional[Shadow]:
     """Start the shadow comparison for one exchange, or None when it does not apply (off, legacy
     tenant, no ready Rust process) or is skipped. Never raises."""
-    if not wanted() or tenant_id == "legacy":
+    if snap is None or not wanted() or tenant_id == "legacy":
         return None
     try:
         if server_lookup is None:
@@ -207,20 +260,17 @@ def begin(st, tenant_id: str, message: str, turns: list, day, extra_context: str
         token, ready = server.control()
         if not ready or not token:
             return None
+        if not _managed_state_of(st, tenant_id):
+            return _skip("not the tenant's managed storage")
         if getattr(st.assembler, "local_reference", ""):
-            _count("skipped")
-            log.info("Diary answer shadow: skipped (local reference)")
-            return None
-        config = getattr(getattr(st.retrieval, "embedding", None), "config", None)
-        if config is None:
-            _count("skipped")
-            log.info("Diary answer shadow: skipped (no shared embedding configuration)")
-            return None
+            return _skip("local reference")
+        if snap.embedding is None:
+            return _skip("no shared embedding configuration")
         cfg = st.assembler.cfg
         request = {
             "mode": "context",
             "message": message,
-            "turns": [dict(t) for t in turns],
+            "turns": snap.turns,
             "day": day.isoformat(),
             "extra_context": extra_context,
             "trace": False,
@@ -228,15 +278,19 @@ def begin(st, tenant_id: str, message: str, turns: list, day, extra_context: str
             "cfg": {"context": cfg.get("context") or {}, "retrieval": cfg.get("retrieval") or {}},
             "system_prompt": st.assembler._system_prompt(),
             "stream": False,
-            "embedding": config.get(),
+            "embedding": snap.embedding,
         }
         json.dumps(request)  # a config value JSON cannot carry: skipped, not failed later
+        return Shadow(server.base_url, token, tenant_id, request, messages, transport=transport).start()
     except (TypeError, ValueError, OSError) as exc:
-        _count("skipped")
-        log.info("Diary answer shadow: skipped (%s)", type(exc).__name__)
-        return None
-    except Exception:  # the shadow must never fail an exchange
-        log.exception("Diary answer shadow: could not start")
+        return _skip(type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001 - the shadow must never fail an exchange; no traceback (content)
+        log.warning("Diary answer shadow: could not start (%s)", type(exc).__name__)
         _count("failed")
         return None
-    return Shadow(server.base_url, token, tenant_id, request, messages, transport=transport).start()
+
+
+def _skip(reason: str) -> None:
+    _count("skipped")
+    log.info("Diary answer shadow: skipped (%s)", reason)
+    return None

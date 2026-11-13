@@ -1081,8 +1081,11 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     day = entry_day or now.date()
     # Opt-in gate tracing (retrieval_trace.py): a per-call collector, returned only to this caller.
     trace = RetrievalTrace() if retrieval_trace else None
-    messages = (st.assembler.build(day, message, session_turns=sess["turns"]) if trace is None
-                else st.assembler.build(day, message, session_turns=sess["turns"], trace=trace))
+    # R9 (DIARY_RUST_ANSWER=shadow; off by default: None): the inputs both sides build from.
+    snap = rust_answer.snapshot(st, sess["turns"])
+    turns = sess["turns"] if snap is None else snap.turns
+    messages = (st.assembler.build(day, message, session_turns=turns) if trace is None
+                else st.assembler.build(day, message, session_turns=turns, trace=trace))
     if extra_context:
         # Per-exchange reference only: never change the journaled user message,
         # session history, system prompt, or shared assembler state.
@@ -1092,41 +1095,43 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     budget = ExchangeBudget()
     # #127: every companion answer is capped, and the deadline closes the model call it gives up on.
     cap = getattr(st, "max_answer_tokens", DEFAULT_MAX_ANSWER_TOKENS)
-    # R9 (DIARY_RUST_ANSWER=shadow; off by default): the Rust answer half builds the same context
-    # beside the model call; only the comparison's outcome is logged.
-    shadow = rust_answer.begin(st, str(tenant_id or "legacy").lower(), message, sess["turns"], day,
-                               extra_context, messages, cap)
-    if emit:
-        emit({"type": "status", "text": "Generating companion response…"})
+    # R9: the Rust answer half builds the same context beside the model call; only the comparison's
+    # outcome is logged. It is closed on every path, and finished before the save.
+    shadow = rust_answer.begin(st, str(tenant_id or "legacy").lower(), message, snap, day, extra_context,
+                               messages, cap)
     try:
         if emit:
-            reply = budget.run(lambda gate, alive: st.llm_main.chat_stream(messages, gate, temperature=0.7, alive=alive,
-                                                                            max_tokens=cap),
-                               emit=emit, first_token=True)
-        else:
-            reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7, max_tokens=cap, alive=alive))
-    except ExchangeTimeout as exc:
-        exc.nothing_saved = True  # the answer comes first; no save has begun
+            emit({"type": "status", "text": "Generating companion response…"})
+        try:
+            if emit:
+                reply = budget.run(lambda gate, alive: st.llm_main.chat_stream(messages, gate, temperature=0.7, alive=alive,
+                                                                                max_tokens=cap),
+                                   emit=emit, first_token=True)
+            else:
+                reply = budget.run(lambda gate, alive: st.llm_main.chat(messages, temperature=0.7, max_tokens=cap, alive=alive))
+        except ExchangeTimeout as exc:
+            exc.nothing_saved = True  # the answer comes first; no save has begun
+            raise
+
+        # #127: an answer the model server cut off at the cap is kept, with a note saying it was shortened.
+        truncated = bool(getattr(reply, "truncated", False))
+        # #1505: inline reasoning is removed again here, so neither the saved entry nor the reply can carry it.
+        visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
+        if truncated and not visible:
+            raise LengthCapError()  # #135: a distinct reason; nothing is saved
+        if not visible:
+            # #140: the streamed path already refuses an empty answer; the unstreamed path must not save one either.
+            raise EmptyAnswerError()  # #146: a distinct reason; nothing is saved
+        if marker is None:
+            # A truncated answer is cut before its trailing log marker, so the marker is missing. That is
+            # expected and defaults to logging (never lose content); #135 records it, without the answer text.
+            if truncated:
+                log.info("Diary answer reached the length cap and has no log marker because it was truncated; logging it by default")
+            marker = "ok"  # model omitted the marker — default to logging (never lose content)
+    except BaseException:
+        rust_answer.close(shadow)
         raise
-
-    # #127: an answer the model server cut off at the cap is kept, with a note saying it was shortened.
-    truncated = bool(getattr(reply, "truncated", False))
-    # #1505: inline reasoning is removed again here, so neither the saved entry nor the reply can carry it.
-    visible, marker = LLMClient.strip_log_marker(strip_reasoning(reply))
-    if truncated and not visible:
-        raise LengthCapError()  # #135: a distinct reason; nothing is saved
-    if not visible:
-        # #140: the streamed path already refuses an empty answer; the unstreamed path must not save one either.
-        raise EmptyAnswerError()  # #146: a distinct reason; nothing is saved
-    if marker is None:
-        # A truncated answer is cut before its trailing log marker, so the marker is missing. That is
-        # expected and defaults to logging (never lose content); #135 records it, without the answer text.
-        if truncated:
-            log.info("Diary answer reached the length cap and has no log marker because it was truncated; logging it by default")
-        marker = "ok"  # model omitted the marker — default to logging (never lose content)
-
-    if shadow is not None:
-        shadow.finish()  # the comparison must not read the corpus after this save
+    rust_answer.finish(shadow)  # the comparison must not read the corpus after this save
     outcome = st.pipeline.log_exchange(user_message=message, assistant_message=visible, now=now, day=day, budget=budget, **({"progress": emit} if emit else {}))
 
     # #1505: remember only an answered exchange that was saved (or deliberately skipped by the
@@ -2088,4 +2093,5 @@ BACKGROUND_ENTRY_POINTS = {
     "tenant_assertion:feed": "subprocess pipe", "tenant_assertion:drain": "subprocess pipe",
     "rust_forward:self._supervise": "child process supervision",
     "rust_forward:self._reap": "child process supervision",
+    "rust_answer:self._run": "no tenant writes (the read-only Rust answer endpoint)",
 }

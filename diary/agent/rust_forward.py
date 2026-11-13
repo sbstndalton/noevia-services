@@ -241,6 +241,7 @@ class RustServer:
         # acquired, by either process's writers (tenant_writer admission barrier).
         self.reaping = 0
         self.base_url = f"http://127.0.0.1:{port}"
+        self.answer_only = False
         _servers.add(self)
 
     # ---- lifecycle ----
@@ -929,6 +930,8 @@ def start(config_factory: Callable[[int, str, str], dict], routes: dict, writers
     if not routes and not writers and not answering:
         return None
     _server = RustServer(config_factory)
+    # Started only for the read-only answer shadow: it never writes, so deletion does not wait on it.
+    _server.answer_only = not routes and not writers
     _server.start()
     return _server
 
@@ -948,6 +951,6 @@ def fence_tenant(user_id: str) -> None:
     """DELETE /api/internal/tenant, after Python's tombstone: the Rust side stops writing the tenant
     (and finishes the write in flight) before its root is removed."""
     server = current()
-    if server is not None and not server.prepare_delete(user_id):
+    if server is not None and not getattr(server, "answer_only", False) and not server.prepare_delete(user_id):
         from fastapi import HTTPException
         raise HTTPException(503, "Diary saving did not confirm the tenant fence. Deletion remains paused.")

@@ -36,14 +36,20 @@ class FakeServer:
         self.lost_calls += 1
 
 
-def state():
+DIRTY = ["Entries/2026/September/September 1, 2026.md", "AI Memory/qa.md"]
+
+
+def state(dirty=DIRTY):
     config = SimpleNamespace(get=lambda: {"active": {"model": "qa-embed-a", "base_url": None, "profile": "plain"}})
-    return SimpleNamespace(retrieval=SimpleNamespace(embedding=SimpleNamespace(config=config)))
+    return SimpleNamespace(retrieval=SimpleNamespace(embedding=SimpleNamespace(config=config)),
+                           journal=SimpleNamespace(dirty_documents=lambda: list(dirty)),
+                           cfg=Config({"llm": {"timeout_s": 7, "max_retries": 2}}))
 
 
-def call(transport, tenant=TENANT, server=None):
+def call(transport, tenant=TENANT, server=None, st=None, held=True):
     server = server or FakeServer()
-    return rust_index.reindex_dirty(state(), tenant, server_lookup=lambda: server, transport=transport), server
+    with (tenant_writer.hold(TENANT) if held else nullcontext()):
+        return rust_index.reindex_dirty(st or state(), tenant, server_lookup=lambda: server, transport=transport), server
 
 
 def recording(seen, status=200, body=None, headers=None):
@@ -73,8 +79,25 @@ def test_a_non_writer_legacy_or_unready_tenant_stays_in_python(monkeypatch):
     assert call(recording(seen), tenant="legacy")[0] is False
     assert call(recording(seen), tenant=None)[0] is False
     assert call(recording(seen), server=FakeServer(ready=False))[0] is False
-    assert rust_index.reindex_dirty(state(), TENANT, server_lookup=lambda: None, transport=recording(seen)) is False
+    with tenant_writer.hold(TENANT):
+        assert rust_index.reindex_dirty(state(), TENANT, server_lookup=lambda: None, transport=recording(seen)) is False
+    assert call(recording(seen), held=False)[0] is False  # never claims a lock this context does not hold
     assert seen == []
+
+
+def test_nothing_dirty_makes_no_call(monkeypatch):
+    monkeypatch.setenv("DIARY_RUST_INDEX", "on")
+    seen = []
+    assert call(recording(seen), st=state(dirty=[]))[0] is True and seen == []
+
+
+def test_the_deadline_grows_with_the_dirty_documents(monkeypatch):
+    monkeypatch.setenv("DIARY_RUST_INDEX", "on")
+    seen = []
+    call(recording(seen))
+    (req,) = seen
+    # 60 s, plus per document llm.timeout_s for each of 1 + llm.max_retries attempts.
+    assert req.extensions["timeout"]["read"] == rust_index.REINDEX_BASE_S + len(DIRTY) * 7 * 3
 
 
 def test_a_complete_reply_is_the_reindex(monkeypatch, caplog):
@@ -107,22 +130,25 @@ def test_anything_short_of_a_complete_reply_reindexes_in_python(monkeypatch, sta
     assert done is False and server.lost_calls == 0
 
 
-def test_a_refused_connection_falls_back_without_losing_the_child(monkeypatch):
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout])
+def test_a_call_never_made_falls_back_without_losing_the_child(monkeypatch, error):
     monkeypatch.setenv("DIARY_RUST_INDEX", "on")
 
     def refuse(request):
-        raise httpx.ConnectError("synthetic refusal")
+        raise error("synthetic refusal")
     done, server = call(httpx.MockTransport(refuse))
     assert done is False and server.lost_calls == 0
 
 
-def test_a_forward_that_may_have_reached_the_child_marks_it_lost(monkeypatch):
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.WriteTimeout])
+def test_a_call_that_may_have_reached_the_child_loses_it_and_leaves_the_documents_dirty(monkeypatch, error):
+    # The lost child may still be writing: no Python re-index now; the next pass does it after the reap.
     monkeypatch.setenv("DIARY_RUST_INDEX", "on")
 
     def stall(request):
-        raise httpx.ReadTimeout("synthetic stall")
+        raise error("synthetic stall")
     done, server = call(httpx.MockTransport(stall))
-    assert done is False and server.lost_calls == 1
+    assert done is True and server.lost_calls == 1
 
 
 class Journal:
@@ -135,14 +161,18 @@ class Journal:
 
 
 @pytest.mark.parametrize("rust_done", [True, False])
-def test_reindex_dirty_skips_the_python_loop_only_after_the_rust_reindex(monkeypatch, rust_done):
+def test_reindex_dirty_asks_rust_under_the_locks_and_skips_the_python_loop_only_after_it(monkeypatch, rust_done):
     import agent.workspace_import as wi
-    monkeypatch.setattr(wi, "drain_index_outbox", lambda backend, journal: None)
-    calls = []
-    monkeypatch.setattr(appmod.rust_index, "reindex_dirty", lambda st, uid: calls.append(uid) or rust_done)
+    order = []
+    monkeypatch.setattr(wi, "drain_index_outbox", lambda backend, journal: order.append("drain"))
+    lock = tenant_writer.TenantWriteLock(TENANT)
+
+    def rust(st, uid):
+        order.append(("rust", uid, tenant_writer.held(uid), lock._is_owned()))
+        return rust_done
+    monkeypatch.setattr(appmod.rust_index, "reindex_dirty", rust)
     journal = Journal()
-    st = SimpleNamespace(tenant_id=TENANT, journal=journal,
-                         store=SimpleNamespace(_write_lock=nullcontext(), backend=None))
+    st = SimpleNamespace(tenant_id=TENANT, journal=journal, store=SimpleNamespace(_write_lock=lock, backend=None))
     appmod._reindex_dirty(st)
-    assert calls == [TENANT]
+    assert order == ["drain", ("rust", TENANT, True, True)]
     assert journal.listed == (0 if rust_done else 1)
