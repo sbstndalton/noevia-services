@@ -187,3 +187,137 @@ def test_the_fixture_is_not_changed_by_a_run(tmp_path):
     before = copy.deepcopy(ops)
     sc.run_ops(ops, lambda op: ok(), lambda op: ok())
     assert ops == before
+
+
+# ---------------- R9: exchange replies, fresh ids and the vector index ----------------
+
+SSE = {'content-type': 'text/event-stream; charset=utf-8'}
+
+
+def _frames(*events, keep_alive=False, compact=False):
+    out = []
+    for i, e in enumerate(events):
+        if keep_alive and i == 1:
+            out.append(': keep-alive\n\n')
+        text = json.dumps(e, separators=(',', ':'), sort_keys=True) if compact else json.dumps(e)
+        out.append('data: ' + text + '\n\n')
+    return ''.join(out).encode()
+
+
+def test_the_exchange_route_is_known():
+    assert '/v1/chat/completions' in sc.PATHS
+    ops = base_ops(ops=[{'name': 'ask', 'method': 'POST', 'path': '/v1/chat/completions', 'body': {'messages': []}}])
+    assert sc.load_ops(write_ops_dir(ops))['ops'][0]['path'] == '/v1/chat/completions'
+
+
+def write_ops_dir(data, _box=[]):
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix='qa-shadow-'))
+    _box.append(d)
+    return write_ops(d, data)
+
+
+def test_event_streams_compare_as_parsed_events():
+    events = [{'type': 'status', 'text': 'Opening diary context…'}, {'type': 'delta', 'text': 'Synthetic é'},
+              {'type': 'diary', 'reply': 'Synthetic é', 'decision': 'logged', 'xid': 'x'}, {'type': 'done'}]
+    python = sc.canonical_reply(200, SSE, _frames(*events))
+    rust = sc.canonical_reply(200, SSE, _frames(*events, keep_alive=True, compact=True))
+    assert sc.diff_replies(python, rust) == []
+    changed = [dict(e) for e in events]
+    changed[1]['text'] = 'Different'
+    assert sc.diff_replies(python, sc.canonical_reply(200, SSE, _frames(*changed))) == ['body']
+    # A missing event is a difference; a frame that is not JSON is too.
+    assert sc.diff_replies(python, sc.canonical_reply(200, SSE, _frames(*events[:-1]))) == ['body']
+    broken = _frames(*events) + b'data: {not json\n\n'
+    assert sc.diff_replies(python, sc.canonical_reply(200, SSE, broken)) == ['body']
+
+
+def test_masked_keys_apply_inside_stream_events():
+    a = sc.canonical_reply(200, SSE, _frames({'type': 'diary', 'xid': 'one'}), mask=('xid',))
+    b = sc.canonical_reply(200, SSE, _frames({'type': 'diary', 'xid': 'two'}), mask=('xid',))
+    assert sc.diff_replies(a, b) == []
+
+
+def test_fresh_uuids_compare_by_where_they_appear():
+    def reply(x, j):
+        body = json.dumps({'id': 'chatcmpl-' + x, 'diary': {'xid': x, 'journal': j}}).encode()
+        return body
+    x1, j1, x2, j2 = (str(uuid.uuid4()) for _ in range(4))
+    left, right = sc.UuidNumbering(), sc.UuidNumbering()
+    a = sc.canonical_reply(200, {'content-type': 'application/json'}, reply(x1, j1), numbering=left)
+    b = sc.canonical_reply(200, {'content-type': 'application/json'}, reply(x2, j2), numbering=right)
+    assert sc.diff_replies(a, b) == []
+    # One id used in both places where the other side used two different ids is a difference.
+    c = sc.canonical_reply(200, {'content-type': 'application/json'}, reply(x2, x2), numbering=sc.UuidNumbering())
+    assert sc.diff_replies(a, c) == ['body']
+    # Without numbering, fresh ids differ.
+    assert sc.diff_replies(sc.canonical_reply(200, {}, reply(x1, j1)), sc.canonical_reply(200, {}, reply(x2, j2))) == ['body']
+
+
+def _tenant_root(tmp_path, side, xid, journal_id, order):
+    root = tmp_path / side
+    (root / 'corpus').mkdir(parents=True)
+    (root / 'corpus' / '2031-03.md').write_text(f'### 09:00\n\n**Me:** synthetic\n\n<!-- xid:{xid} -->\n')
+    db = sqlite3.connect(root / 'managed-index.db')
+    db.execute('CREATE TABLE journal (id TEXT, payload TEXT, created_at TEXT)')
+    db.execute('INSERT INTO journal VALUES (?, ?, ?)', (journal_id, json.dumps({'xid': xid}), side))
+    db.execute('CREATE TABLE chunks (id INTEGER PRIMARY KEY, body TEXT, updated_at TEXT)')
+    for i in order:
+        db.execute('INSERT INTO chunks VALUES (?, ?, ?)', (i, 'chunk %d' % i, side + str(i)))
+    db.commit()
+    db.close()
+    return root
+
+
+def test_storage_with_fresh_ids_and_clock_columns_compares_equal(tmp_path):
+    a = _tenant_root(tmp_path, 'python', str(uuid.uuid4()), str(uuid.uuid4()), [1, 2])
+    b = _tenant_root(tmp_path, 'rust', str(uuid.uuid4()), str(uuid.uuid4()), [2, 1])
+    assert sc.diff_storage(sc.storage_digest(a, normalise_uuids=True), sc.storage_digest(b, normalise_uuids=True)) == []
+    # Without numbering the corpus file and the journal differ (and nothing else: updated_at is a clock column).
+    reasons = sc.diff_storage(sc.storage_digest(a), sc.storage_digest(b))
+    assert [r['path'] for r in reasons] == ['corpus/2031-03.md', 'managed-index.db']
+
+
+def _load_vec(conn):
+    sqlite_vec = pytest.importorskip('sqlite_vec')
+    conn.enable_load_extension(True)
+    try:
+        sqlite_vec.load(conn)
+    finally:
+        conn.enable_load_extension(False)
+
+
+def _vec_index(path, rows):
+    db = sqlite3.connect(path)
+    _load_vec(db)
+    db.execute('CREATE VIRTUAL TABLE vec_items USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[2])')
+    for chunk_id, vector in rows:
+        import struct
+        db.execute('INSERT INTO vec_items (chunk_id, embedding) VALUES (?, ?)', (chunk_id, struct.pack('2f', *vector)))
+    db.commit()
+    db.close()
+
+
+def test_vector_tables_compare_by_their_rows(tmp_path):
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+    (tmp_path / 'c').mkdir()
+    _vec_index(tmp_path / 'a' / 'index.db', [(1, (1.0, 0.0)), (2, (0.0, 1.0))])
+    _vec_index(tmp_path / 'b' / 'index.db', [(2, (0.0, 1.0)), (1, (1.0, 0.0))])
+    _vec_index(tmp_path / 'c' / 'index.db', [(1, (1.0, 0.0)), (2, (0.5, 1.0))])
+    da = sc.storage_digest(tmp_path / 'a', load_vec=_load_vec)
+    assert 'error' not in da['index.db'], da
+    assert da['index.db']['tables'] == ['vec_items']
+    assert sc.diff_storage(da, sc.storage_digest(tmp_path / 'b', load_vec=_load_vec)) == []
+    assert sc.diff_storage(da, sc.storage_digest(tmp_path / 'c', load_vec=_load_vec)) == [{'path': 'index.db', 'reason': 'content'}]
+
+
+def test_compare_passes_the_r9_options_through(tmp_path):
+    x1, x2 = str(uuid.uuid4()), str(uuid.uuid4())
+    ops = {'tenant': SYNTH, 'ops': [{'name': 'ask', 'method': 'POST', 'path': '/v1/chat/completions'}]}
+    def send(x, served):
+        return lambda op: {'status': 200, 'headers': SSE, 'body': _frames({'type': 'diary', 'xid': x}), 'served': served}
+    a = _tenant_root(tmp_path, 'python', x1, str(uuid.uuid4()), [1])
+    b = _tenant_root(tmp_path, 'rust', x2, str(uuid.uuid4()), [1])
+    report = sc.compare(ops, send(x1, 'python'), send(x2, 'rust'), a, b, normalise_uuids=True)
+    assert report['differences'] == 0 and report['rust_served'] == 1
