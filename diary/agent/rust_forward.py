@@ -90,7 +90,9 @@ DEFAULT_BIN = "/usr/local/bin/noevia-diary"
 # and every other write stay here (single writer until D5).
 SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/files": "GET", "/api/storage-status": "GET",
-             "/api/workspace-export": "GET"}
+             "/api/workspace-export": "GET",
+             # R9: the external-sources scan (served only with the resolved list, below).
+             "/api/external-sources": "GET"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
                 "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
@@ -209,10 +211,25 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
             "binary": workspace_export_native.BINARY,
             "settings": {key: base_cfg.get("corpus." + key) for key in SETTING_KEYS},
         },
+        # R9: DIARY_EXTERNAL_SOURCES as GET /api/external-sources reads it (`~` expanded here: the
+        # child runs with HOME=/nonexistent). Absent when it cannot be resolved: Python answers.
+        **({"external_sources": sources} if (sources := _external_sources()) is not None else {}),
         # R9: present only while DIARY_RUST_ANSWER is on; without it the answer endpoints are 404.
         **({"answer": answer} if (answer := rust_answer.answer_config(
             base_cfg, getattr(state.llm_main, "reasoning_tokens", 0))) is not None else {}),
     }
+
+
+def _external_sources() -> Optional[list]:
+    from .external_sources import external_source_paths
+    try:
+        paths = list(external_source_paths())
+        for p in paths:
+            p.encode("utf-8")  # a lone surrogate would make the whole start-up line unreadable there
+        return paths
+    except Exception as exc:  # noqa: BLE001 - the route then stays with Python (its own error)
+        log.info("DIARY_EXTERNAL_SOURCES not resolvable for the Rust process (%s)", type(exc).__name__)
+        return None
 
 
 class RustServer:

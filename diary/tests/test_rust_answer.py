@@ -110,8 +110,9 @@ def test_off_by_default_nothing_runs_and_no_config_is_sent(monkeypatch, caplog):
 def test_unknown_mode_is_off_with_one_warning(monkeypatch, caplog):
     monkeypatch.setattr(rust_answer, "_warned", set())
     with caplog.at_level(logging.WARNING, logger="diary.rust.answer"):
-        assert rust_answer.mode("on") == "" and rust_answer.mode("on") == ""
+        assert rust_answer.mode("full") == "" and rust_answer.mode("full") == ""
     assert sum("DIARY_RUST_ANSWER" in r.getMessage() for r in caplog.records) == 1
+    assert rust_answer.mode(" ON ") == "on"
     assert rust_answer.snapshot(fake_state(), []) is None  # off: Python builds from the live turns
     assert rust_answer.mode(" Shadow ") == "shadow"
 

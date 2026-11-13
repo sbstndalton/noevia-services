@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -59,6 +60,7 @@ def vector(text: str):
 class Engine(BaseHTTPRequestHandler):
     """The embeddings half of a model server (both processes embed through it)."""
     calls = []
+    answers = []
 
     def log_message(self, *a):
         pass
@@ -73,9 +75,12 @@ class Engine(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
-        if not self.path.endswith("/embeddings"):
+        if not self.path.endswith(("/embeddings", "/chat/completions")):
             self.send_response(404)
             self.end_headers()
+            return
+        if self.path.endswith("/chat/completions"):
+            self.chat(req)
             return
         texts = req.get("input")
         texts = [texts] if isinstance(texts, str) else list(texts or [])
@@ -84,6 +89,30 @@ class Engine(BaseHTTPRequestHandler):
             {"index": i, "embedding": vector(t)} for i, t in enumerate(texts)]}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+    def chat(self, req):
+        """A deterministic companion: the answer names a hash of the exact messages it was sent."""
+        messages = req.get("messages") or []
+        if req.get("temperature") == 0.7:
+            Engine.answers.append(messages)
+        digest = hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()
+        text = (f"QA companion answer {digest[:16]}. " + "The synthetic diary keeps its notes. " * 5
+                + "\n[LOG: ok]") if req.get("temperature") == 0.7 else "ok"
+        if req.get("stream"):
+            half = len(text) // 2
+            lines = [{"choices": [{"delta": {"content": text[:half]}}]},
+                     {"choices": [{"delta": {"content": text[half:]}, "finish_reason": "stop"}]}]
+            body = ("".join(f"data: {json.dumps(x)}\n\n" for x in lines) + "data: [DONE]\n\n").encode()
+            ctype = "text/event-stream"
+        else:
+            body = json.dumps({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}).encode()
+            ctype = "application/json"
+        self.send_response(200)
+        self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -297,3 +326,70 @@ def test_the_rust_reindex_writes_the_index_python_writes(world, monkeypatch):
             assert sum(db.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0] for t in vec_tables) == chunks
         finally:
             db.close()
+
+
+ON_PYTHON = "a1b2c3d4-0e1f-4a2b-8c3d-4e5f60718293"
+ON_RUST = "b2c3d4e5-1f20-4b3c-9d4e-5f6071829304"
+
+
+def test_on_mode_answers_and_saves_what_python_does(world, monkeypatch):
+    # DIARY_RUST_ANSWER=on end to end: two tenants with the same corpus answer the same questions, one
+    # through Python's own path and one through the Rust process. The companion is sent the same
+    # messages (its answer names their hash), the replies, decisions and streamed events are equal, and
+    # both tenants' saved diaries stay equal exchange after exchange.
+    from agent import rust_answer as ra
+    make, server, state_dir = world
+    monkeypatch.setattr(rust_forward, "_server", server)
+    monkeypatch.setattr(ra, "ANSWER_STATS", {k: 0 for k in ra.ANSWER_OUTCOMES})
+    sides = {"python": (make(ON_PYTHON), ON_PYTHON, ""), "rust": (make(ON_RUST), ON_RUST, "on")}
+    when = datetime.datetime(2030, 3, 14, 20, 0)
+    try:
+        for n, (question, _) in enumerate(QUESTIONS):
+            got = {}
+            for name, (st, uid, mode) in sides.items():
+                monkeypatch.setenv("DIARY_RUST_ANSWER", mode)
+                events = []
+                Engine.answers.clear()
+                emit = events.append if n % 2 else None
+                result = appmod._run_exchange(st, question, f"r9-on-{name}", uid, when + datetime.timedelta(minutes=n),
+                                              TODAY, False, "", emit)
+                got[name] = {
+                    "sent": list(Engine.answers),
+                    "result": {k: v for k, v in result.items() if k != "xid"},
+                    "events": [{k: v for k, v in e.items() if k != "xid"} for e in events],
+                }
+            assert got["python"]["sent"] and got["python"] == got["rust"], (question, got)
+        assert ra.answer_stats() == {**{k: 0 for k in ra.ANSWER_OUTCOMES}, "rust": len(QUESTIONS)}
+        texts = {}
+        for name, (st, uid, _) in sides.items():
+            texts[name] = {p: st.store.backend.get_text(p)[0] for p in sorted(CORPUS) if p.startswith("Entries/")}
+            texts[name][day_file(TODAY)] = st.store.backend.get_text(day_file(TODAY))[0]
+        strip = lambda t: re.sub(r"xid:[0-9a-f-]+", "xid:", t or "")
+        assert {p: strip(t) for p, t in texts["python"].items()} == {p: strip(t) for p, t in texts["rust"].items()}
+        # Not two unchanged diaries: every exchange was saved on both sides.
+        assert all(f"**Me:** {q}" in texts["rust"][day_file(TODAY)] for q, _ in QUESTIONS)
+    finally:
+        for _, uid, _ in sides.values():
+            for name in ("python", "rust"):
+                appmod.SESSIONS.pop(f"{uid}:r9-on-{name}", None)
+
+
+SHADOW_INDEXED = "c3d4e5f6-2031-4c4d-8e5f-6071829304a5"
+
+
+def test_the_index_shadow_matches_python_for_every_dirty_document(world, monkeypatch):
+    # DIARY_RUST_INDEX=shadow end to end: the Rust plans of the dirty documents of the synthetic
+    # corpus equal the plans Python applies, and Python's re-index is the one that lands.
+    from agent import rust_index
+    make, server, _ = world
+    monkeypatch.setattr(rust_forward, "_server", server)
+    monkeypatch.setattr(rust_index, "SHADOW_STATS", {k: 0 for k in rust_index.SHADOW_OUTCOMES})
+    monkeypatch.setenv("DIARY_RUST_INDEX", "shadow")
+    st = make(SHADOW_INDEXED, index=False)
+    assert sorted(st.journal.dirty_documents()) == sorted(CORPUS)
+    appmod._reindex_dirty(st)
+    assert st.journal.dirty_documents() == []
+    assert rust_index.shadow_stats() == {**{k: 0 for k in rust_index.SHADOW_OUTCOMES}, "match": len(CORPUS)}
+    # A second pass has nothing dirty: no call, nothing counted.
+    appmod._reindex_dirty(st)
+    assert sum(rust_index.shadow_stats().values()) == len(CORPUS)
