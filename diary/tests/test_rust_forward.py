@@ -240,6 +240,11 @@ WRONG_SECRET = b64({'kind': 'webdav', 'baseUrl': 'http://offline.invalid', 'secr
 REF_ONLY = b64({'kind': 'webdav', 'baseUrl': 'http://offline.invalid', 'corpusRoot': 'D', 'secretRef': 'b' * 32})
 UNVERIFIED = b'{"detail":"invalid tenant assertion"}'
 
+# R9: GET /api/external-sources is native only in a noevia-diary with the R9 shift-2 endpoints. With
+# DIARY_R9_SERVER_BIN (such a binary) it must be served natively; otherwise (an older pinned binary
+# declines it) either side may answer (None), and the replies must still be byte-equal.
+R9_NATIVE = bool(os.environ.get('DIARY_R9_SERVER_BIN'))
+
 # (name, user, path, query, extra headers, expected status, served natively by Rust?)
 CASES = [
     ('months daily', DAILY, '/api/months', b'', {}, 200, True),
@@ -259,9 +264,9 @@ CASES = [
     ('remote ref without secret, unmanaged', OTHER, '/api/months', b'', {'X-Cowork-Storage': REF_ONLY}, 428, False),
     ('client-supplied internal headers are dropped', DAILY, '/api/months', b'',
      {'X-Noevia-Diary-Forward': 'forged', 'X-Noevia-Diary-Asserted': '0'}, 200, True),
-    ('external sources', DAILY, '/api/external-sources', b'', {}, 200, True),
-    ('external sources monthly tenant', MONTHLY, '/api/external-sources', b'', {}, 200, True),
-    ('external sources non-uuid tenant', 'not-a-uuid', '/api/external-sources', b'', {}, 400, True),
+    ('external sources', DAILY, '/api/external-sources', b'', {}, 200, R9_NATIVE or None),
+    ('external sources monthly tenant', MONTHLY, '/api/external-sources', b'', {}, 200, R9_NATIVE or None),
+    ('external sources non-uuid tenant', 'not-a-uuid', '/api/external-sources', b'', {}, 400, R9_NATIVE or None),
     ('health process part', None, '/api/health', b'', {}, 200, True),
     ('health with tenant detail', DAILY, '/api/health', b'', {'X-Cowork-Storage': b64({'kind': 'local'})}, 200, False),
 ]
@@ -287,7 +292,7 @@ def test_parity_table_python_vs_rust(both):
         rows.append((case[0], p.status_code, r.status_code, Recording.served))
         assert wire(p) == wire(r), case[0]
         assert p.status_code == case[5], case[0]
-        assert Recording.served == [case[6]], (case[0], Recording.served)
+        assert case[6] is None or Recording.served == [case[6]], (case[0], Recording.served)
     print('\n'.join(f'{n:48} python={a} rust={b} native={s}' for n, a, b, s in rows))
 
 
