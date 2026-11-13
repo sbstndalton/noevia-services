@@ -1,5 +1,6 @@
 """Unit tests for the Diary shadow comparison (diary/scripts/shadow_compare.py). No binary, no network, synthetic data."""
 import copy
+import hashlib
 import json
 import sqlite3
 import sys
@@ -31,6 +32,20 @@ def test_the_committed_fixture_loads_and_is_synthetic():
     ops = sc.load_ops(FIXTURE)
     assert ops['tenant'].startswith(sc.SYNTHETIC_PREFIX)
     assert {op['method'] for op in ops['ops']} == {'GET', 'PUT', 'POST'}
+
+
+def test_fixture_base_versions_are_the_digest_of_the_previous_content():
+    # A file's version is the sha256 of its text (workspace_files.version); a hand-made value would turn an
+    # intended overwrite into a stale-version conflict on both paths and test nothing.
+    current = {}
+    for op in sc.load_ops(FIXTURE)['ops']:
+        body = op.get('body') or {}
+        if op['path'] != '/api/file' or op['name'].endswith('stale version'):
+            continue
+        before = current.get(body['path'])
+        expected = None if before is None else hashlib.sha256(before.encode()).hexdigest()
+        assert body['version'] == expected, op['name']
+        current[body['path']] = body['content']
 
 
 def test_a_real_looking_tenant_is_refused(tmp_path):
