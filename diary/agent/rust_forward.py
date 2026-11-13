@@ -205,7 +205,7 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
         # D5: entries are written natively only with the transforms Python itself uses.
         "corpus_write_impl": (os.environ.get("DIARY_CORPUS_WRITE_IMPL") or "python").strip().lower(),
         "workspace_export": {
-            "impl": os.environ.get("WORKSPACE_EXPORT_IMPL", "python"),
+            "impl": workspace_export_native.impl_value(),
             "binary": workspace_export_native.BINARY,
             "settings": {key: base_cfg.get("corpus." + key) for key in SETTING_KEYS},
         },

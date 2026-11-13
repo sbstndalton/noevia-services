@@ -19,8 +19,16 @@ ERROR = 'Workspace export could not be completed.'
 log = logging.getLogger(__name__)
 
 
+def impl_value():
+    """The configured selector. Unset, empty or blank means the default (#2338: compose passes an empty value)."""
+    raw = os.environ.get('WORKSPACE_EXPORT_IMPL')
+    if raw is None or raw.strip() == '':
+        return 'python'
+    return raw
+
+
 def selected():
-    value = os.environ.get('WORKSPACE_EXPORT_IMPL', 'python')
+    value = impl_value()
     if value not in ('python', 'rust'):
         raise ValueError(ERROR)
     return value == 'rust'
