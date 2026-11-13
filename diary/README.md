@@ -410,6 +410,21 @@ executable, and `scripts/smoke_diary_leaves.py noevia-diary` starts the server o
 port with a synthetic start-up line and checks its control probe, its refusal of a wrong control
 token or a missing forward secret, and its decline of a route it does not serve.
 
+R9 adds two more switches, both empty (off) in the image; with them unset nothing below runs and
+the start-up config carries no `answer` key:
+- `DIARY_RUST_ANSWER=shadow` (`agent/rust_answer.py`): for each exchange on a tenant's own managed
+  storage, the Rust process builds the same context beside the model call (`POST /internal/answer`,
+  mode `context`) and only the comparison's outcome is logged (`diary.rust.answer`: match, mismatch
+  with the first differing position and lengths, declined, refused, failed, late, skipped; never
+  content). Python still answers and saves; the save waits for the comparison at most 10 s. It
+  starts the Rust process on its own if no route or writer is configured.
+- `DIARY_RUST_INDEX=on` (`agent/rust_index.py`): for a `DIARY_RUST_WRITES` tenant, `_reindex_dirty`
+  hands the dirty-document re-index to the Rust process (`POST /internal/reindex`) under Python's
+  own locks; anything short of a complete reply re-indexes in Python. Its shadow is offline:
+  `scripts/shadow_compare.py` over a Python-indexed and a Rust-indexed copy of synthetic tenants.
+Both need a `noevia-diary` with the R9 endpoints; `tests/test_rust_answer_differential.py` proves
+them against one (`DIARY_R9_SERVER_BIN`) and skips without it.
+
 The leaves without a `self-test` command (and `noevia-diary`) are proven by `scripts/smoke_diary_leaves.py`:
 each runs once through its real adapter, selected only inside that process, on synthetic
 data, and must agree with Python. The image build runs it with `--all`; the noevia Diary
