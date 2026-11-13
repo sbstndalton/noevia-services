@@ -65,8 +65,10 @@ def wanted() -> bool:
 
 
 def answer_config(base_cfg, reasoning_tokens: int) -> Optional[dict]:
-    """The ``answer`` start-up config (noevia-diary answer.rs ``AnswerConfig``), None when off."""
-    if not wanted():
+    """The ``answer`` start-up config (noevia-diary answer.rs ``AnswerConfig``), None when both R9
+    switches are off. The Rust process serves its answer and re-index endpoints only with it."""
+    from . import rust_index
+    if not wanted() and not rust_index.wanted():
         return None
     llm = base_cfg.get("llm") or {}
     return {

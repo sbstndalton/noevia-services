@@ -79,6 +79,7 @@ from .managed_storage import ManagedCorpusBackend
 from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
 from . import tenant_assertion
 from . import rust_answer
+from . import rust_index
 from . import rust_forward
 from . import tenant_writer
 
@@ -1153,6 +1154,10 @@ def _reindex_dirty(st: AppState) -> None:
     with st.store._write_lock:
         from .workspace_import import drain_index_outbox
         drain_index_outbox(st.store.backend, st.journal)
+        # R9 (DIARY_RUST_INDEX=on; off by default): a writer tenant's re-index runs in the Rust
+        # process under these same locks; anything short of its complete reply re-indexes here.
+        if rust_index.reindex_dirty(st, getattr(st, "tenant_id", None)):
+            return
         for document in st.journal.dirty_documents():
             try:
                 text, _ = st.store.backend.get_text(document)
