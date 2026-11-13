@@ -34,8 +34,10 @@ route's file reference, which the Rust answer half does not build): such an exch
   bounds the whole call and closes it when it passes (the first-token deadline is the Rust side's,
   which sees the model's progress). The Rust side's failures map to the exceptions Python's own
   model call raises, so every route answers as before. Whatever the Rust side does not take (the
-  conditions of the shadow above, a decline, or a process that cannot be reached or refuses before
-  any answer began) is answered by Python itself, and counted.
+  conditions of the shadow above, a decline, or a process that cannot be reached or refuses (4xx)
+  before any answer began) is answered by Python itself, and counted. A 5xx is the exchange's
+  failure (the Rust side may already have called the model: never a second answer). A call given
+  up has its socket shut at once, also while the reply has not started (#127).
 """
 from __future__ import annotations
 
@@ -439,43 +441,55 @@ def answer(st, tenant_id: str, message: str, snap: Optional[Snapshot], day, extr
 
     def call(gate, alive):
         from .rust_forward import CONTROL_HEADER, DECLINE_HEADER
-        from .llm import LLMError
+        from .llm import LLMError, _shutdown_upstream
+        holder = {}
+
+        def trace(name, info):
+            # The connection as soon as it exists: a reply whose headers have not come yet (the plain
+            # answer replies only when the model has finished) can still be shut when it is given up.
+            if name == "connection.connect_tcp.complete" and isinstance(info, dict):
+                holder["network"] = info.get("return_value")
+        on_abandon = getattr(alive, "on_abandon", None)
+        unregister = on_abandon(lambda: _shutdown_upstream(holder)) if callable(on_abandon) else None
         try:
             with httpx.Client(base_url=server.base_url, timeout=ANSWER_TIMEOUT, trust_env=False,
                               transport=transport) as client:
                 with client.stream("POST", "/internal/answer", params={"tenant": tenant_id}, content=body,
-                                   headers={CONTROL_HEADER: token, "content-type": "application/json"}) as resp:
-                    unregister = alive.on_abandon(resp.close) if hasattr(alive, "on_abandon") else None
-                    try:
-                        if resp.status_code == 421 and resp.headers.get(DECLINE_HEADER.decode()) == "1":
-                            raise _decline("declined", "")
-                        if resp.status_code != 200:
-                            raise _decline("unavailable", f"HTTP {resp.status_code}")
-                        started.set()
-                        if emit is None:
-                            return _answered(json.loads(resp.read()), setting)
-                        for line in resp.iter_lines():
-                            alive()
-                            if not line.startswith("data:"):
-                                continue
-                            event = json.loads(line[5:].strip())
-                            kind = event.get("type") if isinstance(event, dict) else None
-                            if kind == "answered":
-                                return _answered(event, setting)
-                            if kind == "failed":
-                                raise _python_failure(event.get("failure"), setting)
-                            if kind is not None:
-                                gate(event)
-                        raise LLMError("the Rust answer stream ended before its outcome")
-                    finally:
-                        if unregister is not None:
-                            unregister()
+                                   headers={CONTROL_HEADER: token, "content-type": "application/json"},
+                                   extensions={"trace": trace}) as resp:
+                    holder["response"] = resp
+                    if resp.status_code == 421 and resp.headers.get(DECLINE_HEADER.decode()) == "1":
+                        raise _decline("declined", "")
+                    if resp.status_code >= 500:
+                        # The Rust side may have called the model before failing: never a second answer.
+                        raise LLMError(f"Rust answer failed: HTTP {resp.status_code}")
+                    if resp.status_code != 200:
+                        raise _decline("unavailable", f"HTTP {resp.status_code}")
+                    started.set()
+                    if emit is None:
+                        return _answered(json.loads(resp.read()), setting)
+                    for line in resp.iter_lines():
+                        alive()
+                        if not line.startswith("data:"):
+                            continue
+                        event = json.loads(line[5:].strip())
+                        kind = event.get("type") if isinstance(event, dict) else None
+                        if kind == "answered":
+                            return _answered(event, setting)
+                        if kind == "failed":
+                            raise _python_failure(event.get("failure"), setting)
+                        if kind is not None:
+                            gate(event)
+                    raise LLMError("the Rust answer stream ended before its outcome")
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             if started.is_set():
                 raise LLMError(f"Rust answer failed: {type(exc).__name__}") from exc
             raise _decline("unavailable", type(exc).__name__) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise LLMError(f"Rust answer failed: {type(exc).__name__}") from exc
+        finally:
+            if unregister is not None:
+                unregister()
 
     try:
         result = budget.run(call, emit=emit, first_token=False)

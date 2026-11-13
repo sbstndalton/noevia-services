@@ -262,11 +262,57 @@ def test_the_exchange_deadline_bounds_the_rust_call(monkeypatch):
     assert info.value.nothing_saved is True and "save" not in order
 
 
+def test_a_given_up_call_shuts_its_socket_before_any_reply(monkeypatch):
+    # A Rust process that has taken the request but not replied (the plain answer replies only when
+    # the model has finished): the deadline must close the connection at once, so the Rust side drops
+    # its model call, as Python's own model call does (#127).
+    import socket
+    import threading
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    closed = threading.Event()
+
+    def serve():
+        conn, _ = listener.accept()
+        conn.settimeout(10)
+        try:
+            while conn.recv(65536):
+                pass  # the request, then nothing: wait for the caller to go away
+            closed.set()
+        except OSError:
+            closed.set()
+        finally:
+            conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    server = FakeServer()
+    server.base_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    st = state([])
+    snap = rust_answer.snapshot(st, [])
+    started = time.monotonic()
+    try:
+        with pytest.raises(ExchangeTimeout):
+            rust_answer.answer(st, TENANT, "Synthetic question", snap, date(2026, 9, 1), "", 1024,
+                               ExchangeBudget(total_s=0.3), server_lookup=lambda: server)
+        assert closed.wait(3), "the connection was left open"
+        assert time.monotonic() - started < 2.5
+    finally:
+        listener.close()
+    assert rust_answer.answer_stats()["rust"] == 1
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_a_rust_server_error_is_a_failure_never_a_second_answer(monkeypatch, streamed):
+    order = []
+    with pytest.raises(LLMError):
+        exchange(monkeypatch, lambda r: httpx.Response(500), emit=[].append if streamed else None, order=order)
+    assert order == ["rust"]
+
+
 # ---- Python answers what the Rust side does not take ----
 
 @pytest.mark.parametrize("reply,outcome", [
     (lambda r: httpx.Response(421, headers={rust_forward.DECLINE_HEADER.decode(): "1"}), "declined"),
-    (lambda r: httpx.Response(500), "unavailable"),
     (lambda r: httpx.Response(404), "unavailable"),
     (lambda r: (_ for _ in ()).throw(httpx.ConnectError("synthetic")), "unavailable"),
 ])

@@ -421,7 +421,7 @@ the start-up config carries no `answer` key:
 - `DIARY_RUST_ANSWER=on`: the Rust process builds the context and gets the companion's answer
   (mode `answer`; streamed, its events are relayed as they come) and Python saves it as before. The
   exchange deadline bounds the call and closes it. A decline, a process that cannot be reached or
-  refuses before any answer began, or a case it does not take (the shadow's conditions) is answered
+  refuses (4xx) before any answer began, or a case it does not take (the shadow's conditions) is answered
   by Python; `rust_answer.answer_stats()` counts rust, declined, unavailable and skipped. The Rust
   side's model failures raise the exceptions Python's own call raises.
 - `DIARY_RUST_INDEX=on` (`agent/rust_index.py`): for a `DIARY_RUST_WRITES` tenant, `_reindex_dirty`
@@ -429,7 +429,7 @@ the start-up config carries no `answer` key:
   own locks; anything short of a complete reply re-indexes in Python.
 - `DIARY_RUST_INDEX=shadow`: Python re-indexes every managed tenant as before, after asking the
   Rust process for its plan of the same dirty documents (`plan_only`: rows and vectors, nothing
-  written; at most 30 s). Each plan is compared with the one Python applies and only the outcome is
+  written; passes of at most 8 dirty documents, about 30 s at most). Each plan is compared with the one Python applies and only the outcome is
   logged (`diary.rust.index`: match, mismatch with the first differing position, declined, refused,
   failed, skipped). Changed chunks are embedded twice while it is on. Offline,
   `scripts/shadow_compare.py` compares a Python-indexed and a Rust-indexed copy of synthetic tenants.

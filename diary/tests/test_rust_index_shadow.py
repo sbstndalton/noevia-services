@@ -173,3 +173,16 @@ def test_shadow_sends_the_start_up_config_and_takes_no_writer_role():
     assert rust_answer.answer_config(__import__("agent.config", fromlist=["Config"]).Config({}), 0) is not None
     # The `on` hand-over is not taken in shadow mode.
     assert rust_index.reindex_dirty(state([]), TENANT, server_lookup=lambda: FakeServer()) is False
+
+
+def test_a_large_dirty_set_is_not_compared(monkeypatch):
+    many = [f"Entries/2026/September/September {d}, 2026.md" for d in range(1, 10)]
+    called = []
+    st = state([])
+    st.journal.dirty_documents = lambda: list(many)
+    st.store.backend.files.update({d: "x" for d in many})
+    monkeypatch.setattr(rust_forward, "_server", FakeServer())
+    assert REAL_SHADOW(st, TENANT, many, transport=httpx.MockTransport(lambda r: called.append(1))) is None
+    assert called == [] and rust_index.shadow_stats()["skipped"] == 1
+    assert REAL_SHADOW(st, TENANT, many[:rust_index.SHADOW_MAX_DOCUMENTS],
+                       transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"documents": []}))) is not None

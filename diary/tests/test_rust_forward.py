@@ -78,6 +78,15 @@ def world(tmp_path, monkeypatch):
         monkeypatch.setattr(appmod, '_tenant_states', owned_tenants)
         monkeypatch.setenv('DIARY_TENANT_KEY', KEY)
         monkeypatch.delenv('DIARY_LEGACY_USER_ID', raising=False)
+        # R9: one synthetic external source (a dated and an undated note), a missing one, a file.
+        source = tmp_path / 'qa-source'
+        (source / 'sub').mkdir(parents=True)
+        (source / '2030-01-06 walk.md').write_text('QA synthetic note')
+        (source / 'sub' / 'notes ünïcode.txt').write_text('QA')
+        (source / 'skip.bin').write_text('x')
+        (tmp_path / 'qa-file.md').write_text('x')
+        monkeypatch.setenv('DIARY_EXTERNAL_SOURCES', ','.join(
+            str(p) for p in (source, tmp_path / 'qa-missing', tmp_path / 'qa-file.md', source)))
         # A reindex that succeeds: what a completed Python recovery leaves (no dirty documents).
         monkeypatch.setattr(appmod, '_reindex_dirty', clear_dirty)
         monkeypatch.setattr(appmod, '_deleted_tenants', {})
@@ -250,6 +259,9 @@ CASES = [
     ('remote ref without secret, unmanaged', OTHER, '/api/months', b'', {'X-Cowork-Storage': REF_ONLY}, 428, False),
     ('client-supplied internal headers are dropped', DAILY, '/api/months', b'',
      {'X-Noevia-Diary-Forward': 'forged', 'X-Noevia-Diary-Asserted': '0'}, 200, True),
+    ('external sources', DAILY, '/api/external-sources', b'', {}, 200, True),
+    ('external sources monthly tenant', MONTHLY, '/api/external-sources', b'', {}, 200, True),
+    ('external sources non-uuid tenant', 'not-a-uuid', '/api/external-sources', b'', {}, 400, True),
     ('health process part', None, '/api/health', b'', {}, 200, True),
     ('health with tenant detail', DAILY, '/api/health', b'', {'X-Cowork-Storage': b64({'kind': 'local'})}, 200, False),
 ]

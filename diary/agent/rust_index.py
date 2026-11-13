@@ -24,7 +24,8 @@ With nothing dirty, no call is made.
   changed chunks it would write; it writes nothing). Each document's plan is compared with the one
   Python then applies (its ``prepare_reindex``, which ``reindex_file`` is), and only the outcome is
   logged and counted: positions and counts, never text. The plan call is made under Python's locks,
-  before Python's own re-index, and bounded by SHADOW_DEADLINE_S; a decline, a refusal, a failure or
+  before Python's own re-index, for at most SHADOW_MAX_DOCUMENTS documents (more is skipped), each
+  phase bounded by SHADOW_DEADLINE_S (the Rust side stops planning once the call is given up); a decline, a refusal, a failure or
   a late reply is counted and changes nothing. The embeddings of changed chunks are computed twice
   while it is on. A chunk one side failed to embed (a transient embeddings error) is a mismatch: a
   lead to check, not proof of a fault.
@@ -52,8 +53,11 @@ MODES = ("", "on", "shadow")
 # (llm.timeout_s for each of 1 + llm.max_retries attempts).
 REINDEX_BASE_S = 60.0
 _warned = set()
-# The index shadow's plan call (under Python's locks, before its own re-index).
+# The index shadow's plan call (under Python's locks, before its own re-index): each phase of the
+# call is bounded by this, and a pass with more dirty documents than SHADOW_MAX_DOCUMENTS (a first
+# index, an import) is not compared, so the shadow never holds the locks for long.
 SHADOW_DEADLINE_S = 30.0
+SHADOW_MAX_DOCUMENTS = 8
 # Two vectors of the same text from the same server: equal but for float parsing.
 VECTOR_TOLERANCE = 1e-9
 SHADOW_OUTCOMES = ("match", "mismatch", "declined", "refused", "failed", "skipped")
@@ -247,6 +251,8 @@ def shadow(st, tenant_id: Optional[str], documents: list, server_lookup: Optiona
         config = getattr(getattr(st.retrieval, "embedding", None), "config", None)
         if config is None:
             return _skip("no shared embedding configuration")
+        if len(documents) > SHADOW_MAX_DOCUMENTS:
+            return _skip(f"{len(documents)} dirty documents")
         body = {"embedding": config.get(), "plan_only": True, "documents": list(documents)}
         with httpx.Client(base_url=server.base_url, timeout=SHADOW_DEADLINE_S, trust_env=False,
                           transport=transport) as client:
