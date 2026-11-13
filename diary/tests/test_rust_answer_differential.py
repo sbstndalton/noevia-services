@@ -366,7 +366,8 @@ def test_on_mode_answers_and_saves_what_python_does(world, monkeypatch):
             texts[name][day_file(TODAY)] = st.store.backend.get_text(day_file(TODAY))[0]
         strip = lambda t: re.sub(r"xid:[0-9a-f-]+", "xid:", t or "")
         assert {p: strip(t) for p, t in texts["python"].items()} == {p: strip(t) for p, t in texts["rust"].items()}
-        assert "QA companion answer" in texts["rust"][day_file(TODAY)]
+        # Not two unchanged diaries: every exchange was saved on both sides.
+        assert all(f"**Me:** {q}" in texts["rust"][day_file(TODAY)] for q, _ in QUESTIONS)
     finally:
         for _, uid, _ in sides.values():
             for name in ("python", "rust"):
