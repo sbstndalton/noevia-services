@@ -633,3 +633,14 @@ def test_a_slow_request_body_is_never_read_or_forwarded_and_times_like_python(wo
     # Without a body the same request is forwarded.
     asyncio.run(call(spy, base))
     assert forwarded == ['/api/months']
+
+
+def test_the_external_sources_start_up_list(monkeypatch, tmp_path):
+    # R9: Python's resolved list, in order and deduplicated; an unresolvable or non-UTF-8 value is
+    # left out (the route stays with Python) instead of breaking the whole start-up line.
+    monkeypatch.setenv('DIARY_EXTERNAL_SOURCES', f'{tmp_path}/qa-a, {tmp_path}/qa-b,{tmp_path}/qa-a')
+    assert rust_forward._external_sources() == [f'{tmp_path}/qa-a', f'{tmp_path}/qa-b']
+    monkeypatch.setenv('DIARY_EXTERNAL_SOURCES', '')
+    assert rust_forward._external_sources() == []
+    monkeypatch.setenv('DIARY_EXTERNAL_SOURCES', f'{tmp_path}/qa-\udcff')
+    assert rust_forward._external_sources() is None

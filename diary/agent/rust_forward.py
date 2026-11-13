@@ -223,7 +223,10 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
 def _external_sources() -> Optional[list]:
     from .external_sources import external_source_paths
     try:
-        return list(external_source_paths())
+        paths = list(external_source_paths())
+        for p in paths:
+            p.encode("utf-8")  # a lone surrogate would make the whole start-up line unreadable there
+        return paths
     except Exception as exc:  # noqa: BLE001 - the route then stays with Python (its own error)
         log.info("DIARY_EXTERNAL_SOURCES not resolvable for the Rust process (%s)", type(exc).__name__)
         return None

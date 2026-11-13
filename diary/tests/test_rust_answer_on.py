@@ -301,6 +301,53 @@ def test_a_given_up_call_shuts_its_socket_before_any_reply(monkeypatch):
     assert rust_answer.answer_stats()["rust"] == 1
 
 
+def test_a_call_given_up_while_connecting_is_shut_once_connected(monkeypatch):
+    # The closer runs before the connection exists; the connection must still be shut when it does.
+    import socket
+    import threading
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    outcome = {}
+
+    def serve():
+        listener.settimeout(5)
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            outcome["no connection"] = True
+            return
+        conn.settimeout(5)
+        try:
+            while conn.recv(65536):
+                pass
+            outcome["closed"] = True
+        except OSError:
+            outcome["closed"] = True
+        finally:
+            conn.close()
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    server = FakeServer()
+    server.base_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+    real_client = httpx.Client
+
+    class SlowStart(real_client):
+        def __init__(self, *a, **k):
+            time.sleep(0.2)  # the budget passes before the connection is made
+            super().__init__(*a, **k)
+    monkeypatch.setattr(rust_answer.httpx, "Client", SlowStart)
+    st = state([])
+    try:
+        with pytest.raises(ExchangeTimeout):
+            rust_answer.answer(st, TENANT, "Synthetic question", rust_answer.snapshot(st, []), date(2026, 9, 1), "",
+                               1024, ExchangeBudget(total_s=0.05), server_lookup=lambda: server)
+        t.join(6)
+        assert outcome, "the connection was left open"
+    finally:
+        listener.close()
+
+
 @pytest.mark.parametrize("streamed", [False, True])
 def test_a_rust_server_error_is_a_failure_never_a_second_answer(monkeypatch, streamed):
     order = []

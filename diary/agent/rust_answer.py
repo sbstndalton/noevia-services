@@ -449,6 +449,8 @@ def answer(st, tenant_id: str, message: str, snap: Optional[Snapshot], day, extr
             # answer replies only when the model has finished) can still be shut when it is given up.
             if name == "connection.connect_tcp.complete" and isinstance(info, dict):
                 holder["network"] = info.get("return_value")
+                if getattr(alive, "abandoned", False):
+                    _shutdown_upstream(holder)  # given up while connecting: the closer found nothing
         on_abandon = getattr(alive, "on_abandon", None)
         unregister = on_abandon(lambda: _shutdown_upstream(holder)) if callable(on_abandon) else None
         try:
