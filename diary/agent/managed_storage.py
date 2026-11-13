@@ -59,12 +59,12 @@ class ManagedCorpusBackend:
             # Only construction may create a database; operational reads/writes
             # below use mode=rw and never replace a disappeared database.
             tenant_writer.connect(self.db_path).close()
-        # D5: the schema and identity write below runs on every construction (#2378, open). For a
-        # writer tenant it is a write like any other, under the tenant's writer lock (constructions
-        # run outside every other ordered lock: app._get_backup_backend, _tenant_state). So that a
-        # read does not queue behind a long write, a writer tenant whose schema and identity are
-        # already in place skips it: it would change nothing.
-        if tenant_writer.is_writer(self.tenant) and self._initialized():
+        # #2378: the schema and identity write below used to run on every construction, which made
+        # every read a write on the tenant's database (and queued reads behind any write
+        # transaction). A tenant whose schema and identity are already in place skips it for every
+        # tenant, not only writer tenants: the write would change nothing. A missing table, a
+        # different identity or an incomplete activation still goes through the write path below.
+        if self._initialized():
             if self.marker.exists() and self._read_meta('active') != '1':
                 raise StorageUnavailable('App Diary activation is incomplete. Restore or review the staged database.')
             return

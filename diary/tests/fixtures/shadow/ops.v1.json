@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "tenant": "00000000-0000-4000-8000-0000000000a1",
+  "note": "Synthetic tenant only. Reads and file/directory writes. Appends and edits are not in v1: their xids are random (corpus_store.py uuid4), so storage bytes differ between two runs until the harness pins them.",
+  "ops": [
+    {"name": "health", "method": "GET", "path": "/api/health"},
+    {"name": "months", "method": "GET", "path": "/api/months"},
+    {"name": "day today", "method": "GET", "path": "/api/day", "mask": ["day"]},
+    {"name": "day month", "method": "GET", "path": "/api/day", "query": "month=2030-01"},
+    {"name": "day bad month", "method": "GET", "path": "/api/day", "query": "month=2030-13"},
+    {"name": "files root", "method": "GET", "path": "/api/files", "query": "path="},
+    {"name": "storage status", "method": "GET", "path": "/api/storage-status"},
+    {"name": "file create", "method": "PUT", "path": "/api/file",
+     "body": {"path": "Notes/synthetic-one.md", "content": "Synthetic note one.\n", "version": null}},
+    {"name": "file overwrite", "method": "PUT", "path": "/api/file",
+     "body": {"path": "Notes/synthetic-one.md", "content": "Synthetic note two.\n",
+              "version": "9f6d7c50cf3ec5749a42e5ba696d6abae6758fb05ca53b3a5eaabdf0fa3adef7"}},
+    {"name": "file overwrite stale version", "method": "PUT", "path": "/api/file",
+     "body": {"path": "Notes/synthetic-one.md", "content": "Synthetic note three.\n", "version": "0000"}},
+    {"name": "directory create", "method": "POST", "path": "/api/directory", "body": {"path": "Notes/Archive"}},
+    {"name": "directory exists", "method": "POST", "path": "/api/directory", "body": {"path": "Notes/Archive"}},
+    {"name": "files after writes", "method": "GET", "path": "/api/files", "query": "path=Notes"}
+  ]
+}
