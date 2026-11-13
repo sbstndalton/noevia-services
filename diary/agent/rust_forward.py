@@ -78,7 +78,7 @@ from typing import Callable, Optional
 
 import httpx
 
-from . import tenant_assertion, tenant_writer, workspace_export_native
+from . import rust_answer, tenant_assertion, tenant_writer, workspace_export_native
 from .diary_migration import SETTING_KEYS
 
 log = logging.getLogger("diary.rust")
@@ -209,6 +209,9 @@ def server_config(base_cfg, state, port: int, control_token: str, forward_secret
             "binary": workspace_export_native.BINARY,
             "settings": {key: base_cfg.get("corpus." + key) for key in SETTING_KEYS},
         },
+        # R9: present only while DIARY_RUST_ANSWER is on; without it the answer endpoints are 404.
+        **({"answer": answer} if (answer := rust_answer.answer_config(
+            base_cfg, getattr(state.llm_main, "reasoning_tokens", 0))) is not None else {}),
     }
 
 
@@ -391,6 +394,11 @@ class RustServer:
         with self._lock:
             self.reaping -= 1
         tenant_writer.notify()
+
+    def control(self):
+        """(control token, ready): what an internal call (rust_answer) needs."""
+        with self._lock:
+            return self._token, self.ready
 
     def fence(self, user_id: str, timeout: float = FORWARD_DEADLINE_S) -> bool:
         """DELETE /api/internal/tenant: make the Rust side refuse the tenant's later writes and wait
@@ -913,10 +921,12 @@ def _detach(task, claim) -> None:
 _server: Optional[RustServer] = None
 
 
-def start(config_factory: Callable[[int, str, str], dict], routes: dict, writers=frozenset()) -> Optional[RustServer]:
-    """Lifespan hook: start the Rust process when any route or writer tenant is configured."""
+def start(config_factory: Callable[[int, str, str], dict], routes: dict, writers=frozenset(),
+          answering: bool = False) -> Optional[RustServer]:
+    """Lifespan hook: start the Rust process when any route or writer tenant is configured, or (R9)
+    the answer shadow is on (rust_answer)."""
     global _server
-    if not routes and not writers:
+    if not routes and not writers and not answering:
         return None
     _server = RustServer(config_factory)
     _server.start()

@@ -78,6 +78,7 @@ from .dedicated_storage import StorageUnavailable, tenant_volume
 from .managed_storage import ManagedCorpusBackend
 from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
 from . import tenant_assertion
+from . import rust_answer
 from . import rust_forward
 from . import tenant_writer
 
@@ -787,7 +788,7 @@ async def lifespan(_app: FastAPI):
     # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
     # DIARY_RUST_WRITES a tenant (default: none).
     rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
-                       _RUST_ROUTES, _RUST_WRITERS)
+                       _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted())
     yield
     rust_forward.stop()
     if _embedding_migration is not None:
@@ -1090,6 +1091,10 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
     budget = ExchangeBudget()
     # #127: every companion answer is capped, and the deadline closes the model call it gives up on.
     cap = getattr(st, "max_answer_tokens", DEFAULT_MAX_ANSWER_TOKENS)
+    # R9 (DIARY_RUST_ANSWER=shadow; off by default): the Rust answer half builds the same context
+    # beside the model call; only the comparison's outcome is logged.
+    shadow = rust_answer.begin(st, str(tenant_id or "legacy").lower(), message, sess["turns"], day,
+                               extra_context, messages, cap)
     if emit:
         emit({"type": "status", "text": "Generating companion response…"})
     try:
@@ -1119,6 +1124,8 @@ def _run_exchange(st: AppState, message: str, session_id: str, tenant_id: str = 
             log.info("Diary answer reached the length cap and has no log marker because it was truncated; logging it by default")
         marker = "ok"  # model omitted the marker — default to logging (never lose content)
 
+    if shadow is not None:
+        shadow.finish()  # the comparison must not read the corpus after this save
     outcome = st.pipeline.log_exchange(user_message=message, assistant_message=visible, now=now, day=day, budget=budget, **({"progress": emit} if emit else {}))
 
     # #1505: remember only an answered exchange that was saved (or deliberately skipped by the
