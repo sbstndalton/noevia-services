@@ -10,8 +10,8 @@ FROM rust:1.99-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de
 # Merged Rust runtime dependency; checksum verified below. The inference gate (noevia#2115)
 # is built from the same source in its own cargo invocation, so its dependencies' features never
 # unify into the model manager's build.
-ARG NOEVIA_RS_REF=a0d7df69fff1b1eb1779e4b31889a3e76284c751
-ARG NOEVIA_RS_SHA256=54e8b2549deb40da9c51e2ca8dafa1ae33b232d53de878f729cfaccfc9e83d4c
+ARG NOEVIA_RS_REF=fcebcc62da962c682cb353c8b13485ccc32dd849
+ARG NOEVIA_RS_SHA256=19591739c857b23158c62d0cb3794e3157d3fc3747d52220918aa7349f797f04
 # The source's rust-toolchain.toml names 1.99.0 plus clippy/rustfmt; pin to the image's own
 # toolchain so the build never downloads components it does not need.
 ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never CARGO_BUILD_JOBS=8
