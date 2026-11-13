@@ -789,7 +789,7 @@ async def lifespan(_app: FastAPI):
     # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
     # DIARY_RUST_WRITES a tenant (default: none).
     rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
-                       _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted())
+                       _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted() or rust_index.shadowing())
     yield
     rust_forward.stop()
     if _embedding_migration is not None:
@@ -1193,10 +1193,19 @@ def _reindex_dirty(st: AppState) -> None:
         # process under these same locks; anything short of its complete reply re-indexes here.
         if rust_index.reindex_dirty(st, getattr(st, "tenant_id", None)):
             return
-        for document in st.journal.dirty_documents():
+        documents = st.journal.dirty_documents()
+        # R9 (DIARY_RUST_INDEX=shadow; off by default: None): the Rust process's plans for these
+        # documents, compared with the plan Python applies (reindex_file is prepare + apply).
+        shadow = rust_index.shadow(st, getattr(st, "tenant_id", None), documents)
+        for document in documents:
             try:
                 text, _ = st.store.backend.get_text(document)
-                st.retrieval.reindex_file(document, text)
+                if shadow is None:
+                    st.retrieval.reindex_file(document, text)
+                else:
+                    plan = st.retrieval.prepare_reindex(document, text)
+                    shadow.compare(document, plan)
+                    st.retrieval.apply_reindex(plan)
                 if not getattr(st.retrieval, "pending_embeddings", False):
                     st.journal.clear_dirty(document)
             except Exception as exc:

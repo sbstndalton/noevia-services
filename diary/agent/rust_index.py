@@ -19,15 +19,26 @@ The call's deadline grows with the number of dirty documents, each bounded by th
 own timeout and retries, so it ends only where Python's own loop would also have been stuck.
 With nothing dirty, no call is made.
 
-The Rust process serves this endpoint only with the ``answer`` start-up config, so this mode also
-sends it (rust_answer.answer_config). The shadow comparison for indexing is offline:
-scripts/shadow_compare.py compares the vector tables of a Python-indexed and a Rust-indexed copy
-of the same synthetic tenants.
+- ``shadow``: Python re-indexes as before (any managed tenant), and first asks the Rust process for
+  its plan of the same dirty documents (``plan_only``: the chunk rows and the vectors of the new and
+  changed chunks it would write; it writes nothing). Each document's plan is compared with the one
+  Python then applies (its ``prepare_reindex``, which ``reindex_file`` is), and only the outcome is
+  logged and counted: positions and counts, never text. The plan call is made under Python's locks,
+  before Python's own re-index, and bounded by SHADOW_DEADLINE_S; a decline, a refusal, a failure or
+  a late reply is counted and changes nothing. The embeddings of changed chunks are computed twice
+  while it is on. A chunk one side failed to embed (a transient embeddings error) is a mismatch: a
+  lead to check, not proof of a fault.
+
+The Rust process serves this endpoint only with the ``answer`` start-up config, so these modes also
+send it (rust_answer.answer_config). scripts/shadow_compare.py compares the vector tables of a
+Python-indexed and a Rust-indexed copy of the same synthetic tenants offline.
 """
 from __future__ import annotations
 
 import logging
+import math
 import os
+import threading
 from typing import Callable, Optional
 
 import httpx
@@ -36,11 +47,18 @@ from . import tenant_writer
 
 log = logging.getLogger("diary.rust.index")
 
-MODES = ("", "on")
+MODES = ("", "on", "shadow")
 # The deadline of one re-index call: this, plus per dirty document the model client's worst case
 # (llm.timeout_s for each of 1 + llm.max_retries attempts).
 REINDEX_BASE_S = 60.0
 _warned = set()
+# The index shadow's plan call (under Python's locks, before its own re-index).
+SHADOW_DEADLINE_S = 30.0
+# Two vectors of the same text from the same server: equal but for float parsing.
+VECTOR_TOLERANCE = 1e-9
+SHADOW_OUTCOMES = ("match", "mismatch", "declined", "refused", "failed", "skipped")
+_stats_lock = threading.Lock()
+SHADOW_STATS = {k: 0 for k in SHADOW_OUTCOMES}
 
 
 def mode(raw: Optional[str] = None) -> str:
@@ -57,13 +75,17 @@ def wanted() -> bool:
     return mode() != ""
 
 
+def shadowing() -> bool:
+    return mode() == "shadow"
+
+
 def reindex_dirty(st, tenant_id: Optional[str], server_lookup: Optional[Callable[[], object]] = None,
                   transport: Optional[httpx.BaseTransport] = None) -> bool:
     """Re-index the tenant's dirty documents in the Rust process. True when it did (its per-document
     failures are logged as Python logs its own); False when Python must do it. The caller holds
     st.store._write_lock (the tenant writer lock and the store lock) and has drained the outbox."""
     uid = (tenant_id or "").lower()
-    if not wanted() or not uid or uid == "legacy" or not tenant_writer.is_writer(uid):
+    if mode() != "on" or not uid or uid == "legacy" or not tenant_writer.is_writer(uid):
         return False
     if not tenant_writer.held(uid):
         return False  # the writer header would be untrue: Python re-indexes under its own locks
@@ -114,3 +136,142 @@ def reindex_dirty(st, tenant_id: Optional[str], server_lookup: Optional[Callable
         if error:
             log.warning("edit reindex pending: %s", error)
     return True
+
+
+# ---------------- DIARY_RUST_INDEX=shadow ----------------
+
+
+def _count(outcome: str, n: int = 1) -> None:
+    with _stats_lock:
+        SHADOW_STATS[outcome] += n
+
+
+def shadow_stats() -> dict:
+    with _stats_lock:
+        return dict(SHADOW_STATS)
+
+
+def _close(a, b) -> bool:
+    try:
+        x, y = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(x) and math.isfinite(y) and abs(x - y) <= VECTOR_TOLERANCE * max(1.0, abs(x), abs(y))
+
+
+def compare_plan(python_plan, rust) -> Optional[str]:
+    """None when the plans agree, else where they first differ: positions and counts, no text."""
+    if not isinstance(rust, dict):
+        return "the Rust plan is not an object"
+    if rust.get("error"):
+        return "the Rust side could not plan it"
+    py_rows = [[day, header, h] for day, header, _, h in python_plan.rows]
+    rows = rust.get("rows")
+    if not isinstance(rows, list):
+        return "the Rust plan has no rows"
+    for i, (a, b) in enumerate(zip(py_rows, rows)):
+        if a != b:
+            part = next((name for name, x, y in zip(("day", "header", "hash"), a, b if isinstance(b, list) else [None] * 3)
+                         if x != y), "row")
+            return f"row {i}: {part} differs"
+    if len(py_rows) != len(rows):
+        return f"row counts differ ({len(py_rows)} vs {len(rows)})"
+    if bool(python_plan.pending) != (rust.get("pending") is True):
+        return f"pending differs ({bool(python_plan.pending)} vs {rust.get('pending') is True})"
+    target = python_plan.target.to_json() if python_plan.target is not None else None
+    if target != rust.get("target"):
+        return "the embedding targets differ"
+    vectors = rust.get("embeddings")
+    if not isinstance(vectors, dict):
+        return "the Rust plan has no embeddings"
+    py_vectors = python_plan.embeddings or {}
+    if set(py_vectors) != set(vectors):
+        return f"embedded chunks differ ({len(py_vectors)} vs {len(vectors)})"
+    for n, h in enumerate(sorted(py_vectors)):
+        a, b = list(py_vectors[h]), vectors[h]
+        if not isinstance(b, list) or len(a) != len(b):
+            return f"embedded chunk {n}: widths differ"
+        if not all(_close(x, y) for x, y in zip(a, b)):
+            return f"embedded chunk {n}: vectors differ"
+    return None
+
+
+class IndexShadow:
+    """The Rust plans of one re-index pass, compared document by document as Python applies its own."""
+
+    def __init__(self, plans: dict):
+        self._plans = plans
+
+    def compare(self, document: str, python_plan) -> str:
+        try:
+            difference = compare_plan(python_plan, self._plans.get(document))
+        except Exception as exc:  # noqa: BLE001 - the shadow never fails a re-index; no content
+            _count("failed")
+            log.info("Diary index shadow: failed (%s)", type(exc).__name__)
+            return "failed"
+        if difference is None:
+            _count("match")
+            log.info("Diary index shadow: plan matches (%d chunks)", len(python_plan.rows))
+            return "match"
+        _count("mismatch")
+        log.warning("Diary index shadow: plan differs: %s", difference)
+        return "mismatch"
+
+
+def _skip(reason: str) -> None:
+    _count("skipped")
+    log.info("Diary index shadow: skipped (%s)", reason)
+    return None
+
+
+def shadow(st, tenant_id: Optional[str], documents: list, server_lookup: Optional[Callable[[], object]] = None,
+           transport: Optional[httpx.BaseTransport] = None) -> Optional[IndexShadow]:
+    """The Rust plans for this pass's dirty documents, or None (off, nothing dirty, not applicable,
+    or the call did not give a complete reply: counted). Never raises. The caller holds
+    st.store._write_lock and has drained the outbox."""
+    uid = (tenant_id or "").lower()
+    if not shadowing() or not documents or not uid or uid == "legacy":
+        return None
+    try:
+        from . import rust_forward
+        from .managed_storage import ManagedCorpusBackend
+        server = (server_lookup or rust_forward.current)()
+        token, ready = server.control() if server is not None else ("", False)
+        if not ready or not token:
+            return None
+        backend = getattr(st.store, "backend", None)
+        if not isinstance(backend, ManagedCorpusBackend) or getattr(backend, "tenant", None) != uid:
+            return _skip("not the tenant's managed storage")
+        if not callable(getattr(st.retrieval, "prepare_reindex", None)):
+            return _skip("no plan step")
+        config = getattr(getattr(st.retrieval, "embedding", None), "config", None)
+        if config is None:
+            return _skip("no shared embedding configuration")
+        body = {"embedding": config.get(), "plan_only": True, "documents": list(documents)}
+        with httpx.Client(base_url=server.base_url, timeout=SHADOW_DEADLINE_S, trust_env=False,
+                          transport=transport) as client:
+            resp = client.post("/internal/reindex", params={"tenant": uid}, json=body,
+                               headers={rust_forward.CONTROL_HEADER: token})
+    except httpx.HTTPError as exc:
+        _count("failed")
+        log.info("Diary index shadow: failed (%s)", type(exc).__name__)
+        return None
+    except Exception as exc:  # noqa: BLE001 - the shadow never fails a re-index; no content
+        _count("failed")
+        log.info("Diary index shadow: could not start (%s)", type(exc).__name__)
+        return None
+    if resp.status_code == 421 and resp.headers.get(rust_forward.DECLINE_HEADER.decode()) == "1":
+        _count("declined")
+        log.info("Diary index shadow: declined")
+        return None
+    if resp.status_code != 200:
+        _count("refused")
+        log.info("Diary index shadow: refused (HTTP %d)", resp.status_code)
+        return None
+    try:
+        plans = {d["document"]: d for d in resp.json()["documents"] if isinstance(d, dict)}
+    except (ValueError, KeyError, TypeError):
+        _count("failed")
+        log.info("Diary index shadow: unreadable reply")
+        return None
+    return IndexShadow(plans)

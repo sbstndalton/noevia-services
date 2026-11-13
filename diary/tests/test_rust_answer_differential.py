@@ -372,3 +372,24 @@ def test_on_mode_answers_and_saves_what_python_does(world, monkeypatch):
         for _, uid, _ in sides.values():
             for name in ("python", "rust"):
                 appmod.SESSIONS.pop(f"{uid}:r9-on-{name}", None)
+
+
+SHADOW_INDEXED = "c3d4e5f6-2031-4c4d-8e5f-6071829304a5"
+
+
+def test_the_index_shadow_matches_python_for_every_dirty_document(world, monkeypatch):
+    # DIARY_RUST_INDEX=shadow end to end: the Rust plans of the dirty documents of the synthetic
+    # corpus equal the plans Python applies, and Python's re-index is the one that lands.
+    from agent import rust_index
+    make, server, _ = world
+    monkeypatch.setattr(rust_forward, "_server", server)
+    monkeypatch.setattr(rust_index, "SHADOW_STATS", {k: 0 for k in rust_index.SHADOW_OUTCOMES})
+    monkeypatch.setenv("DIARY_RUST_INDEX", "shadow")
+    st = make(SHADOW_INDEXED, index=False)
+    assert sorted(st.journal.dirty_documents()) == sorted(CORPUS)
+    appmod._reindex_dirty(st)
+    assert st.journal.dirty_documents() == []
+    assert rust_index.shadow_stats() == {**{k: 0 for k in rust_index.SHADOW_OUTCOMES}, "match": len(CORPUS)}
+    # A second pass has nothing dirty: no call, nothing counted.
+    appmod._reindex_dirty(st)
+    assert sum(rust_index.shadow_stats().values()) == len(CORPUS)

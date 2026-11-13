@@ -418,10 +418,21 @@ the start-up config carries no `answer` key:
   with the first differing position and lengths, declined, refused, failed, late, skipped; never
   content). Python still answers and saves; the save waits for the comparison at most 10 s. It
   starts the Rust process on its own if no route or writer is configured.
+- `DIARY_RUST_ANSWER=on`: the Rust process builds the context and gets the companion's answer
+  (mode `answer`; streamed, its events are relayed as they come) and Python saves it as before. The
+  exchange deadline bounds the call and closes it. A decline, a process that cannot be reached or
+  refuses before any answer began, or a case it does not take (the shadow's conditions) is answered
+  by Python; `rust_answer.answer_stats()` counts rust, declined, unavailable and skipped. The Rust
+  side's model failures raise the exceptions Python's own call raises.
 - `DIARY_RUST_INDEX=on` (`agent/rust_index.py`): for a `DIARY_RUST_WRITES` tenant, `_reindex_dirty`
   hands the dirty-document re-index to the Rust process (`POST /internal/reindex`) under Python's
-  own locks; anything short of a complete reply re-indexes in Python. Its shadow is offline:
-  `scripts/shadow_compare.py` over a Python-indexed and a Rust-indexed copy of synthetic tenants.
+  own locks; anything short of a complete reply re-indexes in Python.
+- `DIARY_RUST_INDEX=shadow`: Python re-indexes every managed tenant as before, after asking the
+  Rust process for its plan of the same dirty documents (`plan_only`: rows and vectors, nothing
+  written; at most 30 s). Each plan is compared with the one Python applies and only the outcome is
+  logged (`diary.rust.index`: match, mismatch with the first differing position, declined, refused,
+  failed, skipped). Changed chunks are embedded twice while it is on. Offline,
+  `scripts/shadow_compare.py` compares a Python-indexed and a Rust-indexed copy of synthetic tenants.
 Both need a `noevia-diary` with the R9 endpoints; `tests/test_rust_answer_differential.py` proves
 them against one (`DIARY_R9_SERVER_BIN`) and skips without it.
 
