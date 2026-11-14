@@ -848,7 +848,7 @@ def _rust_write_uncertain(user_id: str) -> None:
             state.recovered = False
 
 
-_RUST_ROUTES = rust_forward.configured_routes()
+_RUST_ROUTES = rust_forward.configured_routes(main=rust_parent.active())
 # R9 main mode (rust_parent): the parent serves the writer tenants' writes; their lock here is a
 # lease on its writer slot (S3).
 _PARENT_MODE = rust_parent.active()

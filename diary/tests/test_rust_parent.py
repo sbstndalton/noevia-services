@@ -482,8 +482,18 @@ def _sequence(d: Deployment):
                                    ('read path not str', b'{"path":5}', 'application/json'),
                                    ('read list body', b'[]', 'application/json'),
                                    ('read bad json', b'{nope', 'application/json'),
-                                   ('read text body', b'path', 'text/plain')):
+                                   ('read text body', b'path', 'text/plain'),
+                                   ('read path null', b'{"path":null}', 'application/json'),
+                                   ('read merge-patch', b'{"path":"Entries/x.md"}', 'application/merge-patch+json')):
             go(label, 'POST', '/api/file', body=body, content_type=ctype)
+        empty = _signed(QA, 'POST', '/api/file', b'', content_type='application/json')
+        go('read empty body', 'POST', '/api/file', headers={**empty, 'Content-Length': '0'})
+        no_token = {k: v for k, v in _signed(QA, 'POST', '/api/file', b'{}', content_type='application/json').items()
+                    if k != 'Authorization'}
+        go('read no token', 'POST', '/api/file', body=b'{}', headers=no_token)
+        bad_no_token = {k: v for k, v in _signed(QA, 'POST', '/api/file', b'[]', content_type='application/json').items()
+                        if k != 'Authorization'}
+        go('read bad body no token', 'POST', '/api/file', body=b'[]', headers=bad_no_token)
     day = '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA synthetic walk by the river, “ünïcode”.\n\n'
     path = 'Entries/2030/January/January 6, 2030.md'
     read = go('read new file', 'POST', '/api/file', body=json.dumps({'path': path}).encode(),

@@ -92,9 +92,10 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/files": "GET", "/api/storage-status": "GET",
              "/api/workspace-export": "GET",
              # R9: the external-sources scan (served only with the resolved list, below).
-             "/api/external-sources": "GET",
-             # R9 main mode only: the file read takes a body, which this forwarder never forwards.
-             "/api/file": "POST"}
+             "/api/external-sources": "GET"}
+# R9 main mode only (rust_parent): routes the Rust parent serves natively that this forwarder never
+# would (the file read takes a body). Honoured only when this app is the Rust process's child.
+MAIN_ONLY = {"/api/file": "POST"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
                 "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
@@ -134,15 +135,17 @@ _HOP = {b"connection", b"keep-alive", b"transfer-encoding", b"te", b"upgrade", b
 _DROP_REPLY = {b"date", b"server", b"connection", b"keep-alive", b"transfer-encoding"}
 
 
-def configured_routes(raw: Optional[str] = None) -> dict:
-    """{path: method} from DIARY_RUST_ROUTES; unknown names get one warning and are ignored."""
+def configured_routes(raw: Optional[str] = None, main: bool = False) -> dict:
+    """{path: method} from DIARY_RUST_ROUTES; unknown names get one warning and are ignored.
+    `main` (R9: the Rust process is the parent) also accepts MAIN_ONLY."""
     raw = os.environ.get("DIARY_RUST_ROUTES", "") if raw is None else raw
+    known = {**SUPPORTED, **MAIN_ONLY} if main else SUPPORTED
     routes = {}
     for name in (part.strip() for part in raw.split(",")):
         if not name:
             continue
-        if name in SUPPORTED:
-            routes[name] = SUPPORTED[name]
+        if name in known:
+            routes[name] = known[name]
         else:
             log.warning("DIARY_RUST_ROUTES: %r is not served by the Rust Diary process; ignoring it", name[:64])
     return routes

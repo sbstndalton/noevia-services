@@ -288,6 +288,8 @@ def test_d4b_routes_are_supported_but_off_by_default(monkeypatch):
     routes = rust_forward.configured_routes('/api/files,/api/file,/api/storage-status,/api/workspace-export')
     # POST /api/file carries a body, which is never forwarded: not a Rust route (yet).
     assert routes == {'/api/files': 'GET', '/api/storage-status': 'GET', '/api/workspace-export': 'GET'}
+    # R9 main mode only (the Rust process as parent serves it natively, with its body).
+    assert rust_forward.configured_routes('/api/file', main=True) == {'/api/file': 'POST'}
 
 
 def test_server_config_carries_the_export_selection(world, monkeypatch):
