@@ -34,6 +34,7 @@ KEY = 'synthetic-tenant-key-r9-main'
 TOKEN = 'synthetic-service-token-r9-main'
 QA = '3e819f41-6d50-4fb1-8c43-4d5e6f708192'
 QB = '4f92a052-7e61-4ac2-9d54-5e6f708192a3'
+DAILY_QA = '6b14c274-9083-4ce4-9f76-708192a3b4c5'
 BIN = os.environ.get('DIARY_R9_SERVER_BIN', '')
 needs_server = pytest.mark.skipif(not (BIN and os.path.isfile(BIN)), reason='noevia-diary not built (set DIARY_R9_SERVER_BIN)')
 
@@ -75,9 +76,12 @@ def test_the_entrypoint_execs_todays_command_unless_diary_main_is_rust(tmp_path)
 
 def test_the_handshake_must_be_complete():
     good = {'control_token': 't' * 32, 'parent_secret': 's' * 64, 'control_port': 8011}
-    assert rust_parent.read_handshake(io.StringIO(json.dumps(good) + '\n')) == good
+    assert rust_parent.read_handshake(io.StringIO(json.dumps(good) + '\n')) == {**good, 'embedding_epoch': ''}
+    with_epoch = {**good, 'embedding_epoch': 'e' * 32}
+    assert rust_parent.read_handshake(io.StringIO(json.dumps(with_epoch) + '\n')) == with_epoch
     for bad in ({**good, 'control_token': ''}, {**good, 'parent_secret': 1}, {**good, 'control_port': 0},
-                {**good, 'control_port': 70000}, {k: v for k, v in good.items() if k != 'parent_secret'}):
+                {**good, 'control_port': 70000}, {k: v for k, v in good.items() if k != 'parent_secret'},
+                {**good, 'embedding_epoch': 5}):
         with pytest.raises(ValueError):
             rust_parent.read_handshake(io.StringIO(json.dumps(bad) + '\n'))
     with pytest.raises(ValueError):
@@ -117,7 +121,7 @@ def test_the_parent_is_what_the_internal_callers_reach():
 
 # ---------------- ParentMiddleware ----------------
 
-def _call(headers, recovered=lambda uid: uid == QA):
+def _call(headers, recovered=lambda uid: uid == QA, written=None):
     seen = {}
 
     async def app(scope, receive, send):
@@ -134,7 +138,8 @@ def _call(headers, recovered=lambda uid: uid == QA):
     async def receive():
         return {'type': 'http.request', 'body': b'', 'more_body': False}
 
-    mw = rust_parent.ParentMiddleware(app, secret=lambda: 'sec', is_recovered=recovered)
+    mw = rust_parent.ParentMiddleware(app, secret=lambda: 'sec', is_recovered=recovered,
+                                      on_written=(written.append if written is not None else None))
     scope = {'type': 'http', 'method': 'GET', 'path': '/api/months', 'headers': headers}
     asyncio.run(mw(scope, receive, send))
     return seen, sent
@@ -173,6 +178,12 @@ def test_the_middleware_takes_the_parents_verdict_strips_internal_headers_and_st
                                (b'x-cowork-user-id', QA.encode())])
     assert seen['asserted'] is False
     assert (b'x-noevia-diary-recovered', b'0') in sent[0]['headers']
+    # A native write of the parent: the tenant's state here is marked stale before the request runs.
+    told = []
+    _call(base + [(b'x-noevia-diary-written', b'1'), (b'x-cowork-user-id', QB.encode())], written=told)
+    _call(base + [(b'x-noevia-diary-written', b'1')], written=told)  # no tenant: nothing to mark
+    _call(base + [(b'x-cowork-user-id', QA.encode())], written=told)
+    assert told == [QB]
     # No tenant, or not a UUID: no stamp.
     for extra in ([], [(b'x-cowork-user-id', b'legacy-user')]):
         _seen, sent = _call(base + extra)
@@ -314,22 +325,39 @@ def test_the_async_acquisition_returns_a_lease_granted_after_cancellation(leased
 
 def test_the_parent_lease_client():
     seen = []
+    other = '5a03b163-8f72-4bd3-8e65-6f708192a3b4'
 
     def handler(request):
-        seen.append((request.method, request.url.path, dict(request.url.params), request.headers.get('x-noevia-diary-control')))
+        p = dict(request.url.params)
+        seen.append((request.method, request.url.path, p, request.headers.get('x-noevia-diary-control')))
         if request.method == 'POST':
-            return httpx.Response(200, json={'lease': '7'}) if request.url.params['tenant'] == QA else httpx.Response(503)
-        return httpx.Response(200 if request.url.params['lease'] == '7' else 404)
+            if p['tenant'] == QA:
+                return httpx.Response(200, json={'lease': '7'})
+            if p['tenant'] == other:
+                raise httpx.ReadTimeout('reply lost', request=request)
+            return httpx.Response(503 if p['tenant'] == QB else 403)
+        if p.get('lease') == '9':
+            return httpx.Response(500)
+        return httpx.Response(200 if p.get('lease') == '7' or p.get('holder') else 404)
 
-    leases = rust_parent.ParentLeases('http://127.0.0.1:1', 'tok', transport=httpx.MockTransport(handler))
+    leases = rust_parent.ParentLeases('http://127.0.0.1:1', 'tok', transport=httpx.MockTransport(handler),
+                                      release_delays=(0.0, 0.0))
     assert leases.acquire(QA, 1.5) == '7'
-    with pytest.raises(tenant_writer.WriterBusy):
-        leases.acquire(QB, 0)
+    post = seen[0]
+    assert post[:2] == ('POST', '/internal/lease') and post[3] == 'tok'
+    assert post[2]['tenant'] == QA and post[2]['wait_ms'] == '1500' and len(post[2]['holder']) == 32
+    # Busy: nothing to return. Refused otherwise, or the reply lost: whatever the holder got is returned.
+    for tenant, returned in ((QB, False), (DAILY_QA, True), (other, True)):
+        seen.clear()
+        with pytest.raises(tenant_writer.WriterBusy):
+            leases.acquire(tenant, 0)
+        holder = seen[0][2]['holder']
+        assert (('DELETE', '/internal/lease', {'holder': holder}, 'tok') in seen) is returned
     leases.release('7')
+    leases.release('8')  # 404: nothing live, counts as returned
     with pytest.raises(RuntimeError):
-        leases.release('8')
-    assert seen[0] == ('POST', '/internal/lease', {'tenant': QA, 'wait_ms': '1500'}, 'tok')
-    assert seen[2][:2] == ('DELETE', '/internal/lease')
+        leases.release('9')  # never confirmed, after the bounded retries
+    assert sum(1 for c in seen if c[2].get('lease') == '9') == 2
 
 
 # ---------------- the differential (real binaries) ----------------

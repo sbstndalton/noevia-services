@@ -785,22 +785,32 @@ async def lifespan(_app: FastAPI):
     # #1636: a re-index configured at start (LLM_EMBED_NEXT_*, or saved) resumes in the background,
     # once the seeded embeddings addresses have been checked to be on this network (which can take a
     # while when the resolver is not up yet, so not on the startup path).
-    threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
-    # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
-    # DIARY_RUST_WRITES a tenant (default: none).
     if _PARENT_MODE:
-        # R9 main mode: the Rust process is the parent; it takes this app's start-up config.
+        # R9 main mode: the Rust process is the parent; it takes this app's start-up config. Done
+        # before any thread here can take a writer lock (the lease client must be in place).
         parent = rust_parent.ParentServer(**rust_parent.read_handshake())
         _parent.append(parent)
+        owned = rust_parent.embedding_owned()
+        if owned:
+            if not parent.embedding_epoch:
+                raise RuntimeError("DIARY_RUST_EMBEDDING=on needs a Rust parent that owns the embedding configuration")
+            embedding_mod.shared_for(_base_cfg).config.follow_parent(
+                embedding_mod.effective_path_for(_base_cfg), parent.embedding_epoch)
         rust_forward.adopt(parent)
         if _RUST_WRITERS:
             # S3: the writer tenants' lock is a lease on the parent's writer slot.
             tenant_writer.configure_remote(rust_parent.ParentLeases(parent.base_url, parent.control()[0]))
         config = rust_forward.server_config(_base_cfg, st, parent.port, parent.control()[0], parent.forward_secret)
         writers = ["*"] if _RUST_WRITERS == rust_forward.ALL_TENANTS else sorted(_RUST_WRITERS)
-        await run_in_threadpool(parent.send_config, {**config, "native_routes": sorted(_RUST_ROUTES),
-                                                     "native_writers": writers})
-    else:
+        await run_in_threadpool(parent.send_config, {
+            **config, "native_routes": sorted(_RUST_ROUTES), "native_writers": writers,
+            **({"embedding": rust_parent.embedding_config(_base_cfg)} if owned else {})})
+    # S4 (DIARY_RUST_EMBEDDING=on in main mode): the Rust parent guards the addresses and re-embeds.
+    if not rust_parent.embedding_owned():
+        threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
+    if not _PARENT_MODE:
+        # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
+        # DIARY_RUST_WRITES a tenant (default: none).
         rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
                            _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted() or rust_index.shadowing())
     yield
@@ -853,7 +863,7 @@ if _PARENT_MODE:
     # R9 main mode: the Rust parent verified every assertion and owns the nonces (rust_parent doc).
     app.add_middleware(rust_parent.ParentMiddleware,
                        secret=lambda: _parent[0].forward_secret if _parent else "",
-                       is_recovered=_rust_recovered)
+                       is_recovered=_rust_recovered, on_written=_rust_write_uncertain)
 else:
     if _RUST_ROUTES or _RUST_WRITERS:
         app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,

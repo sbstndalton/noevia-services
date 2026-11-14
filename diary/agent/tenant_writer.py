@@ -168,7 +168,7 @@ def lease_of(uid: Optional[str]) -> Optional[str]:
         return None
     with _cond:
         slot = _slots.get(entry[0])
-        return slot.lease if slot is not None and slot.owner is entry[1] else None
+        return slot.lease if slot is not None and slot.owner is entry[1] and slot.users > 0 else None
 
 
 _cond = threading.Condition()
@@ -220,7 +220,8 @@ def held(uid: Optional[str]) -> bool:
         return False
     with _cond:
         slot = _slots.get(entry[0])
-        return slot is not None and slot.owner is entry[1]
+        # users == 0: the last reference is returning the parent's lease; nothing is held any more.
+        return slot is not None and slot.owner is entry[1] and slot.users > 0
 
 
 def _check_order(uid: str) -> None:
@@ -400,7 +401,9 @@ async def acquire_async(uid: str, until: float) -> Hold:
         try:
             await asyncio.shield(future)
         except asyncio.CancelledError:
-            future.add_done_callback(lambda _f: _settle_cancelled(uid, token))
+            # Off the loop: settling may call the parent.
+            future.add_done_callback(lambda _f: threading.Thread(
+                target=_settle_cancelled, args=(uid, token), name="writer-lease-settle", daemon=True).start())
             raise
         except BaseException:
             _abandon(uid, token)
