@@ -8,6 +8,7 @@ compares status, content type and body byte for byte. It needs the real binaries
 noevia-diary, the tenant-assertion leaf) and skips without them.
 """
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -396,7 +398,7 @@ def _env(root: Path, main: bool, writers: bool = False, extra: Optional[dict] = 
         if os.environ.get(name):
             env[name] = os.environ[name]
     if main:
-        env['DIARY_RUST_ROUTES'] = '/api/months,/api/day,/api/files,/api/storage-status'
+        env['DIARY_RUST_ROUTES'] = '/api/months,/api/day,/api/files,/api/storage-status,/api/file'
         env['DIARY_RUST_SERVER_BIN'] = BIN
         if writers:
             # S3: QA's writes are the parent's (native), under the slot the child leases.
@@ -416,6 +418,7 @@ class Deployment:
         else:
             argv = [*uvicorn, '--port', str(self.port)]
         root.mkdir(parents=True, exist_ok=True)
+        self.root = root
         self.logfile = root / f'server-{"rust" if main else "python"}-{time.monotonic_ns()}.log'
         self.log = open(self.logfile, 'wb')
         self.proc = subprocess.Popen(argv, cwd=ROOT, env=_env(root, main, writers, extra), stdout=self.log,
@@ -475,6 +478,25 @@ def _sequence(d: Deployment):
         go('months', 'GET', '/api/months')
         go('day', 'GET', '/api/day', query='month=2030-01')
         go('files', 'GET', '/api/files')
+        # POST /api/file (a read with a body): a missing file, a bad path, bodies FastAPI refuses.
+        for label, body, ctype in (('read missing', b'{"path":"Entries/2030/January/January 5, 2030.md"}', 'application/json'),
+                                   ('read no path', b'{}', 'application/json'),
+                                   ('read bad path', b'{"path":"../x.md"}', 'application/json'),
+                                   ('read path not str', b'{"path":5}', 'application/json'),
+                                   ('read list body', b'[]', 'application/json'),
+                                   ('read bad json', b'{nope', 'application/json'),
+                                   ('read text body', b'path', 'text/plain'),
+                                   ('read path null', b'{"path":null}', 'application/json'),
+                                   ('read merge-patch', b'{"path":"Entries/x.md"}', 'application/merge-patch+json')):
+            go(label, 'POST', '/api/file', body=body, content_type=ctype)
+        empty = _signed(QA, 'POST', '/api/file', b'', content_type='application/json')
+        go('read empty body', 'POST', '/api/file', headers={**empty, 'Content-Length': '0'})
+        no_token = {k: v for k, v in _signed(QA, 'POST', '/api/file', b'{}', content_type='application/json').items()
+                    if k != 'Authorization'}
+        go('read no token', 'POST', '/api/file', body=b'{}', headers=no_token)
+        bad_no_token = {k: v for k, v in _signed(QA, 'POST', '/api/file', b'[]', content_type='application/json').items()
+                        if k != 'Authorization'}
+        go('read bad body no token', 'POST', '/api/file', body=b'[]', headers=bad_no_token)
     day = '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA synthetic walk by the river, “ünïcode”.\n\n'
     path = 'Entries/2030/January/January 6, 2030.md'
     read = go('read new file', 'POST', '/api/file', body=json.dumps({'path': path}).encode(),
@@ -486,6 +508,7 @@ def _sequence(d: Deployment):
         go('months', 'GET', '/api/months')
         go('day', 'GET', '/api/day', query='month=2030-01')
         go('files', 'GET', '/api/files')
+        go('read written', 'POST', '/api/file', body=json.dumps({'path': path}).encode(), content_type='application/json')
     go('other tenant months', 'GET', '/api/months', user=QB)
     go('health', 'GET', '/api/health', headers={'Authorization': f'Bearer {TOKEN}'})
     go('no token', 'GET', '/api/months', headers={'X-Cowork-User-ID': QA})
@@ -551,6 +574,8 @@ def test_main_mode_answers_exactly_as_the_python_main_process(tmp_path):
         seen = [sum(text.count(f'"GET {route}') for route in ('/api/months', '/api/files', '/api/storage-status'))
                 for text in (logs['python'], logs[name])]
         assert seen[1] < seen[0], (name, seen)
+        reads = [text.count('"POST /api/file') for text in (logs['python'], logs[name])]
+        assert reads[1] < reads[0], (name, reads)
     # S3: the writer tenant's save was the parent's (the child never saw the PUT).
     assert '"PUT /api/file' in logs['python'] and '"PUT /api/file' not in logs['rust-writers']
     assert '"PUT /api/file' in logs['rust']
@@ -687,6 +712,23 @@ def _masked(status_code, payload):
     return status_code, payload
 
 
+def _dirty(d: Deployment, user=QA):
+    db = d.root / 'state' / 'users' / user / 'managed-index.db'
+    with sqlite3.connect(db) as conn:
+        return sorted(r[0] for r in conn.execute('SELECT document FROM dirty_documents'))
+
+
+def _health(d: Deployment, user=QA):
+    """GET /api/health with tenant detail (journal counts, retrieval stats): S8 serves it in the
+    parent for a recovered managed tenant while the parent owns the embedding configuration."""
+    storage = base64.urlsafe_b64encode(json.dumps({'kind': 'local'}).encode()).decode().rstrip('=')
+    headers = {'Authorization': f'Bearer {TOKEN}', 'X-Cowork-User-ID': user, 'X-Cowork-Storage': storage}
+    headers[ta.HEADER] = ta.sign(KEY, user, 'GET', '/api/health', headers, int(time.time()), secrets.token_hex(16),
+                                 b'', body_hash=ta.STREAM)
+    r = d.client.get('/api/health', headers=headers)
+    return r.status_code, r.content
+
+
 def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     out = []
 
@@ -707,7 +749,12 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     _reads(d)
     _put(d, 'Entries/2030/January/January 6, 2030.md',
          '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA synthetic walk by the river.\n\n')
+    # S6b: the save re-indexed before it replied, whichever process served it.
+    out.append(('dirty after save', 200, _dirty(d)))
     out.append(('active ready', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
+    _reads(d)  # the child's recovered stamp (a native write voided it)
+    out.append(('health with tenant', *_health(d)))
+    out.append(('health with tenant again', *_health(d)))
     call('bad action', 'POST', {'action': 'bogus'})
     call('bad json', 'POST', b'{not json')
     call('switch without next', 'POST', {'action': 'switch'})
@@ -717,12 +764,16 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     mark = len(stub.seen)
     _put(d, 'Entries/2030/January/January 7, 2030.md',
          '## Monday, January 7, 2030\n\n### 10:00 — garden\n\n**Me:** QA second note about the garden.\n\n')
-    # The save after the switch embeds with the new model: the child follows the owner's switch.
+    out.append(('dirty after the second save', 200, _dirty(d)))
+    # The save after the switch embeds with the new model: the child follows the owner's switch
+    # (or, for a writer tenant, the parent re-indexes with the switched configuration).
     models_after = {m for m, _ in stub.seen[mark:]}
     out.append(('models after switch', 200, sorted(models_after)))
     call('finish', 'POST', {'action': 'finish'})
     call('finish again', 'POST', {'action': 'finish'})
     out.append(('final', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
+    _reads(d)
+    out.append(('health with tenant, final', *_health(d)))
     return out
 
 
@@ -730,12 +781,13 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
 @needs_binary
 def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_path):
     results = {}
-    for name, main in (('python', False), ('rust-owner', True)):
+    for name, main, writers in (('python', False, False), ('rust-owner', True, False), ('rust-owner-writers', True, True)):
         stub = StubEmbeddings()
         extra = {'LLM_EMBED_BASE_URL': stub.url, 'LLM_EMBED_MODEL': 'qa-embed-a', 'LLM_EMBED_PROFILE': 'nomic-v1'}
         if main:
             extra['DIARY_RUST_EMBEDDING'] = 'on'
-        d = Deployment(tmp_path / name, main, extra=extra)
+            extra['DIARY_RUST_ROUTES'] = '/api/health,/api/months,/api/day,/api/files,/api/storage-status,/api/file'
+        d = Deployment(tmp_path / name, main, writers=writers, extra=extra)
         try:
             results[name] = _embedding_sequence(d, stub)
         finally:
@@ -744,15 +796,21 @@ def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_pat
         if main:
             log = d.logfile.read_text()
             assert 'embedding set-next: active nomic-v1/qa-embed-a' in log, log[-3000:]
+            # A writer tenant's saves are the parent's (S6b re-indexes them there), not the child's.
+            assert ('"PUT /api/file' in log) is not writers, log[-3000:]
+            assert 'edit reindex pending' not in log, log[-3000:]
+            # S8: the tenant detail was the parent's at least once (3 tenant probes, plus the start-up probe).
+            assert log.count('"GET /api/health') < 3, log[-3000:]
             effective = tmp_path / name / 'state' / 'embedding-config.effective.json'
             assert json.loads(effective.read_text())['active']['model'] == 'qa-embed-b'
         saved = json.loads((tmp_path / name / 'state' / 'embedding-config.json').read_text())
         assert saved['active']['model'] == 'qa-embed-b' and saved['previous'] is None
-    assert [r[0] for r in results['python']] == [r[0] for r in results['rust-owner']]
-    for py, rs in zip(results['python'], results['rust-owner']):
-        assert py == rs, (py, rs)
-    after = [r for r in results['rust-owner'] if r[0] == 'models after switch']
-    assert after == [('models after switch', 200, ['qa-embed-b'])], after
+    for name in ('rust-owner', 'rust-owner-writers'):
+        assert [r[0] for r in results['python']] == [r[0] for r in results[name]]
+        for py, rs in zip(results['python'], results[name]):
+            assert py == rs, (name, py, rs)
+        after = [r for r in results[name] if r[0] == 'models after switch']
+        assert after == [('models after switch', 200, ['qa-embed-b'])], (name, after)
     shutil.rmtree(tmp_path, ignore_errors=True)
 
 

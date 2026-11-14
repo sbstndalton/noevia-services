@@ -102,6 +102,12 @@ class StoreClosed(CorpusError):
     """The tenant store was closed (e.g. tenant deleted); no further writes."""
 
 
+# R9 S6b (main mode only; app.py sets it when this app is the Rust process's child): a journal row
+# this store did not just enqueue itself is a replay, and marks the document it writes dirty, as the
+# parent's replay does. With Python as the main process every replay runs right after a sweep, so
+# it marks nothing (False: unchanged).
+REPLAY_MARKS = False
+
 MAX_APPLY_ATTEMPTS = 20
 # After a transient (storage/network) failure, apply_pending is a no-op for
 # this long so appends during an outage do not hammer the backend.
@@ -459,14 +465,15 @@ class CorpusStore:
                 "month_label": self.month_label(day),
             },
         )
+        own = {exchange_jid}
         # Register the month link too (applier dedupes; harmless if the link exists).
         # Skipped entirely when the corpus runs without an INDEX.md.
         if self.index_enabled and self.entry_layout == "monthly":
-            self.journal.enqueue(
+            own.add(self.journal.enqueue(
                 "index_month",
                 {"month": self.month_filename(day), "label": self.month_label(day)},
-            )
-        self.apply_pending()
+            ))
+        self._apply_own(own)
         if self._corpus_write_impl == "rust" and not self.journal.is_applied(exchange_jid):
             raise native_write.NativeWriteUnavailable(
                 "Diary exchange is pending; the save outcome is uncertain until journal replay"
@@ -486,7 +493,7 @@ class CorpusStore:
             "index_update",
             {"open_questions": open_question_ops, "timeline": timeline_ops, "today": today},
         )
-        self.apply_pending()
+        self._apply_own({jid})
         return jid
 
     # ---------------- editing ----------------
@@ -710,6 +717,19 @@ class CorpusStore:
             return True
         return False
 
+    def _apply_own(self, ids: set) -> None:
+        """apply_pending right after enqueueing `ids`: their first application is not a replay
+        (REPLAY_MARKS); a row of them still pending afterwards is one when it is applied later."""
+        self.__dict__.setdefault("_own_rows", set()).update(ids)
+        try:
+            self.apply_pending()
+        finally:
+            self._own_rows.difference_update(ids)
+
+    def _mark_replay(self, entry: JournalEntry, path: str) -> None:
+        if REPLAY_MARKS and entry.id not in self.__dict__.get("_own_rows", ()):
+            self.journal.mark_dirty(path)
+
     @serialized
     def apply_pending(self, limit: int = 100, force: bool = False) -> int:
         """Apply all unapplied journal entries in order. Returns count applied now.
@@ -804,6 +824,7 @@ class CorpusStore:
                 return current, False  # already applied — replay safe
             return fmt.append_to_month_text(current, day, sub_header, body), True
 
+        self._mark_replay(entry, path)
         self._guarded_write(path, mutate)
         if p.get("scaffold"):
             self._scaffold()
@@ -831,6 +852,7 @@ class CorpusStore:
                 return idx.render(), True
             return current, False
 
+        self._mark_replay(entry, self.index_path())
         self._guarded_write(self.index_path(), mutate)
 
     def _apply_index_update(self, entry: JournalEntry) -> None:
@@ -846,6 +868,7 @@ class CorpusStore:
             )
             return (idx.render(), True) if changed else (current, False)
 
+        self._mark_replay(entry, self.index_path())
         self._guarded_write(self.index_path(), mutate)
 
     # ---------------- context helpers ----------------

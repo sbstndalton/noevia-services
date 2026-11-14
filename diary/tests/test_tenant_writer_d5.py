@@ -808,6 +808,54 @@ def test_recovery_after_a_lost_write_invalidates_documents_created_since_the_bui
     assert st.recovered and new in seen
 
 
+def test_a_parent_served_write_recovers_without_sweeping_every_document(guarded, monkeypatch):
+    """S6b (main mode): after the parent served a native write, the state recovers again, but only
+    the documents the journal marks are reindexed: the parent marks its document dirty before it
+    writes, so no sweep of every Markdown document is needed (unlike a lost forwarded write)."""
+    client, _ = guarded
+    hb = {'X-Cowork-User-ID': B}
+    assert client.get('/api/storage-status', headers=hb).status_code == 200
+    st = appmod._tenant_state(plain_request(B))
+    assert st.recovered
+    marked, other = 'Entries/2030/January/January 8, 2030.md', 'Entries/2030/January/January 9, 2030.md'
+    with tenant_writer.hold(B):  # what the parent's native write leaves: the mark, then the corpus
+        st.journal.mark_dirty(marked)
+        assert st.managed.put(marked, b'## Tuesday, January 8, 2030\n')[0]
+        assert st.managed.put(other, b'## Wednesday, January 9, 2030\n')[0]
+    seen = []
+
+    def record(state):
+        seen.extend(state.journal.dirty_documents())
+    monkeypatch.setattr(appmod, '_reindex_dirty', record)
+    appmod._rust_wrote(B)  # what ParentMiddleware's on_written does
+    assert not st.recovered and not getattr(st, 'dirty_on_recover', False)
+    assert client.get('/api/files', headers=hb).status_code == 200
+    assert st.recovered and marked in seen and other not in seen
+    # A journal row still pending when the state recovers: its replay here marks nothing, so the
+    # recovery sweeps after all.
+    seen.clear()
+    with tenant_writer.hold(B):
+        st.journal.enqueue('index_update', {'today': '2030-01-09', 'open_questions': [], 'timeline': []})
+    monkeypatch.setattr(st.store, 'apply_pending', lambda *a, **k: 0)  # still pending at the sweep
+    appmod._rust_wrote(B)
+    assert client.get('/api/files', headers=hb).status_code == 200
+    assert st.recovered and other in seen and st.dirty_on_recover is False
+    # A recovery that fails before its check keeps the flag for the next one.
+    seen.clear()
+    appmod._rust_wrote(B)
+    real = st.journal.pending_count
+
+    def failing():
+        raise RuntimeError('synthetic journal failure')
+    monkeypatch.setattr(st.journal, 'pending_count', failing)
+    with pytest.raises(RuntimeError):
+        appmod._recover_state(st)
+    assert st.sweep_if_pending and not st.recovered
+    monkeypatch.setattr(st.journal, 'pending_count', real)
+    appmod._recover_state(st)
+    assert st.recovered and not st.sweep_if_pending and other in seen
+
+
 def test_every_fallback_path_bounds_the_body_and_its_deadline(monkeypatch):
     """P2: with the Rust process unavailable, a writer tenant's write still never runs on Python
     with a body over the bound or unfinished at the deadline."""

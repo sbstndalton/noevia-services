@@ -242,3 +242,36 @@ def test_poison_pill_malformed_payload_does_not_block_subsequent_entries(store):
 
     # Both entries are now marked applied (malformed quarantined, exchange succeeded)
     assert store.journal.pending_count() == 0
+
+
+@pytest.mark.parametrize("marks", [False, True])
+def test_a_replayed_row_marks_its_document_only_in_main_mode(store, monkeypatch, marks):
+    """R9 S6b: as the Rust process's child (REPLAY_MARKS) a journal row this store did not just
+    enqueue is a replay and marks the document it writes; its own fresh rows mark nothing, and
+    with Python as the main process nothing changes."""
+    from agent import corpus_store
+    monkeypatch.setattr(corpus_store, "REPLAY_MARKS", marks)
+    past = date(2026, 8, 30)
+    xid = store.new_xid()
+    store.journal.enqueue("exchange", {
+        "xid": xid, "day": past.isoformat(), "sub_header": "09:00 | QA",
+        "body": fmt.render_exchange("QA synthetic past note.", "", xid),
+        "month": store.month_filename(past),
+    })
+    today = date(2026, 9, 3)
+    store.log_exchange(day=today, sub_header="QA", me_text="QA synthetic note.", claude_text="", now=None)
+    dirty = set(store.journal.dirty_documents())
+    assert store.journal.pending_count() == 0
+    assert store.document_path(today) not in dirty
+    assert (store.document_path(past) in dirty) is marks
+    assert (store.index_path() in dirty) is False  # INDEX.md registration was this call's own row
+
+
+def test_journal_replay_runs_under_the_store_lock(store):
+    """Recovery calls apply_pending directly (app._recover_state): it must keep the store lock,
+    the closed check and the backend transaction (the review of R9 S6b caught it lost)."""
+    from agent.corpus_store import StoreClosed
+    assert getattr(type(store).apply_pending, "__wrapped__", None) is not None
+    store.closed = True
+    with pytest.raises(StoreClosed):
+        store.apply_pending()
