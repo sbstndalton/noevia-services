@@ -20,4 +20,9 @@ case "${1:-}" in
     fi
     ;;
 esac
+# R9 main mode (DIARY_MAIN=rust; unset = the line below, unchanged): the Rust Diary process becomes
+# the main process on the public port and runs the image's HTTP command as its child on loopback.
+if [ "${DIARY_MAIN:-}" = "rust" ] && [ "${1:-}" = "uvicorn" ] && [ "${2:-}" = "agent.app:app" ]; then
+  exec /usr/local/bin/noevia-diary --main -- uvicorn agent.app:app --host 127.0.0.1 --port 8012
+fi
 exec "$@"

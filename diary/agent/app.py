@@ -80,7 +80,7 @@ from .diary_migration import LegacyWriteGuard, corpus_settings, snapshot
 from . import tenant_assertion
 from . import rust_answer
 from . import rust_index
-from . import rust_forward
+from . import rust_forward, rust_parent
 from . import tenant_writer
 
 log = logging.getLogger("diary")
@@ -788,8 +788,16 @@ async def lifespan(_app: FastAPI):
     threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
     # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
     # DIARY_RUST_WRITES a tenant (default: none).
-    rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
-                       _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted() or rust_index.shadowing())
+    if _PARENT_MODE:
+        # R9 main mode: the Rust process is the parent; it takes this app's start-up config.
+        parent = rust_parent.ParentServer(**rust_parent.read_handshake())
+        _parent.append(parent)
+        rust_forward.adopt(parent)
+        config = rust_forward.server_config(_base_cfg, st, parent.port, parent.control()[0], parent.forward_secret)
+        await run_in_threadpool(parent.send_config, {**config, "native_routes": sorted(_RUST_ROUTES)})
+    else:
+        rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
+                           _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted() or rust_index.shadowing())
     yield
     rust_forward.stop()
     if _embedding_migration is not None:
@@ -826,16 +834,25 @@ def _rust_write_uncertain(user_id: str) -> None:
 
 
 _RUST_ROUTES = rust_forward.configured_routes()
-_RUST_WRITERS = rust_forward.configured_writers()
+# R9 main mode (rust_parent): every write is served here under this process's own writer lock.
+_PARENT_MODE = rust_parent.active()
+_parent: list = []
+_RUST_WRITERS = frozenset() if _PARENT_MODE else rust_forward.configured_writers()
 tenant_writer.configure(_RUST_WRITERS)
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 # D4: the forwarder sits INSIDE the assertion middleware (added first = innermost). D8: a request
 # it will forward to the ready Rust process is verified there instead (rust_forward.delegates); the
 # middleware verifies every other one, and the forwarder verifies any it ends up serving here.
-if _RUST_ROUTES or _RUST_WRITERS:
-    app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
-                       is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
-app.add_middleware(TenantAssertionMiddleware)
+if _PARENT_MODE:
+    # R9 main mode: the Rust parent verified every assertion and owns the nonces (rust_parent doc).
+    app.add_middleware(rust_parent.ParentMiddleware,
+                       secret=lambda: _parent[0].forward_secret if _parent else "",
+                       is_recovered=_rust_recovered)
+else:
+    if _RUST_ROUTES or _RUST_WRITERS:
+        app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,
+                           is_recovered=_rust_recovered, writers=_RUST_WRITERS, on_uncertain=_rust_write_uncertain)
+    app.add_middleware(TenantAssertionMiddleware)
 
 
 @app.exception_handler(tenant_writer.WriterBusy)

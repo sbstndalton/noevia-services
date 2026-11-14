@@ -964,6 +964,12 @@ def current() -> Optional[RustServer]:
     return _server
 
 
+def adopt(server) -> None:
+    """R9 main mode (rust_parent): the Rust parent is the process the internal calls reach."""
+    global _server
+    _server = server
+
+
 def fence_tenant(user_id: str) -> None:
     """DELETE /api/internal/tenant, after Python's tombstone: the Rust side stops writing the tenant
     (and finishes the write in flight) before its root is removed."""
