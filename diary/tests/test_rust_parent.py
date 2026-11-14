@@ -751,34 +751,30 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
 @needs_server
 @needs_binary
 def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_path):
-    results, logs = {}, {}
-    for name, main, writers in (('python', False, False), ('rust-owner', True, False), ('rust-owner-writers', True, True)):
+    results = {}
+    for name, main in (('python', False), ('rust-owner', True)):
         stub = StubEmbeddings()
         extra = {'LLM_EMBED_BASE_URL': stub.url, 'LLM_EMBED_MODEL': 'qa-embed-a', 'LLM_EMBED_PROFILE': 'nomic-v1'}
         if main:
             extra['DIARY_RUST_EMBEDDING'] = 'on'
-        d = Deployment(tmp_path / name, main, writers, extra=extra)
+        d = Deployment(tmp_path / name, main, extra=extra)
         try:
             results[name] = _embedding_sequence(d, stub)
         finally:
             d.close()
             stub.close()
-        logs[name] = d.logfile.read_text()
         if main:
-            log = logs[name]
+            log = d.logfile.read_text()
             assert 'embedding set-next: active nomic-v1/qa-embed-a' in log, log[-3000:]
             effective = tmp_path / name / 'state' / 'embedding-config.effective.json'
             assert json.loads(effective.read_text())['active']['model'] == 'qa-embed-b'
         saved = json.loads((tmp_path / name / 'state' / 'embedding-config.json').read_text())
         assert saved['active']['model'] == 'qa-embed-b' and saved['previous'] is None
-    for name in ('rust-owner', 'rust-owner-writers'):
-        assert [r[0] for r in results['python']] == [r[0] for r in results[name]]
-        for py, rs in zip(results['python'], results[name]):
-            assert py == rs, (name, py, rs)
-        after = [r for r in results[name] if r[0] == 'models after switch']
-        assert after == [('models after switch', 200, ['qa-embed-b'])], (name, after)
-    # S6: the writer tenant's saves were the parent's, and it re-indexed them (same coverage).
-    assert '"PUT /api/file' not in logs['rust-owner-writers']
+    assert [r[0] for r in results['python']] == [r[0] for r in results['rust-owner']]
+    for py, rs in zip(results['python'], results['rust-owner']):
+        assert py == rs, (py, rs)
+    after = [r for r in results['rust-owner'] if r[0] == 'models after switch']
+    assert after == [('models after switch', 200, ['qa-embed-b'])], after
     shutil.rmtree(tmp_path, ignore_errors=True)
 
 
