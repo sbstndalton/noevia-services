@@ -786,6 +786,8 @@ async def lifespan(_app: FastAPI):
     # once the seeded embeddings addresses have been checked to be on this network (which can take a
     # while when the resolver is not up yet, so not on the startup path).
     threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
+    # #2612: with an R9 switch set, the answer/index outcome lines (INFO) reach the container log.
+    rust_answer.configure_outcome_logging()
     # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
     # DIARY_RUST_WRITES a tenant (default: none).
     rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),

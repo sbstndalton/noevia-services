@@ -92,6 +92,36 @@ def answering() -> bool:
     return mode() == "on"
 
 
+# #2612: the Diary configures no Python logging, so without a handler of their own the outcome lines
+# below that are logged at INFO ("context matches", "plan matches", "skipped", "Python answers") never
+# reached the container log; only WARNING lines did, through Python's last-resort handler.
+OUTCOME_LOGGERS = ("diary.rust.answer", "diary.rust.index")
+
+
+def configure_outcome_logging(stream=None) -> bool:
+    """With an R9 switch set (DIARY_RUST_ANSWER or DIARY_RUST_INDEX), give the two outcome loggers a
+    stderr handler at INFO, once. Nothing changes when both are off, or when logging is already
+    configured (a root handler exists, e.g. under a test runner): those lines then reach it as before.
+    The outcome lines carry counts, positions and reasons only, never content."""
+    from . import rust_index
+    if not wanted() and not rust_index.wanted():
+        return False
+    if logging.getLogger().handlers:
+        return False
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    handler.set_name("r9-outcomes")
+    added = False
+    for name in OUTCOME_LOGGERS:
+        logger = logging.getLogger(name)
+        if any(h.get_name() == "r9-outcomes" for h in logger.handlers):
+            continue
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        added = True
+    return added
+
+
 def answer_config(base_cfg, reasoning_tokens: int) -> Optional[dict]:
     """The ``answer`` start-up config (noevia-diary answer.rs ``AnswerConfig``), None when both R9
     switches are off. The Rust process serves its answer and re-index endpoints only with it."""
