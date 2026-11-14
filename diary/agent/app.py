@@ -2168,5 +2168,7 @@ BACKGROUND_ENTRY_POINTS = {
     "tenant_assertion:feed": "subprocess pipe", "tenant_assertion:drain": "subprocess pipe",
     "rust_forward:self._supervise": "child process supervision",
     "rust_forward:self._reap": "child process supervision",
+    # R9 main mode (S3): returns a parent writer lease granted after its async caller was cancelled.
+    "tenant_writer:_settle_cancelled": "no tenant writes (lease bookkeeping with the Rust parent)",
     "rust_answer:self._run": "no tenant writes (the read-only Rust answer endpoint)",
 }
