@@ -914,6 +914,9 @@ _EMBEDDING_ACTIONS = ("set-next", "clear-next", "switch", "rollback", "finish", 
 
 def _embedding_guard(request: Request, mutating: bool) -> Optional[JSONResponse]:
     """Service-wide and web-only: the service token, and never a tenant (#1636)."""
+    if embedding_mod.shared_for(_base_cfg).config.following():
+        # R9 S4: the Rust parent serves these; this process must never start a second migration.
+        return JSONResponse({"error": "served by the Rust Diary process"}, status_code=503)
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     if mutating and not get_state().auth_token:

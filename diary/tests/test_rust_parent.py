@@ -753,3 +753,26 @@ def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_pat
     after = [r for r in results['rust-owner'] if r[0] == 'models after switch']
     assert after == [('models after switch', 200, ['qa-embed-b'])], after
     shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+@needs_server
+@needs_binary
+def test_a_refused_seed_address_is_refused_for_the_child_too(tmp_path):
+    """A seeded embeddings address off this network (a documentation range: refused without DNS) is refused
+    by the owner in memory; the child follows that refusal (embedding off) exactly as Python as main process."""
+    statuses = {}
+    for name, main in (('python', False), ('rust-owner', True)):
+        extra = {'LLM_EMBED_BASE_URL': 'http://203.0.113.9:8080/v1', 'LLM_EMBED_MODEL': 'qa-embed-a'}
+        if main:
+            extra['DIARY_RUST_EMBEDDING'] = 'on'
+        d = Deployment(tmp_path / name, main, extra=extra)
+        try:
+            statuses[name] = _masked(200, _until(d, lambda s: s.get('damaged'), deadline_s=30))
+            if main:
+                effective = json.loads((tmp_path / name / 'state' / 'embedding-config.effective.json').read_text())
+                assert effective['active']['profile'] == 'unavailable' and 'refused' in effective['damaged']
+        finally:
+            d.close()
+    assert statuses['python'] == statuses['rust-owner']
+    assert statuses['python'][1]['active']['profile'] == 'unavailable'
+    shutil.rmtree(tmp_path, ignore_errors=True)
