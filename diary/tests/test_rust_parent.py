@@ -489,9 +489,10 @@ def _sequence(d: Deployment):
     go('other tenant months', 'GET', '/api/months', user=QB)
     go('health', 'GET', '/api/health', headers={'Authorization': f'Bearer {TOKEN}'})
     go('no token', 'GET', '/api/months', headers={'X-Cowork-User-ID': QA})
-    nonce = secrets.token_hex(16)
-    go('nonce first', 'GET', '/api/months', nonce=nonce)
-    go('nonce replay', 'GET', '/api/months', nonce=nonce)
+    # An exact replay (same timestamp and nonce: the replay cache's key, as in Python).
+    replayed = _signed(QA, 'GET', '/api/months')
+    go('nonce first', 'GET', '/api/months', headers=dict(replayed))
+    go('nonce replay', 'GET', '/api/months', headers=dict(replayed))
     bad = _signed(QA, 'GET', '/api/months')
     bad[ta.HEADER] = bad[ta.HEADER][:-4] + 'AAAA'
     go('bad assertion', 'GET', '/api/months', headers=bad)
