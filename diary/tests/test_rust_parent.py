@@ -8,6 +8,7 @@ compares status, content type and body byte for byte. It needs the real binaries
 noevia-diary, the tenant-assertion leaf) and skips without them.
 """
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -20,7 +21,9 @@ import subprocess
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional
 
 import httpx
 import pytest
@@ -385,7 +388,7 @@ def _config(root: Path) -> Path:
     return path
 
 
-def _env(root: Path, main: bool, writers: bool = False) -> dict:
+def _env(root: Path, main: bool, writers: bool = False, extra: Optional[dict] = None) -> dict:
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(root), 'TZ': 'UTC',
            'PYTHONPATH': str(ROOT), 'DIARY_CONFIG': str(_config(root)), 'DIARY_TENANT_KEY': KEY,
            'LLM_BASE_URL': 'http://127.0.0.1:9/v1', 'LLM_EMBED_BASE_URL': 'http://127.0.0.1:9/v1'}
@@ -398,11 +401,12 @@ def _env(root: Path, main: bool, writers: bool = False) -> dict:
         if writers:
             # S3: QA's writes are the parent's (native), under the slot the child leases.
             env['DIARY_RUST_WRITES'] = QA
+    env.update(extra or {})
     return env
 
 
 class Deployment:
-    def __init__(self, root: Path, main: bool, writers: bool = False):
+    def __init__(self, root: Path, main: bool, writers: bool = False, extra: Optional[dict] = None):
         self.port = _free_port()
         uvicorn = [sys.executable, '-m', 'uvicorn', 'agent.app:app', '--host', '127.0.0.1']
         if main:
@@ -414,7 +418,7 @@ class Deployment:
         root.mkdir(parents=True, exist_ok=True)
         self.logfile = root / f'server-{"rust" if main else "python"}-{time.monotonic_ns()}.log'
         self.log = open(self.logfile, 'wb')
-        self.proc = subprocess.Popen(argv, cwd=ROOT, env=_env(root, main, writers), stdout=self.log,
+        self.proc = subprocess.Popen(argv, cwd=ROOT, env=_env(root, main, writers, extra), stdout=self.log,
                                      stderr=subprocess.STDOUT)
         self.client = httpx.Client(base_url=f'http://127.0.0.1:{self.port}', timeout=30, trust_env=False)
         deadline = time.monotonic() + 60
@@ -581,4 +585,171 @@ def test_either_parent_starts_on_the_data_the_other_wrote(tmp_path):
         assert _reads(d) == by_rust
     finally:
         assert d.close() in (0, -signal.SIGTERM)
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+# ---------------- S4: the parent owns the embedding configuration ----------------
+
+def test_the_child_follows_the_parents_embedding_snapshot(tmp_path):
+    from agent.config import Config
+    from agent.embedding import EmbeddingConfig, EmbeddingConfigError, effective_path_for
+    cfg = Config({'retrieval': {'db_path': str(tmp_path / 'index.db')},
+                  'llm': {'embed_model': 'qa-embed-a', 'embed_base_url': 'http://10.0.0.9:8080/v1'}})
+    path = effective_path_for(cfg)
+    assert path == tmp_path / 'embedding-config.effective.json'
+    config = EmbeddingConfig(cfg, tmp_path / 'embedding-config.json')
+    assert config.active().model == 'qa-embed-a'
+    config.follow_parent(path, 'epoch-1')
+    # Before the parent's snapshot for this run: embedding off (fail closed), nothing changeable.
+    assert config.active().profile == 'unavailable' and config.get()['damaged']
+    with pytest.raises(EmbeddingConfigError):
+        config.set_next({'model': 'qa-embed-b'})
+    snap = {'active': {'base_url': None, 'model': 'qa-embed-b', 'profile': 'nomic-v1'}, 'next': None,
+            'previous': {'base_url': 'http://10.0.0.9:8080/v1', 'model': 'qa-embed-a', 'profile': 'nomic-v1'},
+            'source': 'saved'}
+    path.write_text(json.dumps({**snap, 'epoch': 'epoch-0'}))  # an earlier run's: ignored
+    assert config.active().profile == 'unavailable'
+    path.write_text(json.dumps({**snap, 'epoch': 'epoch-1'}))
+    got = config.get()
+    assert got['active']['model'] == 'qa-embed-b' and got['previous']['model'] == 'qa-embed-a'
+    assert got['source'] == 'saved' and 'damaged' not in got
+    version = got['version']
+    assert config.get()['version'] == version  # unchanged file: nothing re-read
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps({**snap, 'epoch': 'epoch-1', 'damaged': 'QA refusal', 'next': None,
+                               'active': {'base_url': None, 'model': 'qa-embed-b', 'profile': 'unavailable'}}))
+    os.replace(tmp, path)
+    assert config.active().profile == 'unavailable' and config.get()['damaged'] == 'QA refusal'
+    assert config.get()['version'] > version
+    # Refusals of seeded addresses are the parent's to make: none here.
+    config.refuse_seeded({'active': 'QA'})
+    config.release_seeded('active')
+    path.write_text('{"broken')
+    assert config.active().profile == 'unavailable'  # a torn read keeps the last snapshot
+
+
+class StubEmbeddings:
+    """A synthetic embeddings server: deterministic 8-dimensional vectors from (model, text); it
+    records the model of every request."""
+
+    def __init__(self):
+        seen = self.seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get('content-length') or 0)) or b'{}')
+                texts = body.get('input') or []
+                texts = [texts] if isinstance(texts, str) else texts
+                seen.append((body.get('model'), len(texts)))
+                data = []
+                for i, text in enumerate(texts):
+                    h = hashlib.sha256(f"{body.get('model')}|{text}".encode()).digest()
+                    data.append({'index': i, 'embedding': [b / 255.0 + 0.01 for b in h[:8]]})
+                out = json.dumps({'data': data}).encode()
+                self.send_response(200)
+                self.send_header('content-type', 'application/json')
+                self.send_header('content-length', str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self.server.server_address[1]}/v1'
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _embedding(d: Deployment, method='GET', body=None, headers=None):
+    h = {'Authorization': f'Bearer {TOKEN}'} if headers is None else headers
+    content = body if isinstance(body, bytes) else (json.dumps(body).encode() if body is not None else None)
+    return d.client.request(method, '/api/internal/embedding', headers=h, content=content)
+
+
+def _until(d: Deployment, ready, deadline_s=60.0):
+    end = time.monotonic() + deadline_s
+    while True:
+        r = _embedding(d)
+        if r.status_code == 200 and ready(r.json()) and not r.json().get('running'):
+            return r.json()
+        assert time.monotonic() < end, r.text
+        time.sleep(0.3)
+
+
+def _masked(status_code, payload):
+    if isinstance(payload, dict):
+        payload = {k: v for k, v in payload.items() if k not in ('running', 'last_pass', 'version')}
+    return status_code, payload
+
+
+def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
+    out = []
+
+    def norm(payload):
+        return json.loads(json.dumps(payload).replace(stub.url, 'STUB'))
+
+    def call(label, method='GET', body=None, headers=None):
+        r = _embedding(d, method, body, headers)
+        try:
+            payload = r.json()
+        except ValueError:
+            payload = r.text
+        out.append((label, *_masked(r.status_code, norm(payload))))
+        return r
+
+    call('no token', headers={})
+    call('a tenant', headers={'Authorization': f'Bearer {TOKEN}', **{k: v for k, v in _signed(QA, 'GET', '/api/internal/embedding').items() if k != 'Authorization'}})
+    _reads(d)
+    _put(d, 'Entries/2030/January/January 6, 2030.md',
+         '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA synthetic walk by the river.\n\n')
+    out.append(('active ready', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
+    call('bad action', 'POST', {'action': 'bogus'})
+    call('bad json', 'POST', b'{not json')
+    call('switch without next', 'POST', {'action': 'switch'})
+    call('set next', 'POST', {'action': 'set-next', 'target': {'base_url': stub.url, 'model': 'qa-embed-b', 'profile': 'nomic-v1'}})
+    out.append(('next ready', *_masked(200, norm(_until(d, lambda s: (s['coverage']['next'] or {}).get('ready'))))))
+    call('switch', 'POST', {'action': 'switch'})
+    mark = len(stub.seen)
+    _put(d, 'Entries/2030/January/January 7, 2030.md',
+         '## Monday, January 7, 2030\n\n### 10:00 — garden\n\n**Me:** QA second note about the garden.\n\n')
+    # The save after the switch embeds with the new model: the child follows the owner's switch.
+    models_after = {m for m, _ in stub.seen[mark:]}
+    out.append(('models after switch', 200, sorted(models_after)))
+    call('finish', 'POST', {'action': 'finish'})
+    call('finish again', 'POST', {'action': 'finish'})
+    out.append(('final', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
+    return out
+
+
+@needs_server
+@needs_binary
+def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_path):
+    results = {}
+    for name, main in (('python', False), ('rust-owner', True)):
+        stub = StubEmbeddings()
+        extra = {'LLM_EMBED_BASE_URL': stub.url, 'LLM_EMBED_MODEL': 'qa-embed-a', 'LLM_EMBED_PROFILE': 'nomic-v1'}
+        if main:
+            extra['DIARY_RUST_EMBEDDING'] = 'on'
+        d = Deployment(tmp_path / name, main, extra=extra)
+        try:
+            results[name] = _embedding_sequence(d, stub)
+        finally:
+            d.close()
+            stub.close()
+        if main:
+            log = d.logfile.read_text()
+            assert 'embedding set-next: active nomic-v1/qa-embed-a' in log, log[-3000:]
+            effective = tmp_path / name / 'state' / 'embedding-config.effective.json'
+            assert json.loads(effective.read_text())['active']['model'] == 'qa-embed-b'
+        saved = json.loads((tmp_path / name / 'state' / 'embedding-config.json').read_text())
+        assert saved['active']['model'] == 'qa-embed-b' and saved['previous'] is None
+    assert [r[0] for r in results['python']] == [r[0] for r in results['rust-owner']]
+    for py, rs in zip(results['python'], results['rust-owner']):
+        assert py == rs, (py, rs)
+    after = [r for r in results['rust-owner'] if r[0] == 'models after switch']
+    assert after == [('models after switch', 200, ['qa-embed-b'])], after
     shutil.rmtree(tmp_path, ignore_errors=True)
