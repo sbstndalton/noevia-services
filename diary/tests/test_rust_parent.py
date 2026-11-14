@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -64,7 +65,8 @@ def test_the_entrypoint_execs_todays_command_unless_diary_main_is_rust(tmp_path)
         assert _run(script, cmd, main) == 'uvicorn agent.app:app --host 0.0.0.0 --port 8010'
     # The image command itself (CMD) becomes the Rust parent's child on loopback.
     image_cmd = ['uvicorn', 'agent.app:app', '--host', '0.0.0.0', '--port', '8010']
-    assert _run(script, image_cmd, 'rust') == ('rust --main -- uvicorn agent.app:app --host 127.0.0.1 --port 8012')
+    assert _run(script, image_cmd, 'rust') == ('rust --main -- uvicorn agent.app:app --host 127.0.0.1 --port 8012 '
+                                               '--no-proxy-headers')
     # Operator commands are unchanged in main mode.
     assert _run(script, ['echo', 'something', 'else'], 'rust') == 'something else'
 
@@ -166,7 +168,9 @@ def test_the_middleware_takes_the_parents_verdict_strips_internal_headers_and_st
     assert seen['asserted'] is True
     assert [k for k, _ in seen['headers']] == [b'authorization', b'x-cowork-user-id']
     assert (b'x-noevia-diary-recovered', b'1') in sent[0]['headers']
-    seen, sent = _call(base + [(b'x-noevia-diary-asserted', b'0'), (b'x-cowork-user-id', QB.encode())])
+    # Two tenant headers: the first counts (as for the parent's verifier and Starlette).
+    seen, sent = _call(base + [(b'x-noevia-diary-asserted', b'0'), (b'x-cowork-user-id', QB.encode()),
+                               (b'x-cowork-user-id', QA.encode())])
     assert seen['asserted'] is False
     assert (b'x-noevia-diary-recovered', b'0') in sent[0]['headers']
     # No tenant, or not a UUID: no stamp.
@@ -376,7 +380,7 @@ class Deployment:
         if main:
             child = _free_port()
             argv = [BIN, '--main', '--host', '127.0.0.1', '--port', str(self.port), '--control-port', str(_free_port()),
-                    '--child-port', str(child), '--', *uvicorn, '--port', str(child)]
+                    '--child-port', str(child), '--', *uvicorn, '--port', str(child), '--no-proxy-headers']
         else:
             argv = [*uvicorn, '--port', str(self.port)]
         root.mkdir(parents=True, exist_ok=True)
@@ -429,7 +433,9 @@ def _sequence(d: Deployment):
     def go(label, method, path, user=QA, body=b'', query='', content_type=None, headers=None, nonce=None):
         h = headers if headers is not None else _signed(user, method, path, body, query.encode(), nonce, content_type)
         r = d.client.request(method, path + (f'?{query}' if query else ''), headers=h, content=body or None)
-        out.append((label, r.status_code, r.headers.get('content-type'), r.content))
+        # Wall-clock values differ between two runs; everything else must be byte-equal.
+        body = re.sub(rb'"(modified|updated|created_at|at)":\s*[0-9.]+', rb'"\1":0', r.content)
+        out.append((label, r.status_code, r.headers.get('content-type'), body))
         return r
 
     for _ in range(2):
@@ -499,8 +505,10 @@ def test_main_mode_answers_exactly_as_the_python_main_process(tmp_path):
         finally:
             code = d.close()
         logs[name] = d.logfile.read_text()
-        # SIGTERM: both stop cleanly (uvicorn 0; the Rust parent passes it to its child and exits 0).
-        assert code == 0, (name, code, logs[name][-4000:])
+        # SIGTERM: both stop after a graceful shutdown (uvicorn re-raises the signal; the Rust parent
+        # passes it to its child and exits 0).
+        assert code == (0 if main else -signal.SIGTERM), (name, code, logs[name][-4000:])
+        assert 'Application shutdown complete' in logs[name], name
     for name in ('rust', 'rust-writers'):
         assert [r[0] for r in results['python']] == [r[0] for r in results[name]]
         for py, rs in zip(results['python'], results[name]):
@@ -528,7 +536,7 @@ def test_either_parent_starts_on_the_data_the_other_wrote(tmp_path):
         _put(d, day, '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA written by Python.\n\n')
         by_python = _reads(d)
     finally:
-        assert d.close() == 0
+        assert d.close() in (0, -signal.SIGTERM)
     d = Deployment(root, main=True, writers=True)
     try:
         assert _reads(d) == by_python
@@ -537,12 +545,12 @@ def test_either_parent_starts_on_the_data_the_other_wrote(tmp_path):
         by_rust = _reads(d)
         log = d.logfile
     finally:
-        assert d.close() == 0
+        assert d.close() in (0, -signal.SIGTERM)
     assert by_rust != by_python
     assert '"PUT /api/file' not in log.read_text()
     d = Deployment(root, main=False)
     try:
         assert _reads(d) == by_rust
     finally:
-        assert d.close() == 0
+        assert d.close() in (0, -signal.SIGTERM)
     shutil.rmtree(tmp_path, ignore_errors=True)

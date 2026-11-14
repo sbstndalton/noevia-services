@@ -178,7 +178,7 @@ class ParentMiddleware:
             elif lower.startswith(INTERNAL_PREFIX):
                 continue
             else:
-                if lower == b"x-cowork-user-id":
+                if lower == b"x-cowork-user-id" and not user:  # the first, as Starlette reads it
                     user = value.decode("latin-1").lower()
                 kept.append((name, value))
         expected = self.secret().encode()
