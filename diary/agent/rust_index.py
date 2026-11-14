@@ -93,7 +93,7 @@ def reindex_dirty(st, tenant_id: Optional[str], server_lookup: Optional[Callable
         return False
     if not tenant_writer.held(uid):
         return False  # the writer header would be untrue: Python re-indexes under its own locks
-    from . import rust_forward
+    from . import rust_forward, rust_parent
     server = (server_lookup or rust_forward.current)()
     if server is None:
         return False
@@ -114,7 +114,9 @@ def reindex_dirty(st, tenant_id: Optional[str], server_lookup: Optional[Callable
                           trust_env=False, transport=transport) as client:
             resp = client.post("/internal/reindex", params={"tenant": uid}, json={"embedding": config.get()},
                                headers={rust_forward.CONTROL_HEADER: token,
-                                        rust_forward.WRITER_HEADER.decode(): "1"})
+                                        rust_forward.WRITER_HEADER.decode(): "1",
+                                        # R9 main mode: the parent's lease this pass runs under.
+                                        **rust_parent.lease_headers(uid)})
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         log.warning("Rust re-index not reached (%s); re-indexing here", type(exc).__name__)
         return False

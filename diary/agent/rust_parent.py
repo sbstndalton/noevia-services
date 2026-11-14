@@ -1,0 +1,277 @@
+"""R9 main mode: this app as the CHILD of the Rust Diary process (DIARY_MAIN=rust in entrypoint.sh).
+
+Unset (the default) changes nothing: this module is inert unless DIARY_PARENT=rust, which only the
+Rust main process (noevia-rs bins/noevia-diary front.rs, `noevia-diary --main`) sets on its child.
+
+In child mode the Rust process listens on the public port and this app on 127.0.0.1:8012. The Rust
+side is the only tenant-assertion verifier and nonce owner; it serves the read routes this process
+names in DIARY_RUST_ROUTES natively and forwards everything else here. So, in child mode:
+- the parent sends one JSON line on stdin: ``control_token``, ``parent_secret``, ``control_port``;
+- this app POSTs its start-up config (`rust_forward.server_config`, plus ``native_routes``) to the
+  parent's control port at start-up, and refuses to start when the parent does not take it;
+- ParentMiddleware replaces TenantAssertionMiddleware and ForwardMiddleware: every request must carry
+  the parent secret (else 401 with the middleware's own body), the parent's verdict
+  (``x-noevia-diary-asserted: 1``) becomes ``tenant_asserted``, and every reply to a request naming
+  a UUID tenant is stamped ``x-noevia-diary-recovered: 1|0`` (does this process hold a recovered
+  managed state for it?), which is what lets the parent serve that tenant's reads natively;
+- no Rust child is started; `rust_forward.current()` is the parent (ParentServer), so the answer
+  endpoint (DIARY_RUST_ANSWER), the index shadow (DIARY_RUST_INDEX=shadow) and the deletion fence
+  reach the parent's control port;
+- S3, the writer tenants (DIARY_RUST_WRITES, sent as ``native_writers``): their writes are served
+  natively by the parent, which owns their writer slot. This process's tenant writer lock for them
+  is a LEASE on that slot (tenant_writer.configure_remote, ParentLeases), so one write of such a
+  tenant runs at a time across both processes; the calls made under the lease (the deletion fence,
+  DIARY_RUST_INDEX=on's re-index) name it in ``x-noevia-diary-lease`` and join it there. Every other
+  tenant's writes are served here, with this process's lock as before (a no-op).
+The parent never restarts this process: when it exits the parent exits and the container restarts.
+"""
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import os
+import re
+import secrets
+import sys
+import time
+from typing import Callable, Optional
+
+import httpx
+
+log = logging.getLogger("diary.rust")
+
+PARENT_HEADER = b"x-noevia-diary-parent"
+ASSERTED_HEADER = b"x-noevia-diary-asserted"
+WRITTEN_HEADER = b"x-noevia-diary-written"
+RECOVERED_HEADER = b"x-noevia-diary-recovered"
+CONTROL_HEADER = "x-noevia-diary-control"
+INTERNAL_PREFIX = b"x-noevia-diary-"
+UNVERIFIED = b'{"detail":"invalid tenant assertion"}'
+LEASE_HEADER = "x-noevia-diary-lease"
+CONFIG_DEADLINE_S = 30.0
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def active() -> bool:
+    """Child mode: the Rust main process started this app."""
+    return (os.environ.get("DIARY_PARENT") or "").strip() == "rust"
+
+
+def embedding_owned() -> bool:
+    """S4 (DIARY_RUST_EMBEDDING=on, main mode only): the parent owns the embedding configuration,
+    its address guard, the re-embedding migration and GET/POST /api/internal/embedding; this process
+    follows the parent's snapshot (EmbeddingConfig.follow_parent) and changes nothing."""
+    return active() and (os.environ.get("DIARY_RUST_EMBEDDING") or "").strip().lower() == "on"
+
+
+# The configuration keys the parent's embedding owner reads (the rest of the config stays here).
+EMBEDDING_KEYS = ("llm.embed_base_url", "llm.embed_model", "llm.embed_profile", "llm.embed_next_base_url",
+                  "llm.embed_next_model", "llm.embed_next_profile", "llm.timeout_s", "llm.max_retries",
+                  "retrieval.db_path", "retrieval.embedding_state_path", "retrieval.reindex_duty")
+
+
+def embedding_config(cfg) -> dict:
+    """The nested subset of `cfg` (EMBEDDING_KEYS, as cfg.get resolves them) the parent needs."""
+    out: dict = {}
+    for key in EMBEDDING_KEYS:
+        value = cfg.get(key)
+        if value is None:
+            continue
+        node = out
+        *parents, leaf = key.split(".")
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = value
+    return out
+
+
+def read_handshake(stream=None) -> dict:
+    """The parent's one stdin line. Raises (the app then refuses to start) when it is missing."""
+    line = (stream or sys.stdin).readline()
+    data = json.loads(line)
+    token, secret, port = data.get("control_token"), data.get("parent_secret"), data.get("control_port")
+    if not (isinstance(token, str) and token and isinstance(secret, str) and secret
+            and isinstance(port, int) and 0 < port < 65536):
+        raise ValueError("the Rust parent's handshake is incomplete")
+    epoch = data.get("embedding_epoch", "")
+    if not isinstance(epoch, str):
+        raise ValueError("the Rust parent's handshake is incomplete")
+    return {"control_token": token, "parent_secret": secret, "control_port": port, "embedding_epoch": epoch}
+
+
+class ParentServer:
+    """`rust_forward.RustServer`'s surface for the internal callers (rust_answer, rust_index, the
+    deletion fence), pointing at the parent's control port. Always ready while this process runs."""
+
+    def __init__(self, control_token: str, parent_secret: str, control_port: int, embedding_epoch: str = ""):
+        self._token = control_token
+        self.embedding_epoch = embedding_epoch
+        self.forward_secret = parent_secret
+        self.port = control_port
+        self.base_url = f"http://127.0.0.1:{control_port}"
+        self.ready = True
+        self.restarts = 0
+        self.reaping = 0
+        self.answer_only = False
+
+    def control(self):
+        return self._token, True
+
+    def forward_secret_for(self, _user_id: str) -> str:
+        return self.forward_secret
+
+    def fence(self, user_id: str, timeout: float = 30.0) -> bool:
+        try:
+            with httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=False) as client:
+                resp = client.post("/internal/fence", params={"tenant": user_id},
+                                   headers={CONTROL_HEADER: self._token, **lease_headers(user_id)})
+            return resp.status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    def prepare_delete(self, user_id: str) -> bool:
+        return self.fence(user_id)
+
+    def lost(self) -> None:
+        # The parent is the container's main process: it is never restarted from here.
+        log.warning("Rust Diary parent did not answer an internal call")
+
+    def stop(self) -> None:
+        pass
+
+    def send_config(self, config: dict, deadline_s: float = CONFIG_DEADLINE_S,
+                    transport: Optional[httpx.BaseTransport] = None) -> None:
+        """POST the start-up config until the parent takes it (200) or refuses it (raises)."""
+        body = json.dumps(config, separators=(",", ":"))
+        until = time.monotonic() + deadline_s
+        with httpx.Client(base_url=self.base_url, timeout=5.0, trust_env=False, transport=transport) as client:
+            while True:
+                try:
+                    resp = client.post("/internal/child/config", content=body,
+                                       headers={CONTROL_HEADER: self._token, "content-type": "application/json"})
+                    if resp.status_code == 200:
+                        return
+                    raise RuntimeError(f"the Rust parent refused the start-up config ({resp.status_code})")
+                except httpx.TransportError:
+                    if time.monotonic() >= until:
+                        raise RuntimeError("the Rust parent did not take the start-up config in time") from None
+                    time.sleep(0.1)
+
+
+def lease_headers(user_id: str) -> dict:
+    """The lease this context holds for the tenant, as the header a call made under it carries."""
+    from . import tenant_writer
+    lease = tenant_writer.lease_of(user_id)
+    return {LEASE_HEADER: lease} if lease else {}
+
+
+class ParentLeases:
+    """tenant_writer's remote: leases on the parent's writer slot (noevia-diary lease.rs)."""
+
+    RELEASE_DELAYS_S = (0.0, 0.2, 1.0)
+
+    def __init__(self, base_url: str, control_token: str, transport: Optional[httpx.BaseTransport] = None,
+                 release_delays=RELEASE_DELAYS_S):
+        self._token = control_token
+        self._delays = tuple(release_delays)
+        self._client = httpx.Client(base_url=base_url, timeout=5.0, trust_env=False, transport=transport)
+
+    def acquire(self, uid: str, wait_s: float) -> str:
+        """A lease, or WriterBusy. Each request names a fresh holder nonce: a grant whose reply was
+        lost is returned by that nonce, so it never locks the tenant out."""
+        from . import tenant_writer
+        wait_ms = max(0, int(wait_s * 1000))
+        holder = secrets.token_hex(16)
+        try:
+            resp = self._client.post("/internal/lease", params={"tenant": uid, "wait_ms": str(wait_ms), "holder": holder},
+                                     headers={CONTROL_HEADER: self._token}, timeout=wait_s + 10.0)
+        except httpx.HTTPError as exc:
+            log.error("Diary writer lease request failed (%s); returning anything granted", type(exc).__name__)
+            self._release({"holder": holder})
+            raise tenant_writer.WriterBusy(uid) from None
+        if resp.status_code == 200:
+            try:
+                lease = resp.json().get("lease")
+            except ValueError:
+                lease = None
+            if isinstance(lease, str) and lease.isdigit():
+                return lease
+        if resp.status_code != 503:
+            log.error("Diary writer lease refused by the Rust parent (HTTP %d)", resp.status_code)
+            self._release({"holder": holder})
+        raise tenant_writer.WriterBusy(uid)
+
+    def release(self, lease: str) -> None:
+        if not self._release({"lease": lease}):
+            raise RuntimeError("lease release not confirmed")
+
+    def _release(self, params: dict) -> bool:
+        """DELETE with bounded retries; 404 (nothing live) counts as returned."""
+        for delay in self._delays:
+            if delay:
+                time.sleep(delay)
+            try:
+                resp = self._client.delete("/internal/lease", params=params, headers={CONTROL_HEADER: self._token})
+            except httpx.HTTPError:
+                continue
+            if resp.status_code in (200, 404):
+                return True
+        return False
+
+
+class ParentMiddleware:
+    """Pure ASGI, outermost in child mode (see the module doc)."""
+
+    def __init__(self, app, secret: Callable[[], str], is_recovered: Callable[[str], bool],
+                 on_written: Optional[Callable[[str], None]] = None):
+        self.app = app
+        self.secret = secret
+        self.is_recovered = is_recovered
+        self.on_written = on_written or (lambda _uid: None)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        supplied, asserted, written, kept, user = b"", False, False, [], ""
+        for name, value in scope.get("headers") or []:
+            lower = name.lower()
+            if lower == PARENT_HEADER:
+                supplied = value
+            elif lower == ASSERTED_HEADER:
+                asserted = value == b"1"
+            elif lower == WRITTEN_HEADER:
+                written = value == b"1"
+            elif lower.startswith(INTERNAL_PREFIX):
+                continue
+            else:
+                if lower == b"x-cowork-user-id" and not user:  # the first, as Starlette reads it
+                    user = value.decode("latin-1").lower()
+                kept.append((name, value))
+        expected = self.secret().encode()
+        if not expected or not hmac.compare_digest(supplied, expected):
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-length", str(len(UNVERIFIED)).encode()),
+                                    (b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": UNVERIFIED})
+            return
+        scope = dict(scope)
+        scope["headers"] = kept
+        state = scope.setdefault("state", {})
+        if asserted:
+            state["tenant_asserted"] = True
+        tenant = user if _UUID_RE.fullmatch(user) else ""
+        if written and tenant:
+            # S3: the parent served a native write of this tenant: what this process holds for it
+            # is stale (D5's on_uncertain after a served native write).
+            self.on_written(tenant)
+
+        async def stamped(message):
+            if tenant and message.get("type") == "http.response.start":
+                message = dict(message)
+                message["headers"] = [*(message.get("headers") or []),
+                                      (RECOVERED_HEADER, b"1" if self.is_recovered(tenant) else b"0")]
+            await send(message)
+
+        await self.app(scope, receive, stamped)

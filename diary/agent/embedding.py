@@ -236,6 +236,9 @@ class EmbeddingConfig:
         self.version = 0
         self.damaged: Optional[str] = None
         self._held: Dict[str, Dict[str, Any]] = {}  # 'active' | 'next' -> {reason, transient, target}
+        # R9 main mode (follow_parent): (effective snapshot file, run epoch) and its last stat.
+        self._follow: Optional[tuple] = None
+        self._follow_stamp = None
         saved = self._read()
         self.source = "saved" if saved else "environment"
         self._state = saved or seed_from_cfg(cfg)
@@ -266,7 +269,7 @@ class EmbeddingConfig:
         changes like a damaged file, because falling back to the chat engine would send it the same
         text. ``transient`` (the name did not resolve yet) can be undone by release_seeded."""
         with self._lock:
-            if self.source != "environment":
+            if self.source != "environment" or self._follow is not None:
                 return
             for which in ("active", "next"):
                 reason = reasons.get(which)
@@ -289,7 +292,7 @@ class EmbeddingConfig:
         """Takes back a transient refusal once the address resolves to this network."""
         with self._lock:
             held = self._held.get(which)
-            if held is None or not held["transient"] or self.source != "environment":
+            if held is None or not held["transient"] or self.source != "environment" or self._follow is not None:
                 return
             del self._held[which]
             if which == "next":
@@ -312,6 +315,8 @@ class EmbeddingConfig:
         os.replace(tmp, self.state_file)
 
     def _change(self, state) -> Dict[str, Any]:
+        if self._follow is not None:
+            raise EmbeddingConfigError("The embedding configuration is owned by the Rust Diary process.", "badState", 409)
         if self.damaged:
             raise EmbeddingConfigError(self.damaged, "badState", 409)
         self._persist(state)
@@ -320,8 +325,51 @@ class EmbeddingConfig:
         self.source = "saved"
         return self.get()
 
+    # ---- R9 main mode: the Rust parent owns the configuration (DIARY_RUST_EMBEDDING=on) ----
+
+    def follow_parent(self, effective: Path, epoch: str) -> None:
+        """From now on this configuration is the parent's: read from the snapshot it writes for this
+        run (``effective``, carrying ``epoch``), whenever that file changes, and never changed here.
+        Until the parent's snapshot for this run is there, embedding is off (fail closed)."""
+        with self._lock:
+            self._follow, self._follow_stamp = (Path(effective), epoch), None
+            self._held = {}
+            self._state = {"active": Target(None, "unavailable", "unavailable"), "next": None, "previous": None}
+            self.damaged = "The Diary's embedding configuration is not ready yet."
+            self.version += 1
+            self._refresh_locked()
+
+    def _refresh_locked(self) -> None:
+        if self._follow is None:
+            return
+        path, epoch = self._follow
+        try:
+            st = os.stat(path)
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+            if stamp == self._follow_stamp:
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # the parent replaces it atomically: the next call sees the whole file
+        if not isinstance(data, dict) or data.get("epoch") != epoch:
+            return
+        def target(d):
+            return Target(d.get("base_url"), d.get("model"), d.get("profile")) if isinstance(d, dict) else None
+        active = target(data.get("active"))
+        if active is None:
+            return
+        self._follow_stamp = stamp
+        self._state = {"active": active, "next": target(data.get("next")), "previous": target(data.get("previous"))}
+        self.source = data.get("source") if data.get("source") in ("saved", "environment") else "saved"
+        self.damaged = data.get("damaged") or None
+        self.version += 1
+
+    def following(self) -> bool:
+        return self._follow is not None
+
     def get(self) -> Dict[str, Any]:
         with self._lock:
+            self._refresh_locked()
             s = self._state
             return {"active": s["active"].to_json(), "next": s["next"].to_json() if s["next"] else None,
                     "previous": s["previous"].to_json() if s["previous"] else None, "source": self.source,
@@ -329,14 +377,17 @@ class EmbeddingConfig:
 
     def active(self) -> Target:
         with self._lock:
+            self._refresh_locked()
             return self._state["active"]
 
     def next(self) -> Optional[Target]:
         with self._lock:
+            self._refresh_locked()
             return self._state["next"]
 
     def previous(self) -> Optional[Target]:
         with self._lock:
+            self._refresh_locked()
             return self._state["previous"]
 
     def set_next(self, raw) -> Dict[str, Any]:
@@ -597,6 +648,12 @@ _shared: Dict[str, "SharedEmbedding"] = {}
 class SharedEmbedding:
     config: EmbeddingConfig
     embedder: Embedder
+
+
+def effective_path_for(cfg) -> Path:
+    """R9 main mode: the snapshot the Rust parent writes for its child (beside the state file)."""
+    state = state_path_for(cfg)
+    return state.with_name(state.stem + ".effective.json")
 
 
 def state_path_for(cfg) -> Path:
