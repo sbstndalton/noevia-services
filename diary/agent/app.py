@@ -850,6 +850,19 @@ def _rust_write_uncertain(user_id: str) -> None:
             state.recovered = False
 
 
+def _rust_wrote(user_id: str) -> None:
+    """S6b (main mode): the parent served a native write of this tenant. The state recovers again
+    before it is served here (journal replay, the outbox drain, _reindex_dirty), but without the
+    sweep of every Markdown document: the parent's write marks its own document dirty before it
+    writes anything, so its invalidation is in the journal however the write ended. A process lost
+    meanwhile restarts the container, and every new state sweeps once (dirty_on_recover)."""
+    key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
+    with _tenant_lock:
+        state = _tenant_states.get(key)
+        if state is not None:
+            state.recovered = False
+
+
 _RUST_ROUTES = rust_forward.configured_routes(main=rust_parent.active())
 # R9 main mode (rust_parent): the parent serves the writer tenants' writes; their lock here is a
 # lease on its writer slot (S3).
@@ -865,7 +878,7 @@ if _PARENT_MODE:
     # R9 main mode: the Rust parent verified every assertion and owns the nonces (rust_parent doc).
     app.add_middleware(rust_parent.ParentMiddleware,
                        secret=lambda: _parent[0].forward_secret if _parent else "",
-                       is_recovered=_rust_recovered, on_written=_rust_write_uncertain)
+                       is_recovered=_rust_recovered, on_written=_rust_wrote)
 else:
     if _RUST_ROUTES or _RUST_WRITERS:
         app.add_middleware(rust_forward.ForwardMiddleware, routes=_RUST_ROUTES, is_deleted=_tenant_deleted,

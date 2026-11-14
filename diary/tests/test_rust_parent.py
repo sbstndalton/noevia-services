@@ -17,6 +17,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -416,6 +417,7 @@ class Deployment:
         else:
             argv = [*uvicorn, '--port', str(self.port)]
         root.mkdir(parents=True, exist_ok=True)
+        self.root = root
         self.logfile = root / f'server-{"rust" if main else "python"}-{time.monotonic_ns()}.log'
         self.log = open(self.logfile, 'wb')
         self.proc = subprocess.Popen(argv, cwd=ROOT, env=_env(root, main, writers, extra), stdout=self.log,
@@ -709,6 +711,12 @@ def _masked(status_code, payload):
     return status_code, payload
 
 
+def _dirty(d: Deployment, user=QA):
+    db = d.root / 'state' / 'users' / user / 'managed-index.db'
+    with sqlite3.connect(db) as conn:
+        return sorted(r[0] for r in conn.execute('SELECT document FROM dirty_documents'))
+
+
 def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     out = []
 
@@ -729,6 +737,8 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     _reads(d)
     _put(d, 'Entries/2030/January/January 6, 2030.md',
          '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA synthetic walk by the river.\n\n')
+    # S6b: the save re-indexed before it replied, whichever process served it.
+    out.append(('dirty after save', 200, _dirty(d)))
     out.append(('active ready', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
     call('bad action', 'POST', {'action': 'bogus'})
     call('bad json', 'POST', b'{not json')
@@ -739,7 +749,9 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     mark = len(stub.seen)
     _put(d, 'Entries/2030/January/January 7, 2030.md',
          '## Monday, January 7, 2030\n\n### 10:00 — garden\n\n**Me:** QA second note about the garden.\n\n')
-    # The save after the switch embeds with the new model: the child follows the owner's switch.
+    out.append(('dirty after the second save', 200, _dirty(d)))
+    # The save after the switch embeds with the new model: the child follows the owner's switch
+    # (or, for a writer tenant, the parent re-indexes with the switched configuration).
     models_after = {m for m, _ in stub.seen[mark:]}
     out.append(('models after switch', 200, sorted(models_after)))
     call('finish', 'POST', {'action': 'finish'})
@@ -752,12 +764,12 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
 @needs_binary
 def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_path):
     results = {}
-    for name, main in (('python', False), ('rust-owner', True)):
+    for name, main, writers in (('python', False, False), ('rust-owner', True, False), ('rust-owner-writers', True, True)):
         stub = StubEmbeddings()
         extra = {'LLM_EMBED_BASE_URL': stub.url, 'LLM_EMBED_MODEL': 'qa-embed-a', 'LLM_EMBED_PROFILE': 'nomic-v1'}
         if main:
             extra['DIARY_RUST_EMBEDDING'] = 'on'
-        d = Deployment(tmp_path / name, main, extra=extra)
+        d = Deployment(tmp_path / name, main, writers=writers, extra=extra)
         try:
             results[name] = _embedding_sequence(d, stub)
         finally:
@@ -766,15 +778,19 @@ def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_pat
         if main:
             log = d.logfile.read_text()
             assert 'embedding set-next: active nomic-v1/qa-embed-a' in log, log[-3000:]
+            # A writer tenant's saves are the parent's (S6b re-indexes them there), not the child's.
+            assert ('"PUT /api/file' in log) is not writers, log[-3000:]
+            assert 'edit reindex pending' not in log, log[-3000:]
             effective = tmp_path / name / 'state' / 'embedding-config.effective.json'
             assert json.loads(effective.read_text())['active']['model'] == 'qa-embed-b'
         saved = json.loads((tmp_path / name / 'state' / 'embedding-config.json').read_text())
         assert saved['active']['model'] == 'qa-embed-b' and saved['previous'] is None
-    assert [r[0] for r in results['python']] == [r[0] for r in results['rust-owner']]
-    for py, rs in zip(results['python'], results['rust-owner']):
-        assert py == rs, (py, rs)
-    after = [r for r in results['rust-owner'] if r[0] == 'models after switch']
-    assert after == [('models after switch', 200, ['qa-embed-b'])], after
+    for name in ('rust-owner', 'rust-owner-writers'):
+        assert [r[0] for r in results['python']] == [r[0] for r in results[name]]
+        for py, rs in zip(results['python'], results[name]):
+            assert py == rs, (name, py, rs)
+        after = [r for r in results[name] if r[0] == 'models after switch']
+        assert after == [('models after switch', 200, ['qa-embed-b'])], (name, after)
     shutil.rmtree(tmp_path, ignore_errors=True)
 
 
