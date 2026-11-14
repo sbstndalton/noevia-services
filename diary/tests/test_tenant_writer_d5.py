@@ -840,6 +840,20 @@ def test_a_parent_served_write_recovers_without_sweeping_every_document(guarded,
     appmod._rust_wrote(B)
     assert client.get('/api/files', headers=hb).status_code == 200
     assert st.recovered and other in seen and st.dirty_on_recover is False
+    # A recovery that fails before its check keeps the flag for the next one.
+    seen.clear()
+    appmod._rust_wrote(B)
+    real = st.journal.pending_count
+
+    def failing():
+        raise RuntimeError('synthetic journal failure')
+    monkeypatch.setattr(st.journal, 'pending_count', failing)
+    with pytest.raises(RuntimeError):
+        appmod._recover_state(st)
+    assert st.sweep_if_pending and not st.recovered
+    monkeypatch.setattr(st.journal, 'pending_count', real)
+    appmod._recover_state(st)
+    assert st.recovered and not st.sweep_if_pending and other in seen
 
 
 def test_every_fallback_path_bounds_the_body_and_its_deadline(monkeypatch):

@@ -56,6 +56,7 @@ from .config import load_config
 from .context import ContextAssembler, completed_exchanges
 from .temporal_native import TemporalUnavailable, UNAVAILABLE_TEXT as TEMPORAL_UNAVAILABLE_TEXT
 from .deadline import ExchangeBudget, ExchangeTimeout
+from . import corpus_store
 from .corpus_store import MONTH_ID_RE, CorpusError, CorpusStore, EditConflict
 from .external_sources import (
     external_source_paths,
@@ -546,10 +547,12 @@ def _recover_state(state: "AppState") -> None:
         # after a lost Rust write (_rust_write_uncertain), whose document Python cannot know. The
         # files are read NOW, not when the state was built, so documents created since are covered.
         managed = getattr(state, "managed", None)
-        # S6b (main mode, after a parent-served write: _rust_wrote): this replay marks nothing, so a
-        # journal row still pending here sweeps after all, as every other recovery here does.
-        if state.__dict__.pop("sweep_if_pending", False) and state.journal.pending_count():
-            state.dirty_on_recover = True
+        # S6b (main mode, after a parent-served write: _rust_wrote): a journal row still pending
+        # here sweeps after all, as every other recovery here does.
+        if getattr(state, "sweep_if_pending", False):
+            if state.journal.pending_count():
+                state.dirty_on_recover = True
+            state.sweep_if_pending = False  # only once the check is done (a raise keeps it)
         if getattr(state, "dirty_on_recover", False) and managed is not None:
             with managed.db() as db:
                 # Paths still in the import outbox are marked by its drain (_reindex_dirty).
@@ -860,8 +863,9 @@ def _rust_wrote(user_id: str) -> None:
     sweep of every Markdown document: the parent's write (and its journal replay) marks each
     document dirty before it writes it, so its invalidation is in the journal however the write
     ended. A process lost meanwhile restarts the container, and every new state sweeps once
-    (dirty_on_recover). This process's replay marks nothing: a row still pending when it recovers
-    sweeps after all (sweep_if_pending, _recover_state)."""
+    (dirty_on_recover). This process's replays mark what they write in main mode
+    (corpus_store.REPLAY_MARKS); a row still pending when it recovers also sweeps
+    (sweep_if_pending, _recover_state)."""
     key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
     with _tenant_lock:
         state = _tenant_states.get(key)
@@ -874,6 +878,8 @@ _RUST_ROUTES = rust_forward.configured_routes(main=rust_parent.active())
 # R9 main mode (rust_parent): the parent serves the writer tenants' writes; their lock here is a
 # lease on its writer slot (S3).
 _PARENT_MODE = rust_parent.active()
+# S6b: in main mode a replayed journal row marks what it writes (the parent sweeps once per process).
+corpus_store.REPLAY_MARKS = _PARENT_MODE
 _parent: list = []
 _RUST_WRITERS = rust_forward.configured_writers()
 tenant_writer.configure(_RUST_WRITERS)
