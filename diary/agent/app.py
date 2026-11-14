@@ -808,6 +808,8 @@ async def lifespan(_app: FastAPI):
     # S4 (DIARY_RUST_EMBEDDING=on in main mode): the Rust parent guards the addresses and re-embeds.
     if not rust_parent.embedding_owned():
         threading.Thread(target=_start_embedding, name="embedding-start", daemon=True).start()
+    # #2612: with an R9 switch set, the answer/index outcome lines (INFO) reach the container log.
+    rust_answer.configure_outcome_logging()
     if not _PARENT_MODE:
         # D4: start the Rust Diary server only when DIARY_RUST_ROUTES names a route or (D5)
         # DIARY_RUST_WRITES a tenant (default: none).
