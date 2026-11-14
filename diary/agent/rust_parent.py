@@ -16,9 +16,13 @@ names in DIARY_RUST_ROUTES natively and forwards everything else here. So, in ch
   managed state for it?), which is what lets the parent serve that tenant's reads natively;
 - no Rust child is started; `rust_forward.current()` is the parent (ParentServer), so the answer
   endpoint (DIARY_RUST_ANSWER), the index shadow (DIARY_RUST_INDEX=shadow) and the deletion fence
-  reach the parent's control port. DIARY_RUST_WRITES is ignored: every write is served here under
-  this process's own tenant writer lock (the lock moves to the parent in a later step), so
-  DIARY_RUST_INDEX=on has nothing to hand over either.
+  reach the parent's control port;
+- S3, the writer tenants (DIARY_RUST_WRITES, sent as ``native_writers``): their writes are served
+  natively by the parent, which owns their writer slot. This process's tenant writer lock for them
+  is a LEASE on that slot (tenant_writer.configure_remote, ParentLeases), so one write of such a
+  tenant runs at a time across both processes; the calls made under the lease (the deletion fence,
+  DIARY_RUST_INDEX=on's re-index) name it in ``x-noevia-diary-lease`` and join it there. Every other
+  tenant's writes are served here, with this process's lock as before (a no-op).
 The parent never restarts this process: when it exits the parent exits and the container restarts.
 """
 from __future__ import annotations
@@ -42,6 +46,7 @@ RECOVERED_HEADER = b"x-noevia-diary-recovered"
 CONTROL_HEADER = "x-noevia-diary-control"
 INTERNAL_PREFIX = b"x-noevia-diary-"
 UNVERIFIED = b'{"detail":"invalid tenant assertion"}'
+LEASE_HEADER = "x-noevia-diary-lease"
 CONFIG_DEADLINE_S = 30.0
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -86,7 +91,7 @@ class ParentServer:
         try:
             with httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=False) as client:
                 resp = client.post("/internal/fence", params={"tenant": user_id},
-                                   headers={CONTROL_HEADER: self._token})
+                                   headers={CONTROL_HEADER: self._token, **lease_headers(user_id)})
             return resp.status_code == 200
         except httpx.HTTPError:
             return False
@@ -118,6 +123,37 @@ class ParentServer:
                     if time.monotonic() >= until:
                         raise RuntimeError("the Rust parent did not take the start-up config in time") from None
                     time.sleep(0.1)
+
+
+def lease_headers(user_id: str) -> dict:
+    """The lease this context holds for the tenant, as the header a call made under it carries."""
+    from . import tenant_writer
+    lease = tenant_writer.lease_of(user_id)
+    return {LEASE_HEADER: lease} if lease else {}
+
+
+class ParentLeases:
+    """tenant_writer's remote: leases on the parent's writer slot (noevia-diary lease.rs)."""
+
+    def __init__(self, base_url: str, control_token: str, transport: Optional[httpx.BaseTransport] = None):
+        self._token = control_token
+        self._client = httpx.Client(base_url=base_url, timeout=5.0, trust_env=False, transport=transport)
+
+    def acquire(self, uid: str, wait_s: float) -> str:
+        from . import tenant_writer
+        wait_ms = max(0, int(wait_s * 1000))
+        resp = self._client.post("/internal/lease", params={"tenant": uid, "wait_ms": str(wait_ms)},
+                                 headers={CONTROL_HEADER: self._token}, timeout=wait_s + 10.0)
+        if resp.status_code == 200:
+            lease = resp.json().get("lease")
+            if isinstance(lease, str) and lease.isdigit():
+                return lease
+        raise tenant_writer.WriterBusy(uid)
+
+    def release(self, lease: str) -> None:
+        resp = self._client.delete("/internal/lease", params={"lease": lease}, headers={CONTROL_HEADER: self._token})
+        if resp.status_code != 200:
+            raise RuntimeError(f"lease release answered {resp.status_code}")
 
 
 class ParentMiddleware:

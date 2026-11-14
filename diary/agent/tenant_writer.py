@@ -36,6 +36,13 @@ the writer lock is never taken while an OrderedLock is held: both raise LockOrde
 waiting. Acquisition waits at most DEADLINE_S (the forward deadline); then WriterBusy (503).
 
 For any other tenant (the default: DIARY_RUST_WRITES empty) the lock is a no-op.
+
+R9 main mode, S3 (rust_parent; DIARY_MAIN=rust): the Rust process is this process's PARENT and owns
+the tenant's writer slot. configure_remote() makes the first acquisition of a writer tenant's lock
+also take a LEASE on that slot (outside every lock here, within the same deadline), and the last
+release return it; joins stay local. A lease the parent refuses or cannot grant is WriterBusy and
+leaves nothing held. While this process holds the lease, the calls it makes to the parent under it
+(the deletion fence, the re-index) name it (lease_of) and join it there.
 """
 from __future__ import annotations
 
@@ -136,11 +143,32 @@ def notify() -> None:
 # ------------------------------------------------------------------ the lock
 
 class _Slot:
-    __slots__ = ("owner", "users")
+    __slots__ = ("owner", "users", "lease")
 
     def __init__(self):
         self.owner = None
         self.users = 0
+        self.lease = None
+
+
+# R9 main mode: the parent's lease API (rust_parent.ParentLeases), None otherwise.
+_remote = None
+
+
+def configure_remote(remote) -> None:
+    """`remote.acquire(uid, wait_s) -> str` (raises WriterBusy) and `remote.release(lease)`."""
+    global _remote
+    _remote = remote
+
+
+def lease_of(uid: Optional[str]) -> Optional[str]:
+    """The parent lease this context holds for the tenant (main mode), else None."""
+    entry = _held.get()
+    if not entry or not uid or entry[0] != uid.lower():
+        return None
+    with _cond:
+        slot = _slots.get(entry[0])
+        return slot.lease if slot is not None and slot.owner is entry[1] else None
 
 
 _cond = threading.Condition()
@@ -225,7 +253,8 @@ def _join(uid: str, token) -> bool:
     middleware's hold)."""
     with _cond:
         slot = _slots.get(uid)
-        if slot is None or slot.owner is not token:
+        # users == 0: the last reference is returning the parent's lease; never join that.
+        if slot is None or slot.owner is not token or slot.users <= 0:
             return False
         slot.users += 1
         return True
@@ -234,13 +263,56 @@ def _join(uid: str, token) -> bool:
 def _release(uid: str, token) -> None:
     with _cond:
         slot = _slots.get(uid)
-        if slot is None or slot.owner is not token:
+        if slot is None or slot.owner is not token or slot.users <= 0:
             return
         slot.users -= 1
-        if slot.users <= 0:
+        if slot.users > 0:
+            return
+        lease, slot.lease = slot.lease, None
+        if lease is None:
             slot.owner = None
             _slots.pop(uid, None)
             _cond.notify_all()
+            return
+    # Main mode: the slot stays ours (users 0: nobody joins it) until the parent has the lease back.
+    try:
+        _remote.release(lease)
+    except Exception as exc:  # noqa: BLE001 - the parent lists a lease it still holds (/internal/leases)
+        log.error("Diary writer lease was not returned to the Rust parent (%s)", type(exc).__name__)
+    finally:
+        _abandon(uid, token)
+
+
+def _abandon(uid: str, token) -> None:
+    """Free a slot this token owns, whatever its count (a lease that was not granted, or returned)."""
+    with _cond:
+        slot = _slots.get(uid)
+        if slot is not None and slot.owner is token:
+            slot.owner, slot.users, slot.lease = None, 0, None
+            _slots.pop(uid, None)
+            _cond.notify_all()
+
+
+def _lease(uid: str, token, until: float) -> None:
+    """Main mode: take the parent's lease for a slot this token has just taken (outside _cond)."""
+    if _remote is None:
+        return
+    try:
+        lease = _remote.acquire(uid, max(0.0, until - time.monotonic()))
+    except WriterBusy:
+        raise
+    except Exception as exc:  # noqa: BLE001 - no lease: nothing may be written
+        log.error("Diary writer lease from the Rust parent failed (%s)", type(exc).__name__)
+        raise WriterBusy(uid) from None
+    with _cond:
+        slot = _slots.get(uid)
+        if slot is None or slot.owner is not token:
+            stale = True
+        else:
+            slot.lease, stale = lease, False
+    if stale:  # cannot happen (only this token frees its slot): never keep a lease nobody holds
+        _remote.release(lease)
+        raise WriterBusy(uid)
 
 
 class Hold:
@@ -297,6 +369,11 @@ def acquire(uid: Optional[str], deadline_s: Optional[float] = None) -> Hold:
                 raise WriterBusy(uid, None if reason == "busy" else "restarting")
             # Barriers are polled: their state changes outside _cond (notify() shortens the wait).
             _cond.wait(min(remaining, 0.05))
+    try:
+        _lease(uid, token, until)
+    except BaseException:
+        _abandon(uid, token)
+        raise
     return Hold(uid, token, _held.set((uid, token)))
 
 
@@ -316,7 +393,31 @@ async def acquire_async(uid: str, until: float) -> Hold:
             raise WriterBusy(uid, None if reason == "busy" else "restarting")
         await asyncio.sleep(min(pause, max(0.0, until - time.monotonic())))
         pause = min(pause * 2, 0.05)
+    if _remote is not None:
+        # The lease call blocks: run it off the loop. A cancelled caller still settles it: a
+        # lease granted after the cancellation is returned (the slot is freed with it).
+        future = asyncio.get_running_loop().run_in_executor(None, _lease, uid, token, until)
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            future.add_done_callback(lambda _f: _settle_cancelled(uid, token))
+            raise
+        except BaseException:
+            _abandon(uid, token)
+            raise
     return Hold(uid, token, _held.set((uid, token)))
+
+
+def _settle_cancelled(uid: str, token) -> None:
+    with _cond:
+        slot = _slots.get(uid)
+        lease = slot.lease if slot is not None and slot.owner is token else None
+    if lease is not None:
+        try:
+            _remote.release(lease)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Diary writer lease was not returned to the Rust parent (%s)", type(exc).__name__)
+    _abandon(uid, token)
 
 
 @contextmanager

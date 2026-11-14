@@ -793,8 +793,13 @@ async def lifespan(_app: FastAPI):
         parent = rust_parent.ParentServer(**rust_parent.read_handshake())
         _parent.append(parent)
         rust_forward.adopt(parent)
+        if _RUST_WRITERS:
+            # S3: the writer tenants' lock is a lease on the parent's writer slot.
+            tenant_writer.configure_remote(rust_parent.ParentLeases(parent.base_url, parent.control()[0]))
         config = rust_forward.server_config(_base_cfg, st, parent.port, parent.control()[0], parent.forward_secret)
-        await run_in_threadpool(parent.send_config, {**config, "native_routes": sorted(_RUST_ROUTES)})
+        writers = ["*"] if _RUST_WRITERS == rust_forward.ALL_TENANTS else sorted(_RUST_WRITERS)
+        await run_in_threadpool(parent.send_config, {**config, "native_routes": sorted(_RUST_ROUTES),
+                                                     "native_writers": writers})
     else:
         rust_forward.start(lambda port, token, secret: rust_forward.server_config(_base_cfg, st, port, token, secret),
                            _RUST_ROUTES, _RUST_WRITERS, answering=rust_answer.wanted() or rust_index.shadowing())
@@ -834,10 +839,11 @@ def _rust_write_uncertain(user_id: str) -> None:
 
 
 _RUST_ROUTES = rust_forward.configured_routes()
-# R9 main mode (rust_parent): every write is served here under this process's own writer lock.
+# R9 main mode (rust_parent): the parent serves the writer tenants' writes; their lock here is a
+# lease on its writer slot (S3).
 _PARENT_MODE = rust_parent.active()
 _parent: list = []
-_RUST_WRITERS = frozenset() if _PARENT_MODE else rust_forward.configured_writers()
+_RUST_WRITERS = rust_forward.configured_writers()
 tenant_writer.configure(_RUST_WRITERS)
 app = FastAPI(title="Diary Companion", lifespan=lifespan, docs_url=None, redoc_url=None)
 # D4: the forwarder sits INSIDE the assertion middleware (added first = innermost). D8: a request

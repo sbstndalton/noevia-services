@@ -17,13 +17,14 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from agent import rust_forward, rust_parent
+from agent import rust_forward, rust_parent, tenant_writer
 from agent import tenant_assertion as ta
 from tests.tenant_binary import needs_binary
 
@@ -174,6 +175,159 @@ def test_the_middleware_takes_the_parents_verdict_strips_internal_headers_and_st
         assert not any(k == b'x-noevia-diary-recovered' for k, _ in sent[0]['headers'])
 
 
+# ---------------- S3: the writer lock as a lease on the parent's slot ----------------
+
+class FakeParent:
+    """tenant_writer's remote, recording every call and refusing two live leases of one tenant."""
+
+    def __init__(self, busy=False, fail=False, release_fails=False):
+        self.busy, self.fail, self.release_fails = busy, fail, release_fails
+        self.calls, self.live, self.n = [], {}, 0
+        self.lock = threading.Lock()
+
+    def acquire(self, uid, wait_s):
+        with self.lock:
+            self.calls.append(('acquire', uid))
+            if self.busy:
+                raise tenant_writer.WriterBusy(uid)
+            if self.fail:
+                raise RuntimeError('parent unreachable')
+            assert uid not in self.live.values(), 'two live leases for one tenant'
+            self.n += 1
+            lease = str(self.n)
+            self.live[lease] = uid
+            return lease
+
+    def release(self, lease):
+        with self.lock:
+            self.calls.append(('release', lease))
+            self.live.pop(lease)
+            if self.release_fails:
+                raise RuntimeError('lost')
+
+
+@pytest.fixture
+def leased():
+    parent = FakeParent()
+    tenant_writer.configure(frozenset({QA}))
+    tenant_writer.configure_remote(parent)
+    try:
+        yield parent
+    finally:
+        tenant_writer.configure_remote(None)
+        tenant_writer.configure(frozenset())
+
+
+def test_a_writer_tenants_lock_is_one_lease_per_outer_hold(leased):
+    assert tenant_writer.lease_of(QA) is None
+    with tenant_writer.hold(QA):
+        assert tenant_writer.lease_of(QA) == '1' and tenant_writer.held(QA)
+        with tenant_writer.hold(QA):  # re-entrant: joins locally
+            assert tenant_writer.lease_of(QA) == '1'
+        assert tenant_writer.lease_of(QB) is None
+    assert tenant_writer.lease_of(QA) is None and not tenant_writer.held(QA)
+    with tenant_writer.hold(QB):  # not a writer tenant: no lease
+        pass
+    assert leased.calls == [('acquire', QA), ('release', '1')] and not leased.live
+
+
+def test_a_refused_or_failed_lease_holds_nothing(leased):
+    for kind in ('busy', 'fail'):
+        setattr(leased, kind, True)
+        with pytest.raises(tenant_writer.WriterBusy):
+            with tenant_writer.hold(QA, deadline_s=0.1):
+                pass
+        setattr(leased, kind, False)
+        assert not tenant_writer.held(QA)
+    with tenant_writer.hold(QA, deadline_s=0.1):  # the slot was freed
+        pass
+    assert not leased.live
+
+
+def test_writers_in_two_threads_take_the_lease_one_after_the_other(leased):
+    inside, order = threading.Event(), []
+
+    def first():
+        with tenant_writer.hold(QA):
+            order.append('first')
+            inside.set()
+            time.sleep(0.2)
+
+    t = threading.Thread(target=first)
+    t.start()
+    inside.wait(5)
+    with tenant_writer.hold(QA, deadline_s=5):
+        order.append('second')
+    t.join(5)
+    assert order == ['first', 'second']
+    assert [c[0] for c in leased.calls] == ['acquire', 'release', 'acquire', 'release']
+
+
+def test_a_lost_release_is_logged_and_frees_the_local_slot(leased, caplog):
+    leased.release_fails = True
+    with tenant_writer.hold(QA):
+        pass
+    assert 'was not returned' in caplog.text
+    leased.release_fails = False
+    with tenant_writer.hold(QA, deadline_s=0.1):
+        pass
+
+
+def test_the_async_acquisition_returns_a_lease_granted_after_cancellation(leased):
+    gate = threading.Event()
+    real = leased.acquire
+
+    def slow(uid, wait_s):
+        gate.wait(5)
+        return real(uid, wait_s)
+
+    leased.acquire = slow
+
+    async def main():
+        task = asyncio.ensure_future(tenant_writer.acquire_async(QA, time.monotonic() + 5))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.set()
+        for _ in range(100):
+            if not leased.live and not tenant_writer._slots:
+                return
+            await asyncio.sleep(0.02)
+
+    asyncio.run(main())
+    assert not leased.live and QA not in tenant_writer._slots
+    leased.acquire = real
+
+    async def ok():
+        hold = await tenant_writer.acquire_async(QA, time.monotonic() + 5)
+        assert tenant_writer.lease_of(QA) == '2'
+        hold.release()
+
+    asyncio.run(ok())
+    assert not leased.live
+
+
+def test_the_parent_lease_client():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params), request.headers.get('x-noevia-diary-control')))
+        if request.method == 'POST':
+            return httpx.Response(200, json={'lease': '7'}) if request.url.params['tenant'] == QA else httpx.Response(503)
+        return httpx.Response(200 if request.url.params['lease'] == '7' else 404)
+
+    leases = rust_parent.ParentLeases('http://127.0.0.1:1', 'tok', transport=httpx.MockTransport(handler))
+    assert leases.acquire(QA, 1.5) == '7'
+    with pytest.raises(tenant_writer.WriterBusy):
+        leases.acquire(QB, 0)
+    leases.release('7')
+    with pytest.raises(RuntimeError):
+        leases.release('8')
+    assert seen[0] == ('POST', '/internal/lease', {'tenant': QA, 'wait_ms': '1500'}, 'tok')
+    assert seen[2][:2] == ('DELETE', '/internal/lease')
+
+
 # ---------------- the differential (real binaries) ----------------
 
 def _free_port():
@@ -193,13 +347,13 @@ def _config(root: Path) -> Path:
                 'aux': {'base_url': 'http://127.0.0.1:9/v1', 'model': 'aux-a'}},
         'ui': {'auth_token': TOKEN},
     }
-    (root / 'state').mkdir(parents=True)
+    (root / 'state').mkdir(parents=True, exist_ok=True)
     path = root / 'config.yaml'
     path.write_text(yaml.safe_dump(cfg))
     return path
 
 
-def _env(root: Path, main: bool) -> dict:
+def _env(root: Path, main: bool, writers: bool = False) -> dict:
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(root), 'TZ': 'UTC',
            'PYTHONPATH': str(ROOT), 'DIARY_CONFIG': str(_config(root)), 'DIARY_TENANT_KEY': KEY,
            'LLM_BASE_URL': 'http://127.0.0.1:9/v1', 'LLM_EMBED_BASE_URL': 'http://127.0.0.1:9/v1'}
@@ -209,11 +363,14 @@ def _env(root: Path, main: bool) -> dict:
     if main:
         env['DIARY_RUST_ROUTES'] = '/api/months,/api/day,/api/files,/api/storage-status'
         env['DIARY_RUST_SERVER_BIN'] = BIN
+        if writers:
+            # S3: QA's writes are the parent's (native), under the slot the child leases.
+            env['DIARY_RUST_WRITES'] = QA
     return env
 
 
 class Deployment:
-    def __init__(self, root: Path, main: bool):
+    def __init__(self, root: Path, main: bool, writers: bool = False):
         self.port = _free_port()
         uvicorn = [sys.executable, '-m', 'uvicorn', 'agent.app:app', '--host', '127.0.0.1']
         if main:
@@ -222,18 +379,21 @@ class Deployment:
                     '--child-port', str(child), '--', *uvicorn, '--port', str(child)]
         else:
             argv = [*uvicorn, '--port', str(self.port)]
-        self.log = open(root / 'server.log', 'wb')
-        self.proc = subprocess.Popen(argv, cwd=ROOT, env=_env(root, main), stdout=self.log, stderr=subprocess.STDOUT)
+        root.mkdir(parents=True, exist_ok=True)
+        self.logfile = root / f'server-{"rust" if main else "python"}-{time.monotonic_ns()}.log'
+        self.log = open(self.logfile, 'wb')
+        self.proc = subprocess.Popen(argv, cwd=ROOT, env=_env(root, main, writers), stdout=self.log,
+                                     stderr=subprocess.STDOUT)
         self.client = httpx.Client(base_url=f'http://127.0.0.1:{self.port}', timeout=30, trust_env=False)
         deadline = time.monotonic() + 60
         while True:
-            assert self.proc.poll() is None, (root / 'server.log').read_text()
+            assert self.proc.poll() is None, self.logfile.read_text()
             try:
                 if self.client.get('/api/health', headers={'Authorization': f'Bearer {TOKEN}'}).status_code == 200:
                     break
             except httpx.HTTPError:
                 pass
-            assert time.monotonic() < deadline, (root / 'server.log').read_text()
+            assert time.monotonic() < deadline, self.logfile.read_text()
             time.sleep(0.2)
 
     def close(self):
@@ -306,26 +466,83 @@ def _sequence(d: Deployment):
     return out
 
 
+def _reads(d: Deployment, user=QA):
+    out = []
+    for method, path, query in (('GET', '/api/storage-status', ''), ('GET', '/api/months', ''),
+                                ('GET', '/api/day', 'month=2030-01'), ('GET', '/api/files', '')):
+        r = d.client.request(method, path + (f'?{query}' if query else ''),
+                             headers=_signed(user, method, path, query=query.encode()))
+        out.append((path, r.status_code, r.content))
+    return out
+
+
+def _put(d: Deployment, path: str, content: str, user=QA):
+    read = d.client.post('/api/file', content=json.dumps({'path': path}).encode(),
+                         headers=_signed(user, 'POST', '/api/file', json.dumps({'path': path}).encode(),
+                                         content_type='application/json'))
+    assert read.status_code == 200, read.text
+    body = json.dumps({'path': path, 'content': content, 'version': read.json().get('version')}).encode()
+    r = d.client.put('/api/file', content=body,
+                     headers=_signed(user, 'PUT', '/api/file', body, content_type='application/json'))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
 @needs_server
 @needs_binary
 def test_main_mode_answers_exactly_as_the_python_main_process(tmp_path):
-    results = {}
-    for name, main in (('python', False), ('rust', True)):
-        d = Deployment(tmp_path / name, main)
+    results, logs = {}, {}
+    for name, main, writers in (('python', False, False), ('rust', True, False), ('rust-writers', True, True)):
+        d = Deployment(tmp_path / name, main, writers)
         try:
             results[name] = _sequence(d)
         finally:
             code = d.close()
+        logs[name] = d.logfile.read_text()
         # SIGTERM: both stop cleanly (uvicorn 0; the Rust parent passes it to its child and exits 0).
-        assert code == 0, (name, code, (tmp_path / name / 'server.log').read_text()[-4000:])
-    assert [r[0] for r in results['python']] == [r[0] for r in results['rust']]
-    for py, rs in zip(results['python'], results['rust']):
-        assert py == rs, (py, rs)
-    log = (tmp_path / 'rust' / 'server.log').read_text()
-    assert 'child start-up config installed' in log
-    # Some reads were served natively by the parent: the child's access log saw fewer of them.
-    python_log = (tmp_path / 'python' / 'server.log').read_text()
-    seen = [sum(text.count(f'"GET {route}') for route in ('/api/months', '/api/files', '/api/storage-status'))
-            for text in (python_log, log)]
-    assert seen[1] < seen[0], seen
+        assert code == 0, (name, code, logs[name][-4000:])
+    for name in ('rust', 'rust-writers'):
+        assert [r[0] for r in results['python']] == [r[0] for r in results[name]]
+        for py, rs in zip(results['python'], results[name]):
+            assert py == rs, (name, py, rs)
+        assert 'child start-up config installed' in logs[name]
+        # Some reads were served natively by the parent: the child's access log saw fewer of them.
+        seen = [sum(text.count(f'"GET {route}') for route in ('/api/months', '/api/files', '/api/storage-status'))
+                for text in (logs['python'], logs[name])]
+        assert seen[1] < seen[0], (name, seen)
+    # S3: the writer tenant's save was the parent's (the child never saw the PUT).
+    assert '"PUT /api/file' in logs['python'] and '"PUT /api/file' not in logs['rust-writers']
+    assert '"PUT /api/file' in logs['rust']
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+@needs_server
+@needs_binary
+def test_either_parent_starts_on_the_data_the_other_wrote(tmp_path):
+    """On-disk compatibility, both directions: Python main → Rust main (writers) → Python main on one data root."""
+    root = tmp_path / 'shared'
+    day = 'Entries/2030/January/January 6, 2030.md'
+    d = Deployment(root, main=False)
+    try:
+        _reads(d)  # activates the managed tenant
+        _put(d, day, '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA written by Python.\n\n')
+        by_python = _reads(d)
+    finally:
+        assert d.close() == 0
+    d = Deployment(root, main=True, writers=True)
+    try:
+        assert _reads(d) == by_python
+        _put(d, day, '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA written by Rust.\n\n')
+        _put(d, 'Entries/2030/January/January 7, 2030.md', '## Monday, January 7, 2030\n\n')
+        by_rust = _reads(d)
+        log = d.logfile
+    finally:
+        assert d.close() == 0
+    assert by_rust != by_python
+    assert '"PUT /api/file' not in log.read_text()
+    d = Deployment(root, main=False)
+    try:
+        assert _reads(d) == by_rust
+    finally:
+        assert d.close() == 0
     shutil.rmtree(tmp_path, ignore_errors=True)
