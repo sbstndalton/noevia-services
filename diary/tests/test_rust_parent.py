@@ -396,7 +396,7 @@ def _env(root: Path, main: bool, writers: bool = False, extra: Optional[dict] = 
         if os.environ.get(name):
             env[name] = os.environ[name]
     if main:
-        env['DIARY_RUST_ROUTES'] = '/api/months,/api/day,/api/files,/api/storage-status'
+        env['DIARY_RUST_ROUTES'] = '/api/months,/api/day,/api/files,/api/storage-status,/api/file'
         env['DIARY_RUST_SERVER_BIN'] = BIN
         if writers:
             # S3: QA's writes are the parent's (native), under the slot the child leases.
@@ -475,6 +475,15 @@ def _sequence(d: Deployment):
         go('months', 'GET', '/api/months')
         go('day', 'GET', '/api/day', query='month=2030-01')
         go('files', 'GET', '/api/files')
+        # POST /api/file (a read with a body): a missing file, a bad path, bodies FastAPI refuses.
+        for label, body, ctype in (('read missing', b'{"path":"Entries/2030/January/January 5, 2030.md"}', 'application/json'),
+                                   ('read no path', b'{}', 'application/json'),
+                                   ('read bad path', b'{"path":"../x.md"}', 'application/json'),
+                                   ('read path not str', b'{"path":5}', 'application/json'),
+                                   ('read list body', b'[]', 'application/json'),
+                                   ('read bad json', b'{nope', 'application/json'),
+                                   ('read text body', b'path', 'text/plain')):
+            go(label, 'POST', '/api/file', body=body, content_type=ctype)
     day = '## Sunday, January 6, 2030\n\n### 09:15 — walk\n\n**Me:** QA synthetic walk by the river, “ünïcode”.\n\n'
     path = 'Entries/2030/January/January 6, 2030.md'
     read = go('read new file', 'POST', '/api/file', body=json.dumps({'path': path}).encode(),
@@ -486,6 +495,7 @@ def _sequence(d: Deployment):
         go('months', 'GET', '/api/months')
         go('day', 'GET', '/api/day', query='month=2030-01')
         go('files', 'GET', '/api/files')
+        go('read written', 'POST', '/api/file', body=json.dumps({'path': path}).encode(), content_type='application/json')
     go('other tenant months', 'GET', '/api/months', user=QB)
     go('health', 'GET', '/api/health', headers={'Authorization': f'Bearer {TOKEN}'})
     go('no token', 'GET', '/api/months', headers={'X-Cowork-User-ID': QA})
@@ -550,6 +560,8 @@ def test_main_mode_answers_exactly_as_the_python_main_process(tmp_path):
         seen = [sum(text.count(f'"GET {route}') for route in ('/api/months', '/api/files', '/api/storage-status'))
                 for text in (logs['python'], logs[name])]
         assert seen[1] < seen[0], (name, seen)
+        reads = [text.count('"POST /api/file') for text in (logs['python'], logs[name])]
+        assert reads[1] < reads[0], (name, reads)
     # S3: the writer tenant's save was the parent's (the child never saw the PUT).
     assert '"PUT /api/file' in logs['python'] and '"PUT /api/file' not in logs['rust-writers']
     assert '"PUT /api/file' in logs['rust']

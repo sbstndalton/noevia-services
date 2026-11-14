@@ -92,7 +92,9 @@ SUPPORTED = {"/api/health": "GET", "/api/months": "GET", "/api/day": "GET",
              "/api/files": "GET", "/api/storage-status": "GET",
              "/api/workspace-export": "GET",
              # R9: the external-sources scan (served only with the resolved list, below).
-             "/api/external-sources": "GET"}
+             "/api/external-sources": "GET",
+             # R9 main mode only: the file read takes a body, which this forwarder never forwards.
+             "/api/file": "POST"}
 # D5: a tenant's writes move together (DIARY_RUST_WRITES), never route by route.
 WRITE_ROUTES = {"/api/file": "PUT", "/api/directory": "POST", "/api/entries/append": "POST",
                 "/api/entries/edit": "POST", "/api/storage-backup": "POST"}
