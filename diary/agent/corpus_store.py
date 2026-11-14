@@ -717,7 +717,6 @@ class CorpusStore:
             return True
         return False
 
-    @serialized
     def _apply_own(self, ids: set) -> None:
         """apply_pending right after enqueueing `ids`: their first application is not a replay
         (REPLAY_MARKS); a row of them still pending afterwards is one when it is applied later."""
@@ -731,6 +730,7 @@ class CorpusStore:
         if REPLAY_MARKS and entry.id not in self.__dict__.get("_own_rows", ()):
             self.journal.mark_dirty(path)
 
+    @serialized
     def apply_pending(self, limit: int = 100, force: bool = False) -> int:
         """Apply all unapplied journal entries in order. Returns count applied now.
 

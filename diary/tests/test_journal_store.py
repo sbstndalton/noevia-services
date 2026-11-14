@@ -265,3 +265,13 @@ def test_a_replayed_row_marks_its_document_only_in_main_mode(store, monkeypatch,
     assert store.document_path(today) not in dirty
     assert (store.document_path(past) in dirty) is marks
     assert (store.index_path() in dirty) is False  # INDEX.md registration was this call's own row
+
+
+def test_journal_replay_runs_under_the_store_lock(store):
+    """Recovery calls apply_pending directly (app._recover_state): it must keep the store lock,
+    the closed check and the backend transaction (the review of R9 S6b caught it lost)."""
+    from agent.corpus_store import StoreClosed
+    assert getattr(type(store).apply_pending, "__wrapped__", None) is not None
+    store.closed = True
+    with pytest.raises(StoreClosed):
+        store.apply_pending()
