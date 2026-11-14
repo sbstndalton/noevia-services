@@ -831,6 +831,15 @@ def test_a_parent_served_write_recovers_without_sweeping_every_document(guarded,
     assert not st.recovered and not getattr(st, 'dirty_on_recover', False)
     assert client.get('/api/files', headers=hb).status_code == 200
     assert st.recovered and marked in seen and other not in seen
+    # A journal row still pending when the state recovers: its replay here marks nothing, so the
+    # recovery sweeps after all.
+    seen.clear()
+    with tenant_writer.hold(B):
+        st.journal.enqueue('index_update', {'today': '2030-01-09', 'open_questions': [], 'timeline': []})
+    monkeypatch.setattr(st.store, 'apply_pending', lambda *a, **k: 0)  # still pending at the sweep
+    appmod._rust_wrote(B)
+    assert client.get('/api/files', headers=hb).status_code == 200
+    assert st.recovered and other in seen and st.dirty_on_recover is False
 
 
 def test_every_fallback_path_bounds_the_body_and_its_deadline(monkeypatch):

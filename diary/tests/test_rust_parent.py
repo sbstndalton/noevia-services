@@ -8,6 +8,7 @@ compares status, content type and body byte for byte. It needs the real binaries
 noevia-diary, the tenant-assertion leaf) and skips without them.
 """
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -717,6 +718,17 @@ def _dirty(d: Deployment, user=QA):
         return sorted(r[0] for r in conn.execute('SELECT document FROM dirty_documents'))
 
 
+def _health(d: Deployment, user=QA):
+    """GET /api/health with tenant detail (journal counts, retrieval stats): S8 serves it in the
+    parent for a recovered managed tenant while the parent owns the embedding configuration."""
+    storage = base64.urlsafe_b64encode(json.dumps({'kind': 'local'}).encode()).decode().rstrip('=')
+    headers = {'Authorization': f'Bearer {TOKEN}', 'X-Cowork-User-ID': user, 'X-Cowork-Storage': storage}
+    headers[ta.HEADER] = ta.sign(KEY, user, 'GET', '/api/health', headers, int(time.time()), secrets.token_hex(16),
+                                 b'', body_hash=ta.STREAM)
+    r = d.client.get('/api/health', headers=headers)
+    return r.status_code, r.content
+
+
 def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     out = []
 
@@ -740,6 +752,9 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     # S6b: the save re-indexed before it replied, whichever process served it.
     out.append(('dirty after save', 200, _dirty(d)))
     out.append(('active ready', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
+    _reads(d)  # the child's recovered stamp (a native write voided it)
+    out.append(('health with tenant', *_health(d)))
+    out.append(('health with tenant again', *_health(d)))
     call('bad action', 'POST', {'action': 'bogus'})
     call('bad json', 'POST', b'{not json')
     call('switch without next', 'POST', {'action': 'switch'})
@@ -757,6 +772,8 @@ def _embedding_sequence(d: Deployment, stub: StubEmbeddings):
     call('finish', 'POST', {'action': 'finish'})
     call('finish again', 'POST', {'action': 'finish'})
     out.append(('final', *_masked(200, norm(_until(d, lambda s: (s['coverage']['active'] or {}).get('ready'))))))
+    _reads(d)
+    out.append(('health with tenant, final', *_health(d)))
     return out
 
 
@@ -769,6 +786,7 @@ def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_pat
         extra = {'LLM_EMBED_BASE_URL': stub.url, 'LLM_EMBED_MODEL': 'qa-embed-a', 'LLM_EMBED_PROFILE': 'nomic-v1'}
         if main:
             extra['DIARY_RUST_EMBEDDING'] = 'on'
+            extra['DIARY_RUST_ROUTES'] = '/api/health,/api/months,/api/day,/api/files,/api/storage-status,/api/file'
         d = Deployment(tmp_path / name, main, writers=writers, extra=extra)
         try:
             results[name] = _embedding_sequence(d, stub)
@@ -781,6 +799,8 @@ def test_the_parent_owning_embeddings_answers_as_the_python_main_process(tmp_pat
             # A writer tenant's saves are the parent's (S6b re-indexes them there), not the child's.
             assert ('"PUT /api/file' in log) is not writers, log[-3000:]
             assert 'edit reindex pending' not in log, log[-3000:]
+            # S8: the tenant detail was the parent's at least once (3 tenant probes, plus the start-up probe).
+            assert log.count('"GET /api/health') < 3, log[-3000:]
             effective = tmp_path / name / 'state' / 'embedding-config.effective.json'
             assert json.loads(effective.read_text())['active']['model'] == 'qa-embed-b'
         saved = json.loads((tmp_path / name / 'state' / 'embedding-config.json').read_text())

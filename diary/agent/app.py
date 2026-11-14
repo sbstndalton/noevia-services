@@ -546,6 +546,10 @@ def _recover_state(state: "AppState") -> None:
         # after a lost Rust write (_rust_write_uncertain), whose document Python cannot know. The
         # files are read NOW, not when the state was built, so documents created since are covered.
         managed = getattr(state, "managed", None)
+        # S6b (main mode, after a parent-served write: _rust_wrote): this replay marks nothing, so a
+        # journal row still pending here sweeps after all, as every other recovery here does.
+        if state.__dict__.pop("sweep_if_pending", False) and state.journal.pending_count():
+            state.dirty_on_recover = True
         if getattr(state, "dirty_on_recover", False) and managed is not None:
             with managed.db() as db:
                 # Paths still in the import outbox are marked by its drain (_reindex_dirty).
@@ -853,13 +857,16 @@ def _rust_write_uncertain(user_id: str) -> None:
 def _rust_wrote(user_id: str) -> None:
     """S6b (main mode): the parent served a native write of this tenant. The state recovers again
     before it is served here (journal replay, the outbox drain, _reindex_dirty), but without the
-    sweep of every Markdown document: the parent's write marks its own document dirty before it
-    writes anything, so its invalidation is in the journal however the write ended. A process lost
-    meanwhile restarts the container, and every new state sweeps once (dirty_on_recover)."""
+    sweep of every Markdown document: the parent's write (and its journal replay) marks each
+    document dirty before it writes it, so its invalidation is in the journal however the write
+    ended. A process lost meanwhile restarts the container, and every new state sweeps once
+    (dirty_on_recover). This process's replay marks nothing: a row still pending when it recovers
+    sweeps after all (sweep_if_pending, _recover_state)."""
     key = f"{user_id}:{hashlib.sha256(b'managed').hexdigest()[:16]}"
     with _tenant_lock:
         state = _tenant_states.get(key)
         if state is not None:
+            state.sweep_if_pending = True
             state.recovered = False
 
 
